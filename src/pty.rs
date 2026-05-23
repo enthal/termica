@@ -101,9 +101,32 @@ impl PtySession {
         for arg in &config.args {
             cmd.arg(arg);
         }
+
+        // Inherit the parent process's environment. `portable_pty`'s
+        // CommandBuilder starts EMPTY by default — without this loop
+        // the child has no $PATH, no $HOME, no $LANG, and (worst of
+        // all for a terminal emulator) no $TERM. With $TERM unset,
+        // programs that need terminfo (`less` arrow-key handling is
+        // the canonical example) fall back to a "dumb" definition
+        // where many escape sequences are simply ignored.
+        for (k, v) in std::env::vars_os() {
+            cmd.env(k, v);
+        }
+
+        // Termica is an xterm-class terminal emulator: we render
+        // 24-bit color, honor alternate screen, encode arrows as
+        // CSI sequences (see `crate::input`). So we always advertise
+        // `xterm-256color` regardless of what the parent shell had
+        // — that env var describes the terminal the child is talking
+        // to (us), not the one Termica itself was launched from.
+        cmd.env("TERM", "xterm-256color");
+
+        // Explicit `config.env` entries win over both inherited and
+        // built-in values.
         for (k, v) in &config.env {
             cmd.env(k, v);
         }
+
         if let Some(cwd) = &config.cwd {
             cmd.cwd(cwd);
         }
@@ -300,5 +323,57 @@ mod tests {
             Err(other) => panic!("unexpected error: {other:?}"),
         }
         let _ = session.kill();
+    }
+
+    // --- environment ----------------------------------------------------
+    //
+    // Regression coverage for the bug where the child was spawned with an
+    // EMPTY environment, leaving `$TERM` unset and breaking terminfo-driven
+    // programs like `less` (arrow-key scrolling silently did nothing).
+
+    fn drain_to_string(session: &mut PtySession) -> String {
+        let reader = session.take_reader().expect("take_reader");
+        let bytes = drain_until_quiet(reader, Duration::from_secs(2));
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    #[test]
+    fn child_environment_advertises_xterm_256color() {
+        // The terminal-emulator's `$TERM` describes the terminal the child
+        // is talking to — that's Termica, which is xterm-256color.
+        let mut session = PtySession::spawn(&sh_c(r#"printf "TERM=%s" "$TERM""#)).expect("spawn");
+        let s = drain_to_string(&mut session);
+        assert!(s.contains("TERM=xterm-256color"), "expected TERM=xterm-256color, got: {s:?}");
+    }
+
+    #[test]
+    fn child_environment_inherits_parent_variables() {
+        // `std::env::set_var` is `unsafe fn` from edition 2024 and we
+        // `forbid(unsafe_code)`, so we can't synthesize a fresh var on
+        // the parent. Instead we lean on `$HOME`, which both CI
+        // runners (ubuntu-latest, macos-latest) and any sensible dev
+        // workstation set. If we read it on the parent side and the
+        // child sees the same value, inheritance is working.
+        let parent_home = std::env::var("HOME").expect("test parent must have HOME set");
+        assert!(!parent_home.is_empty(), "HOME on parent is empty");
+        let mut session = PtySession::spawn(&sh_c(r#"printf "HOME=%s" "$HOME""#)).expect("spawn");
+        let s = drain_to_string(&mut session);
+        let expected = format!("HOME={parent_home}");
+        assert!(s.contains(&expected), "expected child to see {expected:?}; got: {s:?}");
+    }
+
+    #[test]
+    fn explicit_config_env_overrides_inherited_value() {
+        // PtyConfig::env overrides must beat the inherited parent env.
+        // We override TERM specifically to prove the layering ordering.
+        let mut session = PtySession::spawn(&PtyConfig {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), r#"printf "TERM=%s" "$TERM""#.into()],
+            env: vec![("TERM".into(), "screen-256color".into())],
+            ..PtyConfig::default()
+        })
+        .expect("spawn");
+        let s = drain_to_string(&mut session);
+        assert!(s.contains("TERM=screen-256color"), "expected explicit override, got: {s:?}");
     }
 }
