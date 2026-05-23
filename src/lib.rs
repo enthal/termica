@@ -1,9 +1,10 @@
 //! Termica library entry point.
 //!
-//! Phase 1E-a: the eframe app owns one [`pane::PaneSession`] that
+//! Phase 1E-b: the eframe app owns one [`pane::PaneSession`] that
 //! drains a real PTY into a [`terminal::TerminalState`] in the
-//! background and renders a debug view (byte counter + monospaced
-//! screen text). The custom cell renderer arrives in Phase 1E-b.
+//! background. The custom cell renderer ([`render::paint_terminal`])
+//! paints the grid directly into the central panel. Keyboard input
+//! still goes nowhere — the input encoder is Phase 1E-c.
 //!
 //! See [`SPEC.md`](../SPEC.md) and [`spec/01-architecture.md`](../spec/01-architecture.md)
 //! for the layered architecture this crate grows into.
@@ -12,6 +13,7 @@
 
 pub mod pane;
 pub mod pty;
+pub mod render;
 pub mod terminal;
 
 use eframe::egui;
@@ -19,26 +21,27 @@ use eframe::egui;
 use pane::{PaneSession, PaneView};
 use pty::PtyConfig;
 
-/// Render the workspace's central panel content into `ui`.
+/// Render the workspace's status header into `ui`.
 ///
 /// Pure UI: takes a plain [`PaneView`] snapshot, never touches OS
 /// resources, safe to drive from `egui_kittest` snapshot tests.
+/// The cell grid is painted separately by [`render::paint_terminal`]
+/// directly below this header.
 pub fn central_panel(ui: &mut egui::Ui, view: &PaneView) {
     ui.heading("Termica");
     ui.label(format!(
-        "Phase 1E-a — PTY pipeline live. \
+        "Phase 1E-b — cell renderer live. \
          Bytes received: {}   ·   alt-screen: {}",
         view.bytes_received, view.alt_screen
     ));
     ui.separator();
-    ui.monospace(&view.screen_text);
 }
 
 /// The top-level eframe application.
 ///
 /// Holds one [`PaneSession`] for now (multi-pane workspace lives in
 /// [Phase 2 (#2)](https://github.com/enthal/termica/issues/2)). On
-/// spawn failure the pane is `None` and the UI renders an error
+/// spawn failure the pane is `Err` and the UI renders an error
 /// banner — the app stays alive so the user can see what went wrong
 /// instead of silently exiting.
 pub struct TermicaApp {
@@ -66,14 +69,14 @@ impl eframe::App for TermicaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Liveness: ask for a redraw next frame so PTY output keeps
         // flowing even when the user is idle. (~ every 50 ms is more
-        // than enough for a debug view; the renderer PR will tune.)
+        // than enough for the debug stages; Phase 1E-c will tune.)
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
 
-        let view = match &mut self.pane {
-            Ok(pane) => {
-                pane.drain();
-                pane.view()
-            }
+        if let Ok(pane) = &mut self.pane {
+            pane.drain();
+        }
+        let view = match &self.pane {
+            Ok(pane) => pane.view(),
             Err(_) => PaneView::default(),
         };
 
@@ -86,6 +89,12 @@ impl eframe::App for TermicaApp {
                 ui.separator();
             }
             central_panel(ui, &view);
+
+            // Cell-grid renderer. Painted right below the status
+            // header so the on-screen pane reads top-to-bottom.
+            if let Ok(pane) = &self.pane {
+                render::paint_terminal(ui, pane.terminal());
+            }
         });
     }
 }
