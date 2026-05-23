@@ -6,10 +6,18 @@
 //! plus an explicit glyph draw, so future styled-run batching and
 //! per-cell decorations have a clean place to grow.
 //!
-//! Out of scope for this PR (deliberately): bold / italic /
-//! underline rendering, cursor shape / blink, selection / search
-//! highlights, styled-run batching as an optimization. Those land
-//! across later 1E-* and Phase 2 sub-PRs.
+//! Phase 1E-f also covers the basic cell-attribute decorations:
+//! bold (brighten), dim (darken), inverse (swap fg/bg), hidden
+//! (skip glyph), underline / strikethrough (extra line). Italic
+//! needs an italic monospace font and is deferred to Phase 10;
+//! every underline variant currently renders as the same single
+//! line, with the spec calling out doubled / curly / dotted /
+//! dashed as future polish.
+//!
+//! Still out of scope for this PR (deliberately): cursor shape /
+//! blink, selection / search highlights, styled-run batching as
+//! an optimization, mouse selection. Those land across later
+//! 1E-* and Phase 2 sub-PRs.
 //!
 //! See [`spec/02-terminal-engine.md`](../spec/02-terminal-engine.md#rendering)
 //! for the rendering contract this implements.
@@ -18,8 +26,9 @@
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
-use eframe::egui::{self, Color32, FontId, Pos2, Rect, Vec2};
+use eframe::egui::{self, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 
 use crate::terminal::TerminalState;
 
@@ -74,23 +83,46 @@ pub fn paint_terminal(ui: &mut egui::Ui, term: &TerminalState) {
 
             let x = rect.min.x + col as f32 * cell_w;
             let y = rect.min.y + row as f32 * row_h;
+            let cell_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w, row_h));
 
-            let bg = ansi_to_egui(cell.bg);
+            let (fg, bg, paint_glyph) = cell_colors(cell);
+
             if let Some(c) = bg {
-                let cell_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w, row_h));
                 painter.rect_filled(cell_rect, 0.0, c);
             }
 
             // Spaces don't paint a glyph (default cells are already
-            // covered by the pane background). Non-space glyphs do.
-            if cell.c != ' ' {
-                let fg = ansi_to_egui(cell.fg).unwrap_or(DEFAULT_FG);
+            // covered by the pane background). Non-space glyphs do —
+            // unless the HIDDEN flag is set, in which case we paint
+            // the bg (above) but not the glyph itself.
+            if paint_glyph && cell.c != ' ' {
                 painter.text(
                     Pos2::new(x, y),
                     egui::Align2::LEFT_TOP,
                     cell.c.to_string(),
                     font_id.clone(),
                     fg,
+                );
+            }
+
+            // Underline decorations. alacritty distinguishes plain /
+            // double / curly / dotted / dashed underlines; for v1 we
+            // collapse all variants to one line under the cell. Phase
+            // 10 polish can break them apart with proper rendering.
+            if cell.flags.intersects(Flags::ALL_UNDERLINES) {
+                let underline_y = y + row_h - 1.5;
+                painter.line_segment(
+                    [Pos2::new(x, underline_y), Pos2::new(x + cell_w, underline_y)],
+                    Stroke::new(1.0, fg),
+                );
+            }
+
+            // Strikeout: a single line through the vertical middle.
+            if cell.flags.contains(Flags::STRIKEOUT) {
+                let strike_y = y + row_h * 0.5;
+                painter.line_segment(
+                    [Pos2::new(x, strike_y), Pos2::new(x + cell_w, strike_y)],
+                    Stroke::new(1.0, fg),
                 );
             }
         }
@@ -109,6 +141,65 @@ pub fn paint_terminal(ui: &mut egui::Ui, term: &TerminalState) {
         let cursor_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w, row_h));
         painter.rect_filled(cursor_rect, 0.0, CURSOR_COLOR);
     }
+}
+
+/// Resolve a cell to its `(fg, bg, paint_glyph)` triple for this
+/// frame, applying the per-cell attribute flags:
+///
+/// - `INVERSE`: swap fg / bg (with logical-default substitution).
+/// - `BOLD`: brighten the fg toward white. Cheap stand-in for a
+///   real bold font; Phase 10 can swap in a proper bold glyph
+///   render. Bold is intentionally **not** applied to bg.
+/// - `DIM`: darken the fg toward black. Same caveat.
+/// - `HIDDEN`: keep colors but signal the caller to skip the glyph.
+///
+/// `bg` is `None` when the cell wants the pane default — that lets
+/// `paint_terminal` skip per-cell background fills for default
+/// cells (the pane-wide fill already covered them).
+fn cell_colors(cell: &alacritty_terminal::term::cell::Cell) -> (Color32, Option<Color32>, bool) {
+    let mut fg = ansi_to_egui(cell.fg).unwrap_or(DEFAULT_FG);
+    // The default-bg case keeps `bg_opt = None` so the per-cell fill
+    // is skipped; only solid-color backgrounds paint a rectangle.
+    let mut bg_opt = ansi_to_egui(cell.bg);
+
+    if cell.flags.contains(Flags::INVERSE) {
+        // After inversion, "default bg" becomes the actual fg color
+        // and vice versa — neither side can be `None` anymore, so
+        // when one was logical-default we substitute its visible
+        // counterpart.
+        let prev_fg = fg;
+        let prev_bg = bg_opt.unwrap_or(DEFAULT_BG);
+        fg = prev_bg;
+        bg_opt = Some(prev_fg);
+    }
+
+    if cell.flags.contains(Flags::DIM) {
+        fg = scale_brightness(fg, 0.5);
+    }
+    if cell.flags.contains(Flags::BOLD) {
+        fg = brighten_toward_white(fg, 0.3);
+    }
+
+    let paint_glyph = !cell.flags.contains(Flags::HIDDEN);
+    (fg, bg_opt, paint_glyph)
+}
+
+/// Move each RGB channel `f` of the distance toward `255`.
+fn brighten_toward_white(c: Color32, f: f32) -> Color32 {
+    let f = f.clamp(0.0, 1.0);
+    let r = c.r() as f32 + (255.0 - c.r() as f32) * f;
+    let g = c.g() as f32 + (255.0 - c.g() as f32) * f;
+    let b = c.b() as f32 + (255.0 - c.b() as f32) * f;
+    Color32::from_rgb(r as u8, g as u8, b as u8)
+}
+
+/// Multiply each RGB channel by `f` (0 = black, 1 = unchanged).
+fn scale_brightness(c: Color32, f: f32) -> Color32 {
+    let f = f.clamp(0.0, 1.0);
+    let r = (c.r() as f32 * f) as u8;
+    let g = (c.g() as f32 * f) as u8;
+    let b = (c.b() as f32 * f) as u8;
+    Color32::from_rgb(r, g, b)
 }
 
 /// Map an alacritty `Color` to an egui `Color32`. Returns `None`
@@ -267,5 +358,106 @@ mod tests {
             assert_eq!(c.r(), c.g());
             assert_eq!(c.g(), c.b());
         }
+    }
+
+    // --- cell-attribute helpers ----------------------------------------
+
+    #[test]
+    fn brighten_toward_white_moves_each_channel_toward_max() {
+        let base = Color32::from_rgb(100, 100, 100);
+        let brightened = brighten_toward_white(base, 0.5);
+        // r = 100 + (255-100)*0.5 = 177.5 -> truncated to 177
+        assert!(
+            brightened.r() > base.r() && brightened.g() > base.g() && brightened.b() > base.b(),
+            "expected all channels to brighten; got {brightened:?}"
+        );
+        // f=0 must be a no-op.
+        assert_eq!(brighten_toward_white(base, 0.0), base);
+        // f=1 must produce pure white.
+        let white = brighten_toward_white(base, 1.0);
+        assert_eq!((white.r(), white.g(), white.b()), (255, 255, 255));
+    }
+
+    #[test]
+    fn scale_brightness_dims_toward_black() {
+        let base = Color32::from_rgb(200, 100, 50);
+        let dim = scale_brightness(base, 0.5);
+        assert!(
+            dim.r() < base.r() && dim.g() < base.g() && dim.b() < base.b(),
+            "expected all channels to dim; got {dim:?}"
+        );
+        // f=0 must be black.
+        let black = scale_brightness(base, 0.0);
+        assert_eq!((black.r(), black.g(), black.b()), (0, 0, 0));
+        // f=1 must be unchanged.
+        assert_eq!(scale_brightness(base, 1.0), base);
+    }
+
+    fn cell_with_flags(flags: Flags) -> alacritty_terminal::term::cell::Cell {
+        // Build a cell with named-default fg/bg and the requested
+        // attribute flags. The struct-update syntax keeps clippy's
+        // `field_reassign_with_default` happy.
+        alacritty_terminal::term::cell::Cell {
+            c: 'X',
+            flags,
+            ..alacritty_terminal::term::cell::Cell::default()
+        }
+    }
+
+    #[test]
+    fn cell_colors_default_returns_default_fg_and_none_bg() {
+        let cell = cell_with_flags(Flags::empty());
+        let (fg, bg, paint) = cell_colors(&cell);
+        assert_eq!(fg, DEFAULT_FG);
+        assert!(bg.is_none(), "default-bg cell should not paint a per-cell rect");
+        assert!(paint);
+    }
+
+    #[test]
+    fn cell_colors_inverse_swaps_fg_and_bg() {
+        let cell = cell_with_flags(Flags::INVERSE);
+        let (fg, bg, _paint) = cell_colors(&cell);
+        // Default fg + default bg, swapped: fg becomes DEFAULT_BG,
+        // bg becomes DEFAULT_FG (and is now a real fill).
+        assert_eq!(fg, DEFAULT_BG);
+        assert_eq!(bg, Some(DEFAULT_FG));
+    }
+
+    #[test]
+    fn cell_colors_bold_brightens_fg() {
+        let plain = cell_colors(&cell_with_flags(Flags::empty())).0;
+        let bold = cell_colors(&cell_with_flags(Flags::BOLD)).0;
+        // Bold > plain on every channel (brightness moved toward white).
+        assert!(bold.r() >= plain.r() && bold.g() >= plain.g() && bold.b() >= plain.b());
+        assert!(
+            bold.r() > plain.r() || bold.g() > plain.g() || bold.b() > plain.b(),
+            "bold should brighten at least one channel"
+        );
+    }
+
+    #[test]
+    fn cell_colors_dim_darkens_fg() {
+        let plain = cell_colors(&cell_with_flags(Flags::empty())).0;
+        let dim = cell_colors(&cell_with_flags(Flags::DIM)).0;
+        assert!(dim.r() <= plain.r() && dim.g() <= plain.g() && dim.b() <= plain.b());
+        assert!(dim.r() < plain.r() || dim.g() < plain.g() || dim.b() < plain.b());
+    }
+
+    #[test]
+    fn cell_colors_hidden_suppresses_glyph() {
+        let (_fg, _bg, paint) = cell_colors(&cell_with_flags(Flags::HIDDEN));
+        assert!(!paint, "HIDDEN flag should suppress glyph painting");
+    }
+
+    #[test]
+    fn cell_colors_bold_dim_combined_picks_a_middle() {
+        // BOLD + DIM together are a real (if unusual) terminal state.
+        // The order in `cell_colors` applies DIM first, then BOLD,
+        // so the result lands between the two extremes. The contract
+        // is just "doesn't panic, returns something sensible" — we
+        // assert the result differs from plain.
+        let plain = cell_colors(&cell_with_flags(Flags::empty())).0;
+        let combined = cell_colors(&cell_with_flags(Flags::BOLD | Flags::DIM)).0;
+        assert_ne!(plain, combined);
     }
 }
