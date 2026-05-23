@@ -127,6 +127,14 @@ Commits should be small and reviewable. A commit that touches >1 crate without a
 - Before merging, update [README.md](README.md) to reflect any user-facing changes and the spec to reflect any normative changes.
 - **Squash on merge**; keep the branch. After merging, switch to `main` and pull.
 
+## Watching CI on open PRs
+
+- **Use the `Monitor` tool**, not polling loops. After `gh pr create`, set up a persistent `Monitor` task that watches `gh pr list` / `gh pr checks` and emits one line per state change — the harness then notifies you when CI completes, when a check turns red, or when a PR is merged. Keep working in parallel; never sit idle waiting on CI.
+- **Do not write `until` loops over `gh pr checks`.** They block the agent, burn context with retries, and reproduce exactly what `Monitor` already does correctly. The same goes for `sleep N && gh pr checks` chains — they are forbidden by the harness in any case.
+- Acceptable one-shot pattern: `Bash` with `run_in_background: true` running a command that exits when a single condition is true (e.g. `gh pr checks N --watch --fail-fast`). Use this when you specifically need a single completion notification for one PR; use `Monitor` when you want continuous events across the work session or across multiple PRs.
+- Don't `gh pr merge` inside a polling loop either — merge only after the monitor (or a deliberate manual user instruction) tells you a PR is green.
+- The same rule applies to anything else with discrete events: log tails, CI for non-PR commits, external job state. If you're tempted to poll, reach for `Monitor` instead.
+
 ## Command governance
 
 - Use relative paths in shell commands, not absolute paths.
