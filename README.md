@@ -1,6 +1,6 @@
 # Termica
 
-> **🚧 Status: WIP — pre-implementation.** This repository currently contains only the design spec, license, toolchain pin, and a placeholder `main` so `cargo build` succeeds. No application code exists yet. The first feature PR will land the Phase 1 terminal pane described in [spec/02-terminal-engine.md](spec/02-terminal-engine.md). Watch this banner — it will track the actual phase as work lands.
+> **🚧 Status: WIP — Phase 1 nearly complete.** A single PTY-backed terminal pane is live. `cargo run` opens a native window running your `$SHELL`, with a custom egui cell renderer (24-bit + 256-color), CSI/SS3 arrow encoding, bracketed paste, visible cursor honoring DECTCEM, and window-resize-to-PTY-resize wiring. `vim`, `less`, `htop` all work. Mouse selection / clipboard and VT golden tests are the remaining Phase 1 items. After Phase 1: workspace tabs and splits ([#2](https://github.com/enthal/termica/issues/2)). Watch this banner — it tracks the actual phase as work lands.
 
 Termica is a native terminal workspace built with Rust and [egui](https://github.com/emilk/egui). It combines a real terminal emulator with an editor-driven shell experience, persistent command history, searchable transcripts, structured command execution, and modern pane-based workflows.
 
