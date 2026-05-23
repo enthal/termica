@@ -1,0 +1,7 @@
+# Threshold for snapshot image comparison.
+# Higher = more tolerant of GPU/driver pixel differences.
+threshold = 2.0
+
+[[os_thresholds]]
+os = "macos"
+threshold = 0.6
