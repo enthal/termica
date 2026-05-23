@@ -66,6 +66,13 @@ pub fn paint_terminal(ui: &mut egui::Ui, term: &TerminalState) {
     let grid = term.grid();
     let cols = grid.columns();
     let rows = grid.screen_lines();
+    // Translate viewport rows (`0..rows`) to grid `Line` indices.
+    // When the user scrolls into the scrollback, the visible top
+    // moves UP into negative `Line` territory.
+    //
+    // See `alacritty_terminal::term::viewport_to_point`:
+    //     grid_line = viewport_line - display_offset
+    let display_offset = grid.display_offset() as i32;
 
     let size = Vec2::new(cols as f32 * cell_w, rows as f32 * row_h);
     let (rect, _response) = ui.allocate_exact_size(size, egui::Sense::hover());
@@ -78,7 +85,8 @@ pub fn paint_terminal(ui: &mut egui::Ui, term: &TerminalState) {
 
     for row in 0..rows {
         for col in 0..cols {
-            let pt = Point::new(Line(row as i32), Column(col));
+            let grid_line = (row as i32) - display_offset;
+            let pt = Point::new(Line(grid_line), Column(col));
             let cell = &grid[pt];
 
             let x = rect.min.x + col as f32 * cell_w;

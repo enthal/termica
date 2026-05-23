@@ -156,6 +156,24 @@ fn snapshot_terminal_cell_attributes() {
 }
 
 #[test]
+fn snapshot_terminal_scrolled_into_scrollback() {
+    // Emit enough numbered lines to push earlier ones into the
+    // scrollback buffer, then scroll the display up by 5 rows. The
+    // visible region should now show older rows instead of the
+    // most-recent ones — that's the mouse-wheel-scroll experience.
+    let mut term = TerminalState::new(5, 30);
+    for i in 0..20 {
+        let line = format!("row-{i:02}\r\n");
+        term.feed(line.as_bytes());
+    }
+    term.scroll_display(5);
+    let mut harness = Harness::builder()
+        .with_size(egui::Vec2::new(700.0, 180.0))
+        .build_ui(move |ui| render::paint_terminal(ui, &term));
+    harness.snapshot("terminal_scrolled_into_scrollback");
+}
+
+#[test]
 fn snapshot_terminal_alt_screen() {
     // Enter alt screen, write some content (with explicit cursor home
     // because alacritty does NOT reposition the cursor on `\e[?1049h`).

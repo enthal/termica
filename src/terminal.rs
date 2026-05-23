@@ -87,6 +87,26 @@ impl TerminalState {
         self.term.resize(size);
     }
 
+    /// Shift the displayed viewport through the scrollback buffer.
+    /// Positive `lines` scrolls toward older content (up); negative
+    /// scrolls toward newer (down). The current view becomes
+    /// `min(history_size, max(0, display_offset + lines))` lines
+    /// back from the live bottom; alacritty handles the clamping.
+    ///
+    /// Has no effect on the alternate screen (which has no scrollback
+    /// of its own), and never affects the kernel-side PTY size.
+    pub fn scroll_display(&mut self, lines: i32) {
+        use alacritty_terminal::grid::Scroll;
+        self.term.scroll_display(Scroll::Delta(lines));
+    }
+
+    /// How many lines back from the live bottom of the scrollback we
+    /// are currently viewing. `0` means "tracking the latest output";
+    /// any positive value means the user scrolled up.
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
     /// True when the terminal is in alternate-screen mode (vim/htop/
     /// less/fzf/tmux territory). The pane mode machine in Phase 3
     /// uses this as a hard signal that the program below owns every
@@ -135,20 +155,26 @@ impl TerminalState {
         self.term.mode().contains(TermMode::SHOW_CURSOR)
     }
 
-    /// Cursor position as `(row, col)` zero-indexed into the visible
-    /// grid. Returns `None` if the row is outside the visible region
-    /// (shouldn't happen during normal operation but we don't want
-    /// the renderer to read past the end of its allocated rect).
+    /// Cursor position as `(viewport_row, col)` zero-indexed into the
+    /// currently displayed region. Returns `None` if the cursor's
+    /// grid line falls outside the visible viewport — that happens
+    /// when the user has scrolled into the scrollback far enough
+    /// that the cursor's line is no longer on screen.
+    ///
+    /// The translation is the same as alacritty's `viewport_to_point`
+    /// run in reverse: `viewport_row = grid_line + display_offset`.
     pub fn cursor_position(&self) -> Option<(usize, usize)> {
         use alacritty_terminal::grid::Dimensions;
-        let cur = self.term.grid().cursor.point;
-        let line = cur.line.0;
+        let grid = self.term.grid();
+        let cur = grid.cursor.point;
+        let display_offset = grid.display_offset() as i32;
+        let viewport_row = cur.line.0 + display_offset;
         let col = cur.column.0;
-        if line < 0 {
+        if viewport_row < 0 {
             return None;
         }
-        let row = line as usize;
-        if row >= self.term.grid().screen_lines() || col >= self.term.grid().columns() {
+        let row = viewport_row as usize;
+        if row >= grid.screen_lines() || col >= grid.columns() {
             return None;
         }
         Some((row, col))
@@ -338,5 +364,61 @@ mod tests {
         // Resizing must not accidentally drop us out of alt screen —
         // vim et al would never recover if it did.
         assert!(state.is_alternate_screen());
+    }
+
+    // --- scrollback ------------------------------------------------
+    //
+    // The renderer paints whatever rows the grid says are visible.
+    // After a `scroll_display` the visible window slides into the
+    // scrollback. The mouse-wheel handler in `TermicaApp::update` is
+    // the only production caller; tests verify the underlying state
+    // moves.
+
+    /// Feed enough lines to push earlier content into the scrollback
+    /// buffer. `rows` here is the grid height; we emit `rows * 3`
+    /// numbered lines so older lines are forced offscreen.
+    fn feed_overflow(state: &mut TerminalState, rows: u16) {
+        for i in 0..(rows as usize * 3) {
+            let line = format!("row-{i}\r\n");
+            state.feed(line.as_bytes());
+        }
+    }
+
+    #[test]
+    fn fresh_terminal_has_zero_display_offset() {
+        let state = TerminalState::new(5, 20);
+        assert_eq!(state.display_offset(), 0);
+    }
+
+    #[test]
+    fn scroll_display_up_increases_display_offset() {
+        let mut state = TerminalState::new(5, 20);
+        feed_overflow(&mut state, 5);
+        assert_eq!(state.display_offset(), 0, "fresh state should track live bottom");
+        state.scroll_display(3);
+        assert_eq!(state.display_offset(), 3);
+    }
+
+    #[test]
+    fn scroll_display_down_returns_to_bottom() {
+        let mut state = TerminalState::new(5, 20);
+        feed_overflow(&mut state, 5);
+        state.scroll_display(5);
+        assert!(state.display_offset() > 0);
+        // A large negative delta should clamp to 0 (live bottom).
+        state.scroll_display(-100);
+        assert_eq!(state.display_offset(), 0);
+    }
+
+    #[test]
+    fn scroll_display_clamps_to_history_size() {
+        let mut state = TerminalState::new(5, 20);
+        feed_overflow(&mut state, 5);
+        // Try to scroll way past the top — alacritty clamps to the
+        // history size; we never panic and never overshoot.
+        state.scroll_display(10_000);
+        let offset = state.display_offset();
+        assert!(offset > 0, "should have scrolled into history");
+        assert!(offset <= 1_000, "offset should be bounded by history size: {offset}");
     }
 }
