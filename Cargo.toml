@@ -14,9 +14,21 @@ rust-version = "1.95"
 # a second crate appears.
 members = ["."]
 
+[lib]
+name = "termica"
+path = "src/lib.rs"
+
+[[bin]]
+name = "termica"
+path = "src/main.rs"
+
 [dependencies]
-# Intentionally empty on commit zero. Dependencies arrive with the
-# first feature PR (eframe / egui / egui_tiles / alacritty_terminal /
-# portable-pty). See spec/01-architecture.md for the planned set.
+# Phase 1B: native window via eframe + egui. egui pulls in the painter
+# layer we will use directly for the custom cell renderer in Phase 1E.
+eframe = { version = "0.33", default-features = true }
+egui = "0.33"
 
 [dev-dependencies]
+# Snapshot-driven UI tests (knauty pattern). Pinned to the egui major
+# series we depend on so the harness sees the same egui types.
+egui_kittest = { version = "0.33", features = ["wgpu", "snapshot"] }

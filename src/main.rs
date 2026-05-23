@@ -1,11 +1,11 @@
-// Termica — pre-implementation placeholder.
+// Termica binary entry point.
 //
-// This binary exists so `cargo build` succeeds on commit zero before
-// any application code lands. The real entry point arrives with the
-// terminal-pane crate in the Phase 1 PR. See SPEC.md.
+// All application logic lives in the library crate (`src/lib.rs`)
+// so tests can drive it without going through `main`. See SPEC.md
+// and CLAUDE.md.
 
 #![forbid(unsafe_code)]
 
-fn main() {
-    eprintln!("termica: pre-implementation — see SPEC.md for design, README.md for status.");
+fn main() -> eframe::Result<()> {
+    termica::run()
 }

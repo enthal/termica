@@ -54,6 +54,13 @@ jobs:
           toolchain: "1.95.0"
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # egui_kittest's snapshot feature renders through wgpu; on Ubuntu
+      # runners that means we need the Vulkan loader + a software
+      # backend so headless rendering works. macOS uses Metal and needs
+      # nothing extra. Matches knauty's CI setup.
+      - name: Install Linux GPU deps
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
@@ -69,4 +76,7 @@ jobs:
         with:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@v2
+      - name: Install Linux GPU deps
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
       - run: cargo test --workspace --locked
