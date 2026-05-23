@@ -8,6 +8,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod pty;
+
 use eframe::egui;
 
 /// Render the workspace's central panel content into `ui`.
