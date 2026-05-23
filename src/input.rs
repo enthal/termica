@@ -55,7 +55,24 @@ pub fn encode_event(event: &egui::Event, modes: TerminalModes) -> Option<Vec<u8>
             // we can pass it through verbatim.
             if s.is_empty() { None } else { Some(s.as_bytes().to_vec()) }
         }
-        egui::Event::Paste(s) => Some(s.as_bytes().to_vec()),
+        egui::Event::Paste(s) => {
+            if s.is_empty() {
+                None
+            } else if modes.bracketed_paste {
+                // Bracketed paste: wrap the payload in `\e[200~` and
+                // `\e[201~`. The shell uses these markers to skip
+                // completion / history expansion of the paste — a
+                // raw multi-line paste would otherwise run lines
+                // halfway, leaving the shell stuck mid-edit.
+                let mut out = Vec::with_capacity(s.len() + 12);
+                out.extend_from_slice(b"\x1b[200~");
+                out.extend_from_slice(s.as_bytes());
+                out.extend_from_slice(b"\x1b[201~");
+                Some(out)
+            } else {
+                Some(s.as_bytes().to_vec())
+            }
+        }
         egui::Event::Key { key, pressed: true, modifiers, .. } => {
             encode_key(*key, *modifiers, modes)
         }
@@ -197,7 +214,13 @@ mod tests {
     /// Modes after a program (less, vim, htop) has issued `\e[?1h`
     /// (DECCKM on). Arrow keys / Home / End must encode as SS3.
     fn app_cursor_modes() -> TerminalModes {
-        TerminalModes { application_cursor: true }
+        TerminalModes { application_cursor: true, ..TerminalModes::default() }
+    }
+
+    /// Modes after a shell has issued `\e[?2004h` (bracketed paste
+    /// on). Pasted text must be wrapped in `\e[200~` … `\e[201~`.
+    fn bracketed_paste_modes() -> TerminalModes {
+        TerminalModes { bracketed_paste: true, ..TerminalModes::default() }
     }
 
     fn text_event(s: &str) -> egui::Event {
@@ -238,13 +261,51 @@ mod tests {
     }
 
     #[test]
-    fn paste_event_encodes_as_raw_bytes() {
-        // Bracketed-paste wrapping is a later PR; current contract is
-        // pass-through. The test pins this so the future change is
-        // intentional (it'll need a new test for the wrapping).
+    fn paste_event_encodes_as_raw_bytes_when_bracketed_paste_off() {
+        // Default modes => no wrapping; the paste payload reaches the
+        // shell verbatim, same as if the user had typed it.
         let bytes = encode_event(&egui::Event::Paste("ls -la".into()), default_modes())
             .expect("paste encodes");
         assert_eq!(bytes, b"ls -la");
+    }
+
+    #[test]
+    fn paste_event_wraps_in_brackets_when_bracketed_paste_on() {
+        // After the shell turns on DECSET 2004 (`\e[?2004h`), pastes
+        // must be wrapped in `\e[200~` / `\e[201~`. The shell uses
+        // these markers to skip completion / history expansion of
+        // the paste.
+        let bytes = encode_event(&egui::Event::Paste("ls -la".into()), bracketed_paste_modes())
+            .expect("paste encodes");
+        assert_eq!(bytes, b"\x1b[200~ls -la\x1b[201~");
+    }
+
+    #[test]
+    fn empty_paste_event_returns_none() {
+        // No payload, no bytes. Guards against empty `\e[200~\e[201~`
+        // markers in bracketed-paste mode, which would be harmless
+        // but pointless.
+        assert!(encode_event(&egui::Event::Paste(String::new()), default_modes()).is_none());
+        assert!(
+            encode_event(&egui::Event::Paste(String::new()), bracketed_paste_modes()).is_none()
+        );
+    }
+
+    #[test]
+    fn multiline_paste_wraps_payload_once_when_bracketed_paste_on() {
+        // The whole pasted block — including embedded newlines — sits
+        // inside ONE pair of markers; the shell treats it as a single
+        // chunk. Without bracketed paste, those embedded `\n`s would
+        // execute each line immediately and leave the shell stuck
+        // mid-edit on the final line. This test pins the contract.
+        let payload = "echo one\necho two\necho three";
+        let bytes = encode_event(&egui::Event::Paste(payload.into()), bracketed_paste_modes())
+            .expect("paste encodes");
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"\x1b[200~");
+        expected.extend_from_slice(payload.as_bytes());
+        expected.extend_from_slice(b"\x1b[201~");
+        assert_eq!(bytes, expected);
     }
 
     // --- key-release suppression -----------------------------------
