@@ -20,15 +20,20 @@ use alacritty_terminal::vte::ansi::Processor;
 
 /// Plain snapshot of the VT mode flags the input encoder cares about.
 ///
-/// Default is "fresh terminal" — application cursor mode off, etc.
-/// Public so callers (notably [`crate::input::encode_event`]) can
-/// hold the value across frames without borrowing a
-/// [`TerminalState`].
+/// Default is "fresh terminal" — application cursor mode off,
+/// bracketed paste off, etc. Public so callers (notably
+/// [`crate::input::encode_event`]) can hold the value across frames
+/// without borrowing a [`TerminalState`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TerminalModes {
     /// DECCKM. When `true`, arrow keys / Home / End should be encoded
     /// as SS3 sequences (`\eOA` etc.) instead of CSI (`\e[A` etc.).
     pub application_cursor: bool,
+    /// Bracketed paste mode (DECSET 2004, `\e[?2004h`). When `true`,
+    /// pasted text must be wrapped in `\e[200~` … `\e[201~` so the
+    /// shell can tell pasted input apart from typed input (and skip
+    /// completion / history expansion of the paste).
+    pub bracketed_paste: bool,
 }
 
 /// No-op event listener. `alacritty_terminal` calls into this on bell,
@@ -103,10 +108,22 @@ impl TerminalState {
         self.term.mode().contains(TermMode::APP_CURSOR)
     }
 
+    /// True when the program has enabled bracketed paste mode
+    /// (DECSET 2004, `\e[?2004h`). When on, pasted text must be wrapped
+    /// in `\e[200~` … `\e[201~` so the shell can distinguish a paste
+    /// from typed input.
+    pub fn bracketed_paste_mode(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
     /// Snapshot the input-relevant mode flags so the input encoder
     /// can choose the correct byte sequences for the current frame.
     pub fn modes(&self) -> TerminalModes {
-        TerminalModes { application_cursor: self.application_cursor_mode() }
+        TerminalModes {
+            application_cursor: self.application_cursor_mode(),
+            bracketed_paste: self.bracketed_paste_mode(),
+        }
     }
 
     /// True when the cursor should be visible to the user (DECTCEM —
