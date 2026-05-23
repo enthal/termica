@@ -12,10 +12,16 @@
 //! - `Ctrl + <letter>` → control bytes 0x01..0x1A.
 //! - Function keys F1–F12.
 //!
+//! Phase 1E-c-extra: pass DECCKM (application cursor keys mode)
+//! through. Programs like `less`, `vim`, `htop` enable DECCKM via
+//! the terminfo `smkx` sequence on entry, and their keymaps are
+//! bound to the SS3 form of the arrow / Home / End keys. The
+//! encoder picks between CSI and SS3 based on the [`TerminalModes`]
+//! snapshot the caller passes.
+//!
 //! Out of scope here (later sub-PRs / Phase 3):
-//! - Application cursor mode encoding for arrows (`SS3` variants).
-//! - Bracketed paste wrapping (Phase 1E-d-or-similar; needs hookup
-//!   to the [`crate::terminal::TerminalState`] mode flags).
+//! - Bracketed paste wrapping (needs hookup to a similar
+//!   `bracketed_paste` flag on [`TerminalModes`]).
 //! - Mouse reporting encoding.
 //! - macOS-specific Cmd-handling beyond what egui already gives us.
 //! - IME composition.
@@ -28,14 +34,20 @@
 
 use eframe::egui::{self, Key, Modifiers};
 
+use crate::terminal::TerminalModes;
+
 /// Encode a single egui input event into the bytes that should be
 /// written to the PTY. Returns `None` for events that aren't part of
 /// keyboard input (mouse, focus, scroll, etc.) and for key *releases*
 /// (we only encode key-down events).
 ///
+/// `modes` carries the current VT mode flags (e.g. DECCKM) — programs
+/// like `less` / `vim` / `htop` switch arrow-key encoding via these,
+/// so the encoder needs the current snapshot once per frame.
+///
 /// Callers iterate `ctx.input(|i| i.events.clone())` and pipe each
 /// result through this function into [`crate::pane::PaneSession::write`].
-pub fn encode_event(event: &egui::Event) -> Option<Vec<u8>> {
+pub fn encode_event(event: &egui::Event, modes: TerminalModes) -> Option<Vec<u8>> {
     match event {
         egui::Event::Text(s) => {
             // egui delivers Enter as a `Key::Enter` event, NOT as
@@ -44,14 +56,16 @@ pub fn encode_event(event: &egui::Event) -> Option<Vec<u8>> {
             if s.is_empty() { None } else { Some(s.as_bytes().to_vec()) }
         }
         egui::Event::Paste(s) => Some(s.as_bytes().to_vec()),
-        egui::Event::Key { key, pressed: true, modifiers, .. } => encode_key(*key, *modifiers),
+        egui::Event::Key { key, pressed: true, modifiers, .. } => {
+            encode_key(*key, *modifiers, modes)
+        }
         _ => None,
     }
 }
 
 /// Encode a single key-down event. Public so the snapshot/unit test
 /// can call it without faking a full `egui::Event`.
-pub fn encode_key(key: Key, modifiers: Modifiers) -> Option<Vec<u8>> {
+pub fn encode_key(key: Key, modifiers: Modifiers, modes: TerminalModes) -> Option<Vec<u8>> {
     // Ctrl + letter takes precedence over per-key encodings: even
     // though Ctrl+M would otherwise be Return, the standard terminal
     // contract says Ctrl+letter → C0 control byte.
@@ -63,15 +77,34 @@ pub fn encode_key(key: Key, modifiers: Modifiers) -> Option<Vec<u8>> {
         return Some(vec![byte]);
     }
 
+    // Arrow keys, Home, End: pick CSI vs SS3 form based on DECCKM.
+    // The `xterm-256color` terminfo entry `kcuu1 = \EOA` etc. — so
+    // any program using terminfo (less, vim, htop, …) sets DECCKM via
+    // `smkx` on entry and then expects the SS3 form. We must match.
+    let cursor_key = if modes.application_cursor {
+        match key {
+            Key::ArrowUp => Some(b"\x1bOA".as_slice()),
+            Key::ArrowDown => Some(b"\x1bOB".as_slice()),
+            Key::ArrowRight => Some(b"\x1bOC".as_slice()),
+            Key::ArrowLeft => Some(b"\x1bOD".as_slice()),
+            Key::Home => Some(b"\x1bOH".as_slice()),
+            Key::End => Some(b"\x1bOF".as_slice()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(b) = cursor_key {
+        return Some(b.to_vec());
+    }
+
     let bytes: &[u8] = match key {
         Key::Enter => b"\r",
         Key::Backspace => b"\x7f",
         Key::Tab => b"\t",
         Key::Escape => b"\x1b",
 
-        // Arrow keys — normal (cursor-key) mode. Application mode
-        // emits `\x1bO[ABCD]`; switching arrives with a later sub-PR
-        // that plumbs the terminal mode flags through.
+        // Arrow keys — normal (cursor-key) mode fallback.
         Key::ArrowUp => b"\x1b[A",
         Key::ArrowDown => b"\x1b[B",
         Key::ArrowRight => b"\x1b[C",
@@ -155,6 +188,18 @@ mod tests {
         Modifiers { ctrl: true, ..Modifiers::default() }
     }
 
+    /// "Default" modes: fresh terminal, no DECCKM. Most tests run
+    /// against this — Termica's initial state.
+    fn default_modes() -> TerminalModes {
+        TerminalModes::default()
+    }
+
+    /// Modes after a program (less, vim, htop) has issued `\e[?1h`
+    /// (DECCKM on). Arrow keys / Home / End must encode as SS3.
+    fn app_cursor_modes() -> TerminalModes {
+        TerminalModes { application_cursor: true }
+    }
+
     fn text_event(s: &str) -> egui::Event {
         egui::Event::Text(s.to_string())
     }
@@ -177,19 +222,19 @@ mod tests {
 
     #[test]
     fn text_event_encodes_as_utf8() {
-        let bytes = encode_event(&text_event("hello")).expect("text encodes");
+        let bytes = encode_event(&text_event("hello"), default_modes()).expect("text encodes");
         assert_eq!(bytes, b"hello");
     }
 
     #[test]
     fn text_event_passes_through_non_ascii() {
-        let bytes = encode_event(&text_event("café")).expect("text encodes");
+        let bytes = encode_event(&text_event("café"), default_modes()).expect("text encodes");
         assert_eq!(bytes, "café".as_bytes());
     }
 
     #[test]
     fn empty_text_event_returns_none() {
-        assert!(encode_event(&text_event("")).is_none());
+        assert!(encode_event(&text_event(""), default_modes()).is_none());
     }
 
     #[test]
@@ -197,7 +242,8 @@ mod tests {
         // Bracketed-paste wrapping is a later PR; current contract is
         // pass-through. The test pins this so the future change is
         // intentional (it'll need a new test for the wrapping).
-        let bytes = encode_event(&egui::Event::Paste("ls -la".into())).expect("paste encodes");
+        let bytes = encode_event(&egui::Event::Paste("ls -la".into()), default_modes())
+            .expect("paste encodes");
         assert_eq!(bytes, b"ls -la");
     }
 
@@ -205,54 +251,93 @@ mod tests {
 
     #[test]
     fn key_release_returns_none() {
-        assert!(encode_event(&key_release(Key::A)).is_none());
-        assert!(encode_event(&key_release(Key::Enter)).is_none());
+        assert!(encode_event(&key_release(Key::A), default_modes()).is_none());
+        assert!(encode_event(&key_release(Key::Enter), default_modes()).is_none());
     }
 
     // --- structural keys --------------------------------------------
 
     #[test]
     fn enter_encodes_as_cr() {
-        assert_eq!(encode_event(&key_event(Key::Enter, no_mods())).unwrap(), b"\r");
+        assert_eq!(
+            encode_event(&key_event(Key::Enter, no_mods()), default_modes()).unwrap(),
+            b"\r"
+        );
     }
 
     #[test]
     fn backspace_encodes_as_del() {
         // 0x7f — what xterm-class terminals expect by default. Some
         // shells will translate to ^H themselves if their stty says so.
-        assert_eq!(encode_event(&key_event(Key::Backspace, no_mods())).unwrap(), b"\x7f");
+        assert_eq!(
+            encode_event(&key_event(Key::Backspace, no_mods()), default_modes()).unwrap(),
+            b"\x7f"
+        );
     }
 
     #[test]
     fn tab_encodes_as_tab() {
-        assert_eq!(encode_event(&key_event(Key::Tab, no_mods())).unwrap(), b"\t");
+        assert_eq!(encode_event(&key_event(Key::Tab, no_mods()), default_modes()).unwrap(), b"\t");
     }
 
     #[test]
     fn escape_encodes_as_esc() {
-        assert_eq!(encode_event(&key_event(Key::Escape, no_mods())).unwrap(), b"\x1b");
+        assert_eq!(
+            encode_event(&key_event(Key::Escape, no_mods()), default_modes()).unwrap(),
+            b"\x1b"
+        );
     }
 
     // --- arrow keys -------------------------------------------------
 
     #[test]
     fn arrow_keys_encode_as_csi() {
-        assert_eq!(encode_event(&key_event(Key::ArrowUp, no_mods())).unwrap(), b"\x1b[A");
-        assert_eq!(encode_event(&key_event(Key::ArrowDown, no_mods())).unwrap(), b"\x1b[B");
-        assert_eq!(encode_event(&key_event(Key::ArrowRight, no_mods())).unwrap(), b"\x1b[C");
-        assert_eq!(encode_event(&key_event(Key::ArrowLeft, no_mods())).unwrap(), b"\x1b[D");
+        assert_eq!(
+            encode_event(&key_event(Key::ArrowUp, no_mods()), default_modes()).unwrap(),
+            b"\x1b[A"
+        );
+        assert_eq!(
+            encode_event(&key_event(Key::ArrowDown, no_mods()), default_modes()).unwrap(),
+            b"\x1b[B"
+        );
+        assert_eq!(
+            encode_event(&key_event(Key::ArrowRight, no_mods()), default_modes()).unwrap(),
+            b"\x1b[C"
+        );
+        assert_eq!(
+            encode_event(&key_event(Key::ArrowLeft, no_mods()), default_modes()).unwrap(),
+            b"\x1b[D"
+        );
     }
 
     // --- navigation keys -------------------------------------------
 
     #[test]
     fn home_end_pageup_pagedown_delete_encode_as_csi() {
-        assert_eq!(encode_event(&key_event(Key::Home, no_mods())).unwrap(), b"\x1b[H");
-        assert_eq!(encode_event(&key_event(Key::End, no_mods())).unwrap(), b"\x1b[F");
-        assert_eq!(encode_event(&key_event(Key::PageUp, no_mods())).unwrap(), b"\x1b[5~");
-        assert_eq!(encode_event(&key_event(Key::PageDown, no_mods())).unwrap(), b"\x1b[6~");
-        assert_eq!(encode_event(&key_event(Key::Delete, no_mods())).unwrap(), b"\x1b[3~");
-        assert_eq!(encode_event(&key_event(Key::Insert, no_mods())).unwrap(), b"\x1b[2~");
+        assert_eq!(
+            encode_event(&key_event(Key::Home, no_mods()), default_modes()).unwrap(),
+            b"\x1b[H"
+        );
+        assert_eq!(
+            encode_event(&key_event(Key::End, no_mods()), default_modes()).unwrap(),
+            b"\x1b[F"
+        );
+        assert_eq!(
+            encode_event(&key_event(Key::PageUp, no_mods()), default_modes()).unwrap(),
+            b"\x1b[5~"
+        );
+        assert_eq!(
+            encode_event(&key_event(Key::PageDown, no_mods()), default_modes()).unwrap(),
+            b"\x1b[6~"
+        );
+        assert_eq!(
+            encode_event(&key_event(Key::Delete, no_mods()), default_modes()).unwrap(),
+            b"\x1b[3~"
+        );
+        assert_eq!(
+            encode_event(&key_event(Key::Insert, no_mods()), default_modes()).unwrap(),
+            b"\x1b[2~"
+        );
     }
 
     // --- Ctrl + letter ----------------------------------------------
@@ -269,7 +354,8 @@ mod tests {
             (Key::Z, 0x1a),
         ];
         for (key, want) in cases {
-            let got = encode_event(&key_event(*key, just_ctrl())).expect("ctrl letter");
+            let got =
+                encode_event(&key_event(*key, just_ctrl()), default_modes()).expect("ctrl letter");
             assert_eq!(got, vec![*want], "Ctrl+{key:?}");
         }
     }
@@ -278,21 +364,105 @@ mod tests {
     fn ctrl_c_sends_etx_signal_byte() {
         // The single most safety-critical control byte we encode:
         // when typed at a foreground process this becomes SIGINT.
-        assert_eq!(encode_event(&key_event(Key::C, just_ctrl())).unwrap(), vec![0x03]);
+        assert_eq!(
+            encode_event(&key_event(Key::C, just_ctrl()), default_modes()).unwrap(),
+            vec![0x03]
+        );
     }
 
     // --- function keys ----------------------------------------------
 
     #[test]
     fn function_keys_f1_to_f4_use_ss3_form() {
-        assert_eq!(encode_event(&key_event(Key::F1, no_mods())).unwrap(), b"\x1bOP");
-        assert_eq!(encode_event(&key_event(Key::F4, no_mods())).unwrap(), b"\x1bOS");
+        assert_eq!(
+            encode_event(&key_event(Key::F1, no_mods()), default_modes()).unwrap(),
+            b"\x1bOP"
+        );
+        assert_eq!(
+            encode_event(&key_event(Key::F4, no_mods()), default_modes()).unwrap(),
+            b"\x1bOS"
+        );
     }
 
     #[test]
     fn function_keys_f5_and_up_use_tilde_form() {
-        assert_eq!(encode_event(&key_event(Key::F5, no_mods())).unwrap(), b"\x1b[15~");
-        assert_eq!(encode_event(&key_event(Key::F12, no_mods())).unwrap(), b"\x1b[24~");
+        assert_eq!(
+            encode_event(&key_event(Key::F5, no_mods()), default_modes()).unwrap(),
+            b"\x1b[15~"
+        );
+        assert_eq!(
+            encode_event(&key_event(Key::F12, no_mods()), default_modes()).unwrap(),
+            b"\x1b[24~"
+        );
+    }
+
+    // --- application cursor mode (DECCKM) --------------------------
+    //
+    // Regression coverage for the `less` arrow-key bug: when a program
+    // sets DECCKM via `\e[?1h`, arrow keys / Home / End must encode as
+    // SS3 (`\eOA` etc.), not CSI (`\e[A`). The terminfo entry
+    // `xterm-256color` has `kcuu1 = \EOA`, and `less`'s keymap is
+    // bound to that.
+
+    #[test]
+    fn arrow_keys_use_ss3_form_in_application_cursor_mode() {
+        assert_eq!(
+            encode_event(&key_event(Key::ArrowUp, no_mods()), app_cursor_modes()).unwrap(),
+            b"\x1bOA"
+        );
+        assert_eq!(
+            encode_event(&key_event(Key::ArrowDown, no_mods()), app_cursor_modes()).unwrap(),
+            b"\x1bOB"
+        );
+        assert_eq!(
+            encode_event(&key_event(Key::ArrowRight, no_mods()), app_cursor_modes()).unwrap(),
+            b"\x1bOC"
+        );
+        assert_eq!(
+            encode_event(&key_event(Key::ArrowLeft, no_mods()), app_cursor_modes()).unwrap(),
+            b"\x1bOD"
+        );
+    }
+
+    #[test]
+    fn home_and_end_use_ss3_form_in_application_cursor_mode() {
+        assert_eq!(
+            encode_event(&key_event(Key::Home, no_mods()), app_cursor_modes()).unwrap(),
+            b"\x1bOH"
+        );
+        assert_eq!(
+            encode_event(&key_event(Key::End, no_mods()), app_cursor_modes()).unwrap(),
+            b"\x1bOF"
+        );
+    }
+
+    #[test]
+    fn pageup_pagedown_unchanged_by_application_cursor_mode() {
+        // Only arrows / Home / End flip form. PgUp / PgDn / Delete /
+        // Insert keep their CSI tilde form regardless of DECCKM.
+        assert_eq!(
+            encode_event(&key_event(Key::PageUp, no_mods()), app_cursor_modes()).unwrap(),
+            b"\x1b[5~"
+        );
+        assert_eq!(
+            encode_event(&key_event(Key::PageDown, no_mods()), app_cursor_modes()).unwrap(),
+            b"\x1b[6~"
+        );
+        assert_eq!(
+            encode_event(&key_event(Key::Delete, no_mods()), app_cursor_modes()).unwrap(),
+            b"\x1b[3~"
+        );
+    }
+
+    #[test]
+    fn enter_and_text_unchanged_by_application_cursor_mode() {
+        // Enter stays \r; printable text stays UTF-8 bytes. DECCKM
+        // doesn't touch the rest of the keyboard.
+        assert_eq!(
+            encode_event(&key_event(Key::Enter, no_mods()), app_cursor_modes()).unwrap(),
+            b"\r"
+        );
+        assert_eq!(encode_event(&text_event("hi"), app_cursor_modes()).unwrap(), b"hi");
     }
 
     // --- unsupported events -----------------------------------------
@@ -300,6 +470,6 @@ mod tests {
     #[test]
     fn pointer_events_return_none() {
         let evt = egui::Event::PointerMoved(egui::Pos2::ZERO);
-        assert!(encode_event(&evt).is_none());
+        assert!(encode_event(&evt, default_modes()).is_none());
     }
 }

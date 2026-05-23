@@ -80,8 +80,11 @@ impl eframe::App for TermicaApp {
         // pulling from `ctx.input` is correct.
         let events: Vec<egui::Event> = ctx.input(|i| i.events.clone());
         if let Ok(pane) = &mut self.pane {
+            // Snapshot the VT mode flags once per frame so the encoder
+            // can pick CSI vs SS3 for arrow keys etc.
+            let modes = pane.terminal().modes();
             for event in &events {
-                if let Some(bytes) = input::encode_event(event) {
+                if let Some(bytes) = input::encode_event(event, modes) {
                     // Best-effort: a write failure means the PTY went
                     // away (child exit or master closed). The reader
                     // thread will hit EOF next and the pane mode will
