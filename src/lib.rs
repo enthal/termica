@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod pty;
+pub mod terminal;
 
 use eframe::egui;
 
