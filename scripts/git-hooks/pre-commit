@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Termica pre-commit hook.
+#
+# Mirrors the CI bar from .github/workflows/ci.yml so a failing CI run
+# on push is a surprise, not a routine. Install with:
+#
+#     scripts/install-git-hooks.sh
+#
+# Skip once, deliberately (rare): git commit --no-verify
+# CLAUDE.md's commit protocol forbids routine --no-verify use.
+
+set -euo pipefail
+
+# Colors, but only on a TTY.
+if [[ -t 1 ]]; then
+    BOLD=$'\033[1m'
+    RED=$'\033[31m'
+    GREEN=$'\033[32m'
+    DIM=$'\033[2m'
+    RESET=$'\033[0m'
+else
+    BOLD="" RED="" GREEN="" DIM="" RESET=""
+fi
+
+step() {
+    printf "%spre-commit:%s %s\n" "${BOLD}" "${RESET}" "$1"
+}
+
+fail() {
+    printf "%spre-commit failed:%s %s\n" "${RED}${BOLD}" "${RESET}" "$1" >&2
+    printf "%sto bypass (discouraged): git commit --no-verify%s\n" "${DIM}" "${RESET}" >&2
+    exit 1
+}
+
+# Only check when there is something staged; empty commits still call
+# the hook but there is nothing to check.
+if git diff --cached --quiet; then
+    step "no staged changes; skipping"
+    exit 0
+fi
+
+step "cargo fmt --all -- --check"
+cargo fmt --all -- --check || fail "formatting issues; run: cargo fmt --all"
+
+step "cargo clippy --workspace --all-targets -- -D warnings"
+cargo clippy --workspace --all-targets -- -D warnings || fail "clippy warnings"
+
+step "cargo test --workspace"
+cargo test --workspace || fail "tests failing"
+
+printf "%spre-commit passed%s\n" "${GREEN}" "${RESET}"

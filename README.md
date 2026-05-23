@@ -75,9 +75,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-### Install git hooks (recommended, once available)
+### Install git hooks (recommended)
 
-A pre-commit hook mirrors the CI bar (fmt + clippy + test) so a red CI on push is a surprise, not a routine. The installer is `scripts/install-git-hooks.sh` (arriving in the first feature PR alongside CI).
+A pre-commit hook mirrors the CI bar (fmt + clippy + test) so a red CI on push is a surprise, not a routine. Install once per checkout:
+
+```sh
+scripts/install-git-hooks.sh
+```
+
+The installer symlinks from [scripts/git-hooks/](scripts/git-hooks/) into `.git/hooks/`, so edits to a hook take effect immediately. To bypass on a specific commit (rare, discouraged): `git commit --no-verify`. [CLAUDE.md](CLAUDE.md) explicitly forbids routine bypass.
 
 ## Working in this repo
 
