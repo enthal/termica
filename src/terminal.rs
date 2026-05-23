@@ -18,6 +18,19 @@ use alacritty_terminal::term::cell::Cell;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::vte::ansi::Processor;
 
+/// Plain snapshot of the VT mode flags the input encoder cares about.
+///
+/// Default is "fresh terminal" — application cursor mode off, etc.
+/// Public so callers (notably [`crate::input::encode_event`]) can
+/// hold the value across frames without borrowing a
+/// [`TerminalState`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TerminalModes {
+    /// DECCKM. When `true`, arrow keys / Home / End should be encoded
+    /// as SS3 sequences (`\eOA` etc.) instead of CSI (`\e[A` etc.).
+    pub application_cursor: bool,
+}
+
 /// No-op event listener. `alacritty_terminal` calls into this on bell,
 /// title change, mouse cursor change, OSC events, etc. For Phase 1D
 /// we discard everything; Phase 3 will replace this with a listener
@@ -65,6 +78,24 @@ impl TerminalState {
     pub fn is_alternate_screen(&self) -> bool {
         use alacritty_terminal::term::TermMode;
         self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// True when the program has enabled DECCKM (application cursor
+    /// keys mode, `\e[?1h`). When on, arrow keys / Home / End must be
+    /// encoded as SS3 sequences (`\eOA` etc.) instead of CSI
+    /// (`\e[A` etc.). Full-screen TTY programs like `less`, `vim`,
+    /// `htop` rely on this to interpret arrow keys at all — the
+    /// terminfo entry `kcuu1` for `xterm-256color` is `\EOA` (the
+    /// SS3 form), and `less`'s keymap is bound to that, not the CSI.
+    pub fn application_cursor_mode(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.mode().contains(TermMode::APP_CURSOR)
+    }
+
+    /// Snapshot the input-relevant mode flags so the input encoder
+    /// can choose the correct byte sequences for the current frame.
+    pub fn modes(&self) -> TerminalModes {
+        TerminalModes { application_cursor: self.application_cursor_mode() }
     }
 
     /// Borrow the current cell grid. The renderer walks this directly
