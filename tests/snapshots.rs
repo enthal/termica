@@ -54,6 +54,23 @@ fn snapshot_central_panel_with_typical_output() {
     harness.snapshot("central_panel_typical");
 }
 
+#[test]
+fn snapshot_central_panel_with_cwd() {
+    // OSC 7 has reported a cwd; the header should show the 📂 line.
+    let view = PaneView {
+        bytes_received: 256,
+        alt_screen: false,
+        rows: 24,
+        cols: 80,
+        cwd: Some(std::path::PathBuf::from("/Users/tim/git/enthal/termica")),
+        screen_text: String::new(),
+    };
+    let mut harness = Harness::builder()
+        .with_size(egui::Vec2::new(800.0, 150.0))
+        .build_ui(move |ui| termica::central_panel(ui, &view));
+    harness.snapshot("central_panel_with_cwd");
+}
+
 // ---- cell-renderer fixtures ----------------------------------------------
 
 fn term_from_bytes(rows: u16, cols: u16, bytes: &[u8]) -> TerminalState {

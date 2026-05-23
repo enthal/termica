@@ -34,6 +34,10 @@ pub struct PaneView {
     pub rows: u16,
     /// Cell-grid columns the PTY is currently sized to.
     pub cols: u16,
+    /// Most recent CWD reported via OSC 7 (or `None` if the shell
+    /// hasn't emitted one). zsh emits OSC 7 on `cd` by default;
+    /// bash needs a `PROMPT_COMMAND` hook to do the same.
+    pub cwd: Option<std::path::PathBuf>,
     /// Visible grid rendered as multi-line text. Convenient for
     /// `--dump-events`-style debugging; the real renderer paints
     /// cells directly via [`crate::render::paint_terminal`].
@@ -110,6 +114,7 @@ impl PaneSession {
             alt_screen: self.terminal.is_alternate_screen(),
             rows: grid.screen_lines() as u16,
             cols: grid.columns() as u16,
+            cwd: self.terminal.cwd().map(|p| p.to_path_buf()),
             screen_text: self.terminal.screen_text(),
         }
     }

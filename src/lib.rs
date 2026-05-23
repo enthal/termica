@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod input;
+pub mod osc;
 pub mod pane;
 pub mod pty;
 pub mod render;
@@ -37,10 +38,17 @@ const MIN_COLS: u16 = 20;
 pub fn central_panel(ui: &mut egui::Ui, view: &PaneView) {
     ui.heading("Termica");
     ui.label(format!(
-        "Phase 1E-d — window resize wired. \
-         Bytes received: {}   ·   alt-screen: {}   ·   grid: {}×{}",
+        "Phase 1E-h — OSC 7 cwd live. \
+         Bytes: {}   ·   alt-screen: {}   ·   grid: {}×{}",
         view.bytes_received, view.alt_screen, view.rows, view.cols
     ));
+    if let Some(cwd) = &view.cwd {
+        // Whole path on a separate line so we don't have to fight
+        // for status-bar width. Phase 5 will turn this into a proper
+        // clickable chip with a `Painter`-drawn icon (CLAUDE.md
+        // forbids Unicode-font icons — they render as tofu on Linux).
+        ui.label(format!("cwd: {}", cwd.display()));
+    }
     ui.separator();
 }
 

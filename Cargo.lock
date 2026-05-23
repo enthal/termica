@@ -3137,6 +3137,7 @@ dependencies = [
  "egui_kittest",
  "portable-pty",
  "thiserror 2.0.18",
+ "vte",
 ]
 
 [[package]]
