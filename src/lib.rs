@@ -133,24 +133,33 @@ impl eframe::App for TermicaApp {
             pane.drain();
         }
 
-        // ---- mouse wheel: scroll the display through scrollback ------
+        // ---- mouse wheel ---------------------------------------------
         //
-        // egui reports a per-frame vertical delta in points. We convert
-        // that to "lines to scroll" using a fixed step (3 lines per
-        // ~50 points of delta — matches the convention every modern
-        // terminal uses) and feed it to alacritty. Positive `delta.y`
-        // means the user scrolled UP (toward older output).
+        // In the main screen we scroll our local scrollback. In the
+        // alternate screen (vim / less / htop / fzf) there is no
+        // scrollback of our own; instead we forward the wheel as N
+        // arrow keystrokes so those programs receive their native
+        // scroll commands. `input::classify_wheel` picks the right
+        // branch.
+        //
+        // Three lines per ~50 points keeps the feel close to
+        // Alacritty / iTerm2's default. egui's positive `delta.y` is
+        // up; alacritty's positive `Scroll::Delta` is also up.
         let scroll_delta_y = ctx.input(|i| i.smooth_scroll_delta.y);
         if scroll_delta_y.abs() > 0.0
             && let Ok(pane) = &mut self.pane
         {
-            // Three lines per ~50 points keeps the feel close to
-            // Alacritty / iTerm2's default. The sign convention:
-            // egui's positive `delta.y` is up; alacritty's positive
-            // `Scroll::Delta` is also up (toward older lines).
             let lines = (scroll_delta_y / 50.0 * 3.0).round() as i32;
-            if lines != 0 {
-                pane.terminal_mut().scroll_display(lines);
+            let alt_screen = pane.terminal().is_alternate_screen();
+            let modes = pane.terminal().modes();
+            match input::classify_wheel(lines, alt_screen, modes) {
+                Some(input::WheelOutcome::ScrollDisplay(lines)) => {
+                    pane.terminal_mut().scroll_display(lines);
+                }
+                Some(input::WheelOutcome::SendBytes(bytes)) => {
+                    let _ = pane.write(&bytes);
+                }
+                None => {}
             }
         }
         let view = match &self.pane {
