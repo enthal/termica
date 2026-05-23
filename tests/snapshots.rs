@@ -124,6 +124,38 @@ fn snapshot_terminal_cursor_hidden_via_dectcem() {
 }
 
 #[test]
+fn snapshot_terminal_cell_attributes() {
+    // Three rows of attribute combos. Each is rendered against the
+    // standard color palette so the visual differences from the
+    // default cell are obvious in the diff.
+    //
+    // Row 0: SGR 1 (bold), SGR 2 (dim), SGR 22 (normal) — same word
+    //        three times, so the rendered width / brightness diff
+    //        across the three is exactly the attribute effect.
+    // Row 1: SGR 4 (underline), SGR 9 (strikeout), both — line
+    //        decorations under and through the text.
+    // Row 2: SGR 7 (inverse) of plain text + SGR 8 (hidden) so the
+    //        word disappears (the background sticks around).
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.extend_from_slice(b"\x1b[1mBOLD\x1b[0m  ");
+    bytes.extend_from_slice(b"\x1b[2mDIM\x1b[0m  ");
+    bytes.extend_from_slice(b"\x1b[22mNORMAL\x1b[0m");
+    bytes.extend_from_slice(b"\r\n");
+    bytes.extend_from_slice(b"\x1b[4munderline\x1b[0m  ");
+    bytes.extend_from_slice(b"\x1b[9mstrikeout\x1b[0m  ");
+    bytes.extend_from_slice(b"\x1b[4;9mboth\x1b[0m");
+    bytes.extend_from_slice(b"\r\n");
+    bytes.extend_from_slice(b"\x1b[7mINVERSE\x1b[0m  ");
+    bytes.extend_from_slice(b"\x1b[8mHIDDEN\x1b[0m");
+
+    let term = term_from_bytes(5, 50, &bytes);
+    let mut harness = Harness::builder()
+        .with_size(egui::Vec2::new(700.0, 180.0))
+        .build_ui(move |ui| render::paint_terminal(ui, &term));
+    harness.snapshot("terminal_cell_attributes");
+}
+
+#[test]
 fn snapshot_terminal_alt_screen() {
     // Enter alt screen, write some content (with explicit cursor home
     // because alacritty does NOT reposition the cursor on `\e[?1049h`).
