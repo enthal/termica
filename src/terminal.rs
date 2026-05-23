@@ -49,11 +49,15 @@ impl EventListener for NopListener {
 
 /// One terminal's grid + parser. Feed bytes via [`Self::feed`]; read
 /// the grid back via [`Self::screen_text`] (testing helper) or via
-/// the lower-level [`Self::with_grid`] callback (renderer / future
-/// uses).
+/// the lower-level [`Self::grid`] / [`Self::cursor_position`] accessors
+/// that the renderer uses.
 pub struct TerminalState {
     term: Term<NopListener>,
     parser: Processor,
+    /// Lightweight second pass over the same byte stream that watches
+    /// for OSC sequences alacritty discards (notably OSC 7 — cwd).
+    /// See [`crate::osc`].
+    osc: crate::osc::OscSniffer,
 }
 
 impl TerminalState {
@@ -63,17 +67,28 @@ impl TerminalState {
         let config = Config::default();
         let term = Term::new(config, &size, NopListener);
         let parser = Processor::new();
-        Self { term, parser }
+        let osc = crate::osc::OscSniffer::new();
+        Self { term, parser, osc }
     }
 
-    /// Feed bytes into the VT parser. The grid mutates accordingly.
-    /// Splitting a byte slice across multiple calls is safe — the
-    /// parser keeps state across calls, so escape sequences split at
+    /// Feed bytes into the VT parser. The grid mutates accordingly,
+    /// and the OSC sniffer's state may update if an OSC 7 (or future
+    /// Termica marker) is recognised.
+    ///
+    /// Splitting a byte slice across multiple calls is safe — both
+    /// parsers keep state across calls, so escape sequences split at
     /// any byte boundary still resolve correctly.
     pub fn feed(&mut self, bytes: &[u8]) {
         for byte in bytes {
             self.parser.advance(&mut self.term, &[*byte]);
+            self.osc.feed_byte(*byte);
         }
+    }
+
+    /// Most recent CWD reported via OSC 7, if any. Updates as the
+    /// shell `cd`s (zsh emits OSC 7 by default; bash needs a hook).
+    pub fn cwd(&self) -> Option<&std::path::Path> {
+        self.osc.state().cwd.as_deref()
     }
 
     /// Resize the grid in place. Unlike `TerminalState::new`, this
