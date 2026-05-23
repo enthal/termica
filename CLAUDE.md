@@ -71,7 +71,7 @@ After regenerating `egui_kittest` snapshots (`UPDATE_SNAPSHOTS=1 cargo test`):
 
 Run `cargo fmt`, `cargo clippy`, and `cargo test --workspace` before every commit. Treat clippy warnings as errors.
 
-A developer-installable pre-commit hook lives at `scripts/git-hooks/pre-commit` (arriving in the first feature PR alongside `scripts/install-git-hooks.sh`). It enforces the same fmt / clippy / test bar as CI. Bypass once with `git commit --no-verify` only if the user explicitly says so.
+A developer-installable pre-commit hook lives at `scripts/git-hooks/pre-commit`. It runs **fmt + clippy** locally so formatting / lint regressions can't slip into a commit. It deliberately does **not** run `cargo test`, because the project's tests-first discipline requires committing a failing test *before* the implementation that makes it pass — a pre-commit that blocked failing tests would block the workflow itself. CI runs tests and gates merge, so test failures still block the world; they just block it at the right boundary. Bypass the hook once with `git commit --no-verify` only if the user explicitly says so.
 
 ## Design principles
 

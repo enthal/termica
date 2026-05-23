@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # Termica pre-commit hook.
 #
-# Mirrors the CI bar from .github/workflows/ci.yml so a failing CI run
-# on push is a surprise, not a routine. Install with:
+# Runs fmt + clippy locally so formatting/lint regressions can't slip
+# into a commit. Does NOT run `cargo test`: the project follows a
+# tests-first discipline (CLAUDE.md), which means a failing test is
+# expected to be committed BEFORE the implementation that makes it
+# pass. CI runs tests and gates merge — that's where test failures
+# block the world.
+#
+# Install with:
 #
 #     scripts/install-git-hooks.sh
 #
@@ -45,7 +51,5 @@ cargo fmt --all -- --check || fail "formatting issues; run: cargo fmt --all"
 step "cargo clippy --workspace --all-targets -- -D warnings"
 cargo clippy --workspace --all-targets -- -D warnings || fail "clippy warnings"
 
-step "cargo test --workspace"
-cargo test --workspace || fail "tests failing"
-
-printf "%spre-commit passed%s\n" "${GREEN}" "${RESET}"
+printf "%spre-commit passed%s %s(tests are CI's job; see scripts/git-hooks/pre-commit header)%s\n" \
+    "${GREEN}" "${RESET}" "${DIM}" "${RESET}"
