@@ -131,10 +131,18 @@ impl PaneSession {
         Ok(())
     }
 
-    /// Borrow the underlying terminal state. Useful for the future
-    /// cell renderer in Phase 1E-b that wants to walk the grid.
+    /// Borrow the underlying terminal state read-only. The renderer
+    /// uses this to walk the grid each frame.
     pub fn terminal(&self) -> &TerminalState {
         &self.terminal
+    }
+
+    /// Borrow the underlying terminal state mutably. Used by the
+    /// update loop for VT-state operations that don't go through the
+    /// PTY — currently only [`TerminalState::scroll_display`] (mouse
+    /// wheel through scrollback).
+    pub fn terminal_mut(&mut self) -> &mut TerminalState {
+        &mut self.terminal
     }
 }
 
