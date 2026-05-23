@@ -1,10 +1,9 @@
 //! Termica library entry point.
 //!
-//! Phase 1E-b: the eframe app owns one [`pane::PaneSession`] that
-//! drains a real PTY into a [`terminal::TerminalState`] in the
-//! background. The custom cell renderer ([`render::paint_terminal`])
-//! paints the grid directly into the central panel. Keyboard input
-//! still goes nowhere — the input encoder is Phase 1E-c.
+//! Phase 1E-d: the eframe app now resizes its PTY + `TerminalState`
+//! to match the window's available cell grid. Dragging the window
+//! tells the shell about the new size on the next frame; vim / less
+//! / htop redraw themselves accordingly.
 //!
 //! See [`SPEC.md`](../SPEC.md) and [`spec/01-architecture.md`](../spec/01-architecture.md)
 //! for the layered architecture this crate grows into.
@@ -22,6 +21,13 @@ use eframe::egui;
 use pane::{PaneSession, PaneView};
 use pty::PtyConfig;
 
+/// Minimum cell grid Termica will ever ask a PTY for. Below this,
+/// shells and full-screen TTY programs behave erratically. The
+/// window's `min_inner_size` is also clamped so a user can't drag
+/// below the equivalent cells.
+const MIN_ROWS: u16 = 5;
+const MIN_COLS: u16 = 20;
+
 /// Render the workspace's status header into `ui`.
 ///
 /// Pure UI: takes a plain [`PaneView`] snapshot, never touches OS
@@ -31,11 +37,26 @@ use pty::PtyConfig;
 pub fn central_panel(ui: &mut egui::Ui, view: &PaneView) {
     ui.heading("Termica");
     ui.label(format!(
-        "Phase 1E-b — cell renderer live. \
-         Bytes received: {}   ·   alt-screen: {}",
-        view.bytes_received, view.alt_screen
+        "Phase 1E-d — window resize wired. \
+         Bytes received: {}   ·   alt-screen: {}   ·   grid: {}×{}",
+        view.bytes_received, view.alt_screen, view.rows, view.cols
     ));
     ui.separator();
+}
+
+/// Compute how many `(rows, cols)` fit into `avail` at the given cell
+/// metrics, clamped to [`MIN_ROWS`] × [`MIN_COLS`].
+///
+/// Pure function so the rounding / clamp policy is unit-testable
+/// without an egui context.
+pub fn cells_from_pixels(avail: egui::Vec2, cell_w: f32, row_h: f32) -> (u16, u16) {
+    // `floor` so we never advertise more cells than physically fit.
+    // The `max(MIN_*)` clamps protect against pathological tiny
+    // windows during initial layout, where `avail` may be (0, 0) for
+    // one frame.
+    let cols = if cell_w > 0.0 { (avail.x / cell_w).floor().max(0.0) as u16 } else { MIN_COLS };
+    let rows = if row_h > 0.0 { (avail.y / row_h).floor().max(0.0) as u16 } else { MIN_ROWS };
+    (rows.max(MIN_ROWS), cols.max(MIN_COLS))
 }
 
 /// The top-level eframe application.
@@ -47,16 +68,21 @@ pub fn central_panel(ui: &mut egui::Ui, view: &PaneView) {
 /// instead of silently exiting.
 pub struct TermicaApp {
     pane: Result<PaneSession, String>,
+    /// Last `(rows, cols)` we told the PTY about. Caching this means
+    /// we only call `PaneSession::resize` when the cell-grid size
+    /// actually changes, not every frame.
+    last_size: Option<(u16, u16)>,
 }
 
 impl TermicaApp {
     /// Construct an app with a freshly spawned shell pane sized to a
-    /// generous default. The eframe `update` loop will resize the
-    /// PTY as the window resizes in a later sub-PR.
+    /// reasonable starting default. The PTY/grid will resize to the
+    /// real window dimensions on the first `update` pass.
     pub fn new() -> Self {
         let config = PtyConfig::default();
-        let pane = PaneSession::spawn(24, 80, &config).map_err(|e| format!("{e}"));
-        Self { pane }
+        let pane = PaneSession::spawn(MIN_ROWS.max(24), MIN_COLS.max(80), &config)
+            .map_err(|e| format!("{e}"));
+        Self { pane, last_size: None }
     }
 }
 
@@ -113,6 +139,22 @@ impl eframe::App for TermicaApp {
             }
             central_panel(ui, &view);
 
+            // ---- resize: compute target cell grid from the space
+            // remaining inside this panel, and tell the PTY if it
+            // changed.
+            let avail = ui.available_size();
+            let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
+            let (cell_w, row_h) =
+                ui.fonts_mut(|f| (f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
+            let (rows, cols) = cells_from_pixels(avail, cell_w, row_h);
+
+            if let Ok(pane) = &mut self.pane
+                && self.last_size != Some((rows, cols))
+            {
+                let _ = pane.resize(rows, cols);
+                self.last_size = Some((rows, cols));
+            }
+
             // Cell-grid renderer. Painted right below the status
             // header so the on-screen pane reads top-to-bottom.
             if let Ok(pane) = &self.pane {
@@ -132,4 +174,47 @@ pub fn run() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native("termica", options, Box::new(|_cc| Ok(Box::new(TermicaApp::new()))))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pure-logic tests for the resize math. The wiring itself is
+    //! exercised by the snapshot tests in `tests/snapshots.rs`.
+
+    use super::*;
+
+    #[test]
+    fn cells_from_pixels_floors_dimensions() {
+        // A space of 800×400 at 10×20 cell metrics fits exactly
+        // 80×20 cells.
+        let (rows, cols) = cells_from_pixels(egui::Vec2::new(800.0, 400.0), 10.0, 20.0);
+        assert_eq!((rows, cols), (20, 80));
+    }
+
+    #[test]
+    fn cells_from_pixels_ignores_fractional_remainder() {
+        // 805×405 still only fits 80×20.
+        let (rows, cols) = cells_from_pixels(egui::Vec2::new(805.0, 405.0), 10.0, 20.0);
+        assert_eq!((rows, cols), (20, 80));
+    }
+
+    #[test]
+    fn cells_from_pixels_clamps_to_minimum() {
+        // A tiny / zero rect during initial layout must not produce
+        // a 0×0 PTY size.
+        let (rows, cols) = cells_from_pixels(egui::Vec2::new(1.0, 1.0), 10.0, 20.0);
+        assert_eq!((rows, cols), (MIN_ROWS, MIN_COLS));
+    }
+
+    #[test]
+    fn cells_from_pixels_handles_zero_metrics() {
+        // Defensive: a misconfigured font setup could report 0 width
+        // or height. We must not divide by zero; we fall back to the
+        // minimum.
+        let (rows, cols) = cells_from_pixels(egui::Vec2::new(800.0, 400.0), 0.0, 20.0);
+        assert_eq!(cols, MIN_COLS);
+        let (rows2, _cols2) = cells_from_pixels(egui::Vec2::new(800.0, 400.0), 10.0, 0.0);
+        assert_eq!(rows2, MIN_ROWS);
+        let _ = rows;
+    }
 }

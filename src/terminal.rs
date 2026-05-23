@@ -71,6 +71,17 @@ impl TerminalState {
         }
     }
 
+    /// Resize the grid in place. Unlike `TerminalState::new`, this
+    /// preserves the existing screen contents — the cells in the
+    /// overlap region keep their characters and styles. New cells
+    /// (when growing) are blank; clipped cells (when shrinking) are
+    /// dropped. `alacritty_terminal::Term::resize` handles both the
+    /// main and alternate screens correctly.
+    pub fn resize(&mut self, rows: u16, cols: u16) {
+        let size = TermSize::new(cols as usize, rows as usize);
+        self.term.resize(size);
+    }
+
     /// True when the terminal is in alternate-screen mode (vim/htop/
     /// less/fzf/tmux territory). The pane mode machine in Phase 3
     /// uses this as a hard signal that the program below owns every
@@ -96,6 +107,34 @@ impl TerminalState {
     /// can choose the correct byte sequences for the current frame.
     pub fn modes(&self) -> TerminalModes {
         TerminalModes { application_cursor: self.application_cursor_mode() }
+    }
+
+    /// True when the cursor should be visible to the user (DECTCEM —
+    /// `\e[?25h` / `\e[?25l`). When `false`, the renderer must not
+    /// draw a cursor block: many full-screen programs hide the
+    /// cursor while they're repainting their UI.
+    pub fn is_cursor_visible(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.mode().contains(TermMode::SHOW_CURSOR)
+    }
+
+    /// Cursor position as `(row, col)` zero-indexed into the visible
+    /// grid. Returns `None` if the row is outside the visible region
+    /// (shouldn't happen during normal operation but we don't want
+    /// the renderer to read past the end of its allocated rect).
+    pub fn cursor_position(&self) -> Option<(usize, usize)> {
+        use alacritty_terminal::grid::Dimensions;
+        let cur = self.term.grid().cursor.point;
+        let line = cur.line.0;
+        let col = cur.column.0;
+        if line < 0 {
+            return None;
+        }
+        let row = line as usize;
+        if row >= self.term.grid().screen_lines() || col >= self.term.grid().columns() {
+            return None;
+        }
+        Some((row, col))
     }
 
     /// Borrow the current cell grid. The renderer walks this directly
@@ -242,5 +281,45 @@ mod tests {
         // column 2 still 'c'.
         state.feed(b"abc\rXY");
         assert_row_contains(&state, 0, "XYc");
+    }
+
+    // --- resize ----------------------------------------------------
+    //
+    // Window-drag resize must NOT clobber what's already on screen.
+    // The previous Phase-1E-a code in `PaneSession::resize` rebuilt
+    // the whole terminal — that was a temporary placeholder; the
+    // in-place path here is the real one.
+
+    #[test]
+    fn resize_preserves_existing_content_when_growing() {
+        let mut state = TerminalState::new(5, 20);
+        state.feed(b"keep-me");
+        state.resize(10, 40);
+        // Existing text is still on row 0 inside the new larger grid.
+        assert_row_contains(&state, 0, "keep-me");
+        // And we now have 10 rows.
+        assert_eq!(state.screen_text().lines().count(), 10);
+    }
+
+    #[test]
+    fn resize_preserves_existing_content_when_shrinking() {
+        let mut state = TerminalState::new(10, 40);
+        state.feed(b"survives");
+        state.resize(5, 20);
+        // The first row still contains our text even though the grid
+        // got smaller in both dimensions.
+        assert_row_contains(&state, 0, "survives");
+        assert_eq!(state.screen_text().lines().count(), 5);
+    }
+
+    #[test]
+    fn alt_screen_flag_survives_resize() {
+        let mut state = TerminalState::new(5, 20);
+        state.feed(b"\x1b[?1049h");
+        assert!(state.is_alternate_screen());
+        state.resize(10, 40);
+        // Resizing must not accidentally drop us out of alt screen —
+        // vim et al would never recover if it did.
+        assert!(state.is_alternate_screen());
     }
 }

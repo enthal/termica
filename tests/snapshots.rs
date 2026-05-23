@@ -99,6 +99,31 @@ fn snapshot_terminal_ansi_colors() {
 }
 
 #[test]
+fn snapshot_terminal_cursor_visible_at_end_of_text() {
+    // Feed some text; the alacritty cursor advances cell-by-cell with
+    // each character, so it ends up immediately after "hi" on row 0.
+    // The renderer must paint the cursor block there.
+    let term = term_from_bytes(4, 30, b"hi");
+    let mut harness = Harness::builder()
+        .with_size(egui::Vec2::new(700.0, 160.0))
+        .build_ui(move |ui| render::paint_terminal(ui, &term));
+    harness.snapshot("terminal_cursor_visible");
+}
+
+#[test]
+fn snapshot_terminal_cursor_hidden_via_dectcem() {
+    // `\e[?25l` hides the cursor (DECTCEM low). The renderer must
+    // NOT draw the cursor block when this is set — programs use this
+    // to indicate "I'm in the middle of a repaint, don't show me
+    // until I'm done".
+    let term = term_from_bytes(4, 30, b"hi\x1b[?25l");
+    let mut harness = Harness::builder()
+        .with_size(egui::Vec2::new(700.0, 160.0))
+        .build_ui(move |ui| render::paint_terminal(ui, &term));
+    harness.snapshot("terminal_cursor_hidden");
+}
+
+#[test]
 fn snapshot_terminal_alt_screen() {
     // Enter alt screen, write some content (with explicit cursor home
     // because alacritty does NOT reposition the cursor on `\e[?1049h`).
