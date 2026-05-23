@@ -77,7 +77,7 @@ cargo fmt --all -- --check
 
 ### Install git hooks (recommended)
 
-A pre-commit hook mirrors the CI bar (fmt + clippy + test) so a red CI on push is a surprise, not a routine. Install once per checkout:
+A pre-commit hook runs fmt + clippy locally — but deliberately not `cargo test`. The project follows a tests-first discipline (see [CLAUDE.md](CLAUDE.md)), which requires committing a failing test before the implementation that makes it pass; running tests in pre-commit would block that workflow. CI runs the full test suite and gates merge. Install the hook once per checkout:
 
 ```sh
 scripts/install-git-hooks.sh
