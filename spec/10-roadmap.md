@@ -36,33 +36,40 @@ What the MVP does **not** need:
 
 Each phase is a separate PR, with its own GH Issue and acceptance criteria. Phases are roughly sequential, but adjacent phases that touch disjoint code may interleave.
 
-### Phase 0 — Skeleton (commit zero, **this PR**)
+### Phase 0 — Skeleton (commit zero) ✅
 
-- Cargo workspace stub + placeholder `main`.
-- `CLAUDE.md`, `SPEC.md`, `spec/*.md` (all ten).
-- `README.md` with WIP banner.
-- Dual MIT / Apache-2.0 licenses.
-- `.gitignore`, `rust-toolchain.toml`, `rustfmt.toml`.
-- `cargo build` succeeds; the binary prints a pre-implementation notice.
+- ✅ Cargo workspace stub + placeholder `main`.
+- ✅ `CLAUDE.md`, `SPEC.md`, `spec/*.md` (all ten).
+- ✅ `README.md` with WIP banner.
+- ✅ Dual MIT / Apache-2.0 licenses.
+- ✅ `.gitignore`, `rust-toolchain.toml`, `rustfmt.toml`.
+- ✅ `cargo build` succeeds; the binary prints a pre-implementation notice.
 
-**Acceptance:** the spec is reviewable and lands as commit zero on `main`.
+**Status:** complete. Spec is reviewable on `main`.
 
-### Phase 1 — Real terminal pane
+### Phase 1 — Real terminal pane (in progress)
 
-- `portable-pty` dependency; spawn bash/zsh in a tempdir.
-- `alacritty_terminal` integration with grid state.
-- Custom egui cell renderer.
-- Keyboard input encoder (printable, arrows, modifiers, Enter, paste).
-- Mouse selection / copy.
-- Resize handling.
-- 24-bit color, 256-color cube.
-- Alternate-screen support (no mode machine yet — just renders correctly).
-- VT golden tests: `bash-basic`, `zsh-basic`, `vim`, `less`, `htop`, `fzf`, `ssh`, `split-reads`.
-- `tests/snapshots/` includes the first `egui_kittest` test (an empty pane renders).
-- CI workflow lands here (fmt + clippy + test + macOS + Linux).
-- `scripts/install-git-hooks.sh` + `scripts/git-hooks/pre-commit` ([liquid-loom pattern](../../liquid-loom/scripts/git-hooks/pre-commit)).
+Sub-PRs:
+
+- ✅ **1A — CI workflow + pre-commit hook** ([#11](https://github.com/enthal/termica/pull/11), with the [#12](https://github.com/enthal/termica/pull/12) hotfix to keep tests-first compatible).
+- ✅ **1B — eframe skeleton + first snapshot test** ([#13](https://github.com/enthal/termica/pull/13)).
+- ✅ **1C — `portable-pty` plumbing** ([#14](https://github.com/enthal/termica/pull/14)).
+- ✅ **1D — `alacritty_terminal` wrapper** ([#15](https://github.com/enthal/termica/pull/15)).
+- ✅ **1E-a — PTY ↔ TerminalState pipeline + status header** ([#16](https://github.com/enthal/termica/pull/16)).
+- ✅ **1E-b — custom egui cell renderer** ([#17](https://github.com/enthal/termica/pull/17)).
+- ✅ **1E-c — keyboard input encoder + DECCKM (CSI/SS3 arrows) + env inheritance** ([#19](https://github.com/enthal/termica/pull/19), [#20](https://github.com/enthal/termica/pull/20), [#21](https://github.com/enthal/termica/pull/21)).
+- ✅ **1E-d — window resize → PTY resize + visible cursor (DECTCEM)** ([#22](https://github.com/enthal/termica/pull/22)).
+- ✅ **1E-e — bracketed paste wrapping** ([#23](https://github.com/enthal/termica/pull/23)).
+- ✅ **1E-f — cell attributes: bold / dim / inverse / hidden / underline / strikethrough** ([#25](https://github.com/enthal/termica/pull/25)).
+
+Remaining:
+
+- ⏳ Mouse selection / copy (needs visual UX feedback).
+- ⏳ VT golden tests: `bash-basic`, `zsh-basic`, `vim`, `less`, `htop`, `fzf`, `ssh`, `split-reads`.
 
 **Acceptance:** open the app, run `vim ~/.zshrc`, edit it, save it, quit it. The user experience matches Alacritty.
+
+✅ The acceptance behavior is **already working today** — `vim`, `less`, `htop` all run interactively; arrow keys scroll in `less`; window resizes propagate to the shell. The remaining items above polish the experience without changing the fundamental capability.
 
 ### Phase 2 — Workspace
 
