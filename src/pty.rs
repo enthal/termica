@@ -50,6 +50,15 @@ fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }
 
+/// True when `program` looks like a zsh binary. Accepts `zsh`,
+/// `/bin/zsh`, `/opt/homebrew/bin/zsh`, etc. — anything whose basename
+/// is `zsh` after stripping a path. We do NOT check `realpath` /
+/// resolve symlinks because the env vars we set are read by the
+/// process zsh actually launches, not whatever it was symlinked from.
+fn shell_kind_is_zsh(program: &str) -> bool {
+    std::path::Path::new(program).file_name().map(|n| n == "zsh").unwrap_or(false)
+}
+
 /// Errors that can come out of the PTY layer. Wraps the
 /// `portable_pty` error text (which is `anyhow`-flavored) into a flat
 /// string so our public surface doesn't drag `anyhow` into the API.
@@ -120,6 +129,27 @@ impl PtySession {
         // — that env var describes the terminal the child is talking
         // to (us), not the one Termica itself was launched from.
         cmd.env("TERM", "xterm-256color");
+
+        // Helpful self-identification for any code that branches on
+        // who's hosting it (Apple's `/etc/zshrc_Apple_Terminal`
+        // checks `$TERM_PROGRAM`; we honestly say "Termica" rather
+        // than spoof Apple_Terminal). Our own zsh integration drives
+        // the OSC 7 emission directly so we don't depend on Apple's
+        // gated path.
+        cmd.env("TERM_PROGRAM", "Termica");
+        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+
+        // Auto-install the minimal zsh OSC 7 integration for spawned
+        // zsh shells. The override is a Termica-managed `ZDOTDIR`
+        // pointing at four pass-through files that source the user's
+        // real zsh init and then append our hook. Skipped silently if
+        // the program isn't zsh, if `$HOME` is unset, or if the user
+        // set `TERMICA_NO_SHELL_INTEGRATION=1`.
+        if shell_kind_is_zsh(&config.program)
+            && let Some(zdotdir) = crate::integration::install_zsh_zdotdir()
+        {
+            cmd.env("ZDOTDIR", &zdotdir);
+        }
 
         // Explicit `config.env` entries win over both inherited and
         // built-in values.
@@ -360,6 +390,39 @@ mod tests {
         let s = drain_to_string(&mut session);
         let expected = format!("HOME={parent_home}");
         assert!(s.contains(&expected), "expected child to see {expected:?}; got: {s:?}");
+    }
+
+    #[test]
+    fn child_environment_advertises_termica_as_term_program() {
+        let mut session =
+            PtySession::spawn(&sh_c(r#"printf "TP=%s" "$TERM_PROGRAM""#)).expect("spawn");
+        let s = drain_to_string(&mut session);
+        assert!(s.contains("TP=Termica"), "expected TERM_PROGRAM=Termica, got: {s:?}");
+    }
+
+    // --- shell-kind detection -------------------------------------------
+    //
+    // The auto-installed zsh integration must trigger for paths that
+    // end in `zsh` and not for everything else.
+
+    #[test]
+    fn shell_kind_is_zsh_detects_basename() {
+        assert!(shell_kind_is_zsh("zsh"));
+        assert!(shell_kind_is_zsh("/bin/zsh"));
+        assert!(shell_kind_is_zsh("/opt/homebrew/bin/zsh"));
+        assert!(shell_kind_is_zsh("/usr/local/bin/zsh"));
+    }
+
+    #[test]
+    fn shell_kind_is_zsh_rejects_others() {
+        assert!(!shell_kind_is_zsh("bash"));
+        assert!(!shell_kind_is_zsh("/bin/bash"));
+        assert!(!shell_kind_is_zsh("/bin/sh"));
+        assert!(!shell_kind_is_zsh("fish"));
+        // `zshell` is not zsh.
+        assert!(!shell_kind_is_zsh("/usr/bin/zshell"));
+        // Empty path.
+        assert!(!shell_kind_is_zsh(""));
     }
 
     #[test]
