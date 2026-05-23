@@ -154,6 +154,56 @@ pub fn encode_key(key: Key, modifiers: Modifiers, modes: TerminalModes) -> Optio
     Some(bytes.to_vec())
 }
 
+/// Outcome of a mouse-wheel tick.
+///
+/// In the **main** screen we move our local scrollback view (no
+/// bytes flow to the shell). In **alternate** screen — `vim`,
+/// `less`, `htop`, `fzf` etc. — there is no scrollback of our own;
+/// instead we forward the wheel as N arrow keystrokes, which is
+/// what every modern terminal does (iTerm2's "Scroll wheel sends
+/// arrow keys when in alternate screen" is the canonical name).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WheelOutcome {
+    /// Adjust the renderer's display offset by `lines` (positive =
+    /// up / toward older content). Pure UI action; nothing reaches
+    /// the PTY.
+    ScrollDisplay(i32),
+    /// Write these bytes to the PTY. Already encoded for the
+    /// current cursor-key mode (CSI vs SS3).
+    SendBytes(Vec<u8>),
+}
+
+/// Decide what to do with `lines` worth of wheel motion. Positive
+/// `lines` is "scroll up" (toward older content); negative is down.
+/// Returns `None` when the motion is too small to act on.
+///
+/// Pure function — lifts the wheel-routing decision out of the
+/// app's update loop so it's unit-testable without an egui context.
+pub fn classify_wheel(lines: i32, alt_screen: bool, modes: TerminalModes) -> Option<WheelOutcome> {
+    if lines == 0 {
+        return None;
+    }
+    if !alt_screen {
+        return Some(WheelOutcome::ScrollDisplay(lines));
+    }
+
+    // Alt-screen: forward as `|lines|` arrow keystrokes. The key
+    // direction matches the user's natural "wheel up = move up"
+    // expectation: positive `lines` (the user wheeled up) means
+    // ArrowUp.
+    let (key, count) = if lines > 0 {
+        (Key::ArrowUp, lines as usize)
+    } else {
+        (Key::ArrowDown, (-lines) as usize)
+    };
+    let one_keystroke = encode_key(key, Modifiers::default(), modes)?;
+    let mut payload = Vec::with_capacity(one_keystroke.len() * count);
+    for _ in 0..count {
+        payload.extend_from_slice(&one_keystroke);
+    }
+    Some(WheelOutcome::SendBytes(payload))
+}
+
 /// Map a key (A..Z) to its C0 control byte for `Ctrl + key`.
 /// Returns `None` for keys that don't form a Ctrl combo this layer
 /// recognises.
@@ -455,6 +505,50 @@ mod tests {
             encode_event(&key_event(Key::F12, no_mods()), default_modes()).unwrap(),
             b"\x1b[24~"
         );
+    }
+
+    // --- mouse wheel routing ---------------------------------------
+    //
+    // Main screen → ScrollDisplay (no PTY traffic).
+    // Alternate screen → encode as N arrow keystrokes, using the
+    // current cursor-key mode (CSI vs SS3).
+
+    #[test]
+    fn wheel_zero_lines_is_none() {
+        assert!(classify_wheel(0, false, default_modes()).is_none());
+        assert!(classify_wheel(0, true, default_modes()).is_none());
+    }
+
+    #[test]
+    fn wheel_main_screen_scrolls_display() {
+        assert_eq!(classify_wheel(3, false, default_modes()), Some(WheelOutcome::ScrollDisplay(3)));
+        assert_eq!(
+            classify_wheel(-5, false, default_modes()),
+            Some(WheelOutcome::ScrollDisplay(-5))
+        );
+    }
+
+    #[test]
+    fn wheel_alt_screen_emits_arrow_up_keystrokes_csi() {
+        // Plain (non-DECCKM) alt screen: emit CSI arrow ups.
+        // 3 lines up = 3 × `\x1b[A`.
+        let got = classify_wheel(3, true, default_modes()).expect("alt screen wheel");
+        assert_eq!(got, WheelOutcome::SendBytes(b"\x1b[A\x1b[A\x1b[A".to_vec()));
+    }
+
+    #[test]
+    fn wheel_alt_screen_emits_arrow_down_keystrokes_csi() {
+        let got = classify_wheel(-2, true, default_modes()).expect("alt screen wheel");
+        assert_eq!(got, WheelOutcome::SendBytes(b"\x1b[B\x1b[B".to_vec()));
+    }
+
+    #[test]
+    fn wheel_alt_screen_emits_ss3_when_application_cursor_on() {
+        // This is the actual `less` case: less sets DECCKM, so we
+        // must emit `\eOA` not `\e[A`. Without this every wheel tick
+        // would land in less's "unknown ESC sequence" handler.
+        let got = classify_wheel(2, true, app_cursor_modes()).expect("ss3 wheel");
+        assert_eq!(got, WheelOutcome::SendBytes(b"\x1bOA\x1bOA".to_vec()));
     }
 
     // --- application cursor mode (DECCKM) --------------------------
