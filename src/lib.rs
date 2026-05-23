@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod input;
 pub mod pane;
 pub mod pty;
 pub mod render;
@@ -67,11 +68,30 @@ impl Default for TermicaApp {
 
 impl eframe::App for TermicaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Liveness: ask for a redraw next frame so PTY output keeps
-        // flowing even when the user is idle. (~ every 50 ms is more
-        // than enough for the debug stages; Phase 1E-c will tune.)
+        // Liveness: ask for a redraw soon so PTY output keeps flowing
+        // even when the user is idle. (~ every 50 ms is more than
+        // enough for the current debug visuals.)
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
 
+        // ---- input: read every event, encode, send to the PTY -------
+        //
+        // Multi-pane focus arrives with Phase 2 (#2). Until then,
+        // there's exactly one pane and no other input consumers, so
+        // pulling from `ctx.input` is correct.
+        let events: Vec<egui::Event> = ctx.input(|i| i.events.clone());
+        if let Ok(pane) = &mut self.pane {
+            for event in &events {
+                if let Some(bytes) = input::encode_event(event) {
+                    // Best-effort: a write failure means the PTY went
+                    // away (child exit or master closed). The reader
+                    // thread will hit EOF next and the pane mode will
+                    // become `Dead` in Phase 3. For now, swallow.
+                    let _ = pane.write(&bytes);
+                }
+            }
+        }
+
+        // ---- output: drain the reader queue into the terminal -------
         if let Ok(pane) = &mut self.pane {
             pane.drain();
         }
