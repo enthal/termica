@@ -30,8 +30,13 @@ pub struct PaneView {
     /// Whether the terminal is currently in alternate-screen mode
     /// (vim / htop / less / fzf / tmux).
     pub alt_screen: bool,
-    /// Visible grid rendered as multi-line text. Convenient for the
-    /// Phase 1E-a debug view; the real renderer paints cells.
+    /// Cell-grid rows the PTY is currently sized to.
+    pub rows: u16,
+    /// Cell-grid columns the PTY is currently sized to.
+    pub cols: u16,
+    /// Visible grid rendered as multi-line text. Convenient for
+    /// `--dump-events`-style debugging; the real renderer paints
+    /// cells directly via [`crate::render::paint_terminal`].
     pub screen_text: String,
 }
 
@@ -98,9 +103,13 @@ impl PaneSession {
     /// Snapshot the parts of the session the UI cares about, without
     /// borrowing anything OS-owned. Cheap to call once per frame.
     pub fn view(&self) -> PaneView {
+        use alacritty_terminal::grid::Dimensions;
+        let grid = self.terminal.grid();
         PaneView {
             bytes_received: self.bytes_received,
             alt_screen: self.terminal.is_alternate_screen(),
+            rows: grid.screen_lines() as u16,
+            cols: grid.columns() as u16,
             screen_text: self.terminal.screen_text(),
         }
     }
@@ -112,13 +121,13 @@ impl PaneSession {
     }
 
     /// Resize the PTY and adjust the terminal's grid. Both must
-    /// agree, so they live in a single call.
+    /// agree, so they live in a single call. The terminal state is
+    /// resized in place (existing screen content is preserved); the
+    /// kernel-side PTY size is updated so terminal-mode programs
+    /// (vim, less, ...) see the new size on their next `read`.
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), PtyError> {
         self.pty.resize(rows, cols)?;
-        // Rebuild the terminal at the new size. This loses scrollback
-        // for now (Phase 1 only — proper resize that preserves
-        // history arrives with persistence in Phase 9 (#9)).
-        self.terminal = TerminalState::new(rows, cols);
+        self.terminal.resize(rows, cols);
         Ok(())
     }
 
@@ -231,5 +240,33 @@ mod tests {
         // sleep gives no output; first drain should see nothing.
         assert_eq!(session.drain(), 0);
         assert_eq!(session.view().bytes_received, 0);
+    }
+
+    #[test]
+    fn resize_keeps_existing_output_on_screen() {
+        // Spawn a shell that prints a marker and then idles, so we
+        // can resize without races against the child exiting.
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c("printf survives-resize; sleep 1")).expect("spawn");
+        let _ = wait_for(&mut session, Duration::from_secs(2), |v| {
+            v.screen_text.contains("survives-resize")
+        });
+        // Now resize up and down. The screen text must still contain
+        // the marker afterwards — that's the whole point of the
+        // in-place resize over the previous "rebuild the terminal"
+        // placeholder.
+        session.resize(20, 100).expect("resize up");
+        assert!(
+            session.view().screen_text.contains("survives-resize"),
+            "marker lost after resize up; screen: {:?}",
+            session.view().screen_text
+        );
+        session.resize(8, 30).expect("resize down");
+        assert!(
+            session.view().screen_text.contains("survives-resize"),
+            "marker lost after resize down; screen: {:?}",
+            session.view().screen_text
+        );
+        let _ = session.write(b"\x03"); // Ctrl-C the sleep so the test ends fast
     }
 }

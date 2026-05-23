@@ -28,12 +28,17 @@ use crate::terminal::TerminalState;
 pub const DEFAULT_FONT_SIZE: f32 = 14.0;
 
 /// Pane background when no cell-level background applies. Slightly
-/// off-black so a cursor block (later) reads as a tile, not a hole.
+/// off-black so a cursor block reads as a tile, not a hole.
 pub const DEFAULT_BG: Color32 = Color32::from_rgb(0x12, 0x12, 0x12);
 
 /// Default foreground. Off-white; matches alacritty's "light"
 /// foreground convention for dark themes.
 pub const DEFAULT_FG: Color32 = Color32::from_rgb(0xd8, 0xd8, 0xd8);
+
+/// Cursor overlay color. Semi-transparent white so the character
+/// underneath stays legible (block cursor over text reads as
+/// inverted-ish, not as a hole). Phase 10 will make this themable.
+pub const CURSOR_COLOR: Color32 = Color32::from_rgba_premultiplied(0x70, 0x70, 0x70, 0x70);
 
 /// Paint `term`'s visible grid into the current cursor position.
 ///
@@ -89,6 +94,20 @@ pub fn paint_terminal(ui: &mut egui::Ui, term: &TerminalState) {
                 );
             }
         }
+    }
+
+    // Cursor overlay. Block shape for now (vim / less / htop all
+    // expect a visible cursor while in their alt-screen UIs). Phase 4
+    // will move ownership of cursor visibility to the prompt-editor
+    // when we're at a trusted shell prompt; until then the renderer
+    // simply mirrors what the terminal mode flags say.
+    if term.is_cursor_visible()
+        && let Some((row, col)) = term.cursor_position()
+    {
+        let x = rect.min.x + col as f32 * cell_w;
+        let y = rect.min.y + row as f32 * row_h;
+        let cursor_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w, row_h));
+        painter.rect_filled(cursor_rect, 0.0, CURSOR_COLOR);
     }
 }
 
