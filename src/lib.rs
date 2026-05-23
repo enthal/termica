@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod input;
+pub mod integration;
 pub mod osc;
 pub mod pane;
 pub mod pty;
