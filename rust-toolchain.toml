@@ -1,0 +1,8 @@
+# Pin the toolchain so local dev and CI always run the same rustc/clippy.
+#
+# To bump, edit `channel` and open a commit that also addresses any
+# new warnings the newer clippy surfaces.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

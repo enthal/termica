@@ -1,0 +1,22 @@
+[package]
+name = "termica"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/enthal/termica"
+description = "A native terminal workspace with a modern editor-driven shell experience, built on Rust and egui."
+rust-version = "1.95"
+
+[workspace]
+# A single root crate today; the architecture in spec/01-architecture.md
+# expands this into a multi-crate workspace as phases land. Keeping the
+# `[workspace]` table here so `cargo` commands behave the same the day
+# a second crate appears.
+members = ["."]
+
+[dependencies]
+# Intentionally empty on commit zero. Dependencies arrive with the
+# first feature PR (eframe / egui / egui_tiles / alacritty_terminal /
+# portable-pty). See spec/01-architecture.md for the planned set.
+
+[dev-dependencies]

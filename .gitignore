@@ -1,0 +1,23 @@
+/target
+**/*.rs.bk
+.DS_Store
+*.swp
+
+# egui_kittest snapshot artifacts — the committed `.png` is the source
+# of truth; `.new.png` / `.diff.png` / `.old.png` are regen artifacts.
+*.new.png
+*.diff.png
+*.old.png
+
+# Local agent worktrees: each is a live `git worktree add` into a
+# sibling branch, not source. Without this entry, `git add -A` from
+# the main checkout greedily slurps every worktree directory as a
+# gitlink, polluting commits with cross-session worktree state.
+.claude/worktrees/
+
+# Termica's own runtime data when run from the repo (transcripts,
+# scrollback chunks, sqlite). Real builds write under the user's
+# data dir; this catches in-tree dev runs.
+/data/
+
+/.claude/settings*.json
