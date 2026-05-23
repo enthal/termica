@@ -28,6 +28,15 @@ path = "src/main.rs"
 eframe = { version = "0.33", default-features = true }
 egui = "0.33"
 
+# Phase 1C: pseudo-terminal plumbing. Synchronous spawn / read / write /
+# resize. The tokio/async layering arrives in Phase 1D once there is a
+# consumer that needs to drain PTY bytes into `alacritty_terminal`.
+portable-pty = "0.9"
+
+# Error-type ergonomics. Used by `pty::PtyError` to keep the public
+# surface narrow without losing the wrapped source's text.
+thiserror = "2"
+
 [dev-dependencies]
 # Snapshot-driven UI tests (knauty pattern). Pinned to the egui major
 # series we depend on so the harness sees the same egui types.
