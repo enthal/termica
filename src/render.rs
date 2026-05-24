@@ -30,6 +30,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Response, Stroke, Vec2};
 
+use crate::links::LinkSpan;
 use crate::selection::{GridGeometry, Selection};
 use crate::terminal::TerminalState;
 
@@ -56,6 +57,12 @@ pub const CURSOR_COLOR: Color32 = Color32::from_rgba_premultiplied(0x70, 0x70, 0
 /// default — saturated enough to be unmistakable, light enough not to
 /// swallow dark text.
 pub const SELECTION_COLOR: Color32 = Color32::from_rgba_premultiplied(0x3a, 0x60, 0xa0, 0x80);
+
+/// Color of the underline drawn beneath a Cmd/Ctrl-hovered URL.
+/// Same colour family as the selection overlay so the two feel like
+/// siblings in the UI, but fully opaque so a thin underline is
+/// readable. Phase 10 will make this themable.
+pub const LINK_UNDERLINE_COLOR: Color32 = Color32::from_rgb(0x7c, 0xa9, 0xff);
 
 /// Result of one paint pass over the terminal grid.
 ///
@@ -90,6 +97,7 @@ pub fn paint_terminal(
     ui: &mut egui::Ui,
     term: &TerminalState,
     selection: Option<&Selection>,
+    hover_link: Option<&LinkSpan>,
 ) -> TerminalRender {
     let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
     // `glyph_width` / `row_height` mutate the font cache as they go,
@@ -197,6 +205,15 @@ pub fn paint_terminal(
         paint_selection_overlay(&painter, start, end, geometry);
     }
 
+    // Link hover underline. The caller has already gated this on
+    // "Cmd/Ctrl held" — if `hover_link` is `Some` we draw the
+    // underline unconditionally, so a future "always show URL
+    // affordance" toggle would just pass the link in without the
+    // modifier gate.
+    if let Some(link) = hover_link {
+        paint_link_underline(&painter, link, geometry);
+    }
+
     // Cursor overlay. Block shape for now (vim / less / htop all
     // expect a visible cursor while in their alt-screen UIs). Phase 4
     // will move ownership of cursor visibility to the prompt-editor
@@ -265,6 +282,30 @@ fn paint_selection_overlay(painter: &egui::Painter, start: Point, end: Point, g:
             SELECTION_COLOR,
         );
     }
+}
+
+/// Underline the cells covered by `link` in the link-hover colour.
+///
+/// Drawn 1.5 px above the cell bottom (matches the regular underline
+/// decoration in [`paint_terminal`]), at 1.5 px thickness so it
+/// reads as "affordance" rather than as a textual underline that
+/// the program itself emitted. Single-row only — multi-row URL
+/// stitching is deferred (see [`crate::links`]).
+fn paint_link_underline(painter: &egui::Painter, link: &LinkSpan, g: GridGeometry) {
+    let viewport_row = link.start.line.0 + g.display_offset;
+    if viewport_row < 0 || viewport_row >= g.screen_lines as i32 {
+        return;
+    }
+
+    let col_lo = link.start.column.0.min(g.cols.saturating_sub(1));
+    let col_hi = link.end.column.0.min(g.cols.saturating_sub(1));
+
+    let x0 = g.origin_x + col_lo as f32 * g.cell_w;
+    let x1 = g.origin_x + (col_hi as f32 + 1.0) * g.cell_w;
+    let y = g.origin_y + (viewport_row as f32 + 1.0) * g.row_h - 1.5;
+
+    painter
+        .line_segment([Pos2::new(x0, y), Pos2::new(x1, y)], Stroke::new(1.5, LINK_UNDERLINE_COLOR));
 }
 
 /// Resolve a cell to its `(fg, bg, paint_glyph)` triple for this
