@@ -181,6 +181,15 @@ impl PaneSession {
         self.selection = Some(Selection::with_mode(p, mode));
     }
 
+    /// Begin a fresh `Word`-mode selection whose anchor is glued to
+    /// a URL's bounds. Used when a double-click lands inside a
+    /// [`crate::links::LinkSpan`] — the user expects the whole URL
+    /// to be selected, not the punctuation-bounded word their
+    /// pointer is on. See [`Selection::with_url_anchor`].
+    pub fn start_url_selection(&mut self, link_start: Point, link_end: Point) {
+        self.selection = Some(Selection::with_url_anchor(link_start, link_end));
+    }
+
     /// Move the head of the current selection. No-op if there is no
     /// active selection (the caller should have called
     /// [`Self::start_selection`] first on drag-start).

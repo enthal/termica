@@ -401,7 +401,21 @@ impl eframe::App for TermicaApp {
                             2 => SelectionMode::Word,
                             _ => SelectionMode::Line,
                         };
-                        pane.start_selection(to_point(pos), mode);
+                        // Word-mode click on a URL → snap selection
+                        // to the URL's bounds instead of the word's.
+                        // The word definition is strict (alphanumeric
+                        // + `_`), so without this override a double-
+                        // click on `example` in `https://example.com`
+                        // would select just `example`. The link
+                        // engine knows where the URL really starts
+                        // and ends; we lean on it.
+                        if mode == SelectionMode::Word
+                            && let Some(link) = link_under_press
+                        {
+                            pane.start_url_selection(link.start, link.end);
+                        } else {
+                            pane.start_selection(to_point(pos), mode);
+                        }
                     }
                 } else if rendered.response.dragged()
                     && let Some(pos) = rendered.response.interact_pointer_pos()

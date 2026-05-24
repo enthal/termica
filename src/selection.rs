@@ -63,11 +63,18 @@ pub enum SelectionMode {
 /// `effective_range` returns `(start, end)` normalised, and for the
 /// `Word` / `Line` modes also expands the endpoints outward to the
 /// surrounding word / line bounds.
+///
+/// `anchor_link` is the special case where a double-click landed on
+/// a URL: the anchor's "word" is the entire URL, not the
+/// punctuation-bounded run of letters under the pointer. Stored
+/// once at click time so `effective_range` doesn't need to re-scan
+/// links every frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
     pub anchor: Point,
     pub head: Point,
     pub mode: SelectionMode,
+    pub anchor_link: Option<(Point, Point)>,
 }
 
 impl Selection {
@@ -82,7 +89,25 @@ impl Selection {
     /// start a `Word` / `Line` selection at the double/triple-click
     /// point.
     pub fn with_mode(p: Point, mode: SelectionMode) -> Self {
-        Self { anchor: p, head: p, mode }
+        Self { anchor: p, head: p, mode, anchor_link: None }
+    }
+
+    /// Construct a `Word`-mode selection whose anchor is anchored to
+    /// a URL's bounds rather than a word's bounds. Used when a
+    /// double-click lands inside a [`crate::links::LinkSpan`]: the
+    /// initial highlight covers the entire URL even though the
+    /// "word" under the pointer would normally be much shorter
+    /// (because punctuation like `:` and `/` break words).
+    ///
+    /// `head` is initialised to `link_end` so the initial selection
+    /// covers the whole URL with no drag motion needed.
+    pub fn with_url_anchor(link_start: Point, link_end: Point) -> Self {
+        Self {
+            anchor: link_start,
+            head: link_end,
+            mode: SelectionMode::Word,
+            anchor_link: Some((link_start, link_end)),
+        }
     }
 
     /// Move the head while keeping the anchor + mode pinned. Called
@@ -118,37 +143,53 @@ impl Selection {
     /// For `Char` selections this is the same as [`Self::range`].
     /// For `Word` / `Line` selections, each endpoint expands outward
     /// to its surrounding word / line bounds, then the two are
-    /// unioned in reading order.
+    /// unioned in reading order. When `anchor_link` is set, the
+    /// anchor contributes the URL's bounds rather than a word's —
+    /// so a double-click on a URL highlights the whole URL even
+    /// after the word definition was tightened to break on
+    /// punctuation.
     pub fn effective_range(&self, grid: &Grid<Cell>) -> (Point, Point) {
-        let (a, b) = self.range();
         match self.mode {
-            SelectionMode::Char => (a, b),
+            SelectionMode::Char => self.range(),
             SelectionMode::Word => {
-                let (a_start, _) = word_bounds_at(grid, a);
-                let (_, b_end) = word_bounds_at(grid, b);
-                (a_start, b_end)
+                let anchor_bounds =
+                    self.anchor_link.unwrap_or_else(|| word_bounds_at(grid, self.anchor));
+                let head_bounds = word_bounds_at(grid, self.head);
+                union_of_ranges(anchor_bounds, head_bounds)
             }
             SelectionMode::Line => {
-                let (a_start, _) = line_bounds_at(grid, a);
-                let (_, b_end) = line_bounds_at(grid, b);
-                (a_start, b_end)
+                let anchor_bounds = line_bounds_at(grid, self.anchor);
+                let head_bounds = line_bounds_at(grid, self.head);
+                union_of_ranges(anchor_bounds, head_bounds)
             }
         }
     }
 }
 
+/// Union of two inclusive `(start, end)` ranges, returned in reading
+/// order (earlier line first; same line → smaller column first).
+/// Each input is itself in reading order; the function picks the
+/// outer endpoints.
+fn union_of_ranges(a: (Point, Point), b: (Point, Point)) -> (Point, Point) {
+    let key = |p: &Point| (p.line.0, p.column.0);
+    let start = if key(&a.0) <= key(&b.0) { a.0 } else { b.0 };
+    let end = if key(&a.1) >= key(&b.1) { a.1 } else { b.1 };
+    (start, end)
+}
+
 /// Bounds of the word containing `p`, as `(start, end)` inclusive.
 ///
-/// A "word" is a maximal run of non-whitespace cells on the same
-/// line. If `p` lies on a whitespace cell, returns `(p, p)` — there
-/// is no word to expand to, just the single cell. The first/last
-/// returned column is clamped to the grid's column range.
+/// A "word" is a maximal run of [word characters](is_word_char) on
+/// the same line. Word characters are alphanumeric plus `_` (the
+/// classic identifier set); everything else — punctuation,
+/// whitespace, separators — breaks a word. This deliberately
+/// strict definition is what makes `(a)` → `a`, `key-value` →
+/// `key`, and so on; URLs are the special case the caller wraps
+/// in a [`Selection::with_url_anchor`].
 ///
-/// We deliberately keep the definition simple (whitespace ↔ non-
-/// whitespace, no Unicode word breaking, no `.`/`/`/`-` smart-split).
-/// Terminal selection is for grabbing arbitrary stretches of text;
-/// the smart variants (URL grabbing etc.) live in the link engine
-/// that follows in the next PR.
+/// If `p` lies on a non-word cell, returns `(p, p)` — there is no
+/// word to expand to, just the single cell. The first/last
+/// returned column is clamped to the grid's column range.
 pub fn word_bounds_at(grid: &Grid<Cell>, p: Point) -> (Point, Point) {
     let cols = grid.columns();
     if cols == 0 {
@@ -158,29 +199,38 @@ pub fn word_bounds_at(grid: &Grid<Cell>, p: Point) -> (Point, Point) {
     let col = p.column.0.min(cols.saturating_sub(1));
 
     let here = grid[Point::new(line, Column(col))].c;
-    if here.is_whitespace() {
+    if !is_word_char(here) {
         let pt = Point::new(line, Column(col));
         return (pt, pt);
     }
 
-    // Walk left while non-whitespace; same right.
+    // Walk left while word-char; same right.
     let mut start = col;
     while start > 0 {
-        let c = grid[Point::new(line, Column(start - 1))].c;
-        if c.is_whitespace() {
+        if !is_word_char(grid[Point::new(line, Column(start - 1))].c) {
             break;
         }
         start -= 1;
     }
     let mut end = col;
     while end + 1 < cols {
-        let c = grid[Point::new(line, Column(end + 1))].c;
-        if c.is_whitespace() {
+        if !is_word_char(grid[Point::new(line, Column(end + 1))].c) {
             break;
         }
         end += 1;
     }
     (Point::new(line, Column(start)), Point::new(line, Column(end)))
+}
+
+/// Whether `c` participates in a double-click "word" selection.
+///
+/// Conservative: alphanumeric (including non-ASCII letters and
+/// digits via `char::is_alphanumeric`) plus `_`. Everything else —
+/// `.`, `/`, `-`, `:`, `(`, etc. — breaks the word. This keeps
+/// `(a)` → `a` and `foo.bar` → `foo`, and lets the link engine
+/// own URL-shaped selections (which span many non-word chars).
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 /// Bounds of the entire line containing `p`, as `(start, end)`
@@ -438,7 +488,7 @@ mod tests {
 
     /// Build a `Char`-mode selection between two raw points.
     fn char_sel(a: Point, b: Point) -> Selection {
-        Selection { anchor: a, head: b, mode: SelectionMode::Char }
+        Selection { anchor: a, head: b, mode: SelectionMode::Char, anchor_link: None }
     }
 
     #[test]
@@ -546,6 +596,7 @@ mod tests {
             anchor: Point::new(Line(0), Column(3)), // inside "hello"
             head: Point::new(Line(0), Column(9)),   // inside "world"
             mode: SelectionMode::Word,
+            anchor_link: None,
         };
         let (start, end) = sel.effective_range(term.grid());
         assert_eq!(start.column.0, 2); // start of "hello"
@@ -561,6 +612,7 @@ mod tests {
             anchor: Point::new(Line(0), Column(9)), // inside "world"
             head: Point::new(Line(0), Column(3)),   // inside "hello"
             mode: SelectionMode::Word,
+            anchor_link: None,
         };
         let (start, end) = sel.effective_range(term.grid());
         assert_eq!(start.column.0, 2);
@@ -576,6 +628,7 @@ mod tests {
             anchor: Point::new(Line(0), Column(5)),
             head: Point::new(Line(2), Column(1)),
             mode: SelectionMode::Line,
+            anchor_link: None,
         };
         let (start, end) = sel.effective_range(term.grid());
         assert_eq!(start, Point::new(Line(0), Column(0)));
@@ -602,5 +655,110 @@ mod tests {
         let sel = Selection::with_mode(Point::new(Line(0), Column(4)), SelectionMode::Word);
         let t = selection_text(term.grid(), &sel);
         assert_eq!(t, "hello");
+    }
+
+    // --- smart word boundaries (punctuation breaks) ----------------
+
+    #[test]
+    fn word_bounds_punctuation_breaks_paren() {
+        // The defining example: `(a)` double-click on the `a` cell
+        // selects just `a`, not the whole `(a)`. The old whitespace-
+        // only rule got this wrong; the new alphanumeric+`_` rule
+        // gets it right.
+        let term = term_with(b"(a)", 5, 20);
+        let (start, end) = word_bounds_at(term.grid(), Point::new(Line(0), Column(1)));
+        assert_eq!(start, Point::new(Line(0), Column(1)));
+        assert_eq!(end, Point::new(Line(0), Column(1)));
+    }
+
+    #[test]
+    fn word_bounds_punctuation_breaks_dash() {
+        // `key-value` should split on `-` → clicking on `key` gives
+        // just `key`. Same rule keeps `foo.bar` → `foo`, `a/b/c` → `a`.
+        let term = term_with(b"key-value", 5, 20);
+        let (start, end) = word_bounds_at(term.grid(), Point::new(Line(0), Column(1)));
+        assert_eq!(start.column.0, 0);
+        assert_eq!(end.column.0, 2);
+    }
+
+    #[test]
+    fn word_bounds_punctuation_breaks_inside_url() {
+        // Without URL awareness, clicking on `example` in
+        // `https://example.com` gives just `example` (the `://`
+        // and `.` break the word). The URL-anchored path in
+        // [`Selection::with_url_anchor`] is what makes the whole
+        // URL select on double-click; this test pins the
+        // *underlying* word boundary.
+        let term = term_with(b"https://example.com", 5, 30);
+        // Click on the `e` in `example` at column 8 (after "https://").
+        let (start, end) = word_bounds_at(term.grid(), Point::new(Line(0), Column(8)));
+        assert_eq!(start.column.0, 8); // start of "example"
+        assert_eq!(end.column.0, 14); // end of "example"
+    }
+
+    #[test]
+    fn word_bounds_underscores_are_part_of_word() {
+        // Identifiers like `MY_VAR_NAME` are one word — `_` is the
+        // one piece of punctuation we keep inside the word definition.
+        let term = term_with(b"MY_VAR_NAME", 5, 20);
+        let (start, end) = word_bounds_at(term.grid(), Point::new(Line(0), Column(4)));
+        assert_eq!(start.column.0, 0);
+        assert_eq!(end.column.0, 10);
+    }
+
+    // --- URL-anchored Word selection ------------------------------
+
+    #[test]
+    fn effective_range_with_url_anchor_covers_whole_url_on_double_click() {
+        // The double-click on a URL case: `with_url_anchor` sets
+        // anchor=link.start, head=link.end. Without any drag motion
+        // the effective range should be the whole URL.
+        let term = term_with(b"see https://example.com please", 5, 40);
+        // "https://example.com" sits at cols 4..=22.
+        let link_start = Point::new(Line(0), Column(4));
+        let link_end = Point::new(Line(0), Column(22));
+        let sel = Selection::with_url_anchor(link_start, link_end);
+        let (start, end) = sel.effective_range(term.grid());
+        assert_eq!(start, link_start);
+        assert_eq!(end, link_end);
+
+        // And selection_text returns exactly the URL.
+        let t = selection_text(term.grid(), &sel);
+        assert_eq!(t, "https://example.com");
+    }
+
+    #[test]
+    fn effective_range_with_url_anchor_extends_word_on_drag_right() {
+        // After double-clicking on a URL, dragging right onto a
+        // following word should extend the selection to include
+        // that word — anchor stays glued to the URL bounds, head
+        // snaps to the new word's bounds.
+        let term = term_with(b"see https://example.com please there", 5, 50);
+        let link_start = Point::new(Line(0), Column(4));
+        let link_end = Point::new(Line(0), Column(22));
+        let mut sel = Selection::with_url_anchor(link_start, link_end);
+        // Drag head into "please" (col 26).
+        sel.extend_to(Point::new(Line(0), Column(26)));
+        let (start, end) = sel.effective_range(term.grid());
+        // Selection should now span the URL through end of "please".
+        assert_eq!(start, link_start);
+        assert_eq!(end.column.0, 29); // last col of "please"
+    }
+
+    #[test]
+    fn effective_range_with_url_anchor_extends_word_on_drag_left() {
+        // Reverse-drag case: dragging the head leftward into a
+        // word before the URL. The anchor still contributes the
+        // full URL; the head contributes the word on the left;
+        // union takes outer bounds.
+        let term = term_with(b"see https://example.com please there", 5, 50);
+        let link_start = Point::new(Line(0), Column(4));
+        let link_end = Point::new(Line(0), Column(22));
+        let mut sel = Selection::with_url_anchor(link_start, link_end);
+        // Drag head into "see" (col 1).
+        sel.extend_to(Point::new(Line(0), Column(1)));
+        let (start, end) = sel.effective_range(term.grid());
+        assert_eq!(start.column.0, 0); // start of "see"
+        assert_eq!(end, link_end);
     }
 }
