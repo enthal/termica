@@ -47,7 +47,7 @@ Each phase is a separate PR, with its own GH Issue and acceptance criteria. Phas
 
 **Status:** complete. Spec is reviewable on `main`.
 
-### Phase 1 — Real terminal pane (in progress)
+### Phase 1 — Real terminal pane ✅
 
 Sub-PRs:
 
@@ -65,17 +65,14 @@ Sub-PRs:
 - ✅ **1E-h — OSC 7 cwd tracking via parallel vte sniffer** ([#28](https://github.com/enthal/termica/pull/28)).
 - ✅ **1E-i — mouse-wheel in alt-screen → arrow keystrokes** ([#29](https://github.com/enthal/termica/pull/29)).
 - ✅ **1E-j — auto-install minimal zsh OSC 7 hook (ZDOTDIR override)** ([#30](https://github.com/enthal/termica/pull/30)).
-- ⏳ **1E-k — mouse selection + Cmd/Ctrl+Shift+C copy to clipboard** (in flight).
-
-Remaining:
-
-- ⏳ Clickable URLs (Cmd/Ctrl + click → OS open).
-- ⏳ Clickable paths relative to cwd (Cmd/Ctrl + click → OS open).
-- ⏳ VT golden tests: `bash-basic`, `zsh-basic`, `vim`, `less`, `htop`, `fzf`, `ssh`, `split-reads`.
+- ✅ **1E-k — mouse selection + Cmd/Ctrl+Shift+C copy to clipboard** ([#31](https://github.com/enthal/termica/pull/31)).
+- ✅ **1E-l — clickable URLs + smarter word boundaries** ([#32](https://github.com/enthal/termica/pull/32)).
+- ✅ **1E-m — clickable on-disk paths relative to cwd** ([#33](https://github.com/enthal/termica/pull/33)).
+- ✅ **1E-n — VT golden tests** (this PR): `bash-basic`, `zsh-basic`, `vim`, `less`, `htop`, `fzf`, `ssh`, `split-reads` under [`testdata/vt/`](../testdata/vt/). The `split-reads` scenario locks in the "escape sequence parsed across read boundaries" invariant.
 
 **Acceptance:** open the app, run `vim ~/.zshrc`, edit it, save it, quit it. The user experience matches Alacritty.
 
-✅ The acceptance behavior is **already working today** — `vim`, `less`, `htop` all run interactively; arrow keys scroll in `less`; window resizes propagate to the shell. The remaining items above polish the experience without changing the fundamental capability.
+✅ Met — `vim`, `less`, `htop`, `fzf`, `ssh` all run interactively; arrow keys scroll in `less`; window resizes propagate to the shell; mouse selection + copy + clickable URLs + clickable paths all live. The terminal-pane fundamentals are complete and locked in by the VT golden suite.
 
 ### Phase 2 — Workspace
 
