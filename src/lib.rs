@@ -15,6 +15,7 @@ pub mod integration;
 pub mod links;
 pub mod osc;
 pub mod pane;
+pub mod paths;
 pub mod pty;
 pub mod render;
 pub mod selection;
@@ -124,6 +125,11 @@ pub struct TermicaApp {
     /// How many consecutive presses we've accumulated within the
     /// multi-click window. Caps at 3.
     click_count: u8,
+    /// User's home directory, captured once at startup. Used by the
+    /// path scanner to expand `~/` tokens. `None` if `$HOME` was
+    /// unset (very unusual; the path scanner gracefully ignores
+    /// `~/`-rooted tokens in that case).
+    home: Option<std::path::PathBuf>,
 }
 
 impl TermicaApp {
@@ -134,12 +140,14 @@ impl TermicaApp {
         let config = PtyConfig::default();
         let pane = PaneSession::spawn(MIN_ROWS.max(24), MIN_COLS.max(80), &config)
             .map_err(|e| format!("{e}"));
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         Self {
             pane,
             last_size: None,
             last_press_time: f64::NEG_INFINITY,
             last_press_pos: egui::Pos2::ZERO,
             click_count: 0,
+            home,
         }
     }
 }
@@ -320,7 +328,20 @@ impl eframe::App for TermicaApp {
                     cols: grid_cols,
                 };
 
-                let links_in_view = links::scan_visible_links(pane.terminal().grid());
+                // Build the unified "clickable spans" list: URLs +
+                // on-disk paths. Both render the same way (one
+                // underline color) and both open the same way
+                // (`open` / `xdg-open` accept paths and URLs
+                // identically), so the renderer and click handler
+                // treat them uniformly. The path scanner skips
+                // URL-scheme tokens internally to avoid overlap.
+                let grid_ref = pane.terminal().grid();
+                let mut links_in_view = links::scan_visible_links(grid_ref);
+                let cwd = pane.terminal().cwd().map(|p| p.to_path_buf());
+                let path_spans =
+                    paths::scan_visible_paths(grid_ref, cwd.as_deref(), self.home.as_deref());
+                links_in_view.extend(path_spans);
+
                 let modifier_held = ctx.input(|i| i.modifiers.command);
                 let pointer_pos = ctx.input(|i| i.pointer.latest_pos());
 
