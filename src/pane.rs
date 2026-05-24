@@ -17,7 +17,10 @@ use std::io::Read;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
+use alacritty_terminal::index::Point;
+
 use crate::pty::{PtyConfig, PtyError, PtySession};
+use crate::selection::{self, Selection, SelectionMode};
 use crate::terminal::TerminalState;
 
 /// Plain snapshot of what the UI needs to render this pane. No OS
@@ -57,6 +60,12 @@ pub struct PaneSession {
     terminal: TerminalState,
     bytes_rx: mpsc::Receiver<Vec<u8>>,
     bytes_received: u64,
+    /// Current mouse selection, if any. Anchored to absolute grid
+    /// `Point`s so the highlight stays glued to the right cells as
+    /// the user scrolls. `None` means "no selection" — distinct from
+    /// `Some(Selection)` where anchor == head (i.e. a single click
+    /// has begun a drag but the pointer hasn't moved yet).
+    selection: Option<Selection>,
     // Held to keep the reader thread alive for the lifetime of this
     // session; we never `take` it. (See drop notes above.)
     _reader: JoinHandle<()>,
@@ -87,7 +96,14 @@ impl PaneSession {
             }
         });
 
-        Ok(Self { pty, terminal, bytes_rx: rx, bytes_received: 0, _reader: handle })
+        Ok(Self {
+            pty,
+            terminal,
+            bytes_rx: rx,
+            bytes_received: 0,
+            selection: None,
+            _reader: handle,
+        })
     }
 
     /// Pull every chunk the reader thread has queued and feed it into
@@ -148,6 +164,47 @@ impl PaneSession {
     /// wheel through scrollback).
     pub fn terminal_mut(&mut self) -> &mut TerminalState {
         &mut self.terminal
+    }
+
+    /// Current selection (anchor + head in absolute grid coordinates),
+    /// or `None` when there is no selection.
+    pub fn selection(&self) -> Option<&Selection> {
+        self.selection.as_ref()
+    }
+
+    /// Begin a fresh selection at `p` with the given granularity mode.
+    /// Replaces any existing selection. Called on mousedown from the
+    /// pointer handler — single click → [`SelectionMode::Char`], double
+    /// click → [`SelectionMode::Word`], triple click →
+    /// [`SelectionMode::Line`].
+    pub fn start_selection(&mut self, p: Point, mode: SelectionMode) {
+        self.selection = Some(Selection::with_mode(p, mode));
+    }
+
+    /// Move the head of the current selection. No-op if there is no
+    /// active selection (the caller should have called
+    /// [`Self::start_selection`] first on drag-start).
+    pub fn extend_selection(&mut self, p: Point) {
+        if let Some(sel) = &mut self.selection {
+            sel.extend_to(p);
+        }
+    }
+
+    /// Drop the current selection. Called on a click without drag and
+    /// after a successful copy.
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// Materialise the text currently under the selection from the
+    /// live grid. Returns `None` when there is no selection or when
+    /// the selection is degenerate (single click, no drag).
+    pub fn selection_text(&self) -> Option<String> {
+        let sel = self.selection.as_ref()?;
+        if sel.is_empty() {
+            return None;
+        }
+        Some(selection::selection_text(self.terminal.grid(), sel))
     }
 }
 

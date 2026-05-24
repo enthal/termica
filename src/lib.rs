@@ -16,12 +16,14 @@ pub mod osc;
 pub mod pane;
 pub mod pty;
 pub mod render;
+pub mod selection;
 pub mod terminal;
 
 use eframe::egui;
 
 use pane::{PaneSession, PaneView};
 use pty::PtyConfig;
+use selection::{SelectionMode, pixel_to_grid_point};
 
 /// Minimum cell grid Termica will ever ask a PTY for. Below this,
 /// shells and full-screen TTY programs behave erratically. The
@@ -29,6 +31,17 @@ use pty::PtyConfig;
 /// below the equivalent cells.
 const MIN_ROWS: u16 = 5;
 const MIN_COLS: u16 = 20;
+
+/// Max gap (seconds) between mousedowns to register as a multi-click.
+/// Tuned to feel close to the OS default — anything quicker than this
+/// counts as a continuation of the previous click.
+const MULTI_CLICK_WINDOW_SECS: f64 = 0.5;
+
+/// Max pixel distance the pointer can drift between mousedowns and
+/// still register as a multi-click. Tighter than a drag threshold so
+/// a slow "click, slight nudge, click" doesn't accidentally trigger
+/// word selection.
+const MULTI_CLICK_DISTANCE_PX: f32 = 8.0;
 
 /// Render the workspace's status header into `ui`.
 ///
@@ -81,6 +94,17 @@ pub struct TermicaApp {
     /// we only call `PaneSession::resize` when the cell-grid size
     /// actually changes, not every frame.
     last_size: Option<(u16, u16)>,
+    /// egui input-time of the most recent mousedown inside the grid.
+    /// Combined with [`Self::last_press_pos`] this lets us turn a
+    /// stream of presses into a 1/2/3 click counter — the OS-level
+    /// double/triple-click event only fires at click *completion*,
+    /// which is too late for "double-click then drag" selection.
+    last_press_time: f64,
+    /// Pointer position of the most recent mousedown.
+    last_press_pos: egui::Pos2,
+    /// How many consecutive presses we've accumulated within the
+    /// multi-click window. Caps at 3.
+    click_count: u8,
 }
 
 impl TermicaApp {
@@ -91,7 +115,13 @@ impl TermicaApp {
         let config = PtyConfig::default();
         let pane = PaneSession::spawn(MIN_ROWS.max(24), MIN_COLS.max(80), &config)
             .map_err(|e| format!("{e}"));
-        Self { pane, last_size: None }
+        Self {
+            pane,
+            last_size: None,
+            last_press_time: f64::NEG_INFINITY,
+            last_press_pos: egui::Pos2::ZERO,
+            click_count: 0,
+        }
     }
 }
 
@@ -113,12 +143,53 @@ impl eframe::App for TermicaApp {
         // Multi-pane focus arrives with Phase 2 (#2). Until then,
         // there's exactly one pane and no other input consumers, so
         // pulling from `ctx.input` is correct.
+        //
+        // Copy-to-clipboard is platform-conditional:
+        //
+        //   - macOS:   we trust egui's high-level `Event::Copy`
+        //              (synthesised from Cmd+C). The raw Key event
+        //              isn't reliably emitted alongside Event::Copy
+        //              on macOS — that was the original Cmd+C bug.
+        //   - Linux /  egui *would* also emit `Event::Copy` on plain
+        //     Windows: Ctrl+C, but Ctrl+C must remain SIGINT for the
+        //              shell. So we ignore Event::Copy off-Mac and
+        //              instead match the Ctrl+Shift+C Key event,
+        //              which is the universal terminal convention.
         let events: Vec<egui::Event> = ctx.input(|i| i.events.clone());
+        let is_macos = cfg!(target_os = "macos");
+
+        let copy_pressed = events.iter().any(|e| match e {
+            egui::Event::Copy => is_macos,
+            egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                !is_macos && input::is_copy_shortcut(*key, *modifiers, false)
+            }
+            _ => false,
+        });
+        if copy_pressed
+            && let Ok(pane) = &mut self.pane
+            && let Some(text) = pane.selection_text()
+        {
+            ctx.copy_text(text);
+            // Leave the highlight visible so the user sees what was
+            // copied — many terminals do this. The next click in
+            // the grid will replace the selection.
+        }
+
         if let Ok(pane) = &mut self.pane {
             // Snapshot the VT mode flags once per frame so the encoder
             // can pick CSI vs SS3 for arrow keys etc.
             let modes = pane.terminal().modes();
             for event in &events {
+                // Skip the off-Mac Ctrl+Shift+C key event so the
+                // encoder never sees it — without Shift held the
+                // encoder would have produced 0x03 (SIGINT), but
+                // Shift kills that branch anyway. Belt and braces.
+                if let egui::Event::Key { key, pressed: true, modifiers, .. } = event
+                    && !is_macos
+                    && input::is_copy_shortcut(*key, *modifiers, false)
+                {
+                    continue;
+                }
                 if let Some(bytes) = input::encode_event(event, modes) {
                     // Best-effort: a write failure means the PTY went
                     // away (child exit or master closed). The reader
@@ -196,8 +267,65 @@ impl eframe::App for TermicaApp {
 
             // Cell-grid renderer. Painted right below the status
             // header so the on-screen pane reads top-to-bottom.
-            if let Ok(pane) = &self.pane {
-                render::paint_terminal(ui, pane.terminal());
+            //
+            // The paint call returns the bounding rect + cell metrics
+            // + display offset that the mouse code below needs to
+            // translate pixel positions into grid `Point`s.
+            if let Ok(pane) = &mut self.pane {
+                let selection = pane.selection().copied();
+                let rendered = render::paint_terminal(ui, pane.terminal(), selection.as_ref());
+
+                // ---- mouse selection ---------------------------------
+                //
+                // We drive selection off `primary_pressed` (rising edge
+                // of the mousedown) rather than `drag_started`, because
+                // the multi-click counter has to fire at the press —
+                // by drag-time the user may already be a few cells in,
+                // and `double_clicked` / `triple_clicked` don't fire
+                // until click *completion*, which is too late.
+                //
+                // Each press picks a [`SelectionMode`]:
+                //   - 1 press   → Char (drag selects cell-by-cell)
+                //   - 2 presses → Word (anchor + head snap to word bounds)
+                //   - 3 presses → Line (each end snaps to whole-row)
+                // The mode is preserved across the drag, so a
+                // double-click+drag continues word-by-word and a
+                // triple-click+drag continues line-by-line.
+                let geom = rendered.geometry;
+                let to_point = |pos: egui::Pos2| pixel_to_grid_point(pos.x, pos.y, geom);
+
+                let (primary_pressed, press_origin, now) =
+                    ctx.input(|i| (i.pointer.primary_pressed(), i.pointer.press_origin(), i.time));
+
+                if primary_pressed
+                    && let Some(pos) = press_origin
+                    && rendered.response.rect.contains(pos)
+                {
+                    let dt = now - self.last_press_time;
+                    let dist = (pos - self.last_press_pos).length();
+                    if dt < MULTI_CLICK_WINDOW_SECS && dist < MULTI_CLICK_DISTANCE_PX {
+                        self.click_count = (self.click_count + 1).min(3);
+                    } else {
+                        self.click_count = 1;
+                    }
+                    self.last_press_time = now;
+                    self.last_press_pos = pos;
+
+                    let mode = match self.click_count {
+                        1 => SelectionMode::Char,
+                        2 => SelectionMode::Word,
+                        _ => SelectionMode::Line,
+                    };
+                    pane.start_selection(to_point(pos), mode);
+                } else if rendered.response.dragged()
+                    && let Some(pos) = rendered.response.interact_pointer_pos()
+                {
+                    // Mode is preserved in the existing selection —
+                    // `extend_to` just moves the head; the renderer /
+                    // text extractor consult `Selection::mode` and
+                    // snap the head outward to word / line bounds.
+                    pane.extend_selection(to_point(pos));
+                }
             }
         });
     }

@@ -204,6 +204,30 @@ pub fn classify_wheel(lines: i32, alt_screen: bool, modes: TerminalModes) -> Opt
     Some(WheelOutcome::SendBytes(payload))
 }
 
+/// True when `(key, mods)` is the platform's "copy selection to
+/// clipboard" shortcut.
+///
+/// - **macOS**: `Cmd+C`, nothing else held.
+/// - **Linux / Windows**: `Ctrl+Shift+C`, nothing else held. The plain
+///   `Ctrl+C` is the universal shell SIGINT (ETX, `0x03`) and must
+///   continue to reach the PTY untouched — that's why the *Shift*
+///   modifier is mandatory off-macOS. (xterm, gnome-terminal, konsole,
+///   alacritty all settle on Ctrl+Shift+C for the same reason.)
+///
+/// Pure; `is_macos` is the caller's compile-time choice
+/// (`cfg!(target_os = "macos")`) so this helper is testable on any
+/// host.
+pub fn is_copy_shortcut(key: Key, mods: Modifiers, is_macos: bool) -> bool {
+    if key != Key::C {
+        return false;
+    }
+    if is_macos {
+        mods.mac_cmd && !mods.ctrl && !mods.alt && !mods.shift
+    } else {
+        mods.ctrl && mods.shift && !mods.alt && !mods.mac_cmd
+    }
+}
+
 /// Map a key (A..Z) to its C0 control byte for `Ctrl + key`.
 /// Returns `None` for keys that don't form a Ctrl combo this layer
 /// recognises.
@@ -626,5 +650,54 @@ mod tests {
     fn pointer_events_return_none() {
         let evt = egui::Event::PointerMoved(egui::Pos2::ZERO);
         assert!(encode_event(&evt, default_modes()).is_none());
+    }
+
+    // --- copy shortcut ----------------------------------------------
+
+    fn mods_mac_cmd() -> Modifiers {
+        Modifiers { mac_cmd: true, ..Modifiers::default() }
+    }
+    fn mods_ctrl_shift() -> Modifiers {
+        Modifiers { ctrl: true, shift: true, ..Modifiers::default() }
+    }
+
+    #[test]
+    fn copy_shortcut_macos_is_cmd_c() {
+        assert!(is_copy_shortcut(Key::C, mods_mac_cmd(), true));
+    }
+
+    #[test]
+    fn copy_shortcut_linux_is_ctrl_shift_c() {
+        assert!(is_copy_shortcut(Key::C, mods_ctrl_shift(), false));
+    }
+
+    #[test]
+    fn copy_shortcut_plain_ctrl_c_is_not_copy_offmac() {
+        // Critical: plain Ctrl+C must stay SIGINT, NEVER be hijacked
+        // for copy. Hijacking would silently break every shell on
+        // every Linux runner.
+        assert!(!is_copy_shortcut(Key::C, just_ctrl(), false));
+    }
+
+    #[test]
+    fn copy_shortcut_cmd_c_on_linux_is_not_copy() {
+        // Cross-OS rules must NOT bleed through: Cmd+C is not a copy
+        // shortcut on a Linux build.
+        assert!(!is_copy_shortcut(Key::C, mods_mac_cmd(), false));
+    }
+
+    #[test]
+    fn copy_shortcut_ctrl_shift_c_on_mac_is_not_copy() {
+        // Same in reverse: on macOS the binding is Cmd+C, not the
+        // X11/Windows shortcut. Keeps the platform feel correct.
+        assert!(!is_copy_shortcut(Key::C, mods_ctrl_shift(), true));
+    }
+
+    #[test]
+    fn copy_shortcut_wrong_key_is_never_copy() {
+        for key in [Key::A, Key::V, Key::X, Key::Enter] {
+            assert!(!is_copy_shortcut(key, mods_mac_cmd(), true));
+            assert!(!is_copy_shortcut(key, mods_ctrl_shift(), false));
+        }
     }
 }

@@ -28,8 +28,9 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
-use eframe::egui::{self, Color32, FontId, Pos2, Rect, Stroke, Vec2};
+use eframe::egui::{self, Color32, FontId, Pos2, Rect, Response, Stroke, Vec2};
 
+use crate::selection::{GridGeometry, Selection};
 use crate::terminal::TerminalState;
 
 /// Font size in egui points. Tuned by eye for legibility on the
@@ -49,13 +50,47 @@ pub const DEFAULT_FG: Color32 = Color32::from_rgb(0xd8, 0xd8, 0xd8);
 /// inverted-ish, not as a hole). Phase 10 will make this themable.
 pub const CURSOR_COLOR: Color32 = Color32::from_rgba_premultiplied(0x70, 0x70, 0x70, 0x70);
 
+/// Selection overlay color. Semi-transparent blue, painted *over* the
+/// cell backgrounds and *under* the glyphs, so selected text remains
+/// readable. Tuned to match what macOS Terminal / iTerm2 settle on by
+/// default — saturated enough to be unmistakable, light enough not to
+/// swallow dark text.
+pub const SELECTION_COLOR: Color32 = Color32::from_rgba_premultiplied(0x3a, 0x60, 0xa0, 0x80);
+
+/// Result of one paint pass over the terminal grid.
+///
+/// The caller (the eframe app) uses this to do hit-testing for the
+/// mouse: which cell did the pointer land on, was it inside the grid,
+/// did a drag begin? The `geometry` field is what pure helpers in
+/// [`crate::selection`] consume.
+#[derive(Debug)]
+pub struct TerminalRender {
+    /// egui response over the painted rect (sensed `click_and_drag`).
+    pub response: Response,
+    /// Geometry of the painted grid, suitable for passing to
+    /// [`crate::selection::pixel_to_grid_point`].
+    pub geometry: GridGeometry,
+}
+
 /// Paint `term`'s visible grid into the current cursor position.
 ///
 /// Allocates exactly `cols × rows` of monospace metrics from `ui` so
 /// the surrounding layout knows we drew there. Caller decides where
 /// the grid lives (typically directly inside a `CentralPanel` after
 /// the status line).
-pub fn paint_terminal(ui: &mut egui::Ui, term: &TerminalState) {
+///
+/// `selection`, if `Some`, is painted as a semi-transparent overlay
+/// over the cells covered by the selection range. The hit-testing /
+/// drag tracking lives in the caller — this function only renders.
+///
+/// Returns a [`TerminalGeometry`] describing what was painted plus
+/// the egui `Response` (sensed `click_and_drag`) so the caller can
+/// turn pointer events into grid coordinates.
+pub fn paint_terminal(
+    ui: &mut egui::Ui,
+    term: &TerminalState,
+    selection: Option<&Selection>,
+) -> TerminalRender {
     let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
     // `glyph_width` / `row_height` mutate the font cache as they go,
     // so the `_mut` access is the correct one — `fonts()` (read-only)
@@ -75,7 +110,7 @@ pub fn paint_terminal(ui: &mut egui::Ui, term: &TerminalState) {
     let display_offset = grid.display_offset() as i32;
 
     let size = Vec2::new(cols as f32 * cell_w, rows as f32 * row_h);
-    let (rect, _response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
     let painter = ui.painter_at(rect);
 
     // One full-pane background draw is cheaper than `rows * cols`
@@ -136,6 +171,32 @@ pub fn paint_terminal(ui: &mut egui::Ui, term: &TerminalState) {
         }
     }
 
+    let geometry = GridGeometry {
+        origin_x: rect.min.x,
+        origin_y: rect.min.y,
+        cell_w,
+        row_h,
+        display_offset,
+        screen_lines: rows,
+        cols,
+    };
+
+    // Selection overlay. Painted on top of the cells (so the
+    // background color of selected cells is tinted blue) and below
+    // the cursor (so the cursor block remains visible inside a
+    // selection). We only paint when there's a real range — a
+    // degenerate `anchor == head` selection is a click that hasn't
+    // become a drag (Char mode), and we don't tint a single cell for
+    // that. Word/Line selections are NEVER considered empty: a
+    // double-click on a word produces a real highlight even with no
+    // drag motion.
+    if let Some(sel) = selection
+        && !sel.is_empty()
+    {
+        let (start, end) = sel.effective_range(grid);
+        paint_selection_overlay(&painter, start, end, geometry);
+    }
+
     // Cursor overlay. Block shape for now (vim / less / htop all
     // expect a visible cursor while in their alt-screen UIs). Phase 4
     // will move ownership of cursor visibility to the prompt-editor
@@ -148,6 +209,61 @@ pub fn paint_terminal(ui: &mut egui::Ui, term: &TerminalState) {
         let y = rect.min.y + row as f32 * row_h;
         let cursor_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w, row_h));
         painter.rect_filled(cursor_rect, 0.0, CURSOR_COLOR);
+    }
+
+    TerminalRender { response, geometry }
+}
+
+/// Paint the semi-transparent selection rectangles.
+///
+/// Takes the `(start, end)` *effective* range already in reading
+/// order — the caller resolves Char vs Word vs Line mode before
+/// calling this. Multi-line selections are drawn as three pieces:
+/// the partial first row, any full middle rows, and the partial last
+/// row. Single-row selections collapse to one rectangle. Selections
+/// that fall partly outside the current viewport (because the user
+/// has scrolled) are clipped to the visible rows.
+fn paint_selection_overlay(painter: &egui::Painter, start: Point, end: Point, g: GridGeometry) {
+    // Translate absolute Lines to viewport row indices, clamping each
+    // endpoint to the visible range. If both endpoints land outside
+    // the viewport on the same side, the clamp collapses them and we
+    // paint nothing (the for-loop range becomes empty).
+    let start_viewport = (start.line.0 + g.display_offset).max(0);
+    let end_viewport = (end.line.0 + g.display_offset).min(g.screen_lines as i32 - 1);
+    if start_viewport > end_viewport {
+        return;
+    }
+
+    for vrow in start_viewport..=end_viewport {
+        let (col_lo, col_hi) = if start.line.0 == end.line.0 {
+            // Single-line selection.
+            (start.column.0, end.column.0)
+        } else if vrow == start.line.0 + g.display_offset {
+            // First row of a multi-line selection.
+            (start.column.0, g.cols.saturating_sub(1))
+        } else if vrow == end.line.0 + g.display_offset {
+            // Last row of a multi-line selection.
+            (0, end.column.0)
+        } else {
+            // Middle row.
+            (0, g.cols.saturating_sub(1))
+        };
+
+        let col_hi = col_hi.min(g.cols.saturating_sub(1));
+        let col_lo = col_lo.min(col_hi);
+
+        let x0 = g.origin_x + col_lo as f32 * g.cell_w;
+        // `+ 1` so the highlight visually includes the cell under the
+        // pointer at the right edge.
+        let x1 = g.origin_x + (col_hi as f32 + 1.0) * g.cell_w;
+        let y0 = g.origin_y + vrow as f32 * g.row_h;
+        let y1 = y0 + g.row_h;
+
+        painter.rect_filled(
+            Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)),
+            0.0,
+            SELECTION_COLOR,
+        );
     }
 }
 
