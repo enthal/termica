@@ -12,6 +12,7 @@
 
 pub mod input;
 pub mod integration;
+pub mod links;
 pub mod osc;
 pub mod pane;
 pub mod pty;
@@ -19,8 +20,10 @@ pub mod render;
 pub mod selection;
 pub mod terminal;
 
+use alacritty_terminal::grid::Dimensions;
 use eframe::egui;
 
+use links::LinkSpan;
 use pane::{PaneSession, PaneView};
 use pty::PtyConfig;
 use selection::{SelectionMode, pixel_to_grid_point};
@@ -42,6 +45,22 @@ const MULTI_CLICK_WINDOW_SECS: f64 = 0.5;
 /// a slow "click, slight nudge, click" doesn't accidentally trigger
 /// word selection.
 const MULTI_CLICK_DISTANCE_PX: f32 = 8.0;
+
+/// Spawn the OS's "open this URL" handler.
+///
+/// macOS: `open <url>`. Linux/BSD: `xdg-open <url>`. Windows would
+/// use `cmd /c start <url>`, but we don't run there yet. The URL is
+/// passed as a single `arg`, never interpolated into a shell string,
+/// so PTY-controlled content cannot inject extra arguments.
+///
+/// Best-effort: a failure (e.g. `xdg-open` not installed) is logged
+/// but otherwise silent. The grid keeps working.
+fn open_url(url: &str) {
+    let cmd = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    if let Err(e) = std::process::Command::new(cmd).arg(url).spawn() {
+        eprintln!("termica: failed to open {url:?}: {e}");
+    }
+}
 
 /// Render the workspace's status header into `ui`.
 ///
@@ -273,7 +292,63 @@ impl eframe::App for TermicaApp {
             // translate pixel positions into grid `Point`s.
             if let Ok(pane) = &mut self.pane {
                 let selection = pane.selection().copied();
-                let rendered = render::paint_terminal(ui, pane.terminal(), selection.as_ref());
+
+                // ---- clickable URLs --------------------------------
+                //
+                // We rescan the visible viewport for URLs every frame
+                // and look up the link under the pointer. Cost is
+                // negligible at terminal sizes (a few KB of chars
+                // per scan) and rescanning is simpler than tracking
+                // incremental grid changes — the viewport scrolls
+                // and reflows for many reasons.
+                //
+                // To paint the underline in the SAME frame as the
+                // hover (no one-frame lag), we pre-compute the
+                // geometry that `paint_terminal` will use, do the
+                // hit-test against it, and pass the result in.
+                let display_offset = pane.terminal().display_offset() as i32;
+                let grid_rows = pane.terminal().grid().screen_lines();
+                let grid_cols = pane.terminal().grid().columns();
+                let origin = ui.next_widget_position();
+                let geom = selection::GridGeometry {
+                    origin_x: origin.x,
+                    origin_y: origin.y,
+                    cell_w,
+                    row_h,
+                    display_offset,
+                    screen_lines: grid_rows,
+                    cols: grid_cols,
+                };
+
+                let links_in_view = links::scan_visible_links(pane.terminal().grid());
+                let modifier_held = ctx.input(|i| i.modifiers.command);
+                let pointer_pos = ctx.input(|i| i.pointer.latest_pos());
+
+                let hover_link: Option<LinkSpan> = pointer_pos.and_then(|pos| {
+                    let in_grid = pos.x >= origin.x
+                        && pos.x < origin.x + grid_cols as f32 * cell_w
+                        && pos.y >= origin.y
+                        && pos.y < origin.y + grid_rows as f32 * row_h;
+                    if !in_grid {
+                        return None;
+                    }
+                    let pt = pixel_to_grid_point(pos.x, pos.y, geom);
+                    links_in_view.iter().find(|l| l.contains(pt)).cloned()
+                });
+                let highlighted_link = if modifier_held { hover_link.as_ref() } else { None };
+
+                let rendered = render::paint_terminal(
+                    ui,
+                    pane.terminal(),
+                    selection.as_ref(),
+                    highlighted_link,
+                );
+
+                // Pointing-hand cursor matches the underline: same
+                // gate so the visual and tactile cues stay in sync.
+                if highlighted_link.is_some() {
+                    ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
 
                 // ---- mouse selection ---------------------------------
                 //
@@ -301,22 +376,33 @@ impl eframe::App for TermicaApp {
                     && let Some(pos) = press_origin
                     && rendered.response.rect.contains(pos)
                 {
-                    let dt = now - self.last_press_time;
-                    let dist = (pos - self.last_press_pos).length();
-                    if dt < MULTI_CLICK_WINDOW_SECS && dist < MULTI_CLICK_DISTANCE_PX {
-                        self.click_count = (self.click_count + 1).min(3);
-                    } else {
-                        self.click_count = 1;
-                    }
-                    self.last_press_time = now;
-                    self.last_press_pos = pos;
+                    let press_pt = to_point(pos);
+                    let link_under_press =
+                        links_in_view.iter().find(|l| l.contains(press_pt)).cloned();
 
-                    let mode = match self.click_count {
-                        1 => SelectionMode::Char,
-                        2 => SelectionMode::Word,
-                        _ => SelectionMode::Line,
-                    };
-                    pane.start_selection(to_point(pos), mode);
+                    if modifier_held && let Some(link) = link_under_press {
+                        // Cmd/Ctrl-click on a URL: open it, do NOT
+                        // start a selection. The user expects the
+                        // grid to feel unchanged after the click.
+                        open_url(&link.url);
+                    } else {
+                        let dt = now - self.last_press_time;
+                        let dist = (pos - self.last_press_pos).length();
+                        if dt < MULTI_CLICK_WINDOW_SECS && dist < MULTI_CLICK_DISTANCE_PX {
+                            self.click_count = (self.click_count + 1).min(3);
+                        } else {
+                            self.click_count = 1;
+                        }
+                        self.last_press_time = now;
+                        self.last_press_pos = pos;
+
+                        let mode = match self.click_count {
+                            1 => SelectionMode::Char,
+                            2 => SelectionMode::Word,
+                            _ => SelectionMode::Line,
+                        };
+                        pane.start_selection(to_point(pos), mode);
+                    }
                 } else if rendered.response.dragged()
                     && let Some(pos) = rendered.response.interact_pointer_pos()
                 {

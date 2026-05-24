@@ -88,7 +88,7 @@ fn snapshot_terminal_plain_text() {
     );
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 200.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None);
+            render::paint_terminal(ui, &term, None, None);
         });
     harness.snapshot("terminal_plain_text");
 }
@@ -112,7 +112,7 @@ fn snapshot_terminal_ansi_colors() {
     let term = term_from_bytes(5, 50, &bytes);
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 180.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None);
+            render::paint_terminal(ui, &term, None, None);
         });
     harness.snapshot("terminal_ansi_colors");
 }
@@ -125,7 +125,7 @@ fn snapshot_terminal_cursor_visible_at_end_of_text() {
     let term = term_from_bytes(4, 30, b"hi");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 160.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None);
+            render::paint_terminal(ui, &term, None, None);
         });
     harness.snapshot("terminal_cursor_visible");
 }
@@ -139,7 +139,7 @@ fn snapshot_terminal_cursor_hidden_via_dectcem() {
     let term = term_from_bytes(4, 30, b"hi\x1b[?25l");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 160.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None);
+            render::paint_terminal(ui, &term, None, None);
         });
     harness.snapshot("terminal_cursor_hidden");
 }
@@ -172,7 +172,7 @@ fn snapshot_terminal_cell_attributes() {
     let term = term_from_bytes(5, 50, &bytes);
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 180.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None);
+            render::paint_terminal(ui, &term, None, None);
         });
     harness.snapshot("terminal_cell_attributes");
 }
@@ -191,7 +191,7 @@ fn snapshot_terminal_scrolled_into_scrollback() {
     term.scroll_display(5);
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 180.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None);
+            render::paint_terminal(ui, &term, None, None);
         });
     harness.snapshot("terminal_scrolled_into_scrollback");
 }
@@ -210,7 +210,31 @@ fn snapshot_terminal_alt_screen() {
     let term = term_from_bytes(5, 40, &bytes);
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 180.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None);
+            render::paint_terminal(ui, &term, None, None);
         });
     harness.snapshot("terminal_alt_screen");
+}
+
+#[test]
+fn snapshot_terminal_link_underline() {
+    // A URL on row 0 with the Cmd/Ctrl-hover underline rendered. The
+    // call site only passes a `Some(link)` when the modifier is held,
+    // so this snapshot stands in for "user is hovering with Cmd held".
+    use alacritty_terminal::index::{Column, Line, Point};
+    use termica::links::scan_visible_links;
+
+    let term = term_from_bytes(3, 40, b"open https://example.com please");
+    // Resolve the link via the same scanner the app uses, so the
+    // snapshot validates both the renderer AND the detector.
+    let spans = scan_visible_links(term.grid());
+    assert_eq!(spans.len(), 1, "scanner should find the URL");
+    let link = spans.into_iter().next().expect("one link");
+    // Sanity: it should be on row 0.
+    assert_eq!(link.start, Point::new(Line(0), Column(5)));
+
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 120.0)).build_ui(move |ui| {
+            render::paint_terminal(ui, &term, None, Some(&link));
+        });
+    harness.snapshot("terminal_link_underline");
 }
