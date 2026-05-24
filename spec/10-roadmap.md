@@ -61,10 +61,16 @@ Sub-PRs:
 - ✅ **1E-d — window resize → PTY resize + visible cursor (DECTCEM)** ([#22](https://github.com/enthal/termica/pull/22)).
 - ✅ **1E-e — bracketed paste wrapping** ([#23](https://github.com/enthal/termica/pull/23)).
 - ✅ **1E-f — cell attributes: bold / dim / inverse / hidden / underline / strikethrough** ([#25](https://github.com/enthal/termica/pull/25)).
+- ✅ **1E-g — mouse-wheel scrollback + scroll-aware renderer** ([#27](https://github.com/enthal/termica/pull/27)).
+- ✅ **1E-h — OSC 7 cwd tracking via parallel vte sniffer** ([#28](https://github.com/enthal/termica/pull/28)).
+- ✅ **1E-i — mouse-wheel in alt-screen → arrow keystrokes** ([#29](https://github.com/enthal/termica/pull/29)).
+- ✅ **1E-j — auto-install minimal zsh OSC 7 hook (ZDOTDIR override)** ([#30](https://github.com/enthal/termica/pull/30)).
+- ⏳ **1E-k — mouse selection + Cmd/Ctrl+Shift+C copy to clipboard** (in flight).
 
 Remaining:
 
-- ⏳ Mouse selection / copy (needs visual UX feedback).
+- ⏳ Clickable URLs (Cmd/Ctrl + click → OS open).
+- ⏳ Clickable paths relative to cwd (Cmd/Ctrl + click → OS open).
 - ⏳ VT golden tests: `bash-basic`, `zsh-basic`, `vim`, `less`, `htop`, `fzf`, `ssh`, `split-reads`.
 
 **Acceptance:** open the app, run `vim ~/.zshrc`, edit it, save it, quit it. The user experience matches Alacritty.

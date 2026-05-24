@@ -86,9 +86,10 @@ fn snapshot_terminal_plain_text() {
         40,
         b"hello, world\r\nthis is a test of the cell\r\nrenderer in Termica.",
     );
-    let mut harness = Harness::builder()
-        .with_size(egui::Vec2::new(700.0, 200.0))
-        .build_ui(move |ui| render::paint_terminal(ui, &term));
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 200.0)).build_ui(move |ui| {
+            render::paint_terminal(ui, &term, None);
+        });
     harness.snapshot("terminal_plain_text");
 }
 
@@ -109,9 +110,10 @@ fn snapshot_terminal_ansi_colors() {
     bytes.extend_from_slice(b"\x1b[91mbright-red\x1b[0m  \x1b[37mwhite\x1b[0m");
 
     let term = term_from_bytes(5, 50, &bytes);
-    let mut harness = Harness::builder()
-        .with_size(egui::Vec2::new(700.0, 180.0))
-        .build_ui(move |ui| render::paint_terminal(ui, &term));
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 180.0)).build_ui(move |ui| {
+            render::paint_terminal(ui, &term, None);
+        });
     harness.snapshot("terminal_ansi_colors");
 }
 
@@ -121,9 +123,10 @@ fn snapshot_terminal_cursor_visible_at_end_of_text() {
     // each character, so it ends up immediately after "hi" on row 0.
     // The renderer must paint the cursor block there.
     let term = term_from_bytes(4, 30, b"hi");
-    let mut harness = Harness::builder()
-        .with_size(egui::Vec2::new(700.0, 160.0))
-        .build_ui(move |ui| render::paint_terminal(ui, &term));
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 160.0)).build_ui(move |ui| {
+            render::paint_terminal(ui, &term, None);
+        });
     harness.snapshot("terminal_cursor_visible");
 }
 
@@ -134,9 +137,10 @@ fn snapshot_terminal_cursor_hidden_via_dectcem() {
     // to indicate "I'm in the middle of a repaint, don't show me
     // until I'm done".
     let term = term_from_bytes(4, 30, b"hi\x1b[?25l");
-    let mut harness = Harness::builder()
-        .with_size(egui::Vec2::new(700.0, 160.0))
-        .build_ui(move |ui| render::paint_terminal(ui, &term));
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 160.0)).build_ui(move |ui| {
+            render::paint_terminal(ui, &term, None);
+        });
     harness.snapshot("terminal_cursor_hidden");
 }
 
@@ -166,9 +170,10 @@ fn snapshot_terminal_cell_attributes() {
     bytes.extend_from_slice(b"\x1b[8mHIDDEN\x1b[0m");
 
     let term = term_from_bytes(5, 50, &bytes);
-    let mut harness = Harness::builder()
-        .with_size(egui::Vec2::new(700.0, 180.0))
-        .build_ui(move |ui| render::paint_terminal(ui, &term));
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 180.0)).build_ui(move |ui| {
+            render::paint_terminal(ui, &term, None);
+        });
     harness.snapshot("terminal_cell_attributes");
 }
 
@@ -184,9 +189,10 @@ fn snapshot_terminal_scrolled_into_scrollback() {
         term.feed(line.as_bytes());
     }
     term.scroll_display(5);
-    let mut harness = Harness::builder()
-        .with_size(egui::Vec2::new(700.0, 180.0))
-        .build_ui(move |ui| render::paint_terminal(ui, &term));
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 180.0)).build_ui(move |ui| {
+            render::paint_terminal(ui, &term, None);
+        });
     harness.snapshot("terminal_scrolled_into_scrollback");
 }
 
@@ -202,8 +208,9 @@ fn snapshot_terminal_alt_screen() {
     bytes.extend_from_slice(b"line 2 on alt screen");
 
     let term = term_from_bytes(5, 40, &bytes);
-    let mut harness = Harness::builder()
-        .with_size(egui::Vec2::new(700.0, 180.0))
-        .build_ui(move |ui| render::paint_terminal(ui, &term));
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 180.0)).build_ui(move |ui| {
+            render::paint_terminal(ui, &term, None);
+        });
     harness.snapshot("terminal_alt_screen");
 }
