@@ -1,0 +1,75 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run executable 'termica'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=termica"
+                ]
+            },
+            "args": []
+        },
+        {
+            "name": "Debug unit tests in library 'termica'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test"
+                ]
+            }
+        },
+        {
+            "name": "Debug executable 'termica'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=termica"
+                ]
+            },
+            "args": []
+        },
+        {
+            "name": "Debug unit tests in executable 'termica'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=termica"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'snapshots'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=snapshots"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'zsh_integration'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=zsh_integration"
+                ]
+            }
+        }
+    ]
+}

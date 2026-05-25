@@ -160,42 +160,114 @@ The transcript is a sequence of `TranscriptItem`s; rendering walks the sequence.
 
 ## Search
 
+The find feature is **block-oriented**: every scope below is expressed
+in terms of [command blocks](#what-is-a-block), and a match is reported
+with the block it lives in. This makes "next match" navigation step
+through blocks rather than raw scrollback rows, and makes scopes like
+`SelectedBlocks` natural.
+
+### What is a "block"?
+
+A **block** is one [`CommandRun`](#command-runs): the prompt + the
+command (whether the user is still editing it, has just submitted it,
+or finished it long ago) + every byte of stdout / stderr / OSC marker
+output that arrived between its `command_start` and `command_end`
+markers. Equivalently, it's what a single header chrome wraps in the
+transcript view ([command blocks](#command-blocks-in-the-transcript)).
+
+A block is the unit the user thinks in — "the command I just ran",
+"the previous build", "the failed deploy" — and the unit `find`
+operates over.
+
+### Scope model
+
 ```rust
 pub enum SearchScope {
-    Pane(PaneId),
-    Tab(TabId),
-    Window(WindowId),
-    Workspace,
+    /// The block(s) the user has explicitly selected in the
+    /// transcript. Empty → no-op.
+    SelectedBlocks,
+
+    /// The most recently opened block in the focused pane. If the
+    /// user is mid-edit at the prompt, that's "the current block".
+    /// Otherwise it's the block that was just closed.
+    LastBlock,
+
+    /// **Default.** Every block in every pane of the currently
+    /// active tab. Across-split scopes naturally fall out of this
+    /// once Phase 2B splits land — a tab is a sub-tree of the
+    /// `egui_tiles::Tree`.
+    CurrentTab,
+
+    /// Every block across every tab in the current window.
+    AllTabsInWindow,
+
+    /// Every block in every open window. Multi-window arrives
+    /// post-MVP; this scope is wired through ahead of time so the
+    /// `find` UI doesn't need a schema change later.
+    AllWindows,
+
+    /// Persisted-but-not-currently-open sessions, via the global
+    /// search index. Post-MVP (see below).
     Global,
-    CommandHistoryOnly,
-    OutputOnly,
 }
 
 pub struct SearchQuery {
     pub text: String,
     pub mode: SearchMode,   // Literal / CaseInsensitive / Regex / Fuzzy
     pub scope: SearchScope,
+    /// Optional filter on top of the scope: `CommandOnly` matches
+    /// only the prompt-and-command portion of each block;
+    /// `OutputOnly` matches only its I/O.
+    pub filter: SearchFilter,
+}
+
+pub enum SearchFilter {
+    Both,           // default
+    CommandOnly,    // exclude output
+    OutputOnly,     // exclude the command line
 }
 
 pub struct SearchResult {
     pub pane_id: PaneId,
-    pub command_run_id: Option<CommandRunId>,
+    pub command_run_id: CommandRunId,
     pub scrollback_position: ScrollbackPosition,
     pub matched_line: String,
     pub match_span: Range<usize>,
 }
 ```
 
+### Default + scope-switcher UX
+
+- `Cmd/Ctrl+F` opens the overlay with `scope = CurrentTab`. This is
+  what users expect from "find in this terminal" — every block they
+  can see by switching splits / tabs-within-the-current-tab is in
+  range, but unrelated tabs aren't.
+- The overlay has a scope chip (e.g. `[Tab]`) the user can click to
+  cycle through `SelectedBlocks` → `LastBlock` → `CurrentTab` →
+  `AllTabsInWindow` → `AllWindows`. `Global` is hidden until the
+  global index ships.
+- Modes (`Literal` / `CaseInsensitive` / `Regex` / `Fuzzy`) and
+  filters (`Both` / `CommandOnly` / `OutputOnly`) are independent
+  toggles in the overlay.
+
+Search engine: literal + case-insensitive in v1 (Phase 8). Regex via
+`regex`; fuzzy via `nucleo`. Tantivy for global persisted output
+search is post-MVP.
+
 ### v1 scopes (shipping)
 
-- `Pane(PaneId)` — current pane's visible buffer + full in-memory scrollback. **Phase 8 deliverable.**
-- `CommandHistoryOnly` — `Ctrl+R` popup. **Phase 6 deliverable.**
+- `SelectedBlocks` / `LastBlock` / `CurrentTab` — **Phase 8 deliverable.**
+- `CommandHistoryOnly` is *not* a scope of `find`; that's the
+  `Ctrl+R` popup, which is its own UI and ships in Phase 6.
 
 ### Post-MVP scopes
 
-- `Tab` / `Window` / `Workspace` — across multiple panes.
-- `Global` — across all persisted sessions, including ones that aren't currently open. Indexed.
-- `OutputOnly` — exclude command lines.
+- `AllTabsInWindow` — straightforward extension; left out of v1 only
+  because the UX of cross-tab match navigation needs a design pass
+  (do we switch the active tab on `⇣`? Do we open a results panel?).
+- `AllWindows` — needs multi-window first.
+- `Global` — across all persisted sessions, including ones that
+  aren't currently open. Tantivy-indexed.
 
 Search engine: literal + case-insensitive in v1 (Phase 8). Regex via `regex`; fuzzy via `nucleo`. Tantivy for global persisted output search is post-MVP.
 

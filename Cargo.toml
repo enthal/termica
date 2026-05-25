@@ -50,6 +50,26 @@ vte = { version = "0.15", default-features = false }
 # Error-type ergonomics. Used by `pty::PtyError` to keep the public
 # surface narrow without losing the wrapped source's text.
 thiserror = "2"
+egui_tiles = "0.14"
+
+# macOS-only: we need `EventLoopBuilderExtMacOS::with_default_menu(false)`
+# to disable winit's default app menubar. Its Quit item invokes
+# `[NSApplication terminate:]` directly, which bypasses our key
+# handler AND `viewport().close_requested()` — by the time `update()`
+# would run, the app is already terminating. Without the default menu,
+# Cmd+Q reaches the window as a normal `Key::Q` event and routes
+# through the quit-confirm modal. Pinned to the same major as eframe's
+# transitive dep so cargo resolves to a single `winit` in the graph.
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = "0.30"
+
+# Cross-platform native menu construction (tauri-apps). We use it to
+# build our own macOS menubar with a Quit item whose action targets a
+# selector we control (not `[NSApp terminate:]`). winit's default menu
+# is disabled via `with_default_menu(false)` so muda's menu is the
+# only menubar installed. Linux/Windows don't get a menubar yet —
+# `match_pane_shortcut` handles Ctrl+Shift+Q etc. natively there.
+muda = "0.19"
 
 [dev-dependencies]
 # Snapshot-driven UI tests (knauty pattern). Pinned to the egui major

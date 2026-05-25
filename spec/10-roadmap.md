@@ -76,13 +76,24 @@ Sub-PRs:
 
 ### Phase 2 — Workspace
 
-- `egui_tiles::Tree<PaneId>` topology; `PaneRegistry`.
-- Tab bar; new tab; close tab; reorder.
-- Splits (right / down).
-- Pane operations: spawn in cwd, duplicate-here, close, move-between-tabs.
-- `egui_kittest` snapshots for: tabs + 2-pane horizontal split; tabs + 3-pane T-split.
+Sub-PRs:
+
+- ✅ **2A — Tabs + drag-splits + app shortcuts + close/quit modals + macOS menubar** (this PR).
+  - `egui_tiles::Tree<PaneId>` topology with the actual `PaneSession` (PTY, reader thread, grid) held in a side `HashMap` so the tree carries only value-type `PaneId`s.
+  - Tab strip per `Tabs` container with `[+]` to spawn and `×` to close; drag a tab to an edge to split.
+  - Per-tab keyboard focus; the focused pane's tab title renders bold; click-to-focus and tab-click-to-focus both work; egui's built-in Tab/arrow focus nav is locked out so keystrokes always reach the PTY.
+  - App-level shortcuts: Cmd+T new tab, Cmd+W close tab (routes to Quit on the last tab), Cmd+Shift+] / [ next/previous tab, Cmd+Q quit. Linux/Windows use Ctrl+Shift equivalents. The encoder rejects all unrecognised modifier+key combos so a chord can never accidentally land in the PTY as a bare key.
+  - Close-tab confirmation modal when the pane's PTY is in alt-screen (vim / less / htop / fzf / ssh-with-TUI); same modal whether the close was a `×` click or Cmd+W.
+  - Quit-confirmation modal with a 60-second auto-quit countdown; Cancel / Esc / backdrop cancels.
+  - Pane input is gated while any modal is up — keys, wheel, clicks, and focus grabs are suppressed so keystrokes intended for the modal don't leak to the PTY.
+  - macOS: custom menubar via `muda`; winit's default Quit menu is disabled so its `[NSApp terminate:]` action can't bypass the quit-confirm modal. Custom About item opens a small in-app modal.
+- ⏳ **2B — Spawn in cwd**: a new tab inherits the focused pane's cwd (from OSC 7 tracking).
+- ⏳ **2C — Duplicate-here**: explicit "duplicate this pane in a new tab" affordance.
+- ⏳ **2D — Split snapshot tests**: `egui_kittest` snapshots for tabs + 2-pane horizontal split and tabs + 3-pane T-split.
 
 **Acceptance:** multi-pane terminal workspace; layout operations don't drop pane state.
+
+**Status:** ✅ 2A shipped; 2B–2D outstanding before Phase 2 closes.
 
 ### Phase 3 — Markers + mode machine
 
