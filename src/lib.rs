@@ -616,6 +616,11 @@ pub struct TermicaApp {
     /// so the only place we send `ViewportCommand::Close` is the
     /// tail of `update`.
     should_quit: bool,
+    /// `true` while the in-app "About Termica" modal is showing.
+    /// Driven by the `MenuEvent { id: "about" }` from our macOS
+    /// menubar (and, in the future, any other surface that wants
+    /// to open it). Closed by Esc / backdrop / OK button.
+    about_open: bool,
 }
 
 impl TermicaApp {
@@ -636,6 +641,7 @@ impl TermicaApp {
             pending_close_confirm: None,
             quit_confirm_started_at: None,
             should_quit: false,
+            about_open: false,
         };
         app.bootstrap();
         app
@@ -822,8 +828,10 @@ impl eframe::App for TermicaApp {
         // simply never produces an event — no menu is installed.
         #[cfg(target_os = "macos")]
         while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
-            if event.id() == "quit" {
-                self.quit_requested = true;
+            match event.id().as_ref() {
+                "quit" => self.quit_requested = true,
+                "about" => self.about_open = true,
+                _ => {}
             }
         }
 
@@ -837,8 +845,9 @@ impl eframe::App for TermicaApp {
         // Compute *before* `tree.ui()` so the modal's existence
         // gates this frame's pane input (otherwise keys leak to the
         // PTY before the modal renders below).
-        let modal_open =
-            self.pending_close_confirm.is_some() || self.quit_confirm_started_at.is_some();
+        let modal_open = self.pending_close_confirm.is_some()
+            || self.quit_confirm_started_at.is_some()
+            || self.about_open;
         egui::CentralPanel::default().show(ctx, |ui| {
             let mut behavior = TabBehavior {
                 panes: &mut self.panes,
@@ -998,6 +1007,31 @@ impl eframe::App for TermicaApp {
 
         if self.should_quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        // About modal: opened by the menubar's About item (macOS)
+        // and by any future surface that sets `about_open = true`.
+        // Esc / backdrop / OK dismisses. Pane input is already gated
+        // because `about_open` feeds into the `modal_open` flag
+        // computed at the top of this frame.
+        if self.about_open {
+            let modal = egui::Modal::new(egui::Id::new("termica-about")).show(ctx, |ui| {
+                ui.set_min_width(320.0);
+                ui.vertical_centered(|ui| {
+                    ui.heading("Termica");
+                    ui.add_space(4.0);
+                    ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                    ui.add_space(8.0);
+                    ui.label("A native terminal workspace.");
+                    ui.add_space(12.0);
+                    if ui.button("OK").clicked() {
+                        self.about_open = false;
+                    }
+                });
+            });
+            if modal.should_close() {
+                self.about_open = false;
+            }
         }
 
         // Apply staged tab-close requests via `remove_recursively`,
@@ -1303,6 +1337,12 @@ fn install_macos_menu() {
     let app_menu = Submenu::new("Termica", true);
     menu.append(&app_menu).expect("muda: append app submenu");
 
+    // Custom About item — fires `MenuEvent { id: "about" }` so we
+    // can render our own egui modal instead of the standard macOS
+    // about panel. Same plumbing as Quit; no accelerator (the
+    // standard "About <App>" item is menu-clickable only).
+    let about_item = MenuItem::with_id("about", "About Termica", true, None);
+
     // Custom Quit item: pressing Cmd+Q (or clicking it) fires a
     // `MenuEvent { id: "quit" }` which `update()` translates to
     // `quit_requested = true`, taking the normal "any pane running?"
@@ -1316,7 +1356,7 @@ fn install_macos_menu() {
 
     app_menu
         .append_items(&[
-            &PredefinedMenuItem::about(None, None),
+            &about_item,
             &PredefinedMenuItem::separator(),
             &PredefinedMenuItem::services(None),
             &PredefinedMenuItem::separator(),
