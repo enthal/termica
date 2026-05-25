@@ -87,7 +87,7 @@ Sub-PRs:
   - Quit-confirmation modal with a 60-second auto-quit countdown; Cancel / Esc / backdrop cancels.
   - Pane input is gated while any modal is up — keys, wheel, clicks, and focus grabs are suppressed so keystrokes intended for the modal don't leak to the PTY.
   - macOS: custom menubar via `muda`; winit's default Quit menu is disabled so its `[NSApp terminate:]` action can't bypass the quit-confirm modal. Custom About item opens a small in-app modal.
-- ⏳ **2B — Spawn in cwd**: a new tab inherits the focused pane's cwd (from OSC 7 tracking).
+- ✅ **2B — Spawn in cwd**: a new tab inherits its parent Tabs container's active pane's OSC 7 cwd; falls back to the termica process's cwd if none is known yet.
 - ⏳ **2C — Duplicate-here**: explicit "duplicate this pane in a new tab" affordance.
 - ⏳ **2D — Split snapshot tests**: `egui_kittest` snapshots for tabs + 2-pane horizontal split and tabs + 3-pane T-split.
 
