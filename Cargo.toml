@@ -50,6 +50,7 @@ vte = { version = "0.15", default-features = false }
 # Error-type ergonomics. Used by `pty::PtyError` to keep the public
 # surface narrow without losing the wrapped source's text.
 thiserror = "2"
+egui_tiles = "0.14"
 
 [dev-dependencies]
 # Snapshot-driven UI tests (knauty pattern). Pinned to the egui major
