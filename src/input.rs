@@ -82,6 +82,18 @@ pub fn encode_event(event: &egui::Event, modes: TerminalModes) -> Option<Vec<u8>
 
 /// Encode a single key-down event. Public so the snapshot/unit test
 /// can call it without faking a full `egui::Event`.
+///
+/// # Modifier policy
+///
+/// Modifiers may NEVER be silently dropped. The only modifier combo
+/// this encoder produces output for is `Ctrl + letter` (with no
+/// other modifier held); everything else falls through to a
+/// per-key table that is only valid for **unmodified** keys. Any
+/// other modifier combination — `Cmd+ArrowUp`, `Shift+Enter`,
+/// `Alt+T`, … — returns `None`, leaving the key combo *unmapped*
+/// (no PTY write). App-level shortcuts (Cmd+T new-tab,
+/// Cmd+Shift+]/[ tab nav, etc.) intercept these events at the
+/// call site in [`crate::render_pane`], not here.
 pub fn encode_key(key: Key, modifiers: Modifiers, modes: TerminalModes) -> Option<Vec<u8>> {
     // Ctrl + letter takes precedence over per-key encodings: even
     // though Ctrl+M would otherwise be Return, the standard terminal
@@ -89,9 +101,18 @@ pub fn encode_key(key: Key, modifiers: Modifiers, modes: TerminalModes) -> Optio
     if modifiers.ctrl
         && !modifiers.alt
         && !modifiers.shift
+        && !modifiers.mac_cmd
         && let Some(byte) = ctrl_letter_byte(key)
     {
         return Some(vec![byte]);
+    }
+
+    // Modifier gate: the per-key tables below are only valid for
+    // unmodified keys. If ANY modifier is held at this point, the
+    // combo is unmapped — return None and let the caller (or no
+    // one) handle it. This is what makes Cmd+Up ≠ Up.
+    if modifiers.ctrl || modifiers.alt || modifiers.shift || modifiers.mac_cmd {
+        return None;
     }
 
     // Arrow keys, Home, End: pick CSI vs SS3 form based on DECCKM.
@@ -699,5 +720,85 @@ mod tests {
             assert!(!is_copy_shortcut(key, mods_mac_cmd(), true));
             assert!(!is_copy_shortcut(key, mods_ctrl_shift(), false));
         }
+    }
+
+    // --- unmapped modifier combos return None ---------------------
+
+    #[test]
+    fn cmd_plus_arrow_is_unmapped() {
+        // The user's canonical case: Cmd+ArrowUp must NOT collapse
+        // down to plain ArrowUp. The encoder's per-key tables only
+        // apply to unmodified keys.
+        assert!(encode_key(Key::ArrowUp, mods_mac_cmd(), default_modes()).is_none());
+        assert!(encode_key(Key::ArrowDown, mods_mac_cmd(), default_modes()).is_none());
+        assert!(encode_key(Key::ArrowLeft, mods_mac_cmd(), default_modes()).is_none());
+        assert!(encode_key(Key::ArrowRight, mods_mac_cmd(), default_modes()).is_none());
+    }
+
+    #[test]
+    fn cmd_plus_special_keys_are_unmapped() {
+        // Same rule for Enter, Home, End, PageUp, PageDown,
+        // Tab — under Cmd, none of these emit their unmodified
+        // byte. App-level shortcuts (Cmd+T, Cmd+Shift+], …) live
+        // outside the encoder.
+        for key in [Key::Enter, Key::Home, Key::End, Key::Tab, Key::Escape] {
+            assert!(
+                encode_key(key, mods_mac_cmd(), default_modes()).is_none(),
+                "Cmd+{key:?} should be unmapped, not collapse to plain {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shift_plus_arrow_is_unmapped() {
+        // Shift+arrows would be select-extend in some terminals; we
+        // don't implement that. Return None rather than secretly
+        // emit a plain arrow keystroke.
+        let shift = Modifiers { shift: true, ..Modifiers::default() };
+        assert!(encode_key(Key::ArrowUp, shift, default_modes()).is_none());
+        assert!(encode_key(Key::ArrowLeft, shift, default_modes()).is_none());
+    }
+
+    #[test]
+    fn alt_plus_arrow_is_unmapped() {
+        let alt = Modifiers { alt: true, ..Modifiers::default() };
+        assert!(encode_key(Key::ArrowUp, alt, default_modes()).is_none());
+    }
+
+    #[test]
+    fn ctrl_plus_arrow_is_unmapped() {
+        // Even Ctrl+arrow is unmapped today. Some shells map this
+        // to word-motion, but we don't have a wire encoding for it
+        // and don't want to silently encode plain CSI/SS3 ArrowUp.
+        let ctrl = Modifiers { ctrl: true, ..Modifiers::default() };
+        assert!(encode_key(Key::ArrowUp, ctrl, default_modes()).is_none());
+    }
+
+    #[test]
+    fn ctrl_plus_letter_still_encodes_with_my_new_gate() {
+        // Regression: the modifier gate must NOT swallow the
+        // Ctrl+letter branch. Ctrl+C → 0x03 (SIGINT) still works.
+        assert_eq!(encode_key(Key::C, just_ctrl(), default_modes()).unwrap(), vec![0x03]);
+        assert_eq!(encode_key(Key::A, just_ctrl(), default_modes()).unwrap(), vec![0x01]);
+    }
+
+    #[test]
+    fn ctrl_plus_letter_with_any_other_modifier_is_unmapped() {
+        // Ctrl+Shift+C / Cmd+Ctrl+C / Alt+Ctrl+C all skip the
+        // Ctrl+letter branch (which requires NO other modifier).
+        let ctrl_shift = Modifiers { ctrl: true, shift: true, ..Modifiers::default() };
+        assert!(encode_key(Key::C, ctrl_shift, default_modes()).is_none());
+        let ctrl_alt = Modifiers { ctrl: true, alt: true, ..Modifiers::default() };
+        assert!(encode_key(Key::C, ctrl_alt, default_modes()).is_none());
+        let ctrl_cmd = Modifiers { ctrl: true, mac_cmd: true, ..Modifiers::default() };
+        assert!(encode_key(Key::C, ctrl_cmd, default_modes()).is_none());
+    }
+
+    #[test]
+    fn plain_keys_still_encode_normally() {
+        // Sanity that the gate doesn't break the no-modifier case.
+        assert_eq!(encode_key(Key::Enter, no_mods(), default_modes()).unwrap(), b"\r");
+        assert_eq!(encode_key(Key::ArrowUp, no_mods(), default_modes()).unwrap(), b"\x1b[A");
+        assert_eq!(encode_key(Key::Tab, no_mods(), default_modes()).unwrap(), b"\t");
     }
 }
