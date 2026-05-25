@@ -546,6 +546,24 @@ pub fn tab_title_for(pane_id: PaneId, cwd: Option<&Path>) -> String {
     format!("pane {}", pane_id.0)
 }
 
+/// Resolve the active pane id inside a Tabs container, if any. Pure
+/// Tree navigation; lifted out of [`TermicaApp::spawn_new_pane_in_tabs`]
+/// so it can be exercised without bringing up a real PTY.
+///
+/// Returns `None` if `tabs_tile` doesn't refer to a Tabs container,
+/// the container has no active child, the active child isn't a leaf
+/// pane, or the tile id is dangling.
+pub fn active_pane_in_tabs(tree: &Tree<PaneId>, tabs_tile: TileId) -> Option<PaneId> {
+    let Tile::Container(egui_tiles::Container::Tabs(tabs)) = tree.tiles.get(tabs_tile)? else {
+        return None;
+    };
+    let active = tabs.active?;
+    match tree.tiles.get(active)? {
+        Tile::Pane(pane_id) => Some(*pane_id),
+        _ => None,
+    }
+}
+
 // =====================================================================
 //  The eframe app
 // =====================================================================
@@ -773,9 +791,22 @@ impl TermicaApp {
     /// Spawn a new pane and add it as a tab inside the given Tabs
     /// container. Active-tab focus moves to the new tab so the user
     /// sees the result of clicking [+].
+    ///
+    /// The new pane's cwd is inherited from the Tabs container's
+    /// currently active pane (its OSC 7-tracked cwd, if any). This
+    /// is what users almost always want: `cd somewhere`, then
+    /// Cmd+T or click `[+]` to open a sibling tab "here". If we
+    /// can't resolve a cwd (the active tile isn't a pane, no OSC 7
+    /// has arrived yet, …) we fall back to the termica process's
+    /// cwd by leaving `PtyConfig.cwd = None`.
     fn spawn_new_pane_in_tabs(&mut self, tabs_tile: TileId) {
+        let cwd = active_pane_in_tabs(&self.tree, tabs_tile)
+            .and_then(|id| self.panes.get(&id))
+            .and_then(|slot| slot.session.terminal().cwd().map(|p| p.to_path_buf()));
+
         let pane_id = self.mint_pane_id();
-        let session = match PaneSession::spawn(24, 80, &PtyConfig::default()) {
+        let config = PtyConfig { cwd, ..PtyConfig::default() };
+        let session = match PaneSession::spawn(24, 80, &config) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("termica: failed to spawn new pane: {e}");
@@ -1423,6 +1454,59 @@ mod tests {
         // Filesystem root — file_name() returns None. We fall back.
         let root = PathBuf::from("/");
         assert_eq!(tab_title_for(PaneId(7), Some(&root)), "pane 7");
+    }
+
+    // --- active pane resolution (Phase 2B spawn-in-cwd) -------------
+    //
+    // These exercise the pure Tree navigation under
+    // [`active_pane_in_tabs`]. The "spawn in cwd" wiring on top of
+    // it (turn a pane id into its OSC 7 cwd, hand to PtyConfig) is
+    // covered by the OSC 7 tracking tests and end-to-end UX use.
+
+    #[test]
+    fn active_pane_in_tabs_returns_default_active_for_single_child() {
+        let mut tree = Tree::<PaneId>::empty("test-single");
+        let pane_tile = tree.tiles.insert_pane(PaneId(1));
+        let tabs_tile = tree.tiles.insert_tab_tile(vec![pane_tile]);
+        // Tabs::new sets active = first child.
+        assert_eq!(active_pane_in_tabs(&tree, tabs_tile), Some(PaneId(1)));
+    }
+
+    #[test]
+    fn active_pane_in_tabs_returns_explicit_active() {
+        let mut tree = Tree::<PaneId>::empty("test-multi");
+        let pane_a = tree.tiles.insert_pane(PaneId(10));
+        let pane_b = tree.tiles.insert_pane(PaneId(20));
+        let tabs_tile = tree.tiles.insert_tab_tile(vec![pane_a, pane_b]);
+        if let Some(Tile::Container(egui_tiles::Container::Tabs(tabs))) =
+            tree.tiles.get_mut(tabs_tile)
+        {
+            tabs.set_active(pane_b);
+        }
+        assert_eq!(active_pane_in_tabs(&tree, tabs_tile), Some(PaneId(20)));
+    }
+
+    #[test]
+    fn active_pane_in_tabs_returns_none_for_empty_tabs() {
+        let mut tree = Tree::<PaneId>::empty("test-empty");
+        let tabs_tile = tree.tiles.insert_tab_tile(vec![]);
+        assert_eq!(active_pane_in_tabs(&tree, tabs_tile), None);
+    }
+
+    #[test]
+    fn active_pane_in_tabs_returns_none_when_tile_is_not_tabs() {
+        let mut tree = Tree::<PaneId>::empty("test-non-tabs");
+        let pane_tile = tree.tiles.insert_pane(PaneId(5));
+        // The pane tile itself isn't a Tabs container.
+        assert_eq!(active_pane_in_tabs(&tree, pane_tile), None);
+    }
+
+    #[test]
+    fn active_pane_in_tabs_returns_none_for_dangling_tile_id() {
+        // `Tree::empty` gives us a tree with no tiles; any `TileId`
+        // we manufacture from `Default` won't exist in `tiles`.
+        let tree = Tree::<PaneId>::empty("test-dangling");
+        assert_eq!(active_pane_in_tabs(&tree, TileId::from_u64(9999)), None);
     }
 
     // --- app-level shortcut mapping ---------------------------------
