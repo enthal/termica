@@ -610,6 +610,14 @@ pub struct TermicaApp {
     /// different pane active — that pane then grabs keyboard focus
     /// on the next render via `slot.ui.needs_focus`.
     prev_active_panes: HashSet<PaneId>,
+    /// Most-recently-focused panes, front = most recent. Updated
+    /// at the end of each frame from `focused_pane`. Consulted when
+    /// a focused tab is closed: instead of letting `egui_tiles`'
+    /// default fallback pick the first child in the parent Tabs,
+    /// we restore focus to the **most-recently-focused live** pane
+    /// — i.e. the one the user was on before they switched to the
+    /// tab they just closed.
+    focus_history: Vec<PaneId>,
     /// "Cmd+Q was pressed this frame" — set by `apply_pane_action`
     /// and consumed in `update` *after* the pane mutations have
     /// settled. The any-pane-running check happens at consumption
@@ -655,6 +663,7 @@ impl TermicaApp {
             pending_closes: Vec::new(),
             focused_pane: None,
             prev_active_panes: HashSet::new(),
+            focus_history: Vec::new(),
             quit_requested: false,
             pending_close_confirm: None,
             quit_confirm_started_at: None,
@@ -869,8 +878,20 @@ impl eframe::App for TermicaApp {
         // Drain every pane every frame (visible or not) so background
         // tabs keep consuming PTY output rather than blocking the
         // reader thread on a full mpsc channel.
+        //
+        // Also reset `slot.ui.focused = false` here. `render_pane`
+        // sets it from `rendered.response.has_focus()` — but a pane
+        // that ISN'T the active tab in its container doesn't render
+        // at all, so its stored `focused` would otherwise stay at
+        // whatever the *last time it rendered* observed. End result
+        // without this reset: the focused-pane snapshot at the end
+        // of `update` returns a stale id, the blue tab underline
+        // sticks to a pane that no longer has keyboard focus.
+        // (Real egui focus is unaffected — that's stored in egui's
+        // memory; only our mirror needs the reset.)
         for slot in self.panes.values_mut() {
             slot.session.drain();
+            slot.ui.focused = false;
         }
 
         // Compute *before* `tree.ui()` so the modal's existence
@@ -1071,8 +1092,40 @@ impl eframe::App for TermicaApp {
         // default egui_tiles close path leaves a stale `active`
         // pointing at the just-removed tile, which blanks the pane
         // area — hence we intercept on_tab_close and finish it here.
+        //
+        // Refocus rule: if the pane that held keyboard focus was
+        // among those just closed, focus moves to the **most-
+        // recently-focused live** pane (via `focus_history`). The
+        // pane's parent Tabs.active is updated and its
+        // `needs_focus` flag set so `render_pane` claims focus on
+        // its next render. Without this, the defensive validation
+        // below would set the parent's active to the *first* live
+        // child of the Tabs container — typically not what the user
+        // wants.
+        let closed_pane_ids: HashSet<PaneId> = self
+            .pending_closes
+            .iter()
+            .filter_map(|tid| match self.tree.tiles.get(*tid) {
+                Some(Tile::Pane(p)) => Some(*p),
+                _ => None,
+            })
+            .collect();
+        let focused_was_closed = self.focused_pane.is_some_and(|p| closed_pane_ids.contains(&p));
         for tile_id in std::mem::take(&mut self.pending_closes) {
             self.tree.remove_recursively(tile_id);
+        }
+        self.focus_history.retain(|p| !closed_pane_ids.contains(p));
+        if focused_was_closed && let Some(&new_focus) = self.focus_history.first() {
+            if let Some(pane_tile) = self.tile_for_pane(new_focus)
+                && let Some(parent) = self.tree.tiles.parent_of(pane_tile)
+                && let Some(Tile::Container(egui_tiles::Container::Tabs(tabs))) =
+                    self.tree.tiles.get_mut(parent)
+            {
+                tabs.set_active(pane_tile);
+            }
+            if let Some(slot) = self.panes.get_mut(&new_focus) {
+                slot.ui.needs_focus = true;
+            }
         }
 
         // Defensive: every Tabs container must have an `active`
@@ -1132,6 +1185,18 @@ impl eframe::App for TermicaApp {
         // next frame's tab styling. `slot.ui.focused` was written
         // by `render_pane` during this frame.
         self.focused_pane = self.panes.iter().find(|(_, s)| s.ui.focused).map(|(id, _)| *id);
+
+        // Maintain `focus_history` — front is most-recently-focused.
+        // Read by the close-and-refocus block above on the *next*
+        // frame: when a focused tab is closed, we restore focus to
+        // the second entry here (the pane the user was on before
+        // they switched to the tab they just closed).
+        if let Some(focused) = self.focused_pane
+            && self.focus_history.first() != Some(&focused)
+        {
+            self.focus_history.retain(|p| *p != focused);
+            self.focus_history.insert(0, focused);
+        }
 
         // Garbage-collect panes whose tiles are no longer in the
         // tree (removed via `pending_closes`). Drops their
@@ -1281,23 +1346,53 @@ impl<'a> Behavior<PaneId> for TabBehavior<'a> {
             return "?".into();
         };
         let cwd = self.panes.get(pane_id).and_then(|s| s.session.terminal().cwd());
-        let title = tab_title_for(*pane_id, cwd);
+        // No styling on the text itself any more. Active-in-container
+        // is already differentiated by egui_tiles' default `tab_ui`
+        // (brighter bg + connecting hline). The focused-for-the-whole-
+        // app indicator is the blue bottom border painted in
+        // [`on_tab_button`] below.
+        egui::RichText::new(tab_title_for(*pane_id, cwd)).into()
+    }
 
-        // Is this tile the active tab in its parent Tabs container?
-        let is_active = tiles
-            .parent_of(tile_id)
-            .and_then(|p| tiles.get(p))
-            .is_some_and(|t| matches!(t, Tile::Container(egui_tiles::Container::Tabs(tabs)) if tabs.active == Some(tile_id)));
-        let is_focused = self.focused_pane == Some(*pane_id);
-
-        let mut rich = egui::RichText::new(title);
-        if !is_active {
-            rich = rich.italics();
+    fn on_tab_button(
+        &mut self,
+        tiles: &Tiles<PaneId>,
+        tile_id: TileId,
+        response: egui::Response,
+    ) -> egui::Response {
+        // Tab click → focus its pane. egui_tiles changes the parent
+        // Tabs.active only when the clicked tab is a *different*
+        // tile, so clicking the already-active tab would otherwise
+        // be a no-op — but the user expects clicking any tab to
+        // bring keyboard focus to its pane, exactly like clicking
+        // the pane's visible body does. We can't rely on the
+        // `now_active.difference(prev_active)` diff in `update`
+        // for this case because active didn't change.
+        if response.clicked()
+            && let Some(Tile::Pane(pane_id)) = tiles.get(tile_id)
+            && let Some(slot) = self.panes.get_mut(pane_id)
+        {
+            slot.ui.needs_focus = true;
         }
+
+        // Paint a blue underline on the tab that owns app-wide
+        // keyboard focus. With multiple split regions each showing
+        // their own active tab, this is what tells the user "your
+        // typing lands HERE" at a glance. We paint into the same
+        // layer the tab was drawn on (via `layer_painter`) and on
+        // top of egui_tiles' own painted geometry — `on_tab_button`
+        // runs after the default `tab_ui` returns.
+        let is_focused = matches!(tiles.get(tile_id), Some(Tile::Pane(pid))
+            if self.focused_pane == Some(*pid));
         if is_focused {
-            rich = rich.strong();
+            let painter = response.ctx.layer_painter(response.layer_id);
+            let rect = response.rect;
+            let color = response.ctx.style().visuals.selection.bg_fill;
+            let stroke = egui::Stroke::new(2.5, color);
+            let y = rect.bottom() - 1.25;
+            painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], stroke);
         }
-        rich.into()
+        response
     }
 }
 
