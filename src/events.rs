@@ -95,6 +95,23 @@ impl EventRecorder {
         self.started_at.elapsed().as_secs_f64()
     }
 
+    /// Build the envelope (`t`, `pane`, `kind`) shared by every JSON
+    /// record. Field order is `t` first, then `pane`, then `kind` —
+    /// `preserve_order` on `serde_json` (see `Cargo.toml`) keeps that
+    /// insertion order through serialisation. Per-kind fields are
+    /// appended by the caller after this returns.
+    fn jsonl_envelope(
+        &self,
+        pane_id: u64,
+        kind: &str,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let mut obj = serde_json::Map::with_capacity(8);
+        obj.insert("t".into(), serde_json::json!(round_ts(self.t_seconds())));
+        obj.insert("pane".into(), serde_json::json!(pane_id));
+        obj.insert("kind".into(), serde_json::json!(kind));
+        obj
+    }
+
     /// Record a pane spawn. `pane_id` is the `PaneId.0` field;
     /// `argv` is the program + flags handed to the OS.
     pub fn record_spawn(&self, pane_id: u64, shell: ShellSpec, argv: &[String]) {
@@ -110,14 +127,10 @@ impl EventRecorder {
                 self.write_line(&line);
             }
             Format::JsonLines => {
-                let v = serde_json::json!({
-                    "t": round_ts(self.t_seconds()),
-                    "pane": pane_id,
-                    "kind": "spawn",
-                    "shell": shell.name(),
-                    "argv": argv,
-                });
-                self.write_jsonl(&v);
+                let mut obj = self.jsonl_envelope(pane_id, "spawn");
+                obj.insert("shell".into(), serde_json::json!(shell.name()));
+                obj.insert("argv".into(), serde_json::json!(argv));
+                self.write_jsonl(&serde_json::Value::Object(obj));
             }
         }
     }
@@ -137,15 +150,11 @@ impl EventRecorder {
                 self.write_line(&line);
             }
             Format::JsonLines => {
-                let v = serde_json::json!({
-                    "t": round_ts(self.t_seconds()),
-                    "pane": pane_id,
-                    "kind": "transition",
-                    "from": format!("{:?}", record.from),
-                    "to": format!("{:?}", record.to),
-                    "reason": format!("{:?}", record.reason),
-                });
-                self.write_jsonl(&v);
+                let mut obj = self.jsonl_envelope(pane_id, "transition");
+                obj.insert("from".into(), serde_json::json!(format!("{:?}", record.from)));
+                obj.insert("to".into(), serde_json::json!(format!("{:?}", record.to)));
+                obj.insert("reason".into(), serde_json::json!(format!("{:?}", record.reason)));
+                self.write_jsonl(&serde_json::Value::Object(obj));
             }
         }
     }
@@ -163,10 +172,7 @@ impl EventRecorder {
                 self.write_line(&line);
             }
             Format::JsonLines => {
-                let mut obj = serde_json::Map::new();
-                obj.insert("t".into(), serde_json::json!(round_ts(self.t_seconds())));
-                obj.insert("pane".into(), serde_json::json!(pane_id));
-                obj.insert("kind".into(), serde_json::json!("lifecycle"));
+                let mut obj = self.jsonl_envelope(pane_id, "lifecycle");
                 lifecycle_to_json(event, &mut obj);
                 self.write_jsonl(&serde_json::Value::Object(obj));
             }
@@ -181,12 +187,8 @@ impl EventRecorder {
                 self.write_line(&line);
             }
             Format::JsonLines => {
-                let v = serde_json::json!({
-                    "t": round_ts(self.t_seconds()),
-                    "pane": pane_id,
-                    "kind": "pty_exit",
-                });
-                self.write_jsonl(&v);
+                let obj = self.jsonl_envelope(pane_id, "pty_exit");
+                self.write_jsonl(&serde_json::Value::Object(obj));
             }
         }
     }
@@ -554,6 +556,90 @@ mod tests {
         let extras: Vec<_> =
             obj.keys().filter(|k| !matches!(k.as_str(), "t" | "pane" | "kind")).collect();
         assert!(extras.is_empty(), "unexpected extras: {extras:?}");
+    }
+
+    /// Find each substring; return their byte offsets if all present.
+    /// Helper for the ordering assertions below.
+    fn positions_of(haystack: &str, needles: &[&str]) -> Vec<usize> {
+        needles
+            .iter()
+            .map(|n| {
+                haystack.find(n).unwrap_or_else(|| panic!("needle {n:?} missing from {haystack:?}"))
+            })
+            .collect()
+    }
+
+    /// Every JSON Lines record must start with `t`, `pane`, `kind` in
+    /// that order, before any per-kind fields. Diagnostic readability
+    /// depends on the envelope showing first — and the spec example
+    /// in spec/03 fixes that order.
+    #[test]
+    fn json_lines_record_starts_with_t_pane_kind_in_order() {
+        let path = tmp_path_with_ext("jsonl");
+        let rec = EventRecorder::new(&path).expect("open recorder");
+        rec.record_spawn(0, ShellSpec::Zsh, &["zsh".into(), "-i".into()]);
+        rec.record_transition(
+            0,
+            &TransitionRecord {
+                from: PaneMode::Bootstrapping,
+                to: PaneMode::RawTerminal,
+                reason: TransitionReason::BootstrapComplete,
+                at: 1,
+            },
+        );
+        rec.record_lifecycle(
+            0,
+            &LifecycleEvent::IntegrationReady { shell: ShellKind::Zsh, version: 1 },
+        );
+        rec.record_pty_exit(0);
+        drop(rec);
+        let body = read_to_string(&path);
+        for line in body.lines().filter(|l| !l.is_empty()) {
+            let p = positions_of(line, &["\"t\":", "\"pane\":", "\"kind\":"]);
+            assert!(
+                p[0] < p[1] && p[1] < p[2],
+                "envelope fields out of order in {line:?} (positions: {p:?})"
+            );
+        }
+    }
+
+    /// The envelope must precede every per-kind field. Otherwise `jq`
+    /// users have to scan every line to find the envelope, and visual
+    /// diffing of `--dump-events` output gets noisy.
+    #[test]
+    fn json_lines_envelope_precedes_per_kind_fields() {
+        let path = tmp_path_with_ext("jsonl");
+        let rec = EventRecorder::new(&path).expect("open recorder");
+        rec.record_spawn(0, ShellSpec::Zsh, &["zsh".into()]);
+        rec.record_transition(
+            0,
+            &TransitionRecord {
+                from: PaneMode::Bootstrapping,
+                to: PaneMode::RawTerminal,
+                reason: TransitionReason::BootstrapComplete,
+                at: 1,
+            },
+        );
+        rec.record_lifecycle(0, &LifecycleEvent::Preexec { command: "ls".into() });
+        rec.record_lifecycle(0, &LifecycleEvent::CommandFinished { exit: 0 });
+        drop(rec);
+        let body = read_to_string(&path);
+        let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+        // spawn: kind must precede shell + argv
+        let p = positions_of(lines[0], &["\"kind\":", "\"shell\":", "\"argv\":"]);
+        assert!(p[0] < p[1] && p[0] < p[2], "spawn envelope must precede per-kind fields: {p:?}");
+        // transition: kind must precede from/to/reason
+        let p = positions_of(lines[1], &["\"kind\":", "\"from\":", "\"to\":", "\"reason\":"]);
+        assert!(
+            p[0] < p[1] && p[0] < p[2] && p[0] < p[3],
+            "transition envelope must precede per-kind fields: {p:?}"
+        );
+        // lifecycle Preexec: kind before event before command
+        let p = positions_of(lines[2], &["\"kind\":", "\"event\":", "\"command\":"]);
+        assert!(p[0] < p[1] && p[1] < p[2], "lifecycle preexec field order wrong: {p:?}");
+        // lifecycle CommandFinished: kind before event before exit
+        let p = positions_of(lines[3], &["\"kind\":", "\"event\":", "\"exit\":"]);
+        assert!(p[0] < p[1] && p[1] < p[2], "lifecycle command_finished field order wrong: {p:?}");
     }
 
     #[test]
