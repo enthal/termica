@@ -6,7 +6,13 @@
 //! event and mode transition. Useful for diagnosing integration
 //! failures end-to-end — `tail -f <path>` while reproducing the bug.
 //!
-//! Format (one record per line):
+//! Two output formats are supported, selected by file extension:
+//!
+//! - `.json` or `.jsonl` → **JSON Lines** (one JSON object per line).
+//!   Trivially parsable in tests, `jq`, and tools.
+//! - Any other extension → **human-readable text**.
+//!
+//! Text example:
 //!
 //! ```text
 //! [t=0.012s] pane=0 spawn shell=zsh argv=["zsh","-i"]
@@ -16,8 +22,17 @@
 //! [t=2.453s] pane=0 transition RawTerminal → ShellPromptEditor (PrecmdMarker)
 //! ```
 //!
+//! JSON Lines example:
+//!
+//! ```text
+//! {"t":0.012,"pane":0,"kind":"spawn","shell":"zsh","argv":["zsh","-i"]}
+//! {"t":0.150,"pane":0,"kind":"transition","from":"Bootstrapping","to":"RawTerminal","reason":"BootstrapComplete"}
+//! {"t":0.151,"pane":0,"kind":"lifecycle","event":"IntegrationReady","shell":"Zsh","version":1}
+//! ```
+//!
 //! Timestamps are seconds-since-recorder-start, not wall clock, so a
-//! recording is comparable to itself regardless of when it ran.
+//! recording is comparable to itself regardless of when it ran. The
+//! full schema is normative in `spec/03-shell-integration.md`.
 
 #![forbid(unsafe_code)]
 
@@ -38,20 +53,41 @@ use crate::shell::TransitionRecord;
 pub struct EventRecorder {
     inner: Mutex<Inner>,
     started_at: Instant,
+    format: Format,
 }
 
 struct Inner {
     writer: BufWriter<File>,
 }
 
+/// Output format for the recorder. Selected once at construction
+/// from the file extension and fixed for the life of the recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Text,
+    JsonLines,
+}
+
+impl Format {
+    fn from_path(path: &Path) -> Self {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("json") | Some("jsonl") => Format::JsonLines,
+            _ => Format::Text,
+        }
+    }
+}
+
 impl EventRecorder {
     /// Open `path` for write (creating or truncating it) and return
-    /// a recorder anchored at `Instant::now()`.
+    /// a recorder anchored at `Instant::now()`. The output format is
+    /// chosen from the file extension: `.json` / `.jsonl` ⇒ JSON
+    /// Lines; anything else ⇒ human-readable text.
     pub fn new(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
         Ok(Self {
             inner: Mutex::new(Inner { writer: BufWriter::new(file) }),
             started_at: Instant::now(),
+            format: Format::from_path(path),
         })
     }
 
@@ -62,39 +98,97 @@ impl EventRecorder {
     /// Record a pane spawn. `pane_id` is the `PaneId.0` field;
     /// `argv` is the program + flags handed to the OS.
     pub fn record_spawn(&self, pane_id: u64, shell: ShellSpec, argv: &[String]) {
-        let line = format!(
-            "[t={:.3}s] pane={} spawn shell={} argv={:?}\n",
-            self.t_seconds(),
-            pane_id,
-            shell.name(),
-            argv,
-        );
-        self.write_line(&line);
+        match self.format {
+            Format::Text => {
+                let line = format!(
+                    "[t={:.3}s] pane={} spawn shell={} argv={:?}\n",
+                    self.t_seconds(),
+                    pane_id,
+                    shell.name(),
+                    argv,
+                );
+                self.write_line(&line);
+            }
+            Format::JsonLines => {
+                let v = serde_json::json!({
+                    "t": round_ts(self.t_seconds()),
+                    "pane": pane_id,
+                    "kind": "spawn",
+                    "shell": shell.name(),
+                    "argv": argv,
+                });
+                self.write_jsonl(&v);
+            }
+        }
     }
 
     /// Record a mode transition observed by [`PromptController`].
     pub fn record_transition(&self, pane_id: u64, record: &TransitionRecord) {
-        let line = format!(
-            "[t={:.3}s] pane={} transition {:?} → {:?} ({:?})\n",
-            self.t_seconds(),
-            pane_id,
-            record.from,
-            record.to,
-            record.reason,
-        );
-        self.write_line(&line);
+        match self.format {
+            Format::Text => {
+                let line = format!(
+                    "[t={:.3}s] pane={} transition {:?} → {:?} ({:?})\n",
+                    self.t_seconds(),
+                    pane_id,
+                    record.from,
+                    record.to,
+                    record.reason,
+                );
+                self.write_line(&line);
+            }
+            Format::JsonLines => {
+                let v = serde_json::json!({
+                    "t": round_ts(self.t_seconds()),
+                    "pane": pane_id,
+                    "kind": "transition",
+                    "from": format!("{:?}", record.from),
+                    "to": format!("{:?}", record.to),
+                    "reason": format!("{:?}", record.reason),
+                });
+                self.write_jsonl(&v);
+            }
+        }
     }
 
     /// Record a single [`LifecycleEvent`] consumed by the controller.
     pub fn record_lifecycle(&self, pane_id: u64, event: &LifecycleEvent) {
-        let line = format!("[t={:.3}s] pane={} lifecycle {:?}\n", self.t_seconds(), pane_id, event);
-        self.write_line(&line);
+        match self.format {
+            Format::Text => {
+                let line = format!(
+                    "[t={:.3}s] pane={} lifecycle {:?}\n",
+                    self.t_seconds(),
+                    pane_id,
+                    event,
+                );
+                self.write_line(&line);
+            }
+            Format::JsonLines => {
+                let mut obj = serde_json::Map::new();
+                obj.insert("t".into(), serde_json::json!(round_ts(self.t_seconds())));
+                obj.insert("pane".into(), serde_json::json!(pane_id));
+                obj.insert("kind".into(), serde_json::json!("lifecycle"));
+                lifecycle_to_json(event, &mut obj);
+                self.write_jsonl(&serde_json::Value::Object(obj));
+            }
+        }
     }
 
     /// Record a PTY-exit notification.
     pub fn record_pty_exit(&self, pane_id: u64) {
-        let line = format!("[t={:.3}s] pane={} pty_exit\n", self.t_seconds(), pane_id);
-        self.write_line(&line);
+        match self.format {
+            Format::Text => {
+                let line = format!("[t={:.3}s] pane={} pty_exit\n", self.t_seconds(), pane_id);
+                self.write_line(&line);
+            }
+            Format::JsonLines => {
+                let v = serde_json::json!({
+                    "t": round_ts(self.t_seconds()),
+                    "pane": pane_id,
+                    "kind": "pty_exit",
+                });
+                self.write_jsonl(&v);
+            }
+        }
     }
 
     fn write_line(&self, line: &str) {
@@ -103,6 +197,64 @@ impl EventRecorder {
             // fatal. If the write fails we drop the record.
             let _ = inner.writer.write_all(line.as_bytes());
             let _ = inner.writer.flush();
+        }
+    }
+
+    fn write_jsonl(&self, value: &serde_json::Value) {
+        if let Ok(mut inner) = self.inner.lock()
+            && let Ok(mut s) = serde_json::to_string(value)
+        {
+            s.push('\n');
+            let _ = inner.writer.write_all(s.as_bytes());
+            let _ = inner.writer.flush();
+        }
+    }
+}
+
+/// Round timestamps to millisecond precision for JSON output. Keeps
+/// recorded files short and `jq`-readable while staying well above
+/// the per-event jitter floor.
+fn round_ts(t: f64) -> f64 {
+    (t * 1000.0).round() / 1000.0
+}
+
+/// Populate a JSON object with the lifecycle event's variant tag and
+/// per-variant fields, per the schema in `spec/03-shell-integration.md`.
+fn lifecycle_to_json(event: &LifecycleEvent, obj: &mut serde_json::Map<String, serde_json::Value>) {
+    use serde_json::json;
+    match event {
+        LifecycleEvent::IntegrationReady { shell, version } => {
+            obj.insert("event".into(), json!("IntegrationReady"));
+            obj.insert("shell".into(), json!(format!("{shell:?}")));
+            obj.insert("version".into(), json!(version));
+        }
+        LifecycleEvent::IntegrationError { reason } => {
+            obj.insert("event".into(), json!("IntegrationError"));
+            obj.insert("reason".into(), json!(reason));
+        }
+        LifecycleEvent::Preexec { command } => {
+            obj.insert("event".into(), json!("Preexec"));
+            obj.insert("command".into(), json!(command));
+        }
+        LifecycleEvent::CommandFinished { exit } => {
+            obj.insert("event".into(), json!("CommandFinished"));
+            obj.insert("exit".into(), json!(exit));
+        }
+        LifecycleEvent::Precmd { cwd } => {
+            obj.insert("event".into(), json!("Precmd"));
+            obj.insert("cwd".into(), json!(cwd.to_string_lossy()));
+        }
+        LifecycleEvent::Cwd { cwd } => {
+            obj.insert("event".into(), json!("Cwd"));
+            obj.insert("cwd".into(), json!(cwd.to_string_lossy()));
+        }
+        LifecycleEvent::PromptVars { vars } => {
+            obj.insert("event".into(), json!("PromptVars"));
+            obj.insert("vars".into(), serde_json::Value::Object(vars.clone()));
+        }
+        LifecycleEvent::CommandAborted { reason } => {
+            obj.insert("event".into(), json!("CommandAborted"));
+            obj.insert("reason".into(), json!(reason));
         }
     }
 }
@@ -118,11 +270,15 @@ mod tests {
     }
 
     fn tmp_path() -> std::path::PathBuf {
+        tmp_path_with_ext("log")
+    }
+
+    fn tmp_path_with_ext(ext: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        p.push(format!("termica-events-{}-{}.log", std::process::id(), n));
+        p.push(format!("termica-events-{}-{}.{}", std::process::id(), n, ext));
         let _ = std::fs::remove_file(&p);
         p
     }
@@ -213,6 +369,223 @@ mod tests {
         let transition_idx = body.find("transition").expect("transition line");
         assert!(spawn_idx < lifecycle_idx, "spawn should precede lifecycle");
         assert!(lifecycle_idx < transition_idx, "lifecycle should precede transition");
+    }
+
+    // ---- JSON Lines format ----------------------------------------
+
+    fn parse_jsonl(body: &str) -> Vec<serde_json::Value> {
+        body.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l)
+                    .unwrap_or_else(|e| panic!("invalid JSON line {l:?}: {e}"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn format_is_json_lines_when_extension_is_json() {
+        let path = tmp_path_with_ext("json");
+        let rec = EventRecorder::new(&path).expect("open recorder");
+        rec.record_pty_exit(0);
+        drop(rec);
+        let body = read_to_string(&path);
+        assert!(body.trim_start().starts_with('{'), "not JSON-shaped: {body:?}");
+    }
+
+    #[test]
+    fn format_is_json_lines_when_extension_is_jsonl() {
+        let path = tmp_path_with_ext("jsonl");
+        let rec = EventRecorder::new(&path).expect("open recorder");
+        rec.record_pty_exit(0);
+        drop(rec);
+        let body = read_to_string(&path);
+        assert!(body.trim_start().starts_with('{'), "not JSON-shaped: {body:?}");
+    }
+
+    #[test]
+    fn format_is_text_when_extension_unknown() {
+        let path = tmp_path_with_ext("log");
+        let rec = EventRecorder::new(&path).expect("open recorder");
+        rec.record_pty_exit(0);
+        drop(rec);
+        let body = read_to_string(&path);
+        assert!(body.starts_with("[t="), "expected text format: {body:?}");
+    }
+
+    #[test]
+    fn json_lines_spawn_record_has_required_fields() {
+        let path = tmp_path_with_ext("jsonl");
+        let rec = EventRecorder::new(&path).expect("open recorder");
+        rec.record_spawn(0, ShellSpec::Zsh, &["zsh".into(), "-i".into()]);
+        drop(rec);
+        let body = read_to_string(&path);
+        let rows = parse_jsonl(&body);
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert!(r["t"].is_number(), "missing t: {r}");
+        assert_eq!(r["pane"], serde_json::json!(0));
+        assert_eq!(r["kind"], "spawn");
+        assert_eq!(r["shell"], "zsh");
+        assert_eq!(r["argv"], serde_json::json!(["zsh", "-i"]));
+    }
+
+    #[test]
+    fn json_lines_transition_record_has_from_to_reason() {
+        let path = tmp_path_with_ext("jsonl");
+        let rec = EventRecorder::new(&path).expect("open recorder");
+        rec.record_transition(
+            7,
+            &TransitionRecord {
+                from: PaneMode::Bootstrapping,
+                to: PaneMode::RawTerminal,
+                reason: TransitionReason::BootstrapComplete,
+                at: 1,
+            },
+        );
+        drop(rec);
+        let rows = parse_jsonl(&read_to_string(&path));
+        let r = &rows[0];
+        assert_eq!(r["pane"], 7);
+        assert_eq!(r["kind"], "transition");
+        assert_eq!(r["from"], "Bootstrapping");
+        assert_eq!(r["to"], "RawTerminal");
+        assert_eq!(r["reason"], "BootstrapComplete");
+    }
+
+    #[test]
+    fn json_lines_lifecycle_integration_ready() {
+        let path = tmp_path_with_ext("jsonl");
+        let rec = EventRecorder::new(&path).expect("open recorder");
+        rec.record_lifecycle(
+            0,
+            &LifecycleEvent::IntegrationReady { shell: ShellKind::Bash, version: 1 },
+        );
+        drop(rec);
+        let rows = parse_jsonl(&read_to_string(&path));
+        let r = &rows[0];
+        assert_eq!(r["kind"], "lifecycle");
+        assert_eq!(r["event"], "IntegrationReady");
+        assert_eq!(r["shell"], "Bash");
+        assert_eq!(r["version"], 1);
+    }
+
+    #[test]
+    fn json_lines_lifecycle_preexec_carries_command() {
+        let path = tmp_path_with_ext("jsonl");
+        let rec = EventRecorder::new(&path).expect("open recorder");
+        rec.record_lifecycle(0, &LifecycleEvent::Preexec { command: "ls -la".into() });
+        drop(rec);
+        let rows = parse_jsonl(&read_to_string(&path));
+        let r = &rows[0];
+        assert_eq!(r["event"], "Preexec");
+        assert_eq!(r["command"], "ls -la");
+    }
+
+    #[test]
+    fn json_lines_lifecycle_command_finished_carries_exit() {
+        let path = tmp_path_with_ext("jsonl");
+        let rec = EventRecorder::new(&path).expect("open recorder");
+        rec.record_lifecycle(0, &LifecycleEvent::CommandFinished { exit: 0 });
+        rec.record_lifecycle(0, &LifecycleEvent::CommandFinished { exit: 127 });
+        drop(rec);
+        let rows = parse_jsonl(&read_to_string(&path));
+        assert_eq!(rows[0]["event"], "CommandFinished");
+        assert_eq!(rows[0]["exit"], 0);
+        assert_eq!(rows[1]["exit"], 127);
+    }
+
+    #[test]
+    fn json_lines_lifecycle_precmd_and_cwd_carry_path() {
+        let path = tmp_path_with_ext("jsonl");
+        let rec = EventRecorder::new(&path).expect("open recorder");
+        rec.record_lifecycle(0, &LifecycleEvent::Precmd { cwd: "/Users/tim".into() });
+        rec.record_lifecycle(0, &LifecycleEvent::Cwd { cwd: "/tmp".into() });
+        drop(rec);
+        let rows = parse_jsonl(&read_to_string(&path));
+        assert_eq!(rows[0]["event"], "Precmd");
+        assert_eq!(rows[0]["cwd"], "/Users/tim");
+        assert_eq!(rows[1]["event"], "Cwd");
+        assert_eq!(rows[1]["cwd"], "/tmp");
+    }
+
+    #[test]
+    fn json_lines_lifecycle_integration_error_and_command_aborted_carry_reason() {
+        let path = tmp_path_with_ext("jsonl");
+        let rec = EventRecorder::new(&path).expect("open recorder");
+        rec.record_lifecycle(0, &LifecycleEvent::IntegrationError { reason: "boom".into() });
+        rec.record_lifecycle(0, &LifecycleEvent::CommandAborted { reason: "ctrl-c".into() });
+        drop(rec);
+        let rows = parse_jsonl(&read_to_string(&path));
+        assert_eq!(rows[0]["event"], "IntegrationError");
+        assert_eq!(rows[0]["reason"], "boom");
+        assert_eq!(rows[1]["event"], "CommandAborted");
+        assert_eq!(rows[1]["reason"], "ctrl-c");
+    }
+
+    #[test]
+    fn json_lines_lifecycle_prompt_vars_carries_vars_object() {
+        let path = tmp_path_with_ext("jsonl");
+        let rec = EventRecorder::new(&path).expect("open recorder");
+        let mut vars = serde_json::Map::new();
+        vars.insert("git_branch".into(), serde_json::json!("main"));
+        vars.insert("dirty".into(), serde_json::json!(true));
+        rec.record_lifecycle(0, &LifecycleEvent::PromptVars { vars });
+        drop(rec);
+        let rows = parse_jsonl(&read_to_string(&path));
+        let r = &rows[0];
+        assert_eq!(r["event"], "PromptVars");
+        assert_eq!(r["vars"]["git_branch"], "main");
+        assert_eq!(r["vars"]["dirty"], true);
+    }
+
+    #[test]
+    fn json_lines_pty_exit_is_minimal() {
+        let path = tmp_path_with_ext("jsonl");
+        let rec = EventRecorder::new(&path).expect("open recorder");
+        rec.record_pty_exit(3);
+        drop(rec);
+        let rows = parse_jsonl(&read_to_string(&path));
+        let r = &rows[0];
+        assert_eq!(r["pane"], 3);
+        assert_eq!(r["kind"], "pty_exit");
+        let obj = r.as_object().expect("object");
+        // Only envelope fields — no per-kind extras.
+        let extras: Vec<_> =
+            obj.keys().filter(|k| !matches!(k.as_str(), "t" | "pane" | "kind")).collect();
+        assert!(extras.is_empty(), "unexpected extras: {extras:?}");
+    }
+
+    #[test]
+    fn json_lines_one_object_per_line() {
+        let path = tmp_path_with_ext("jsonl");
+        let rec = EventRecorder::new(&path).expect("open recorder");
+        rec.record_spawn(0, ShellSpec::Zsh, &["zsh".into()]);
+        rec.record_lifecycle(
+            0,
+            &LifecycleEvent::IntegrationReady { shell: ShellKind::Zsh, version: 1 },
+        );
+        rec.record_transition(
+            0,
+            &TransitionRecord {
+                from: PaneMode::Bootstrapping,
+                to: PaneMode::RawTerminal,
+                reason: TransitionReason::BootstrapComplete,
+                at: 1,
+            },
+        );
+        rec.record_pty_exit(0);
+        drop(rec);
+        let body = read_to_string(&path);
+        let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 4, "expected 4 records, got: {body}");
+        for l in &lines {
+            let v: serde_json::Value =
+                serde_json::from_str(l).unwrap_or_else(|e| panic!("bad line {l}: {e}"));
+            assert!(v["t"].is_number());
+            assert!(v["pane"].is_number());
+            assert!(v["kind"].is_string());
+        }
     }
 
     #[test]
