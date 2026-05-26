@@ -115,6 +115,25 @@ impl TerminalState {
         self.term.scroll_display(Scroll::Delta(lines));
     }
 
+    /// Full reset of the visible state: blank the viewport, drop
+    /// all scrollback, move the cursor to the top-left. The shell
+    /// process itself is untouched — it will redraw the prompt on
+    /// its next prompt cycle (PROMPT_COMMAND / precmd) or when the
+    /// user presses Enter.
+    ///
+    /// This is the action behind the Cmd+K / Ctrl+Shift+K
+    /// shortcut. Three alacritty Handler calls in order:
+    /// `ClearMode::All` blanks the viewport (pushing old content
+    /// into scrollback as it goes), `ClearMode::Saved` then
+    /// purges that scrollback, and `goto` parks the cursor at
+    /// (0, 0) so the next keystroke / redraw lands at the top.
+    pub fn clear_all(&mut self) {
+        use alacritty_terminal::vte::ansi::{ClearMode, Handler};
+        Handler::clear_screen(&mut self.term, ClearMode::All);
+        Handler::clear_screen(&mut self.term, ClearMode::Saved);
+        Handler::goto(&mut self.term, 0, 0);
+    }
+
     /// How many lines back from the live bottom of the scrollback we
     /// are currently viewing. `0` means "tracking the latest output";
     /// any positive value means the user scrolled up.
@@ -435,5 +454,52 @@ mod tests {
         let offset = state.display_offset();
         assert!(offset > 0, "should have scrolled into history");
         assert!(offset <= 1_000, "offset should be bounded by history size: {offset}");
+    }
+
+    // ---- clear_all (Cmd+K full reset) -------------------------------
+
+    #[test]
+    fn clear_all_blanks_the_visible_screen() {
+        let mut state = TerminalState::new(5, 20);
+        state.feed(b"hello\r\nworld\r\nmore output");
+        // Sanity: rows have content before clearing.
+        assert!(state.screen_text().contains("hello"));
+        state.clear_all();
+        // After clear_all the visible grid is all spaces.
+        let text = state.screen_text();
+        for (i, line) in text.lines().enumerate() {
+            assert!(
+                line.chars().all(|c| c == ' '),
+                "row {i} should be blank after clear_all but was {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_all_empties_the_scrollback() {
+        let mut state = TerminalState::new(5, 20);
+        // Push lots of output so it spills into scrollback.
+        feed_overflow(&mut state, 20);
+        // Scroll up so we can see scrollback exists.
+        state.scroll_display(10);
+        assert!(state.display_offset() > 0);
+        // Snap back to live bottom and clear.
+        state.scroll_display(-10_000);
+        state.clear_all();
+        // No scrollback left to scroll into.
+        state.scroll_display(10_000);
+        assert_eq!(state.display_offset(), 0);
+    }
+
+    #[test]
+    fn clear_all_moves_cursor_to_origin() {
+        let mut state = TerminalState::new(5, 20);
+        // Print enough that the cursor lands well below row 0.
+        state.feed(b"line0\r\nline1\r\nline2\r\nline3");
+        let (before_row, _before_col) = state.cursor_position().expect("cursor visible");
+        assert!(before_row > 0, "precondition: cursor should be below row 0");
+        state.clear_all();
+        let (after_row, after_col) = state.cursor_position().expect("cursor still visible");
+        assert_eq!((after_row, after_col), (0, 0));
     }
 }
