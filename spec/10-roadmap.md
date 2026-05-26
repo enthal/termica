@@ -100,8 +100,8 @@ Sub-PRs:
 
 Sub-PRs:
 
-- ⏳ **3A — Marker parser**: OSC 133 + OSC 1337-`Termica=…` parsing in [`src/markers.rs`](../src/markers.rs); wired into [`OscSniffer`](../src/osc.rs) so the existing vte byte pipeline produces a drainable [`MarkerEvent`] stream alongside the OSC 7 cwd snapshot. (this PR)
-- ⏳ **3B — `PromptController`**: state machine with all four modes and every transition tested. Strict tests-first for the five safety rules in [05](05-pane-modes.md).
+- ✅ **3A — Marker parser**: OSC 133 + OSC 1337-`Termica=…` parsing in [`src/markers.rs`](../src/markers.rs); wired into [`OscSniffer`](../src/osc.rs) so the existing vte byte pipeline produces a drainable [`MarkerEvent`] stream alongside the OSC 7 cwd snapshot.
+- ⏳ **3B — `PromptController`**: four-mode state machine in [`src/shell.rs`](../src/shell.rs) with every transition tested under the strict-layer rule; covers the five safety rules from [05](05-pane-modes.md), the integration version handshake, frame-debounced promotion, eager demotion, and `PendingCommand` open/close lifecycle. Data-only — wiring into `PaneSession` is 3E. (this PR)
 - ⏳ **3C — Integration scripts**: bash + zsh as `include_str!` constants. No installer yet.
 - ⏳ **3D — `termica install-integration` CLI**: idempotent fenced-block rcfile mutation; tests against fixture rc files.
 - ⏳ **3E — Wire `PromptController` into `PaneSession`**: mode machine becomes the source of truth for "is this pane at a prompt?"; today's alt-screen heuristic retires.
