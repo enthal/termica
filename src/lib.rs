@@ -22,6 +22,7 @@ pub mod paths;
 pub mod pty;
 pub mod render;
 pub mod selection;
+pub mod shell;
 pub mod terminal;
 
 use std::collections::{HashMap, HashSet};
