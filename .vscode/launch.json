@@ -15,7 +15,7 @@
                 ]
             },
             "env": {
-                "TERMICA_DUMP_EVENTS": "/tmp/termica-vscode-events.log"
+                "TERMICA_DUMP_EVENTS": "/tmp/termica-vscode-events.json"
             },
             "args": []
         },

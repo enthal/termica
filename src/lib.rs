@@ -28,6 +28,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod block;
 pub mod events;
 pub mod input;
 pub mod integration;

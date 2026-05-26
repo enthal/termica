@@ -20,6 +20,7 @@ use std::thread::{self, JoinHandle};
 
 use alacritty_terminal::index::Point;
 
+use crate::block::BlockStack;
 use crate::events::EventRecorder;
 use crate::integration::{ManagedSpawn, ShellSpec, managed_spawn_for, new_session_id};
 use crate::pty::{PtyConfig, PtyError, PtySession};
@@ -78,6 +79,11 @@ pub struct PaneSession {
     /// on `IntegrationReady`, `RawTerminal → ShellPromptEditor` on
     /// `Precmd`, etc. See [`crate::shell::PromptController`].
     controller: PromptController,
+    /// Phase 4A: per-pane block stack. Starts with one `Prompt` block;
+    /// transitions to `Running` on `Preexec` and seals + pushes a new
+    /// `Prompt` on `CommandFinished`. The data model lands first
+    /// (this PR); the renderer learns to walk it in 4A-render.
+    blocks: BlockStack,
     /// Termica session ID, set in the spawned shell's environment as
     /// `TERMICA_SESSION_ID` and echoed back in every lifecycle
     /// message. Used today only for diagnostics; future work may
@@ -166,6 +172,7 @@ impl PaneSession {
             // `RawTerminal`. Callers using `spawn_managed` flip this
             // back to the Bootstrapping start after construction.
             controller: PromptController::new_no_bootstrap(0),
+            blocks: BlockStack::new(0),
             session_id,
             frame: 0,
             last_alt_screen: false,
@@ -281,11 +288,15 @@ impl PaneSession {
         self.record_pending_transitions();
 
         // Feed lifecycle events extracted from the byte stream into
-        // the controller. Order is preserved per spec/03.
+        // the controller AND the block stack. Order is preserved
+        // per spec/03. The block stack reads the terminal snapshot
+        // at seal time, so it must run AFTER the bytes that produced
+        // this event have been fed into the grid (they were, above).
         for event in self.terminal.drain_lifecycle_events() {
             if let Some(rec) = self.recorder.as_ref() {
                 rec.record_lifecycle(self.pane_id, &event);
             }
+            self.blocks.observe_lifecycle_event(&event, &self.terminal, self.frame);
             self.controller.observe_event(event, self.frame);
             self.record_pending_transitions();
         }
@@ -376,6 +387,13 @@ impl PaneSession {
     /// Borrow the pane's `PromptController` (read-only).
     pub fn controller(&self) -> &PromptController {
         &self.controller
+    }
+
+    /// Borrow the pane's [`BlockStack`] (read-only). Renderer (4A-render)
+    /// walks this to paint sealed blocks above the live tail; tests use it
+    /// to assert the block-lifecycle wiring (Phase 4A-data).
+    pub fn blocks(&self) -> &BlockStack {
+        &self.blocks
     }
 
     /// Write bytes to the PTY (e.g. keyboard input). Refuses to
@@ -577,6 +595,65 @@ mod tests {
             .expect("spawn");
         let view = session.view();
         assert!(!view.alt_screen);
+    }
+
+    // ---- block stack wiring ------------------------------------------
+    //
+    // Phase 4A-data: spawning a pane must build a `BlockStack` and
+    // every drained lifecycle event must reach it. Unit-level state
+    // machine coverage lives in `src/block.rs`; these tests prove
+    // the wiring at the `PaneSession::drain` boundary.
+
+    #[test]
+    fn fresh_pane_has_one_prompt_block() {
+        let session = PaneSession::spawn(5, 40, &sh_c("sleep 0.1"), "test-session".into(), 0, None)
+            .expect("spawn");
+        assert_eq!(session.blocks().len(), 1);
+        assert!(
+            matches!(session.blocks().last(), Some(crate::block::Block::Prompt { .. })),
+            "fresh pane's tail block should be Prompt, got {:?}",
+            session.blocks().last()
+        );
+    }
+
+    #[test]
+    fn lifecycle_preexec_seen_in_drain_promotes_tail_to_running() {
+        // Emit a Termica-tagged DCS sequence with a `preexec` payload
+        // into the pane's PTY. The terminal-state parser consumes it
+        // as a lifecycle event; `drain()` then routes the event to
+        // the block stack, which should turn the tail Prompt into
+        // a Running block with the captured command.
+        //
+        // The DCS framing is `ESC P Termica;<json> ESC \`. The
+        // `session` field is required by the schema but the parser
+        // currently doesn't validate it, so any string works.
+        let cmd = "printf '\\033PTermica;{\"type\":\"preexec\",\
+                   \"session\":\"t\",\"value\":\"ls -la\"}\\033\\\\'; sleep 0.5";
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c(cmd), "t".into(), 0, None).expect("spawn");
+
+        // Poll drain() until the block stack has flipped to Running
+        // (or we time out — which would mean the wiring is broken).
+        let stop = Instant::now() + Duration::from_secs(2);
+        loop {
+            session.drain();
+            if matches!(session.blocks().last(), Some(crate::block::Block::Running { .. })) {
+                break;
+            }
+            if Instant::now() >= stop {
+                panic!(
+                    "DCS-JSON Preexec did not promote tail to Running within 2s; \
+                     tail still: {:?}; bytes received: {}",
+                    session.blocks().last(),
+                    session.view().bytes_received
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        match session.blocks().last().unwrap() {
+            crate::block::Block::Running { command, .. } => assert_eq!(command, "ls -la"),
+            other => panic!("expected Running, got {other:?}"),
+        }
     }
 
     #[test]

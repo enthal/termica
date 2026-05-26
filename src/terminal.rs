@@ -36,6 +36,37 @@ pub struct TerminalModes {
     pub bracketed_paste: bool,
 }
 
+/// One cell of a frozen snapshot row. Carries the minimum state the
+/// cell renderer needs to paint a sealed-block cell identically to a
+/// live grid cell: glyph + colors + style flags. Used by the
+/// [`crate::block`] model to freeze a finished command's output as
+/// a [`Vec<StyledLine>`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct StyledCell {
+    pub c: char,
+    pub fg: alacritty_terminal::vte::ansi::Color,
+    pub bg: alacritty_terminal::vte::ansi::Color,
+    pub flags: alacritty_terminal::term::cell::Flags,
+}
+
+/// One row of a frozen snapshot. Width matches the pane's cell
+/// columns at the moment the snapshot was taken; sealed blocks do
+/// not reflow on resize (see
+/// [spec/04 §"Resize"](../spec/04-prompt-editor.md#resize-sealed-blocks-dont-reflow)).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StyledLine {
+    pub cells: Vec<StyledCell>,
+}
+
+impl StyledLine {
+    /// Iterate the line's char content, ignoring style. Test/debug
+    /// helper for assertions like "does the snapshot contain `hello`?";
+    /// the real renderer walks `cells` directly.
+    pub fn text_chars(&self) -> impl Iterator<Item = char> + '_ {
+        self.cells.iter().map(|c| c.c)
+    }
+}
+
 /// No-op event listener. `alacritty_terminal` calls into this on bell,
 /// title change, mouse cursor change, OSC events, etc. For Phase 1D
 /// we discard everything; Phase 3 will replace this with a listener
@@ -228,6 +259,70 @@ impl TerminalState {
         self.term.grid()
     }
 
+    /// Position in the cumulative-line space the
+    /// [`crate::block::BlockStack`] uses to anchor block boundaries.
+    ///
+    /// Returns the cursor's row index measured from the **top of the
+    /// scrollback** downward: `history_size + cursor_viewport_row`.
+    /// As new lines are emitted, the value grows by 1 per line. As
+    /// content scrolls into bounded scrollback the relationship to
+    /// alacritty grid lines drifts (history_size saturates at the
+    /// configured cap), so this is best-effort for very long
+    /// command runs; 4A-render's seal-and-reset model retires the
+    /// drift entirely.
+    pub fn total_lines_seen(&self) -> usize {
+        use alacritty_terminal::grid::Dimensions;
+        let grid = self.term.grid();
+        let scrollback = grid.history_size();
+        let cursor_in_viewport = grid.cursor.point.line.0.max(0) as usize;
+        scrollback + cursor_in_viewport
+    }
+
+    /// Capture a snapshot of the grid rows added since the line index
+    /// `start` was recorded via [`Self::total_lines_seen`]. Returns
+    /// rows `[start, current]` inclusive, each as a [`StyledLine`].
+    ///
+    /// Used by the block model to seal a finished command: at
+    /// `Preexec`, record [`Self::total_lines_seen`]; at
+    /// `CommandFinished`, call this with that recorded value to
+    /// freeze the command's output as a [`Vec<StyledLine>`].
+    ///
+    /// Empty result when `start >= current` (no new content).
+    pub fn snapshot_lines_since(&self, start: usize) -> Vec<StyledLine> {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line, Point};
+
+        let grid = self.term.grid();
+        let current = self.total_lines_seen();
+        if start >= current {
+            return Vec::new();
+        }
+        let history = grid.history_size() as i32;
+        let cols = grid.columns();
+        let screen_lines = grid.screen_lines() as i32;
+
+        let mut out = Vec::with_capacity(current - start + 1);
+        // Iterate the cumulative-line range and map back to alacritty
+        // grid coordinates (`grid_line = cumulative - history_size`).
+        // Negative grid lines are scrollback; non-negative are
+        // viewport. Skip indices outside the grid's bounds — they can
+        // only appear if the scrollback rotated past `start`.
+        for line in (start as i32)..=(current as i32) {
+            let grid_line = line - history;
+            if grid_line < -history || grid_line >= screen_lines {
+                continue;
+            }
+            let mut cells = Vec::with_capacity(cols);
+            for col in 0..cols {
+                let p = Point::new(Line(grid_line), Column(col));
+                let cell = &grid[p];
+                cells.push(StyledCell { c: cell.c, fg: cell.fg, bg: cell.bg, flags: cell.flags });
+            }
+            out.push(StyledLine { cells });
+        }
+        out
+    }
+
     /// Render the current visible grid as plain UTF-8 text, one row
     /// per line, trailing whitespace preserved. Test-and-debug
     /// helper; the real renderer paints cells directly and never
@@ -356,6 +451,61 @@ mod tests {
             state.feed(&[*byte]);
         }
         assert_row_contains(&state, 0, "red");
+    }
+
+    // ---- block-model snapshot APIs --------------------------------
+
+    #[test]
+    fn total_lines_seen_starts_at_zero_for_fresh_terminal() {
+        let state = TerminalState::new(5, 20);
+        assert_eq!(state.total_lines_seen(), 0);
+    }
+
+    #[test]
+    fn total_lines_seen_grows_with_emitted_newlines() {
+        let mut state = TerminalState::new(5, 20);
+        assert_eq!(state.total_lines_seen(), 0);
+        state.feed(b"one\r\n");
+        assert_eq!(state.total_lines_seen(), 1, "after one \\r\\n");
+        state.feed(b"two\r\n");
+        assert_eq!(state.total_lines_seen(), 2);
+        state.feed(b"three\r\n");
+        assert_eq!(state.total_lines_seen(), 3);
+    }
+
+    #[test]
+    fn snapshot_lines_since_returns_empty_when_start_at_or_past_current() {
+        let mut state = TerminalState::new(5, 20);
+        state.feed(b"hello\r\n");
+        let current = state.total_lines_seen();
+        assert!(state.snapshot_lines_since(current).is_empty());
+        assert!(state.snapshot_lines_since(current + 1).is_empty());
+    }
+
+    #[test]
+    fn snapshot_lines_since_captures_rows_emitted_after_start() {
+        let mut state = TerminalState::new(5, 20);
+        state.feed(b"old-prompt$ \r\n"); // cursor moves to row 1
+        let start = state.total_lines_seen();
+        state.feed(b"hello\r\n"); // hello on row 1; cursor to row 2
+        let lines = state.snapshot_lines_since(start);
+        let joined: String =
+            lines.iter().map(|l| l.text_chars().collect::<String>()).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("hello"), "snapshot missing command output: {joined:?}");
+        assert!(!joined.contains("old-prompt$"), "snapshot leaked pre-Preexec content: {joined:?}");
+    }
+
+    #[test]
+    fn snapshot_lines_since_preserves_cell_count_at_pane_width() {
+        let mut state = TerminalState::new(5, 20);
+        state.feed(b"\r\n");
+        let start = state.total_lines_seen();
+        state.feed(b"xyz\r\n");
+        let lines = state.snapshot_lines_since(start);
+        assert!(!lines.is_empty(), "should have captured at least one row");
+        for line in &lines {
+            assert_eq!(line.cells.len(), 20, "row should be padded to pane width");
+        }
     }
 
     #[test]
