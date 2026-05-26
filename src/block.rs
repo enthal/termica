@@ -40,6 +40,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::markers::LifecycleEvent;
+use crate::prompt_editor::PromptEditor;
 use crate::terminal::{StyledLine, TerminalState};
 
 /// Per-pane monotonically increasing identifier for blocks. New
@@ -77,6 +78,11 @@ pub enum Block {
         /// monotonic counter the [`crate::shell::PromptController`]
         /// uses for transitions).
         started_at_frame: u64,
+        /// Native editor for this prompt. Active when the pane is
+        /// in `ShellPromptEditor` mode (spec/05); otherwise dormant
+        /// (its text is `""`). 4C populates this with the user's
+        /// in-progress command and submits it on Enter.
+        editor: PromptEditor,
     },
     Running {
         id: BlockId,
@@ -127,7 +133,12 @@ impl BlockStack {
     pub fn new(started_at_frame: u64) -> Self {
         let mut stack = Self { blocks: Vec::with_capacity(8), next_id: 0 };
         let id = stack.alloc_id();
-        stack.blocks.push(Block::Prompt { id, header: BlockHeader::default(), started_at_frame });
+        stack.blocks.push(Block::Prompt {
+            id,
+            header: BlockHeader::default(),
+            started_at_frame,
+            editor: PromptEditor::new(),
+        });
         stack
     }
 
@@ -205,6 +216,11 @@ impl BlockStack {
             Block::Prompt { id, header, .. } => (*id, header.clone()),
             _ => unreachable!(),
         };
+        // The editor's content is implicitly discarded here. In
+        // Phase 4C, `submit_command` will have moved the text out
+        // before `Preexec` arrives; for 4B with no submit wired yet,
+        // any half-typed buffer is dropped — same as if the user had
+        // pressed Esc and typed the command through the PTY instead.
         *tail = Block::Running { id, header, command, started_at_frame: frame };
     }
 
@@ -245,7 +261,32 @@ impl BlockStack {
         let last = self.blocks.last_mut().expect("checked above");
         *last = sealed;
         let new_id = self.alloc_id();
-        self.blocks.push(Block::Prompt { id: new_id, header, started_at_frame: frame });
+        self.blocks.push(Block::Prompt {
+            id: new_id,
+            header,
+            started_at_frame: frame,
+            editor: PromptEditor::new(),
+        });
+    }
+
+    /// Mutable access to the editor on the live tail block, if any.
+    /// `None` when the tail is not a `Prompt` (e.g. a `Running`
+    /// command is executing) — input routing in `render_pane`
+    /// already checks the mode and tail variant before reaching for
+    /// this, so a `None` return is a no-op for editor input.
+    pub fn editor_on_tail_mut(&mut self) -> Option<&mut PromptEditor> {
+        match self.blocks.last_mut()? {
+            Block::Prompt { editor, .. } => Some(editor),
+            _ => None,
+        }
+    }
+
+    /// Read-only access to the same editor.
+    pub fn editor_on_tail(&self) -> Option<&PromptEditor> {
+        match self.blocks.last()? {
+            Block::Prompt { editor, .. } => Some(editor),
+            _ => None,
+        }
     }
 }
 
@@ -256,6 +297,56 @@ mod tests {
 
     fn fresh_stack() -> BlockStack {
         BlockStack::new(0)
+    }
+
+    // ---- editor wiring (Phase 4B) ------------------------------------
+
+    #[test]
+    fn fresh_stack_exposes_an_empty_editor_on_the_tail() {
+        let stack = fresh_stack();
+        let editor = stack.editor_on_tail().expect("Prompt tail has an editor");
+        assert!(editor.is_empty(), "fresh editor should have no text");
+        assert_eq!(editor.cursor(), 0);
+    }
+
+    #[test]
+    fn editor_persists_typing_on_the_prompt_tail() {
+        let mut stack = fresh_stack();
+        let editor = stack.editor_on_tail_mut().expect("Prompt tail");
+        editor.insert_str("git st");
+        assert_eq!(stack.editor_on_tail().unwrap().text(), "git st");
+    }
+
+    #[test]
+    fn running_tail_has_no_editor_handle() {
+        let mut stack = fresh_stack();
+        let mut term = TerminalState::new(5, 20);
+        stack.observe_lifecycle_event(
+            &LifecycleEvent::Preexec { command: "ls".into() },
+            &mut term,
+            1,
+        );
+        assert!(stack.editor_on_tail().is_none(), "Running tail has no editor");
+        assert!(stack.editor_on_tail_mut().is_none());
+    }
+
+    #[test]
+    fn seal_then_new_prompt_has_a_fresh_empty_editor() {
+        let mut stack = fresh_stack();
+        let mut term = TerminalState::new(5, 20);
+        // Pre-populate the editor — should not survive Preexec
+        // (4B's note: editor content is dropped at this boundary).
+        stack.editor_on_tail_mut().unwrap().insert_str("typed-but-dropped");
+
+        stack.observe_lifecycle_event(
+            &LifecycleEvent::Preexec { command: "ls".into() },
+            &mut term,
+            1,
+        );
+        stack.observe_lifecycle_event(&LifecycleEvent::CommandFinished { exit: 0 }, &mut term, 2);
+
+        let editor = stack.editor_on_tail().expect("new Prompt has editor");
+        assert!(editor.is_empty(), "new Prompt's editor starts fresh");
     }
 
     #[test]

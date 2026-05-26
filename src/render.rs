@@ -31,6 +31,7 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Response, Stroke, Vec2};
 
 use crate::links::LinkSpan;
+use crate::prompt_editor::PromptEditor;
 use crate::selection::{GridGeometry, Selection};
 use crate::terminal::{StyledLine, TerminalState};
 
@@ -289,6 +290,58 @@ pub fn paint_styled_lines(ui: &mut egui::Ui, lines: &[StyledLine]) -> Response {
                     Stroke::new(1.0, fg),
                 );
             }
+        }
+    }
+    response
+}
+
+/// Paint the [`PromptEditor`] inside its [`Block::Prompt`](crate::block::Block::Prompt).
+///
+/// The editor lives at the bottom of a `Prompt` block — Phase 4B
+/// places it directly below the live `Term`'s paint. Each line of
+/// the buffer takes one monospace row; the cursor is a thin
+/// underline at the current char column, below the glyph row.
+///
+/// 4G adds the prompt chrome (the `❯` glyph, the cwd / branch /
+/// dirty chips); 4F adds selection rendering; 4H adds syntax
+/// highlighting. For now the editor paints unstyled `DEFAULT_FG`
+/// text on `DEFAULT_BG`.
+///
+/// Returns the painted [`egui::Response`] over the editor rect.
+pub fn paint_prompt_editor(ui: &mut egui::Ui, editor: &PromptEditor) -> Response {
+    let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
+    let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
+    let row_h = ui.fonts_mut(|f| f.row_height(&font_id));
+    let lines = editor.lines_with_cursor();
+    let rows = lines.len().max(1);
+    // Width of the painted rect: enough room for the widest visible
+    // row + an extra cell to host the cursor when it sits at end of
+    // line. Reads from `ui.available_size` so resize doesn't clip
+    // the editor (its content width tracks the editor buffer; the
+    // pane width is enforced by the live `Term`'s paint above).
+    let widest_chars = lines.iter().map(|l| l.text.chars().count()).max().unwrap_or(0);
+    let cols = widest_chars + 1;
+    let size = Vec2::new((cols as f32 * cell_w).max(cell_w), rows as f32 * row_h);
+
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, DEFAULT_BG);
+
+    for (row_idx, line) in lines.iter().enumerate() {
+        let y = rect.min.y + row_idx as f32 * row_h;
+        if !line.text.is_empty() {
+            painter.text(
+                Pos2::new(rect.min.x, y),
+                egui::Align2::LEFT_TOP,
+                line.text,
+                font_id.clone(),
+                DEFAULT_FG,
+            );
+        }
+        if line.cursor_on_line {
+            let cursor_x = rect.min.x + line.cursor_col_chars as f32 * cell_w;
+            let cursor_rect = Rect::from_min_size(Pos2::new(cursor_x, y), Vec2::new(cell_w, row_h));
+            painter.rect_filled(cursor_rect, 0.0, CURSOR_COLOR);
         }
     }
     response

@@ -309,3 +309,56 @@ fn snapshot_paint_styled_lines_with_ansi_colors() {
         });
     harness.snapshot("paint_styled_lines_ansi_colors");
 }
+
+// ---- editor snapshots (Phase 4B) ----------------------------------------
+
+#[test]
+fn snapshot_paint_prompt_editor_empty() {
+    let editor = termica::prompt_editor::PromptEditor::new();
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(400.0, 80.0)).build_ui(move |ui| {
+            let _ = render::paint_prompt_editor(ui, &editor);
+        });
+    harness.snapshot("paint_prompt_editor_empty");
+}
+
+#[test]
+fn snapshot_paint_prompt_editor_with_text_and_cursor_at_end() {
+    let mut editor = termica::prompt_editor::PromptEditor::new();
+    editor.insert_str("git status");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(400.0, 80.0)).build_ui(move |ui| {
+            let _ = render::paint_prompt_editor(ui, &editor);
+        });
+    harness.snapshot("paint_prompt_editor_typed");
+}
+
+#[test]
+fn snapshot_paint_prompt_editor_multiline() {
+    // Shift+Enter authored: two lines, cursor at the end of the
+    // second line.
+    let mut editor = termica::prompt_editor::PromptEditor::new();
+    editor.insert_str("for f in *.rs; do");
+    editor.insert_newline();
+    editor.insert_str("  cat \"$f\"");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(500.0, 100.0)).build_ui(move |ui| {
+            let _ = render::paint_prompt_editor(ui, &editor);
+        });
+    harness.snapshot("paint_prompt_editor_multiline");
+}
+
+#[test]
+fn snapshot_paint_prompt_editor_cursor_mid_text() {
+    let mut editor = termica::prompt_editor::PromptEditor::new();
+    editor.insert_str("alpha bravo charlie");
+    // Move cursor back four chars (into "charlie").
+    for _ in 0..4 {
+        editor.move_left();
+    }
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(500.0, 80.0)).build_ui(move |ui| {
+            let _ = render::paint_prompt_editor(ui, &editor);
+        });
+    harness.snapshot("paint_prompt_editor_cursor_mid_text");
+}

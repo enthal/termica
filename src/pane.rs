@@ -405,6 +405,44 @@ impl PaneSession {
         self.pane_id
     }
 
+    /// Mutable handle to the editor on the live `Prompt` block, if
+    /// the tail is a `Prompt`. Returns `None` when a `Running`
+    /// command is executing. Phase 4B's keystroke router uses this
+    /// to apply editor edits without leaking the `frame` counter
+    /// out of `PaneSession`.
+    pub fn editor_mut(&mut self) -> Option<&mut crate::prompt_editor::PromptEditor> {
+        self.blocks.editor_on_tail_mut()
+    }
+
+    /// The pane is in `ShellPromptEditor` mode AND the tail block
+    /// is a `Prompt` with an active editor. The single switch the
+    /// keystroke router needs to decide whether to route input to
+    /// the editor vs the PTY.
+    pub fn editor_is_active(&self) -> bool {
+        self.controller.mode() == PaneMode::ShellPromptEditor
+            && self.blocks.editor_on_tail().is_some()
+    }
+
+    /// Demote the pane out of `ShellPromptEditor` back to
+    /// `RawTerminal` (the canonical "Esc on the editor" gesture per
+    /// spec/05). Clears the editor buffer so the next promotion
+    /// starts fresh. No-op when not in `ShellPromptEditor`.
+    pub fn leave_editor_esc(&mut self) {
+        if let Some(editor) = self.blocks.editor_on_tail_mut() {
+            editor.clear();
+        }
+        self.controller.leave_editor_esc(self.frame);
+        // Record the transition into the dump-events file so the
+        // user-initiated demote shows up in diagnostics.
+        if let Some(rec) = self.recorder.as_ref() {
+            let latest = self.controller.last_transition().at;
+            if latest != self.last_transition_at {
+                rec.record_transition(self.pane_id, self.controller.last_transition());
+                self.last_transition_at = latest;
+            }
+        }
+    }
+
     /// Write bytes to the PTY (e.g. keyboard input). Refuses to
     /// write while the pane is in `Bootstrapping` — keystrokes would
     /// race with the bootstrap script's own commands and corrupt
