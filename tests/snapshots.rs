@@ -217,6 +217,28 @@ fn snapshot_terminal_alt_screen() {
 }
 
 #[test]
+fn snapshot_terminal_alt_screen_with_border() {
+    // Same alt-screen content as `snapshot_terminal_alt_screen` but
+    // includes the 1px alt-screen indicator border that
+    // `render_pane::render_pane` paints around the grid when
+    // `view.alt_screen` is true. Snapshots the border colour and
+    // exact placement so future tweaks land deliberately.
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.extend_from_slice(b"\x1b[?1049h"); // alt screen on
+    bytes.extend_from_slice(b"\x1b[H"); // cursor home
+    bytes.extend_from_slice(b"-- alt screen active --\r\n");
+    bytes.extend_from_slice(b"line 2 on alt screen");
+
+    let term = term_from_bytes(5, 40, &bytes);
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 180.0)).build_ui(move |ui| {
+            let rendered = render::paint_terminal(ui, &term, None, None);
+            termica::paint_alt_screen_border(ui.painter(), rendered.response.rect);
+        });
+    harness.snapshot("terminal_alt_screen_with_border");
+}
+
+#[test]
 fn snapshot_terminal_link_underline() {
     // A URL on row 0 with the Cmd/Ctrl-hover underline rendered. The
     // call site only passes a `Some(link)` when the modifier is held,
