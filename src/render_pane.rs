@@ -25,6 +25,41 @@ const MULTI_CLICK_WINDOW_SECS: f64 = 0.5;
 /// still register as a multi-click.
 const MULTI_CLICK_DISTANCE_PX: f32 = 8.0;
 
+/// Color of the 1px border painted around the cell grid while a pane
+/// is in alternate-screen mode (vim / htop / less / fzf / ssh-with-
+/// TUI). A muted teal that's clearly visible against the dark
+/// background but doesn't read as a warning — the signal is "this
+/// pane is owned by a full-screen TTY program," not "something is
+/// wrong." Tuned in unit tests so future tweaks land deliberately,
+/// not by accident.
+pub const ALT_SCREEN_BORDER_COLOR: egui::Color32 = egui::Color32::from_rgb(0x5b, 0xa3, 0xb8);
+
+/// Stroke width of the alt-screen border, in egui logical pixels.
+pub const ALT_SCREEN_BORDER_WIDTH: f32 = 1.0;
+
+/// Paint the alt-screen indicator border around `grid_rect`.
+///
+/// The border is a 1px [`ALT_SCREEN_BORDER_COLOR`] stroke flush
+/// against the grid edges. Painted on top of the cell content with
+/// no rounding so it reads as a tight frame, not pane chrome.
+///
+/// `pub` so a snapshot test in [`tests/`] can drive this helper
+/// directly against a known [`egui::Rect`] without instantiating a
+/// real [`PaneSession`].
+pub fn paint_alt_screen_border(painter: &egui::Painter, grid_rect: egui::Rect) {
+    // egui's `rect_stroke` centres the stroke on the rect edge by
+    // default. We want the stroke to read as a frame *inside* the
+    // grid rect so the bottom-right glyphs aren't clipped by a
+    // half-pixel of border bleed. `StrokeKind::Inside` does exactly
+    // that.
+    painter.rect_stroke(
+        grid_rect,
+        egui::CornerRadius::ZERO,
+        egui::Stroke::new(ALT_SCREEN_BORDER_WIDTH, ALT_SCREEN_BORDER_COLOR),
+        egui::StrokeKind::Inside,
+    );
+}
+
 /// Spawn the OS's "open this URL or path" handler.
 ///
 /// macOS: `open <arg>`. Linux/BSD: `xdg-open <arg>`. The argument
@@ -201,6 +236,19 @@ pub fn render_pane(
         render::paint_terminal(ui, slot.session.terminal(), selection.as_ref(), highlighted_link);
     if highlighted_link.is_some() {
         ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    // ---- alt-screen border --------------------------------------
+    //
+    // When the pane is running a full-screen TTY program (vim, htop,
+    // less, fzf, ssh-with-TUI), paint a 1px border around the cell
+    // grid so the user can see at a glance that input is going
+    // verbatim to that program — different mode, different look.
+    // The border sits flush against the grid rect, not the pane
+    // chrome, so it tracks the actual area where keystrokes are
+    // routed differently.
+    if view.alt_screen {
+        paint_alt_screen_border(ui.painter(), rendered.response.rect);
     }
 
     // ---- mouse selection / link click + focus-on-press ----------
