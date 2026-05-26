@@ -120,43 +120,33 @@ Selecting an entry replaces the editor buffer. The popup never sends to the PTY 
 
 ## Command blocks (transcript view)
 
-The transcript view ([02](02-terminal-engine.md), [08](08-persistence.md)) is enriched with command-block decorations. A command block is one `CommandRun` plus its output range.
+The transcript view is structured as a vertical stack of **command blocks**, each block being one command + its output area + its header chrome. The block data model lives in Phase 4 / [spec/04](04-prompt-editor.md#visual-structure-the-block-model); the underlying live-`Term` / sealed-snapshot architecture lives in [spec/02](02-terminal-engine.md#the-block-model-one-live-term-many-sealed-snapshots). What this document adds is the *enrichment* of those blocks with command-run metadata and the per-block search affordances.
 
-Visual structure:
+Each `Sealed` block ([04](04-prompt-editor.md)) carries a `BlockHeader` (cwd, git branch, dirty summary) and a `command + duration + exit` summary; these are the same fields populated into the persisted `CommandRun` record described below.
 
-```
-┌── cargo test --workspace ────────────────────────── exit 0 · 2.3s ─┐
-│ (output lines, ANSI-styled)                                        │
-│ ...                                                                │
-└────────────────────────────────────────────────────────────────────┘
-```
-
-Affordances:
+Per-block affordances (Phase 7+ polish):
 
 - Click the header to collapse / expand the output.
 - Context menu / hover icons: copy command, copy output, copy command+output, rerun, pin, jump-to-output.
 - Failed (non-zero exit) blocks get a subtle red gutter mark.
-- Blocks are non-modal — the transcript still flows; output below the block is the next prompt cycle.
+- Blocks are non-modal — scrolling moves them as a stack, but each is independently selectable / collapsible.
 
-`Rerun` puts the command back in the editor and submits it. It is **not** a "rerun-in-place" — the original block stays; the new run is a new block.
+`Rerun` puts the command back in the editor and submits it. It is **not** a "rerun-in-place" — the original sealed block stays; the new run is a fresh `Running` → `Sealed` block at the bottom of the stack.
 
 ## Transcript model
 
 ```rust
 pub enum TranscriptItem {
-    /// Terminal-grid output not associated with any command (e.g. between
-    /// shell launch and first prompt, or during raw mode without integration).
-    TerminalLines(ScrollbackRange),
-
-    /// A command block. References a CommandRun + output range.
-    CommandBlock(CommandRunId),
+    /// A command block (Sealed / Running / Prompt — see spec/04).
+    /// References the in-memory block by id; persisted via CommandRun.
+    CommandBlock(BlockId),
 
     /// A session marker (e.g. shell exit, restart, integration version change).
     Marker(SessionMarker),
 }
 ```
 
-The transcript is a sequence of `TranscriptItem`s; rendering walks the sequence. The underlying scrollback chunks ([08](08-persistence.md)) are unchanged — `TranscriptItem` is a structuring view on top.
+The transcript is a sequence of `TranscriptItem`s; rendering walks the sequence. In v1 (Phase 4) every block is a `CommandBlock` — there is no "terminal lines not associated with any command" item, because the block model in [02](02-terminal-engine.md) makes every byte the property of *some* block (the one whose live `Term` was alive when the byte arrived). `Marker` items land in Phase 8+ as cross-cutting session events.
 
 ## Search
 

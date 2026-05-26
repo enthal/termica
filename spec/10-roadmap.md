@@ -123,17 +123,30 @@ The strict tests-first rule from [CLAUDE.md](../CLAUDE.md) applies to **the enti
 - Nested shells (running `zsh` / `bash` / `fish` inside a Termica-managed shell) do not get integration in v1 — the nested shell is un-integrated; pane mode degrades naturally because no lifecycle messages arrive.
 - Remote integration (ssh, docker exec, kubectl exec) is post-MVP.
 
-### Phase 4 — Editor at prompt
+### Phase 4 — Editor at prompt (block-model pivot)
 
-- `termica-editor`: `PromptEditor` widget with all operations from [04](04-prompt-editor.md).
-- Submit path with eager demotion + echo suppression.
-- Multiline + Shift+Enter.
-- Local syntax highlighting (in-house tokenizer).
-- Local completion (paths + history + `$PATH`) on Tab.
-- Up/Down: pane-local history walk.
-- Esc / Ctrl+C / Ctrl+D edge cases.
+**Design pivot ([discussion preceded the spec rewrite](https://github.com/enthal/termica/pulls)):** the original Phase 4 was sketched as "drop an editor widget into the existing single-grid pane." Empirical UX prototyping revealed that a block model — each command is its own self-contained block with header chrome + output area, stacked vertically — is the right shape and pulls Phase 7's command-block work forward. See [04 §"Visual structure: the block model"](04-prompt-editor.md#visual-structure-the-block-model) and [02 §"The block model"](02-terminal-engine.md#the-block-model-one-live-term-many-sealed-snapshots).
 
-**Acceptance:** at a `bash`/`zsh` prompt with integration installed, the editor is active; commands run; the duplicate echo never appears; vim still works exactly as in Phase 1.
+Implementation choice: **one live `Term` for the bottom block (`Running` or `Prompt`); sealed blocks are frozen `Vec<StyledLine>` snapshots.** Sealed blocks do not reflow on resize. Selection is pane-coordinate (`PaneCursor { block_id, line, col }`), not grid-coordinate; copy concatenates block contents and skips chrome.
+
+Sub-PRs:
+
+- ⏳ **4A — Block infrastructure** + simple stacked rendering. `Block` enum (`Prompt` / `Running` / `Sealed`), `Vec<Block>` in `PaneSession`, `PromptController` events drive transitions (`Preexec` → `Running`, `CommandFinished` → seal + new `Prompt`). Renderer paints blocks top-to-bottom in flow. `Prompt` block paints a placeholder where the editor will go.
+- ⏳ **4B — Editor widget** inside the `Prompt` block. `PromptEditor` struct + basic cursor / insert / delete / multiline editing (Shift+Enter). Esc demotes via `leave_editor_esc`. No submit yet — Enter is a placeholder.
+- ⏳ **4C — Submit path + echo suppression.** Enter sends bytes; the `Prompt` block transitions to `Sealed` (or rather, its successor `Running` block is born) per [04 §"Submission semantics"](04-prompt-editor.md#submission-semantics-enter). Echo suppression buffer per [04 §"Echo handling"](04-prompt-editor.md#echo-handling) option (b). The hard part.
+- ⏳ **4D — Fixed-footer `Prompt` block + multiline expand.** The `Prompt` block is glued to the viewport bottom; older blocks scroll under it; multiline grows the footer down and shrinks the scroll area. Big layout shift, but bounded.
+- ⏳ **4E — Sticky-top block header.** When a block's body is visible but its header is scrolled above the viewport, paint the header pinned to the top edge of the scroll area until the body fully scrolls past.
+- ⏳ **4F — Cross-block selection + copy.** `PaneSelection { anchor, head: PaneCursor }`; drag across boundaries; copy concatenates block text, skips chrome.
+- ⏳ **4G — Block header chrome.** Chips above the `Prompt` editor (cwd, branch, dirty); dim header line for `Running` (live duration timer) and `Sealed` (final duration + exit). Pulls forward most of what Phase 5 (status header) was going to do.
+- ⏳ **4H — Local syntax highlighting** (in-house tokenizer per [04 §"Syntax highlighting"](04-prompt-editor.md#syntax-highlighting)).
+- ⏳ **4I — Local completion (Tab).** Path + history + `$PATH` per [04 §"Tab handling"](04-prompt-editor.md#tab-handling). Depends partially on Phase 6 history.
+- ⏳ **4J — History walk (Up/Down) + Ctrl+R popup.** Depends on Phase 6 storage.
+
+4A–4C is the load-bearing trio: at the end of 4C the user can type a command in the editor, press Enter, see it execute in a `Running` block, and see the result in a `Sealed` block. 4D–4G are the UX polish that makes it feel block-oriented. 4H–4J are independently-sliceable polish.
+
+**Acceptance:** at a `bash`/`zsh` prompt with managed integration, the user types into the editor inside the `Prompt` block; Enter executes the command in a `Running` block that seals on `CommandFinished`; the duplicate echo never appears in the transcript; vim still works (alt-screen runs inside a `Running` block, sealed empty-transcript on exit).
+
+**Phase 7 (command blocks) is largely subsumed by Phase 4G's block-header chrome work.** The collapse / expand / context-menu affordances that Phase 7 was going to add layer cleanly on top of 4A's block infrastructure; they become a small Phase-7 polish PR rather than the foundational work the original spec assumed.
 
 ### Phase 5 — Status header
 

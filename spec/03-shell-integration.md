@@ -380,7 +380,36 @@ Post-MVP: detect nested-shell entry, send a fresh bootstrap into the nested shel
 
 Setting `TERMICA_DUMP_EVENTS=<path>` in the environment before launching Termica turns on the lifecycle-event recorder (Phase 3G). The named file is opened with create-or-truncate semantics; every pane writes its spawn, lifecycle events, mode transitions, and PTY-exit to the same file in arrival order. Timestamps are seconds since the recorder started, so a recording is comparable to itself regardless of when it ran.
 
-Example output:
+**Format selection is by file extension:**
+
+- `<path>.json` or `<path>.jsonl` → **JSON Lines** (one JSON object per line). Each record has a `t` (float seconds), `pane` (integer), `kind` (string discriminator) envelope plus per-`kind` fields. Trivially deserializable in tests and tools; `jq` works out of the box.
+- Any other extension → **human-readable text** (the example below).
+
+The format is fixed at recorder construction; a single Termica process writes one format for the life of the recording.
+
+### JSON Lines schema
+
+```jsonc
+{"t":0.012,"pane":0,"kind":"spawn","shell":"zsh","argv":["zsh","-i"]}
+{"t":0.012,"pane":0,"kind":"transition","from":"Bootstrapping","to":"Bootstrapping","reason":"InitialSpawn"}
+{"t":0.187,"pane":0,"kind":"lifecycle","event":"IntegrationReady","shell":"Zsh","version":1}
+{"t":0.188,"pane":0,"kind":"transition","from":"Bootstrapping","to":"RawTerminal","reason":"BootstrapComplete"}
+{"t":0.512,"pane":0,"kind":"lifecycle","event":"Precmd","cwd":"/Users/tim"}
+{"t":3.401,"pane":0,"kind":"lifecycle","event":"Preexec","command":"ls -la"}
+{"t":3.452,"pane":0,"kind":"lifecycle","event":"CommandFinished","exit":0}
+{"t":4.812,"pane":0,"kind":"pty_exit"}
+```
+
+Per-`kind` fields:
+
+| `kind` | extra fields |
+|---|---|
+| `spawn` | `shell` (string), `argv` (array of strings) |
+| `transition` | `from`, `to` (mode names), `reason` (reason name) |
+| `lifecycle` | `event` (variant name) + variant-specific fields: `shell` + `version` for `IntegrationReady`; `command` for `Preexec`; `exit` for `CommandFinished`; `cwd` for `Precmd` / `Cwd`; `reason` for `IntegrationError` / `CommandAborted`; `vars` (object) for `PromptVars` |
+| `pty_exit` | none |
+
+### Human-readable example
 
 ```text
 [t=0.012s] pane=0 spawn shell=zsh argv=["zsh", "-i"]
