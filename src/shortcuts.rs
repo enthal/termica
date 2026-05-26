@@ -47,6 +47,7 @@ pub fn match_pane_shortcut(
             (egui::Key::T, false) => Some(PaneAction::NewTab),
             (egui::Key::W, false) => Some(PaneAction::CloseTab),
             (egui::Key::Q, false) => Some(PaneAction::Quit),
+            (egui::Key::K, false) => Some(PaneAction::ClearScrollback),
             (egui::Key::CloseBracket | egui::Key::CloseCurlyBracket, true) => {
                 Some(PaneAction::NextTab)
             }
@@ -67,6 +68,7 @@ pub fn match_pane_shortcut(
             egui::Key::T => Some(PaneAction::NewTab),
             egui::Key::W => Some(PaneAction::CloseTab),
             egui::Key::Q => Some(PaneAction::Quit),
+            egui::Key::K => Some(PaneAction::ClearScrollback),
             egui::Key::CloseBracket | egui::Key::CloseCurlyBracket => Some(PaneAction::NextTab),
             egui::Key::OpenBracket | egui::Key::OpenCurlyBracket => Some(PaneAction::PrevTab),
             _ => None,
@@ -110,6 +112,22 @@ mod tests {
     #[test]
     fn macos_cmd_q_maps_to_quit() {
         assert_eq!(match_pane_shortcut(egui::Key::Q, mac_cmd_only(), true), Some(PaneAction::Quit));
+    }
+
+    #[test]
+    fn macos_cmd_k_maps_to_clear_scrollback() {
+        assert_eq!(
+            match_pane_shortcut(egui::Key::K, mac_cmd_only(), true),
+            Some(PaneAction::ClearScrollback)
+        );
+    }
+
+    #[test]
+    fn macos_cmd_shift_k_does_not_map() {
+        // Shift on top of Cmd+K is a different chord; we reserve
+        // it for future use. The matcher must not accept it as
+        // ClearScrollback.
+        assert_eq!(match_pane_shortcut(egui::Key::K, mac_cmd_shift(), true), None);
     }
 
     #[test]
@@ -185,6 +203,14 @@ mod tests {
         assert_eq!(
             match_pane_shortcut(egui::Key::Q, linux_ctrl_shift(), false),
             Some(PaneAction::Quit)
+        );
+    }
+
+    #[test]
+    fn linux_ctrl_shift_k_maps_to_clear_scrollback() {
+        assert_eq!(
+            match_pane_shortcut(egui::Key::K, linux_ctrl_shift(), false),
+            Some(PaneAction::ClearScrollback)
         );
     }
 

@@ -233,6 +233,15 @@ impl TermicaApp {
             PaneAction::Quit => {
                 self.quit_requested = true;
             }
+            PaneAction::ClearScrollback => {
+                // Cmd+K: blank the viewport, drop scrollback, home
+                // the cursor. The shell is not signalled — it'll
+                // redraw its prompt on the next prompt cycle (or
+                // when the user presses Enter).
+                if let Some(slot) = self.panes.get_mut(&pane_id) {
+                    slot.session.terminal_mut().clear_all();
+                }
+            }
         }
     }
 

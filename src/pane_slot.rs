@@ -44,6 +44,11 @@ pub enum PaneAction {
     NextTab,
     /// Cmd+Shift+[ (macOS) / Ctrl+Shift+[ (Linux): previous tab.
     PrevTab,
+    /// Cmd+K (macOS) / Ctrl+Shift+K (Linux): full reset of the
+    /// focused pane — blank the viewport, drop scrollback, move
+    /// the cursor home. The shell process is untouched and will
+    /// redraw its prompt on the next prompt cycle.
+    ClearScrollback,
 }
 
 /// Per-pane UI interaction state. Each pane gets its own multi-
