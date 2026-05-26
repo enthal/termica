@@ -81,7 +81,7 @@ These are repeated in [05 — Pane modes](05-pane-modes.md) but worth knowing up
 - Code blocks are illustrative Rust unless otherwise noted; **trait shapes are normative, bodies are not**.
 - Diagrams use ASCII or Mermaid; keep them greppable.
 - Cross-references use relative links so the spec is navigable on GitHub.
-- "Alacritty does X" / "Warp does X" is shorthand for "the design we're echoing has been validated by that project's experience"; we are not bound by their choices.
+- "Alacritty does X" is shorthand for "the design we're echoing has been validated by that project's experience"; we are not bound by its choices.
 
 ## Design tenets (in priority order)
 

@@ -14,11 +14,13 @@
 #![forbid(unsafe_code)]
 
 use std::io::Read;
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
 use alacritty_terminal::index::Point;
 
+use crate::events::EventRecorder;
 use crate::integration::{ManagedSpawn, ShellSpec, managed_spawn_for, new_session_id};
 use crate::pty::{PtyConfig, PtyError, PtySession};
 use crate::selection::{self, Selection, SelectionMode};
@@ -90,6 +92,10 @@ pub struct PaneSession {
     /// Last-seen alt-screen flag — debounces the `observe_alt_screen`
     /// call on the controller so we only notify on transitions.
     last_alt_screen: bool,
+    /// Last-seen `last_transition.at` value, used to detect new
+    /// transitions to dispatch to the [`EventRecorder`]. Updated
+    /// after each emission.
+    last_transition_at: u64,
     /// Owned per-spawn temp directory holding the wrapper file(s) the
     /// shell sourced at startup (zsh's `.zshrc`, bash's `--rcfile`).
     /// Kept here so its `Drop` fires when the pane closes — the
@@ -98,6 +104,14 @@ pub struct PaneSession {
     /// (test / low-level path).
     #[allow(dead_code)]
     wrapper_dir: Option<tempfile::TempDir>,
+    /// Stable per-pane id (the `PaneId.0` field), recorded once at
+    /// spawn so the [`EventRecorder`] can tag emitted lines without
+    /// the pane depending on the `pane_slot` module.
+    pane_id: u64,
+    /// Shared diagnostic event sink. `Some` when
+    /// `TERMICA_DUMP_EVENTS=<path>` was set at startup. All panes
+    /// in the same Termica process write to the same file.
+    recorder: Option<Arc<EventRecorder>>,
 }
 
 impl PaneSession {
@@ -115,6 +129,8 @@ impl PaneSession {
         cols: u16,
         config: &PtyConfig,
         session_id: String,
+        pane_id: u64,
+        recorder: Option<Arc<EventRecorder>>,
     ) -> Result<Self, PtyError> {
         let mut pty = PtySession::spawn(config)?;
         let terminal = TerminalState::new(rows, cols);
@@ -153,7 +169,10 @@ impl PaneSession {
             session_id,
             frame: 0,
             last_alt_screen: false,
+            last_transition_at: 0,
             wrapper_dir: None,
+            pane_id,
+            recorder,
         })
     }
 
@@ -175,15 +194,20 @@ impl PaneSession {
         cols: u16,
         shell: ShellSpec,
         cwd: Option<std::path::PathBuf>,
+        pane_id: u64,
+        recorder: Option<Arc<EventRecorder>>,
     ) -> Result<Self, PtyError> {
         let session_id = new_session_id();
         let ManagedSpawn { argv, pty_bootstrap, env, wrapper_dir } =
             managed_spawn_for(shell, &session_id)
                 .map_err(|e| PtyError::Os(format!("build managed spawn plan: {e}")))?;
+        if let Some(rec) = recorder.as_ref() {
+            rec.record_spawn(pane_id, shell, &argv);
+        }
         let program = argv[0].clone();
         let args: Vec<String> = argv[1..].to_vec();
         let config = PtyConfig { program, args, env, cwd, rows, cols };
-        let mut session = Self::spawn(rows, cols, &config, session_id)?;
+        let mut session = Self::spawn(rows, cols, &config, session_id, pane_id, recorder)?;
         // Tie the wrapper TempDir's lifetime to the pane session.
         // When the pane closes, the directory under $TMPDIR is
         // recursively removed.
@@ -192,6 +216,12 @@ impl PaneSession {
         // starts in `Bootstrapping`. The renderer will suppress the
         // pane until `integration_ready` arrives or the timeout fires.
         session.controller = PromptController::new(0);
+        // Record the initial Bootstrapping `InitialSpawn` transition
+        // so the dump file shows the pane state from t=0.
+        if let Some(rec) = session.recorder.as_ref() {
+            rec.record_transition(session.pane_id, session.controller.last_transition());
+        }
+        session.last_transition_at = session.controller.last_transition().at;
 
         if let Some(bootstrap) = pty_bootstrap {
             // Write the bootstrap to the PTY as the first input the
@@ -248,11 +278,16 @@ impl PaneSession {
         // Tick the bootstrap timeout. No-op once we leave
         // Bootstrapping.
         self.controller.tick_bootstrap_timeout(self.frame);
+        self.record_pending_transitions();
 
         // Feed lifecycle events extracted from the byte stream into
         // the controller. Order is preserved per spec/03.
         for event in self.terminal.drain_lifecycle_events() {
+            if let Some(rec) = self.recorder.as_ref() {
+                rec.record_lifecycle(self.pane_id, &event);
+            }
             self.controller.observe_event(event, self.frame);
+            self.record_pending_transitions();
         }
 
         // Track alt-screen transitions. The terminal flag is the
@@ -262,6 +297,7 @@ impl PaneSession {
         if alt != self.last_alt_screen {
             self.controller.observe_alt_screen(alt, self.frame);
             self.last_alt_screen = alt;
+            self.record_pending_transitions();
         }
 
         // PTY exit is observed via `self.exited` (latched above)
@@ -269,10 +305,28 @@ impl PaneSession {
         // already polls `is_exited` per frame to route pane close,
         // so we notify the controller on the same edge.
         if self.exited && self.controller.mode() != PaneMode::Dead {
+            if let Some(rec) = self.recorder.as_ref() {
+                rec.record_pty_exit(self.pane_id);
+            }
             self.controller.observe_pty_exit(self.frame);
+            self.record_pending_transitions();
         }
 
         consumed
+    }
+
+    /// If the controller has recorded a new transition since we last
+    /// checked, emit it to the [`EventRecorder`]. Centralises the
+    /// "diff the last transition and dispatch" check so all the call
+    /// sites in [`Self::drain`] stay readable.
+    fn record_pending_transitions(&mut self) {
+        let latest = self.controller.last_transition().at;
+        if latest != self.last_transition_at
+            && let Some(rec) = self.recorder.as_ref()
+        {
+            rec.record_transition(self.pane_id, self.controller.last_transition());
+        }
+        self.last_transition_at = latest;
     }
 
     /// `true` once the reader thread has observed PTY EOF and
@@ -452,9 +506,15 @@ mod tests {
 
     #[test]
     fn pipeline_routes_echo_output_into_the_terminal() {
-        let mut session =
-            PaneSession::spawn(5, 40, &sh_c("printf hello-pipeline"), "test-session".into())
-                .expect("spawn /bin/sh");
+        let mut session = PaneSession::spawn(
+            5,
+            40,
+            &sh_c("printf hello-pipeline"),
+            "test-session".into(),
+            0,
+            None,
+        )
+        .expect("spawn /bin/sh");
         let view = wait_for(&mut session, Duration::from_secs(2), |v| {
             v.screen_text.contains("hello-pipeline")
         });
@@ -478,6 +538,8 @@ mod tests {
             40,
             &sh_c("printf one; printf two; printf three"),
             "test-session".into(),
+            0,
+            None,
         )
         .expect("spawn");
         let view =
@@ -496,8 +558,8 @@ mod tests {
     fn write_sends_input_to_the_child() {
         // `cat` echoes its stdin back to its stdout, so writing a
         // line that we then see on the screen proves the write path.
-        let mut session =
-            PaneSession::spawn(5, 40, &sh_c("cat"), "test-session".into()).expect("spawn cat");
+        let mut session = PaneSession::spawn(5, 40, &sh_c("cat"), "test-session".into(), 0, None)
+            .expect("spawn cat");
         session.write(b"pipeline-write-marker\n").expect("write");
         let view = wait_for(&mut session, Duration::from_secs(2), |v| {
             v.screen_text.contains("pipeline-write-marker")
@@ -511,8 +573,8 @@ mod tests {
 
     #[test]
     fn view_alt_screen_starts_false() {
-        let session =
-            PaneSession::spawn(5, 40, &sh_c("sleep 0.1"), "test-session".into()).expect("spawn");
+        let session = PaneSession::spawn(5, 40, &sh_c("sleep 0.1"), "test-session".into(), 0, None)
+            .expect("spawn");
         let view = session.view();
         assert!(!view.alt_screen);
     }
@@ -520,7 +582,8 @@ mod tests {
     #[test]
     fn drain_on_idle_session_returns_zero() {
         let mut session =
-            PaneSession::spawn(5, 40, &sh_c("sleep 0.2"), "test-session".into()).expect("spawn");
+            PaneSession::spawn(5, 40, &sh_c("sleep 0.2"), "test-session".into(), 0, None)
+                .expect("spawn");
         // sleep gives no output; first drain should see nothing.
         assert_eq!(session.drain(), 0);
         assert_eq!(session.view().bytes_received, 0);
@@ -535,6 +598,8 @@ mod tests {
             40,
             &sh_c("printf survives-resize; sleep 1"),
             "test-session".into(),
+            0,
+            None,
         )
         .expect("spawn");
         let _ = wait_for(&mut session, Duration::from_secs(2), |v| {
@@ -567,7 +632,8 @@ mod tests {
         // attached; nothing has disconnected, so the flag stays
         // false even after a drain or two.
         let mut session =
-            PaneSession::spawn(5, 40, &sh_c("sleep 5"), "test-session".into()).expect("spawn");
+            PaneSession::spawn(5, 40, &sh_c("sleep 5"), "test-session".into(), 0, None)
+                .expect("spawn");
         assert!(!session.is_exited(), "fresh session must not be exited");
         for _ in 0..3 {
             session.drain();
@@ -583,7 +649,7 @@ mod tests {
         // drop its `Sender`, and the next `drain` to observe a
         // `Disconnected` from `try_recv`.
         let mut session =
-            PaneSession::spawn(5, 40, &sh_c("printf bye; exit 0"), "test-session".into())
+            PaneSession::spawn(5, 40, &sh_c("printf bye; exit 0"), "test-session".into(), 0, None)
                 .expect("spawn");
         // Drain repeatedly until the flag latches or the deadline
         // expires. We don't use `wait_for` here because we're
@@ -600,7 +666,7 @@ mod tests {
     #[test]
     fn is_exited_stays_latched_across_drains() {
         let mut session =
-            PaneSession::spawn(5, 40, &sh_c("printf done; exit 0"), "test-session".into())
+            PaneSession::spawn(5, 40, &sh_c("printf done; exit 0"), "test-session".into(), 0, None)
                 .expect("spawn");
         let stop_at = Instant::now() + Duration::from_secs(2);
         while !session.is_exited() && Instant::now() < stop_at {
@@ -613,5 +679,52 @@ mod tests {
             session.drain();
             assert!(session.is_exited());
         }
+    }
+
+    #[test]
+    fn drain_emits_pty_exit_to_event_recorder() {
+        // End-to-end check that the recorder receives a `pty_exit`
+        // line when the shell child exits. We spawn a short-lived
+        // `printf; exit` and poll drain() until is_exited() flips.
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("events.log");
+        let recorder = Arc::new(EventRecorder::new(&log_path).expect("recorder"));
+        let mut session = PaneSession::spawn(
+            5,
+            40,
+            &sh_c("printf hi; exit 0"),
+            "test-session".into(),
+            42,
+            Some(recorder.clone()),
+        )
+        .expect("spawn");
+
+        // Spin drain until the reader observes EOF (latches `exited`)
+        // and the recorder writes the pty_exit line. Bounded by 2s.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            session.drain();
+            if session.is_exited() {
+                // One more drain to ensure the transition lines flush.
+                session.drain();
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Drop the session to flush the recorder's BufWriter via
+        // its own Drop (the recorder is shared so we drop our handle
+        // separately below).
+        drop(session);
+        drop(recorder);
+
+        let body = std::fs::read_to_string(&log_path).expect("read log");
+        assert!(body.contains("pane=42"), "log should tag pane id; got:\n{body}");
+        assert!(body.contains("pty_exit"), "log should contain pty_exit; got:\n{body}");
+        assert!(
+            body.contains("Dead") && body.contains("PtyExit"),
+            "log should record the transition to Dead; got:\n{body}"
+        );
     }
 }

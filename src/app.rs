@@ -8,11 +8,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use eframe::egui;
 use egui_tiles::{Tile, TileId, Tiles, Tree};
 
 use crate::behavior::TabBehavior;
+use crate::events::EventRecorder;
 use crate::integration::ShellSpec;
 use crate::pane::PaneSession;
 use crate::pane_slot::{PaneAction, PaneId, PaneSlot, PaneUiState};
@@ -106,6 +108,11 @@ pub struct TermicaApp {
     /// menubar (and, in the future, any other surface that wants
     /// to open it). Closed by Esc / backdrop / OK button.
     about_open: bool,
+    /// Diagnostic event sink shared across all panes in this
+    /// process. `Some` when `TERMICA_DUMP_EVENTS=<path>` was set at
+    /// startup; passed to each [`PaneSession`] on spawn. `None`
+    /// disables dump-events entirely with zero per-pane cost.
+    event_recorder: Option<Arc<EventRecorder>>,
 }
 
 impl TermicaApp {
@@ -113,6 +120,7 @@ impl TermicaApp {
     /// container at the root of the tree.
     pub fn new() -> Self {
         let home = home::home_dir();
+        let event_recorder = init_event_recorder();
         let mut app = Self {
             panes: HashMap::new(),
             tree: Tree::empty("termica-tree"),
@@ -128,6 +136,7 @@ impl TermicaApp {
             quit_confirm_started_at: None,
             should_quit: false,
             about_open: false,
+            event_recorder,
         };
         app.bootstrap();
         app
@@ -136,8 +145,16 @@ impl TermicaApp {
     fn bootstrap(&mut self) {
         let pane_id = self.mint_pane_id();
         let shell = resolve_shell_from_env();
-        let session = PaneSession::spawn_managed(MIN_ROWS.max(24), MIN_COLS.max(80), shell, None)
-            .expect("spawn initial pane");
+        let recorder = self.event_recorder.clone();
+        let session = PaneSession::spawn_managed(
+            MIN_ROWS.max(24),
+            MIN_COLS.max(80),
+            shell,
+            None,
+            pane_id.0,
+            recorder,
+        )
+        .expect("spawn initial pane");
         self.panes.insert(pane_id, PaneSlot { session, ui: PaneUiState::default() });
 
         let mut tiles = Tiles::default();
@@ -284,7 +301,8 @@ impl TermicaApp {
 
         let pane_id = self.mint_pane_id();
         let shell = resolve_shell_from_env();
-        let session = match PaneSession::spawn_managed(24, 80, shell, cwd) {
+        let recorder = self.event_recorder.clone();
+        let session = match PaneSession::spawn_managed(24, 80, shell, cwd, pane_id.0, recorder) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("termica: failed to spawn new pane: {e}");
@@ -711,4 +729,24 @@ impl eframe::App for TermicaApp {
 /// equivalently if the user has set `$SHELL`).
 fn resolve_shell_from_env() -> ShellSpec {
     std::env::var("SHELL").map(|s| ShellSpec::from_shell_path(&s)).unwrap_or(ShellSpec::Zsh)
+}
+
+/// Build an [`EventRecorder`] from `TERMICA_DUMP_EVENTS=<path>` if
+/// the env var is set; otherwise return `None` so dump-events is a
+/// zero-cost opt-in. If opening the file fails we report on stderr
+/// and disable dump-events for the session — a diagnostic feature
+/// is never allowed to abort startup.
+fn init_event_recorder() -> Option<Arc<EventRecorder>> {
+    let path = std::env::var_os("TERMICA_DUMP_EVENTS")?;
+    let path = std::path::PathBuf::from(path);
+    match EventRecorder::new(&path) {
+        Ok(rec) => {
+            eprintln!("termica: dump-events recording to {}", path.display());
+            Some(Arc::new(rec))
+        }
+        Err(e) => {
+            eprintln!("termica: failed to open TERMICA_DUMP_EVENTS path {}: {e}", path.display());
+            None
+        }
+    }
 }

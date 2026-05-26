@@ -378,24 +378,23 @@ Post-MVP: detect nested-shell entry, send a fresh bootstrap into the nested shel
 
 ## Debug surface
 
-A `--dump-events` flag (Phase 3H) writes the lifecycle event stream plus mode transitions to a file:
+Setting `TERMICA_DUMP_EVENTS=<path>` in the environment before launching Termica turns on the lifecycle-event recorder (Phase 3G). The named file is opened with create-or-truncate semantics; every pane writes its spawn, lifecycle events, mode transitions, and PTY-exit to the same file in arrival order. Timestamps are seconds since the recorder started, so a recording is comparable to itself regardless of when it ran.
+
+Example output:
 
 ```text
-[t=0.000ms] spawn pane=p1 shell=zsh argv=["zsh","-g","--no_rcs"]
-[t=0.012ms] mode=Bootstrapping reason=InitialSpawn
-[t=0.048ms] integration_ready shell=zsh version=1
-[t=0.048ms] mode=RawTerminal reason=BootstrapComplete
-[t=2.103ms] precmd cwd=/Users/tim
-[t=2.103ms] mode=ShellPromptEditor reason=PrecmdMarker
-[t=4.812ms] submit_command frame=…
-[t=4.812ms] mode=RawTerminal reason=EnterSubmitted
-[t=4.815ms] preexec cmd="ls -la"
-[t=4.852ms] command_finished exit=0
-[t=4.853ms] precmd cwd=/Users/tim
-[t=4.853ms] mode=ShellPromptEditor reason=PrecmdMarker
+[t=0.012s] pane=0 spawn shell=zsh argv=["zsh", "-i"]
+[t=0.012s] pane=0 transition Bootstrapping → Bootstrapping (InitialSpawn)
+[t=0.187s] pane=0 lifecycle IntegrationReady { shell: Zsh, version: 1 }
+[t=0.188s] pane=0 transition Bootstrapping → RawTerminal (BootstrapComplete)
+[t=0.512s] pane=0 lifecycle Precmd { cwd: "/Users/tim" }
+[t=0.512s] pane=0 transition RawTerminal → ShellPromptEditor (PrecmdMarker)
+[t=3.401s] pane=0 lifecycle Preexec { command: "ls -la" }
+[t=3.452s] pane=0 lifecycle CommandFinished { exit: 0 }
+[t=3.453s] pane=0 lifecycle Precmd { cwd: "/Users/tim" }
 ```
 
-This is the diagnostic surface for debugging integration failures and is the primary tool for the test infrastructure ([09](09-testing.md)).
+This is the diagnostic surface for debugging integration failures and is the primary tool for the test infrastructure ([09](09-testing.md)). Each line is a single record; `tail -f $TERMICA_DUMP_EVENTS` while reproducing a bug gives a real-time view of the state machine. Opening the file is best-effort: if the path is invalid or unwritable, Termica reports on stderr at startup and disables the recorder for the session.
 
 ## Testing
 
