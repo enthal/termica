@@ -63,16 +63,31 @@ This is normative: **any code that watches the raw byte stream for marker patter
 pub enum MarkerEvent {
     PromptStart,
     PromptEnd,
-    CommandStart { cmd_id: Option<CmdId> },
-    CommandEnd { cmd_id: Option<CmdId>, exit: i32, duration_ms: Option<u64> },
+    CommandStart,
+    CommandEnd { exit: Option<i32>, duration_ms: Option<u64> },
     Cwd(PathBuf),
-    ShellAnnounce { kind: ShellKind, version: u32 },
+    ProtocolVersion(u32),
+    Shell(ShellKind),
+}
+
+pub enum ShellKind {
+    Bash,
+    Zsh,
+    Unknown,
 }
 
 pub struct MarkerStream { /* mpsc-style rx */ }
 ```
 
 Order is preserved per-pane. The marker stream is the only input the `PromptController` ([05](05-pane-modes.md)) consumes besides PTY exit notifications.
+
+`ProtocolVersion` and `Shell` are intentionally separate events even though the integration script emits both at every `PromptStart`. The two OSC 1337 sequences don't arrive atomically and there is no per-prompt framing — modeling them as one aggregated event would force the parser to buffer state across OSCs and decide when to "flush." Separate events leave that aggregation (if anyone needs it) to the consumer; the parser stays stateless and each event corresponds one-to-one with an OSC the shell actually emitted.
+
+`CommandStart` / `CommandEnd` carry no `cmd_id`. The original spec drafted `cmd_id: Option<CmdId>` to correlate the two across interleaved background output, but the integration scripts below do not emit `TermicaCmdId=` and there is no consumer in v1. When a future script grows that capability, we'll add the field with tests then; carrying a phantom `Option<CmdId>` today just confuses readers about what works.
+
+`CommandEnd.exit` is `Option<i32>` rather than `i32`: shells *should* always emit the exit code on `OSC 133 ; D`, but some implementations miss it, and our parser refuses to fall back to a sentinel like `0` (which would lie that the command succeeded) or `-1` (which conflates with a real process exit -1). `None` is the honest "the shell didn't tell us" value.
+
+`MarkerEvent::Cwd` corresponds to `OSC 1337 ; TermicaCwd=…`. OSC 7 — the de-facto cwd-reporting OSC that most shells already emit on `cd` — is parsed by the same VT byte pipeline but currently only updates a separate state snapshot (`OscState.cwd`) that the status header / clickable paths consume; it does NOT produce a `Cwd` marker event in Phase 3A. Future phases may unify the two sources once there's a marker-stream consumer that wants OSC 7 in-band.
 
 ## Shell integration scripts
 

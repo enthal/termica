@@ -98,11 +98,16 @@ Sub-PRs:
 
 ### Phase 3 — Markers + mode machine
 
-- `termica-markers`: OSC 133 + OSC 1337 `Termica=…` parser sitting on top of `alacritty_terminal`'s OSC events.
-- `termica-shell`: `PromptController` state machine with all four modes and every transition tested.
-- `termica-integration`: bash + zsh scripts as `include_str!`; `termica install-integration` CLI subcommand with idempotent fenced-block rcfile mutation.
-- Strict tests for the five safety rules ([05](05-pane-modes.md)).
-- `--dump-events` flag writes marker stream + mode transitions to a file.
+Sub-PRs:
+
+- ⏳ **3A — Marker parser**: OSC 133 + OSC 1337-`Termica=…` parsing in [`src/markers.rs`](../src/markers.rs); wired into [`OscSniffer`](../src/osc.rs) so the existing vte byte pipeline produces a drainable [`MarkerEvent`] stream alongside the OSC 7 cwd snapshot. (this PR)
+- ⏳ **3B — `PromptController`**: state machine with all four modes and every transition tested. Strict tests-first for the five safety rules in [05](05-pane-modes.md).
+- ⏳ **3C — Integration scripts**: bash + zsh as `include_str!` constants. No installer yet.
+- ⏳ **3D — `termica install-integration` CLI**: idempotent fenced-block rcfile mutation; tests against fixture rc files.
+- ⏳ **3E — Wire `PromptController` into `PaneSession`**: mode machine becomes the source of truth for "is this pane at a prompt?"; today's alt-screen heuristic retires.
+- ⏳ **3F — `--dump-events` flag**: writes the marker + mode-transition stream to a file for debugging.
+
+The strict tests-first rule from [CLAUDE.md](../CLAUDE.md) applies to **the entire Phase 3 surface area** — every commit lands with tests that failed on the pre-change tree.
 
 **Acceptance:** marker events flow end-to-end; mode transitions are observably correct; installer is idempotent. Editor is **not** wired up yet.
 
