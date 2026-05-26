@@ -565,22 +565,50 @@ pub fn tab_title_for(pane_id: PaneId, cwd: Option<&Path>, home: Option<&Path>) -
     // Normalize trailing slash on the cwd (but keep `/` itself).
     let cwd_norm: &str = if cwd_s.as_ref() == "/" { "/" } else { cwd_s.trim_end_matches('/') };
 
-    if let Some(h) = home {
+    let raw = if let Some(h) = home {
         let home_s = h.to_string_lossy();
         let home_norm = home_s.trim_end_matches('/');
         if !home_norm.is_empty() {
             if cwd_norm == home_norm {
-                return "~".to_string();
-            }
-            if let Some(rest) = cwd_norm.strip_prefix(home_norm)
+                "~".to_string()
+            } else if let Some(rest) = cwd_norm.strip_prefix(home_norm)
                 && rest.starts_with('/')
             {
-                return format!("~{rest}");
+                format!("~{rest}")
+            } else {
+                cwd_norm.to_string()
             }
+        } else {
+            cwd_norm.to_string()
         }
-    }
+    } else {
+        cwd_norm.to_string()
+    };
 
-    cwd_norm.to_string()
+    truncate_tab_title(&raw)
+}
+
+/// Maximum rendered width of a tab title, in chars. Titles longer
+/// than this collapse to `..` + their trailing portion, since the
+/// suffix (a leaf dir like `termica`, or a project subdir) is the
+/// part the user is actually trying to disambiguate by. Picked by
+/// eyeballing: 25 chars fits comfortably without forcing the tab
+/// strip to scroll on a default-size window.
+const MAX_TAB_TITLE_CHARS: usize = 25;
+
+/// Truncate a tab title to [`MAX_TAB_TITLE_CHARS`], preserving the
+/// *tail* of the string with a `..` prefix when truncation kicks
+/// in. Counting is in `char`s, not bytes, so a directory whose name
+/// happens to contain multi-byte UTF-8 doesn't get cut mid-codepoint.
+fn truncate_tab_title(s: &str) -> String {
+    let count = s.chars().count();
+    if count <= MAX_TAB_TITLE_CHARS {
+        return s.to_string();
+    }
+    const ELLIPSIS: &str = "..";
+    let keep = MAX_TAB_TITLE_CHARS - ELLIPSIS.len();
+    let suffix: String = s.chars().skip(count - keep).collect();
+    format!("{ELLIPSIS}{suffix}")
 }
 
 /// Resolve the active pane id inside a Tabs container, if any. Pure
@@ -1584,8 +1612,10 @@ mod tests {
 
     #[test]
     fn tab_title_uses_full_cwd_when_home_unknown() {
-        let cwd = PathBuf::from("/Users/tim/git/enthal/termica");
-        assert_eq!(tab_title_for(PaneId(0), Some(&cwd), None), "/Users/tim/git/enthal/termica");
+        // Short cwd so the truncation rule doesn't kick in and
+        // obscure what this test is asserting.
+        let cwd = PathBuf::from("/Users/tim/git");
+        assert_eq!(tab_title_for(PaneId(0), Some(&cwd), None), "/Users/tim/git");
     }
 
     #[test]
@@ -1632,6 +1662,52 @@ mod tests {
         let cwd = PathBuf::from("/");
         let home = PathBuf::from("/Users/tim");
         assert_eq!(tab_title_for(PaneId(7), Some(&cwd), Some(&home)), "/");
+    }
+
+    #[test]
+    fn tab_title_unchanged_when_at_max_length() {
+        // Exactly 25 chars: `~/` (2) + 23-char dir name.
+        let cwd = PathBuf::from("/Users/tim/abcdefghijklmnopqrstuvw");
+        let home = PathBuf::from("/Users/tim");
+        let title = tab_title_for(PaneId(0), Some(&cwd), Some(&home));
+        assert_eq!(title.chars().count(), MAX_TAB_TITLE_CHARS);
+        assert_eq!(title, "~/abcdefghijklmnopqrstuvw");
+    }
+
+    #[test]
+    fn tab_title_truncates_long_titles_with_leading_ellipsis() {
+        // 42-char `~`-substituted title → expect 25 chars with `..`
+        // prefix and the last 23 chars retained.
+        let cwd = PathBuf::from("/Users/tim/very/long/path/with/lots/of/subdirs/here");
+        let home = PathBuf::from("/Users/tim");
+        let title = tab_title_for(PaneId(0), Some(&cwd), Some(&home));
+        assert_eq!(title.chars().count(), MAX_TAB_TITLE_CHARS);
+        assert!(title.starts_with(".."));
+        // Tail preserved — the user cares about the deepest dir.
+        assert!(title.ends_with("/here"));
+    }
+
+    #[test]
+    fn tab_title_truncates_unsubstituted_paths_too() {
+        // Outside `$HOME`, same rule applies.
+        let cwd = PathBuf::from("/var/log/very/long/path/under/system/dirs/please");
+        let home = PathBuf::from("/Users/tim");
+        let title = tab_title_for(PaneId(0), Some(&cwd), Some(&home));
+        assert_eq!(title.chars().count(), MAX_TAB_TITLE_CHARS);
+        assert!(title.starts_with(".."));
+    }
+
+    #[test]
+    fn tab_title_truncation_is_char_safe_for_multibyte() {
+        // A name longer than 25 with multi-byte chars must not be
+        // sliced mid-codepoint. Using accented chars: each `é` is
+        // 2 bytes but 1 char; `truncate_tab_title` counts in chars.
+        let s = "/Users/tim/répertoire-très-long-avec-accents-partout/";
+        let cwd = PathBuf::from(s);
+        let home = PathBuf::from("/Users/tim");
+        let title = tab_title_for(PaneId(0), Some(&cwd), Some(&home));
+        assert_eq!(title.chars().count(), MAX_TAB_TITLE_CHARS);
+        // If we'd sliced bytes, this would have panicked above.
     }
 
     // --- active pane resolution (Phase 2B spawn-in-cwd) -------------
