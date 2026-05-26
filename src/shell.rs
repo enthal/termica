@@ -46,6 +46,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::path::PathBuf;
+
 use crate::markers::{MarkerEvent, ShellKind};
 
 /// Protocol version this build of Termica understands. The
@@ -143,6 +145,12 @@ pub struct PendingCommand {
     /// Optional duration from the `CommandEnd` extension. The
     /// integration scripts in spec/03 don't currently emit it.
     pub duration_ms: Option<u64>,
+    /// Cwd at the moment the command opened. Captured from the
+    /// most recent `MarkerEvent::Cwd` observation
+    /// (`OSC 1337 ; TermicaCwd=…`). `None` until the shell has
+    /// emitted at least one cwd marker. Phase 7's `CommandRun`
+    /// reads this for its command-block context snapshot.
+    pub cwd_at_start: Option<PathBuf>,
 }
 
 /// The pane-mode state machine.
@@ -161,6 +169,13 @@ pub struct PromptController {
     /// Most recent shell kind announced by `TermicaShell=…`.
     /// Informational only — no transition depends on it.
     shell_kind: Option<ShellKind>,
+    /// Most recent cwd from `MarkerEvent::Cwd`
+    /// (`OSC 1337 ; TermicaCwd=…`). Stamped into
+    /// `PendingCommand.cwd_at_start` whenever a command opens.
+    /// OSC 7 cwd updates also live here once 3E folds OSC 7 into
+    /// the marker stream; for 3B the controller only sees what
+    /// the marker pipeline emits.
+    cwd: Option<PathBuf>,
 }
 
 impl PromptController {
@@ -181,6 +196,7 @@ impl PromptController {
             pending_cmd: None,
             last_completed_cmd: None,
             shell_kind: None,
+            cwd: None,
         }
     }
 
@@ -204,12 +220,7 @@ impl PromptController {
                 // this is the confirming marker — leave the
                 // existing pending alone.)
                 if self.pending_cmd.is_none() && self.mode != PaneMode::Dead {
-                    self.pending_cmd = Some(PendingCommand {
-                        started_frame: frame,
-                        ended_frame: None,
-                        exit: None,
-                        duration_ms: None,
-                    });
+                    self.pending_cmd = Some(self.new_pending(frame));
                 }
             }
             MarkerEvent::CommandEnd { exit, duration_ms } => {
@@ -234,11 +245,14 @@ impl PromptController {
             MarkerEvent::Shell(kind) => {
                 self.shell_kind = Some(kind);
             }
-            MarkerEvent::Cwd(_) => {
-                // We don't track cwd in the controller — the
-                // OscSniffer state owns that snapshot. Phase 7's
-                // CommandRun will record cwd at command-start
-                // time by reading from the sniffer.
+            MarkerEvent::Cwd(path) => {
+                // Track the latest cwd here too so it can be stamped
+                // into `PendingCommand.cwd_at_start` when a command
+                // opens via either `submit_command` or a
+                // `CommandStart` marker. The OscSniffer state still
+                // owns the snapshot read by the status header /
+                // clickable paths.
+                self.cwd = Some(path);
             }
         }
     }
@@ -294,12 +308,7 @@ impl PromptController {
         // arrive (shell crashed), the open-ended pending stays
         // until pty_exit closes it with exit=None.
         if self.pending_cmd.is_none() {
-            self.pending_cmd = Some(PendingCommand {
-                started_frame: frame,
-                ended_frame: None,
-                exit: None,
-                duration_ms: None,
-            });
+            self.pending_cmd = Some(self.new_pending(frame));
         }
     }
 
@@ -325,6 +334,7 @@ impl PromptController {
         self.pending_cmd = None;
         self.last_completed_cmd = None;
         self.shell_kind = None;
+        self.cwd = None;
         self.transition(PaneMode::RawTerminal, TransitionReason::UserRestartedShell, frame);
     }
 
@@ -348,8 +358,25 @@ impl PromptController {
     pub fn shell_kind(&self) -> Option<ShellKind> {
         self.shell_kind
     }
+    pub fn cwd(&self) -> Option<&std::path::Path> {
+        self.cwd.as_deref()
+    }
 
     // ---- internals --------------------------------------------------
+
+    /// Build a fresh open `PendingCommand` stamped with the
+    /// currently-known cwd. Centralised so all open paths
+    /// (`submit_command`, `CommandStart` marker) capture the
+    /// same fields the same way.
+    fn new_pending(&self, frame: u64) -> PendingCommand {
+        PendingCommand {
+            started_frame: frame,
+            ended_frame: None,
+            exit: None,
+            duration_ms: None,
+            cwd_at_start: self.cwd.clone(),
+        }
+    }
 
     fn try_promote_to_editor(&mut self, frame: u64) {
         // Rule 1: only promote from RawTerminal. AlternateScreen +
@@ -766,5 +793,67 @@ mod tests {
         assert_eq!(c.shell_kind(), None);
         c.observe_marker(MarkerEvent::Shell(ShellKind::Zsh), 1);
         assert_eq!(c.shell_kind(), Some(ShellKind::Zsh));
+    }
+
+    // ---- cwd tracking (Phase 3B review concerns) --------------------
+
+    #[test]
+    fn cwd_marker_alone_causes_no_transition_or_pending() {
+        // Tightening the contract: a Cwd event is purely a state
+        // update — it must not advance the mode machine and must
+        // not open a pending command.
+        let mut c = confirmed();
+        let before = *c.last_transition();
+        c.observe_marker(MarkerEvent::Cwd(PathBuf::from("/tmp")), 1);
+        assert_eq!(c.mode(), PaneMode::RawTerminal);
+        assert_eq!(*c.last_transition(), before);
+        assert!(c.pending_cmd().is_none());
+    }
+
+    #[test]
+    fn cwd_marker_updates_tracked_cwd() {
+        let mut c = PromptController::new(0);
+        assert!(c.cwd().is_none());
+        c.observe_marker(MarkerEvent::Cwd(PathBuf::from("/a")), 1);
+        assert_eq!(c.cwd(), Some(std::path::Path::new("/a")));
+        c.observe_marker(MarkerEvent::Cwd(PathBuf::from("/b")), 2);
+        assert_eq!(c.cwd(), Some(std::path::Path::new("/b")));
+    }
+
+    #[test]
+    fn submit_command_stamps_cwd_into_pending_command() {
+        let mut c = confirmed();
+        c.observe_marker(MarkerEvent::Cwd(PathBuf::from("/Users/tim/code")), 1);
+        c.observe_marker(MarkerEvent::PromptEnd, 1);
+        c.submit_command(2);
+        let p = c.pending_cmd().expect("pending should be open");
+        assert_eq!(p.cwd_at_start, Some(PathBuf::from("/Users/tim/code")));
+    }
+
+    #[test]
+    fn commandstart_marker_stamps_cwd_into_pending() {
+        let mut c = confirmed();
+        c.observe_marker(MarkerEvent::Cwd(PathBuf::from("/tmp")), 1);
+        c.observe_marker(MarkerEvent::CommandStart, 2);
+        let p = c.pending_cmd().expect("pending opens on CommandStart");
+        assert_eq!(p.cwd_at_start, Some(PathBuf::from("/tmp")));
+    }
+
+    #[test]
+    fn pending_cwd_is_none_when_no_cwd_marker_seen() {
+        let mut c = confirmed();
+        c.observe_marker(MarkerEvent::PromptEnd, 1);
+        c.submit_command(2);
+        let p = c.pending_cmd().expect("pending should be open");
+        assert!(p.cwd_at_start.is_none());
+    }
+
+    #[test]
+    fn restart_shell_clears_tracked_cwd() {
+        let mut c = confirmed();
+        c.observe_marker(MarkerEvent::Cwd(PathBuf::from("/foo")), 1);
+        c.observe_pty_exit(2);
+        c.restart_shell(3);
+        assert!(c.cwd().is_none());
     }
 }
