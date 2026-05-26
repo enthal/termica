@@ -1,242 +1,362 @@
-//! Minimal shell-side integration.
+//! Managed shell-integration wrappers.
 //!
-//! Phase 1's contract: when Termica spawns zsh, install a tiny
-//! OSC 7 hook so the [`crate::osc::OscSniffer`] has something to
-//! parse — without this, macOS zsh never emits OSC 7 (Apple's
-//! `/etc/zshrc_Apple_Terminal` gates it on `$TERM_PROGRAM`).
+//! Per [spec/03](../spec/03-shell-integration.md), Termica spawns
+//! its own managed shells with rc-file loading disabled, then
+//! delivers a Termica-controlled bootstrap that sources the user's
+//! real dotfiles and installs Termica's lifecycle hooks.
 //!
-//! Mechanism is the classic [`ZDOTDIR`] override: we materialise a
-//! Termica-owned directory containing `.zshenv`, `.zshrc`,
-//! `.zlogin`, and `.zlogout` that each source the user's matching
-//! file (so their personal config still runs) and then append our
-//! snippet. Setting `ZDOTDIR=<our dir>` on the spawned shell makes
-//! zsh read those files instead of the user's directly.
+//! Mechanism per shell:
 //!
-//! [`ZDOTDIR`]: https://zsh.sourceforge.io/Doc/Release/Files.html
+//! - **zsh** — `zsh -i` with `ZDOTDIR=<termica-wrapper-dir>` in env.
+//!   The wrapper's `.zshrc` immediately `unset ZDOTDIR`'s, sources
+//!   `~/.zshenv`, re-evaluates ZDOTDIR, sources the user's real
+//!   `.zshrc`, then installs our hooks.
+//! - **bash** — `bash --noprofile --norc --rcfile <wrapper> -i`.
+//!   The wrapper rcfile is generated on disk; bash reads it during
+//!   normal startup.
+//! - **fish** — `fish --no-config --init-command "<bootstrap>" -i`.
+//!   fish executes the init-command before the first prompt.
 //!
-//! Phase 3's full shell-integration installer will subsume this:
-//! marker emission, deeper hooks, an opt-in installer subcommand,
-//! cleanup. The scaffolding lives here so Phase 3 can extend it
-//! rather than re-introduce the same mechanism.
-//!
-//! Opt out by setting `TERMICA_NO_SHELL_INTEGRATION=1` in the
-//! environment; spawned shells then see the user's real
-//! `$ZDOTDIR` (or none) untouched.
+//! Opt out by setting `TERMICA_NO_SHELL_INTEGRATION=1`; spawned
+//! shells skip the managed-startup machinery and launch with normal
+//! rc-file processing.
 
 #![forbid(unsafe_code)]
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// The OSC 7 hook we append to the user's `.zshrc`. Embedded at
-/// compile time so the binary is self-contained.
-const ZSH_OSC7_SNIPPET: &str = include_str!("../integration/zsh-osc7.zsh");
+use tempfile::TempDir;
 
-/// Termica-owned data directory for shell-integration overrides.
-///
-/// Resolves to `$XDG_DATA_HOME/termica/` if set, else
-/// `$HOME/Library/Application Support/Termica/` (macOS conventional),
-/// else `$HOME/.local/share/termica/` (Linux fallback).
-fn data_dir() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("XDG_DATA_HOME") {
-        return Some(PathBuf::from(p).join("termica"));
+/// Bootstrap .zshrc for zsh. Materialised under Termica's data
+/// directory; zsh is spawned with `ZDOTDIR=<that-dir>` so this file
+/// becomes its .zshrc.
+pub const ZSH_BOOTSTRAP: &str = include_str!("../integration/zsh-bootstrap.zsh");
+
+/// Bootstrap wrapper for bash. Written to disk and passed via
+/// `bash --rcfile <path>`.
+pub const BASH_BOOTSTRAP: &str = include_str!("../integration/bash-bootstrap.bash");
+
+/// Vendored bash-preexec.sh (MIT-licensed, from rcaloras/bash-preexec).
+/// Sourced by the bash wrapper.
+pub const BASH_PREEXEC: &str = include_str!("../integration/bash-preexec.sh");
+
+/// Bootstrap script for fish. Passed inline via `--init-command`.
+pub const FISH_BOOTSTRAP: &str = include_str!("../integration/fish-bootstrap.fish");
+
+/// Integration protocol version this build emits / accepts.
+/// Matches `SUPPORTED_PROTOCOL_VERSION` in [`crate::shell`].
+pub const INTEGRATION_VERSION: u32 = 1;
+
+/// Which shell to spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellSpec {
+    Zsh,
+    Bash,
+    Fish,
+}
+
+impl ShellSpec {
+    /// Resolve a shell from a `$SHELL`-style path by looking at the
+    /// basename. Unknown shells default to `Zsh` (the most common on
+    /// macOS) — callers can override.
+    pub fn from_shell_path(path: &str) -> Self {
+        let basename = Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or("");
+        match basename {
+            "bash" => ShellSpec::Bash,
+            "fish" => ShellSpec::Fish,
+            _ => ShellSpec::Zsh,
+        }
     }
-    let home = std::env::var_os("HOME")?;
-    let home = PathBuf::from(home);
-    if cfg!(target_os = "macos") {
-        Some(home.join("Library/Application Support/Termica"))
-    } else {
-        Some(home.join(".local/share/termica"))
+
+    /// Human-readable name used in env vars and diagnostics.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ShellSpec::Zsh => "zsh",
+            ShellSpec::Bash => "bash",
+            ShellSpec::Fish => "fish",
+        }
     }
 }
 
-/// Materialise a `ZDOTDIR` override directory and return its path.
+/// A complete prepared shell-spawn plan. Materialised once per pane
+/// spawn; consumed by the PTY-spawn code in [`crate::pane`].
+#[derive(Debug)]
+pub struct ManagedSpawn {
+    /// argv to spawn. argv[0] is the program; subsequent entries
+    /// are flags.
+    pub argv: Vec<String>,
+    /// If `Some`, the bootstrap content to write to the PTY as the
+    /// first command after spawn. Reserved for future use; all
+    /// current shells (zsh / bash / fish) deliver the bootstrap via
+    /// CLI / env-var mechanisms instead.
+    pub pty_bootstrap: Option<String>,
+    /// Environment variables to set on the spawned process. Caller
+    /// is expected to merge these with the inherited env.
+    pub env: Vec<(String, String)>,
+    /// Owned per-spawn temp directory holding the wrapper file(s)
+    /// the shell will read at startup (zsh: `$ZDOTDIR/.zshrc` and
+    /// `.zshenv`; bash: `bash-bootstrap.bash` + `bash-preexec.sh`;
+    /// fish: none, because `--init-command` is inline).
+    ///
+    /// The directory's lifetime is tied to whatever owns this
+    /// `ManagedSpawn` (in production: stashed inside `PaneSession`).
+    /// When that owner is dropped, the `TempDir` Drop deletes the
+    /// directory recursively — so the wrapper files exist exactly
+    /// as long as the pane that needs them.
+    pub wrapper_dir: Option<TempDir>,
+}
+
+/// Build a [`ManagedSpawn`] for the given shell.
 ///
-/// The directory holds four files:
+/// `session_id` is the Termica session ID exposed as
+/// `TERMICA_SESSION_ID`. The integration script echoes it back in
+/// every lifecycle message so stale messages from a child that
+/// lingered after restart can be discriminated.
 ///
-/// - `.zshenv` — sources the user's `$HOME/.zshenv` if it exists.
-/// - `.zshrc`  — sources the user's `$HOME/.zshrc` if it exists,
-///   then appends Termica's OSC 7 snippet.
-/// - `.zlogin` / `.zlogout` — pass-through to the user's versions.
-///
-/// Returns `None` if `TERMICA_NO_SHELL_INTEGRATION=1` is set, if
-/// `$HOME` is unset, or if any I/O step fails (we never break a
-/// spawn over a failed integration write — the shell launches
-/// without OSC 7 instead).
-pub fn install_zsh_zdotdir() -> Option<PathBuf> {
-    if std::env::var_os("TERMICA_NO_SHELL_INTEGRATION").is_some() {
-        return None;
+/// Wrapper files (zsh's `.zshrc`, bash's rcfile + `bash-preexec.sh`)
+/// are materialised inside a per-spawn [`TempDir`] returned in
+/// `ManagedSpawn.wrapper_dir`. The shell sources them at startup;
+/// the directory survives until the caller drops the `ManagedSpawn`
+/// (or whatever holds it — in production, `PaneSession`).
+pub fn managed_spawn_for(shell: ShellSpec, session_id: &str) -> io::Result<ManagedSpawn> {
+    let opt_out = std::env::var_os("TERMICA_NO_SHELL_INTEGRATION").is_some();
+    managed_spawn_for_inner(shell, session_id, opt_out)
+}
+
+/// Inner spawn-plan builder with the env-var opt-out factored out
+/// to a parameter. Lets unit tests exercise both branches without
+/// mutating process-wide env (which would require `unsafe` under
+/// Rust 2024 and is forbidden crate-wide).
+fn managed_spawn_for_inner(
+    shell: ShellSpec,
+    session_id: &str,
+    opt_out: bool,
+) -> io::Result<ManagedSpawn> {
+    if opt_out {
+        return Ok(unmanaged_spawn(shell, session_id));
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let target = data_dir()?.join("zsh-integration");
-    write_zdotdir_files(&home, &target).ok()?;
-    Some(target)
+    let mut env = common_env(shell, session_id);
+    match shell {
+        ShellSpec::Zsh => {
+            // Materialise a per-spawn wrapper directory containing our
+            // `.zshrc` and an empty `.zshenv`. Spawn zsh interactively
+            // with `ZDOTDIR=<wrapper>` so it sources OUR `.zshrc`
+            // instead of the user's. Our `.zshrc` immediately unsets
+            // ZDOTDIR (so user code never sees the mutation) and
+            // manually sources `~/.zshenv` and the user's real
+            // `$ZDOTDIR/.zshrc` in the order vanilla zsh would have.
+            //
+            // We chose ZDOTDIR over the "PTY-write hidden bootstrap"
+            // mechanism originally drafted in spec/03 because zsh's
+            // Zsh Line Editor (ZLE) intercepts PTY-stdin bytes as
+            // keystrokes once the shell is interactive, so a
+            // multi-line bootstrap written to the PTY ends up
+            // character-shuffled through line editing instead of
+            // executed as commands.
+            let wrapper = new_wrapper_dir("zsh-wrapper-")?;
+            write_atomic(&wrapper.path().join(".zshrc"), ZSH_BOOTSTRAP)?;
+            // Empty `.zshenv` so zsh's initial `$ZDOTDIR/.zshenv`
+            // lookup succeeds without falling through to a missing
+            // file — we source the user's `$HOME/.zshenv` ourselves
+            // inside `.zshrc`, in the right order, after unsetting
+            // ZDOTDIR.
+            write_atomic(&wrapper.path().join(".zshenv"), "")?;
+            let wrapper_str = wrapper.path().to_str().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 wrapper path")
+            })?;
+            env.push(("ZDOTDIR".into(), wrapper_str.to_string()));
+            Ok(ManagedSpawn {
+                argv: vec!["zsh".into(), "-i".into()],
+                pty_bootstrap: None,
+                env,
+                wrapper_dir: Some(wrapper),
+            })
+        }
+        ShellSpec::Bash => {
+            let wrapper = new_wrapper_dir("bash-wrapper-")?;
+            let wrapper_path = wrapper.path().join("bash-bootstrap.bash");
+            write_atomic(&wrapper_path, BASH_BOOTSTRAP)?;
+            write_atomic(&wrapper.path().join("bash-preexec.sh"), BASH_PREEXEC)?;
+            let wrapper_str = wrapper_path
+                .to_str()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 wrapper path"))?
+                .to_string();
+            // NOTE: we deliberately do NOT pass `--norc`. On bash 3.2
+            // (the version Apple ships with macOS), `--norc` overrides
+            // `--rcfile` — bash honors --norc, skips our wrapper, and
+            // the bootstrap never runs. Without --norc, bash reads
+            // our --rcfile instead of `~/.bashrc` (which is what
+            // --rcfile is documented to do); the wrapper itself
+            // sources the user's real `~/.bashrc` from inside, so the
+            // user's config still runs in the right order.
+            Ok(ManagedSpawn {
+                argv: vec![
+                    "bash".into(),
+                    "--noprofile".into(),
+                    "--rcfile".into(),
+                    wrapper_str,
+                    "-i".into(),
+                ],
+                pty_bootstrap: None,
+                env,
+                wrapper_dir: Some(wrapper),
+            })
+        }
+        ShellSpec::Fish => Ok(ManagedSpawn {
+            argv: vec![
+                "fish".into(),
+                "--no-config".into(),
+                "--init-command".into(),
+                FISH_BOOTSTRAP.to_string(),
+                "-i".into(),
+            ],
+            pty_bootstrap: None,
+            env,
+            wrapper_dir: None,
+        }),
+    }
 }
 
-/// Internal worker: writes the four override files into `target`,
-/// sourcing the matching files in `home`. Idempotent — running
-/// twice with the same inputs produces the same contents.
-///
-/// Public so unit tests can call it against a tmpdir without
-/// touching the real `$HOME` or `$XDG_DATA_HOME`.
-pub fn write_zdotdir_files(home: &Path, target: &Path) -> io::Result<()> {
-    fs::create_dir_all(target)?;
-
-    write_pass_through(home, target, ".zshenv", None)?;
-    write_pass_through(home, target, ".zshrc", Some(ZSH_OSC7_SNIPPET))?;
-    write_pass_through(home, target, ".zlogin", None)?;
-    write_pass_through(home, target, ".zlogout", None)?;
-
-    Ok(())
+/// Create a per-spawn temp directory under `$TMPDIR` (macOS) /
+/// `/tmp` (Linux). The prefix names the shell so debugging is
+/// easier; tempfile appends a random suffix.
+fn new_wrapper_dir(prefix: &str) -> io::Result<TempDir> {
+    tempfile::Builder::new().prefix(prefix).tempdir()
 }
 
-/// Write one pass-through file. If `append_snippet` is `Some`, the
-/// snippet is appended after the user-source line.
-fn write_pass_through(
-    home: &Path,
-    target: &Path,
-    name: &str,
-    append_snippet: Option<&str>,
-) -> io::Result<()> {
-    let user_path = home.join(name);
-    let mut body = String::new();
-    body.push_str("# Auto-generated by Termica's shell integration.\n");
-    body.push_str("# Do not edit by hand; opt out with TERMICA_NO_SHELL_INTEGRATION=1.\n");
-    body.push_str("# This file lives under Termica's data directory and is rewritten on every shell spawn.\n\n");
-    body.push_str(&format!(
-        "if [[ -f {q} ]]; then\n    source {q}\nfi\n",
-        q = single_quote_zsh(&user_path.to_string_lossy())
+/// Fallback spawn when `TERMICA_NO_SHELL_INTEGRATION=1` is set.
+/// Launches the user's shell with normal rc processing; no bootstrap.
+/// The pane will stay in `Bootstrapping` until the timeout, then
+/// transition to `Degraded`.
+fn unmanaged_spawn(shell: ShellSpec, session_id: &str) -> ManagedSpawn {
+    let argv = match shell {
+        ShellSpec::Zsh => vec!["zsh".into(), "-i".into()],
+        ShellSpec::Bash => vec!["bash".into(), "-i".into()],
+        ShellSpec::Fish => vec!["fish".into(), "-i".into()],
+    };
+    ManagedSpawn {
+        argv,
+        pty_bootstrap: None,
+        env: common_env(shell, session_id),
+        wrapper_dir: None,
+    }
+}
+
+fn common_env(shell: ShellSpec, session_id: &str) -> Vec<(String, String)> {
+    vec![
+        ("TERM_PROGRAM".into(), "Termica".into()),
+        ("TERMICA_SESSION_ID".into(), session_id.into()),
+        ("TERMICA_INTEGRATION_VERSION".into(), INTEGRATION_VERSION.to_string()),
+        ("TERMICA_SHELL_INTEGRATION".into(), "1".into()),
+        ("TERMICA_SHELL".into(), shell.name().into()),
+    ]
+}
+
+/// Atomically write `content` to `path`. Writes to a sibling temp
+/// file then renames, so a crash mid-write never leaves a torn file
+/// in place.
+fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "path must have a parent directory")
+    })?;
+    let tmp = parent.join(format!(
+        ".{}.tmp",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("termica-tmp")
     ));
-    if let Some(snippet) = append_snippet {
-        body.push('\n');
-        body.push_str(snippet);
-        if !snippet.ends_with('\n') {
-            body.push('\n');
-        }
-    }
-    fs::write(target.join(name), body)?;
-    Ok(())
+    fs::write(&tmp, content)?;
+    fs::rename(&tmp, path)
 }
 
-/// Quote a string for safe use inside a zsh single-quoted literal.
-/// Single quote → close, backslash-quote, reopen.
-fn single_quote_zsh(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for ch in s.chars() {
-        if ch == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
+/// Generate a fresh session ID. UUIDv4 in canonical hyphenated form.
+pub fn new_session_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests for the file-materialisation logic. The actual
-    //! "zsh sees the hook" round-trip is covered by an integration
-    //! test in `tests/zsh_integration.rs` that spawns a real zsh.
-
     use super::*;
 
-    fn tmpdir() -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        // Per-test nonce: process id + monotonic counter via a small
-        // atomic so concurrent tests don't collide.
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        p.push(format!("termica-test-integration-{}-{}", std::process::id(), n));
-        let _ = fs::remove_dir_all(&p);
-        fs::create_dir_all(&p).expect("create tmp dir");
-        p
+    #[test]
+    fn shell_spec_from_shell_path_handles_bash() {
+        assert_eq!(ShellSpec::from_shell_path("/bin/bash"), ShellSpec::Bash);
+        assert_eq!(ShellSpec::from_shell_path("/usr/local/bin/bash"), ShellSpec::Bash);
     }
 
     #[test]
-    fn write_zdotdir_creates_all_four_files() {
-        let root = tmpdir();
-        let home = root.join("home");
-        let target = root.join("zdot");
-        fs::create_dir_all(&home).unwrap();
-
-        write_zdotdir_files(&home, &target).expect("write");
-
-        assert!(target.join(".zshenv").exists());
-        assert!(target.join(".zshrc").exists());
-        assert!(target.join(".zlogin").exists());
-        assert!(target.join(".zlogout").exists());
+    fn shell_spec_from_shell_path_handles_zsh() {
+        assert_eq!(ShellSpec::from_shell_path("/bin/zsh"), ShellSpec::Zsh);
+        assert_eq!(ShellSpec::from_shell_path("zsh"), ShellSpec::Zsh);
     }
 
     #[test]
-    fn zshrc_sources_user_file_and_includes_osc7_snippet() {
-        let root = tmpdir();
-        let home = root.join("home");
-        let target = root.join("zdot");
-        fs::create_dir_all(&home).unwrap();
-
-        write_zdotdir_files(&home, &target).expect("write");
-
-        let zshrc = fs::read_to_string(target.join(".zshrc")).expect("read .zshrc");
-        // Sources the user's file (which may or may not exist; the
-        // `[[ -f ... ]]` guard handles missing).
-        let expected_source =
-            format!("source {q}", q = single_quote_zsh(&home.join(".zshrc").to_string_lossy()));
-        assert!(
-            zshrc.contains(&expected_source),
-            ".zshrc should source the user's file; got:\n{zshrc}"
-        );
-        // And contains a marker from our snippet — we won't pin the
-        // whole snippet text but `__termica_emit_osc7` is uniquely ours.
-        assert!(
-            zshrc.contains("__termica_emit_osc7"),
-            ".zshrc should embed the OSC 7 hook; got:\n{zshrc}"
-        );
+    fn shell_spec_from_shell_path_handles_fish() {
+        assert_eq!(ShellSpec::from_shell_path("/opt/homebrew/bin/fish"), ShellSpec::Fish);
     }
 
     #[test]
-    fn zshenv_sources_user_file_but_skips_osc7_snippet() {
-        // OSC 7 belongs in .zshrc (interactive shells); .zshenv runs
-        // for every zsh invocation including non-interactive scripts
-        // and would spam them with escape sequences.
-        let root = tmpdir();
-        let home = root.join("home");
-        let target = root.join("zdot");
-        fs::create_dir_all(&home).unwrap();
-
-        write_zdotdir_files(&home, &target).expect("write");
-
-        let zshenv = fs::read_to_string(target.join(".zshenv")).expect("read .zshenv");
-        assert!(zshenv.contains("source"));
-        assert!(
-            !zshenv.contains("__termica_emit_osc7"),
-            ".zshenv must NOT contain the OSC 7 hook; got:\n{zshenv}"
-        );
+    fn shell_spec_from_shell_path_defaults_to_zsh_for_unknown() {
+        assert_eq!(ShellSpec::from_shell_path("/bin/ksh"), ShellSpec::Zsh);
+        assert_eq!(ShellSpec::from_shell_path(""), ShellSpec::Zsh);
     }
 
     #[test]
-    fn write_zdotdir_is_idempotent() {
-        let root = tmpdir();
-        let home = root.join("home");
-        let target = root.join("zdot");
-        fs::create_dir_all(&home).unwrap();
-
-        write_zdotdir_files(&home, &target).expect("write 1");
-        let first = fs::read_to_string(target.join(".zshrc")).expect("read 1");
-        write_zdotdir_files(&home, &target).expect("write 2");
-        let second = fs::read_to_string(target.join(".zshrc")).expect("read 2");
-        assert_eq!(first, second, "two writes should produce identical content");
+    fn managed_spawn_zsh_uses_zdotdir_wrapper() {
+        let spec = managed_spawn_for_inner(ShellSpec::Zsh, "session-id", false).expect("spawn");
+        assert_eq!(spec.argv, vec!["zsh".to_string(), "-i".into()]);
+        // ZDOTDIR redirect; no PTY-write needed.
+        assert!(spec.pty_bootstrap.is_none());
+        let env_keys: Vec<&str> = spec.env.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(env_keys.contains(&"TERMICA_SESSION_ID"));
+        assert!(env_keys.contains(&"TERM_PROGRAM"));
+        assert!(env_keys.contains(&"ZDOTDIR"));
+        // The wrapper file should have been materialised on disk.
+        let zdotdir = spec
+            .env
+            .iter()
+            .find(|(k, _)| k == "ZDOTDIR")
+            .map(|(_, v)| v.clone())
+            .expect("ZDOTDIR set");
+        let zshrc = std::path::PathBuf::from(&zdotdir).join(".zshrc");
+        assert!(zshrc.exists(), ".zshrc should exist under {zdotdir}");
+        let body = std::fs::read_to_string(&zshrc).expect("read .zshrc");
+        assert!(body.contains("termica_emit_raw"), ".zshrc should be Termica's bootstrap");
     }
 
     #[test]
-    fn single_quote_zsh_handles_apostrophes() {
-        // The classic problem: a path with a single quote in it.
-        // Our quoting must produce a string that zsh re-reads as the
-        // exact original.
-        let q = single_quote_zsh("/Users/it's/code");
-        assert_eq!(q, "'/Users/it'\\''s/code'");
+    fn managed_spawn_fish_carries_init_command() {
+        let spec = managed_spawn_for_inner(ShellSpec::Fish, "x", false).expect("spawn");
+        assert_eq!(spec.argv[0], "fish");
+        assert!(spec.argv.iter().any(|a| a == "--no-config"));
+        assert!(spec.argv.iter().any(|a| a == "--init-command"));
+        assert!(spec.pty_bootstrap.is_none());
+        // The bootstrap is shipped inline as one argv slot.
+        assert!(spec.argv.iter().any(|a| a.contains("termica_emit_raw")));
+    }
+
+    #[test]
+    fn opt_out_uses_unmanaged_spawn() {
+        let spec = managed_spawn_for_inner(ShellSpec::Zsh, "x", true).expect("spawn");
+        assert_eq!(spec.argv, vec!["zsh", "-i"]);
+        assert!(spec.pty_bootstrap.is_none());
+    }
+
+    #[test]
+    fn unmanaged_spawn_still_sets_termica_env() {
+        // Even when integration is opted out we want children to know
+        // they're running inside Termica (status header, status indicators).
+        let spec = managed_spawn_for_inner(ShellSpec::Bash, "x", true).expect("spawn");
+        let env_keys: Vec<&str> = spec.env.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(env_keys.contains(&"TERM_PROGRAM"));
+        assert!(env_keys.contains(&"TERMICA_SESSION_ID"));
+    }
+
+    #[test]
+    fn new_session_id_returns_uuid_shape() {
+        let id = new_session_id();
+        // 8-4-4-4-12 hex with hyphens = 36 chars.
+        assert_eq!(id.len(), 36);
+        assert_eq!(id.chars().filter(|&c| c == '-').count(), 4);
     }
 }

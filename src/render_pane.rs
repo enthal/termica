@@ -105,6 +105,45 @@ pub fn render_pane(
     let view = slot.session.view();
     central_panel(ui, &view);
 
+    // ---- bootstrap suppression ----------------------------------
+    //
+    // While the pane is in `Bootstrapping` (spec/05), the integration
+    // script is running inside the shell. Its output is parsed (so
+    // the DCS-JSON lifecycle messages are observed) but NOT rendered:
+    // it's noise the user doesn't need to see. Input is dropped too;
+    // `PaneSession::write` enforces that side independently.
+    //
+    // We still resize the PTY so that when bootstrap completes the
+    // shell already has the right dimensions for the first prompt.
+    if view.is_bootstrapping {
+        let avail = ui.available_size();
+        let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
+        let (cell_w, row_h) =
+            ui.fonts_mut(|f| (f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
+        let (rows, cols) = cells_from_pixels(avail, cell_w, row_h);
+        if slot.ui.last_size != Some((rows, cols)) {
+            let _ = slot.session.resize(rows, cols);
+            slot.ui.last_size = Some((rows, cols));
+        }
+        ui.allocate_ui(avail, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(avail.y / 3.0);
+                ui.label(
+                    egui::RichText::new("Starting shell…")
+                        .size(14.0)
+                        .color(egui::Color32::from_gray(140)),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("(Termica is loading shell integration.)")
+                        .size(11.0)
+                        .color(egui::Color32::from_gray(100)),
+                );
+            });
+        });
+        return;
+    }
+
     // ---- resize PTY to fit available space ----------------------
     let avail = ui.available_size();
     let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);

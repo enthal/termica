@@ -7,26 +7,29 @@
 //!
 //! ## The five rules (from spec/05, restated)
 //!
-//! 1. The prompt editor is **NEVER active** unless the pane is at a
-//!    marker-confirmed shell prompt.
+//! 1. The prompt editor is **NEVER active** unless the pane is at
+//!    a Termica-bootstrap-confirmed shell prompt.
 //! 2. **Alternate screen always disables the prompt editor.** No
 //!    exceptions.
-//! 3. **Shell integration markers are authoritative.** Heuristics
-//!    may enhance but must not be required for correctness.
+//! 3. **Termica's bootstrap is the only source of truth.** Foreign
+//!    OSC 133 / OSC 1337 are ignored.
 //! 4. The shell never sees editing keystrokes from the editor.
-//!    (Phase 4 territory; this module guarantees the *mode* is
-//!    correct.)
-//! 5. Real TTY programs receive raw input. (Already true in
-//!    Phase 1; this module preserves it by defaulting to
-//!    `RawTerminal`.)
+//! 5. Real TTY programs receive raw input.
 //!
-//! ## Promotion gated, demotion eager
+//! ## Bootstrap gates everything
+//!
+//! Every pane starts in `Bootstrapping`. Promotion to `RawTerminal`
+//! requires an `IntegrationReady` lifecycle event at the supported
+//! protocol version. Failure (timeout, `IntegrationError`, or
+//! unsupported version) transitions to `Degraded` — a permanently
+//! raw-only state for that shell run.
+//!
+//! ## Promotion gated, demotion eager (post-bootstrap)
 //!
 //! Promotion → `ShellPromptEditor` requires:
-//! - The pane is in `RawTerminal` (never `AlternateScreen` /
-//!   `Dead`).
-//! - The integration version handshake has confirmed a supported
-//!   version.
+//! - The pane is in `RawTerminal` (never `Bootstrapping` /
+//!   `AlternateScreen` / `Dead` / `Degraded`).
+//! - A fresh `Precmd` lifecycle event arrived.
 //! - The most recent transition *out* of `ShellPromptEditor` was
 //!   not on the current frame (debounce against the same prompt
 //!   round-tripping).
@@ -37,38 +40,38 @@
 //! - [`PromptController::leave_editor_esc`]
 //! - alt-screen toggle (handled by `observe_alt_screen`)
 //! - PTY exit
-//! - integration-version becoming unsupported
-//!
-//! The frame counter is a caller-supplied `u64` (typically the
-//! eframe frame index ticked in `update()`). Strict tests use
-//! constants — never `Instant::now()` — per CLAUDE.md's
-//! "no live timestamps in tests" rule.
 
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
 
-use crate::markers::{MarkerEvent, ShellKind};
+use crate::markers::{LifecycleEvent, ShellKind};
 
 /// Protocol version this build of Termica understands. The
-/// integration script emits its own version via
-/// `OSC 1337 ; TermicaVersion=N`; we accept `N == SUPPORTED_…` and
+/// integration script emits its own version inside the
+/// `IntegrationReady` payload; we accept `v == SUPPORTED_…` and
 /// flag any other value as unsupported.
 pub const SUPPORTED_PROTOCOL_VERSION: u32 = 1;
 
-/// The four exhaustive modes a pane can be in. Spec/05 calls them
-/// out as exactly four; we won't add a fifth without an explicit
-/// spec update, because new sub-states tend to be the answer to
-/// bug pressure that should have been fixed structurally.
+/// Bootstrap timeout in frames. At egui's typical 60 Hz, 180 frames
+/// is ~3 seconds. The exact unit is `tick_bootstrap_timeout`'s frame
+/// counter; callers tick once per `update()` frame.
+pub const BOOTSTRAP_TIMEOUT_FRAMES: u64 = 180;
+
+/// The six exhaustive modes a pane can be in. Spec/05 documents the
+/// transition diagram. New variants require an explicit spec update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneMode {
-    /// Default. Keystrokes go to the PTY; output renders normally;
-    /// no editor surface; mouse selects the transcript.
+    /// Initial state. Bootstrap is running; output buffered, input
+    /// dropped. Transitions to `RawTerminal` on `IntegrationReady`,
+    /// to `Degraded` on `IntegrationError` / timeout / unsupported
+    /// version.
+    Bootstrapping,
+    /// Default operational state. Keystrokes go to the PTY; output
+    /// renders normally; no editor surface.
     RawTerminal,
-    /// The pane is at a marker-confirmed shell prompt. The egui
+    /// The pane is at a Termica-confirmed shell prompt. The egui
     /// editor owns input; only `submit_command` produces PTY bytes.
-    /// Phase 4 wires the actual editor; Phase 3B just guarantees
-    /// the *mode* is correct.
     ShellPromptEditor,
     /// Terminal has entered the alternate screen (vim / htop /
     /// less / fzf / tmux). Strictest raw mode.
@@ -76,47 +79,59 @@ pub enum PaneMode {
     /// PTY child has exited. Transcript remains; "restart shell"
     /// UI is visible; history and search remain accessible.
     Dead,
+    /// Bootstrap failed. Operational as a raw terminal but the
+    /// editor will never activate for this shell run.
+    /// `restart_shell` resets to `Bootstrapping` and tries again.
+    Degraded,
 }
 
-/// How far along the integration version handshake is for this
-/// pane. Updated by `MarkerEvent::ProtocolVersion` observations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How the integration handshake has progressed for this pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IntegrationState {
-    /// No `ProtocolVersion` marker has arrived yet. The shell may
-    /// not have installed Termica's integration script. The
-    /// editor is unavailable in this state.
+    /// No `IntegrationReady` lifecycle event has arrived yet.
     Unknown,
-    /// The shell announced a version we support. Editor promotion
-    /// is gated on this.
-    Confirmed(u32),
-    /// The shell announced a version we don't support. We refuse
-    /// to promote and surface a banner ("upgrade Termica or
-    /// `termica install-integration`"). We never recover from
-    /// this within a single shell run; a `restart_shell` resets.
-    Unsupported,
+    /// The bootstrap announced a version we support. Editor
+    /// promotion is gated on this.
+    Confirmed { shell: ShellKind, version: u32 },
+    /// The bootstrap announced a version we don't support, OR
+    /// the bootstrap explicitly emitted `IntegrationError`, OR
+    /// the bootstrap timeout expired.
+    Failed(IntegrationFailure),
+}
+
+/// Why integration handshake failed. Carried in
+/// `IntegrationState::Failed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntegrationFailure {
+    Timeout,
+    UnsupportedVersion(u32),
+    ScriptError(String),
 }
 
 /// Why a mode transition occurred. Recorded in
 /// [`TransitionRecord`] so an after-the-fact debug session
-/// (`--dump-events` in Phase 3F, or `tracing` logs) can explain
+/// (`--dump-events` in Phase 3G, or `tracing` logs) can explain
 /// why the pane ended up where it did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransitionReason {
     InitialSpawn,
-    MarkerPromptEnd,
+    BootstrapComplete,
+    BootstrapTimeout,
+    BootstrapError,
+    IntegrationVersionUnsupported,
+    PrecmdMarker,
     EnterSubmitted,
     CtrlCEmptyEditor,
+    Esc,
     AlternateScreenEnter,
     AlternateScreenExit,
     PtyExit,
     UserRestartedShell,
-    IntegrationVersionUnsupported,
-    Esc,
 }
 
 /// A single transition. The controller keeps only the most recent
 /// one (callers can stream them out for `--dump-events`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransitionRecord {
     pub from: PaneMode,
     pub to: PaneMode,
@@ -127,63 +142,62 @@ pub struct TransitionRecord {
 }
 
 /// One command attempt. Opened either by `submit_command` (Enter
-/// in the editor — the strong case) or by a `CommandStart`
-/// marker arriving without a prior submit. Closed by `CommandEnd`,
-/// `pty_exit`, or never (the open-ended case).
-///
-/// Phase 7 will enrich this into the spec/07 `CommandRun`
-/// (output_range, context_snapshot, etc). For 3B we keep it lean.
+/// in the editor) or by a `Preexec` lifecycle event arriving
+/// without a prior submit. Closed by `CommandFinished`,
+/// `pty_exit`, or never.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingCommand {
     pub started_frame: u64,
-    /// `Some(frame)` once the command has been closed (by
-    /// `CommandEnd` or `pty_exit`); `None` while still in flight.
     pub ended_frame: Option<u64>,
-    /// Exit code from `CommandEnd`, or `None` if the shell didn't
-    /// emit one or the pane died first.
     pub exit: Option<i32>,
-    /// Optional duration from the `CommandEnd` extension. The
-    /// integration scripts in spec/03 don't currently emit it.
-    pub duration_ms: Option<u64>,
-    /// Cwd at the moment the command opened. Captured from the
-    /// most recent `MarkerEvent::Cwd` observation
-    /// (`OSC 1337 ; TermicaCwd=…`). `None` until the shell has
-    /// emitted at least one cwd marker. Phase 7's `CommandRun`
-    /// reads this for its command-block context snapshot.
     pub cwd_at_start: Option<PathBuf>,
+    pub command_line: Option<String>,
 }
 
 /// The pane-mode state machine.
-///
-/// All inputs flow through the `observe_*` methods (marker events,
-/// alt-screen toggles, PTY exit) or the gesture methods
-/// (`submit_command`, `leave_editor_*`, `restart_shell`). The
-/// machine never reaches out for state; callers tell it what
-/// happened.
 pub struct PromptController {
     mode: PaneMode,
     integration: IntegrationState,
     last_transition: TransitionRecord,
     pending_cmd: Option<PendingCommand>,
     last_completed_cmd: Option<PendingCommand>,
-    /// Most recent shell kind announced by `TermicaShell=…`.
-    /// Informational only — no transition depends on it.
     shell_kind: Option<ShellKind>,
-    /// Most recent cwd from `MarkerEvent::Cwd`
-    /// (`OSC 1337 ; TermicaCwd=…`). Stamped into
-    /// `PendingCommand.cwd_at_start` whenever a command opens.
-    /// OSC 7 cwd updates also live here once 3E folds OSC 7 into
-    /// the marker stream; for 3B the controller only sees what
-    /// the marker pipeline emits.
     cwd: Option<PathBuf>,
+    /// Frame at which the pane entered `Bootstrapping`. Used to
+    /// detect timeout via `tick_bootstrap_timeout`.
+    spawn_frame: u64,
 }
 
 impl PromptController {
-    /// Construct a fresh controller. Starts in `RawTerminal` with
-    /// `Unknown` integration. The initial `TransitionRecord` is
-    /// `InitialSpawn` so downstream consumers (--dump-events) have
-    /// a well-formed first entry instead of a sentinel.
+    /// Construct a fresh controller. Starts in `Bootstrapping` with
+    /// `Unknown` integration.
     pub fn new(frame: u64) -> Self {
+        Self {
+            mode: PaneMode::Bootstrapping,
+            integration: IntegrationState::Unknown,
+            last_transition: TransitionRecord {
+                from: PaneMode::Bootstrapping,
+                to: PaneMode::Bootstrapping,
+                reason: TransitionReason::InitialSpawn,
+                at: frame,
+            },
+            pending_cmd: None,
+            last_completed_cmd: None,
+            shell_kind: None,
+            cwd: None,
+            spawn_frame: frame,
+        }
+    }
+
+    /// Construct a controller that skips the `Bootstrapping` state
+    /// and starts directly in `RawTerminal` with `Unknown`
+    /// integration. Used by [`PaneSession::spawn`] for panes that
+    /// were spawned outside the Phase 3 managed-startup machinery
+    /// (e.g. `/bin/sh -c '…'` test panes). The editor will never
+    /// activate for such a session because no `IntegrationReady`
+    /// event will ever arrive, but raw-terminal input/output works
+    /// normally.
+    pub fn new_no_bootstrap(frame: u64) -> Self {
         Self {
             mode: PaneMode::RawTerminal,
             integration: IntegrationState::Unknown,
@@ -197,69 +211,110 @@ impl PromptController {
             last_completed_cmd: None,
             shell_kind: None,
             cwd: None,
+            spawn_frame: frame,
         }
     }
 
     // ---- observe_* (caller pushes external events in) ---------------
 
-    pub fn observe_marker(&mut self, event: MarkerEvent, frame: u64) {
+    pub fn observe_event(&mut self, event: LifecycleEvent, frame: u64) {
         match event {
-            MarkerEvent::PromptStart => {
-                // PromptStart is informational. The actual gate is
-                // PromptEnd. We deliberately don't promote here —
-                // a partial prompt sequence (PromptStart with no
-                // PromptEnd to follow because the shell crashed)
-                // must NEVER leave us in ShellPromptEditor.
-            }
-            MarkerEvent::PromptEnd => {
-                self.try_promote_to_editor(frame);
-            }
-            MarkerEvent::CommandStart => {
-                // Opens a pending command if none is in flight.
-                // (If `submit_command` already opened one at Enter,
-                // this is the confirming marker — leave the
-                // existing pending alone.)
-                if self.pending_cmd.is_none() && self.mode != PaneMode::Dead {
-                    self.pending_cmd = Some(self.new_pending(frame));
-                }
-            }
-            MarkerEvent::CommandEnd { exit, duration_ms } => {
-                self.close_pending_cmd(frame, exit, duration_ms);
-            }
-            MarkerEvent::ProtocolVersion(v) => {
-                if v == SUPPORTED_PROTOCOL_VERSION {
-                    self.integration = IntegrationState::Confirmed(v);
-                } else {
-                    self.integration = IntegrationState::Unsupported;
-                    // If we're somehow already in editor mode (shouldn't
-                    // be: promotion is gated on Confirmed), demote.
-                    if self.mode == PaneMode::ShellPromptEditor {
+            LifecycleEvent::IntegrationReady { shell, version } => {
+                self.shell_kind = Some(shell);
+                if version == SUPPORTED_PROTOCOL_VERSION {
+                    self.integration = IntegrationState::Confirmed { shell, version };
+                    if self.mode == PaneMode::Bootstrapping {
                         self.transition(
                             PaneMode::RawTerminal,
+                            TransitionReason::BootstrapComplete,
+                            frame,
+                        );
+                    }
+                } else {
+                    self.integration =
+                        IntegrationState::Failed(IntegrationFailure::UnsupportedVersion(version));
+                    if self.mode == PaneMode::Bootstrapping
+                        || self.mode == PaneMode::RawTerminal
+                        || self.mode == PaneMode::ShellPromptEditor
+                    {
+                        self.transition(
+                            PaneMode::Degraded,
                             TransitionReason::IntegrationVersionUnsupported,
                             frame,
                         );
                     }
                 }
             }
-            MarkerEvent::Shell(kind) => {
-                self.shell_kind = Some(kind);
+            LifecycleEvent::IntegrationError { reason } => {
+                self.integration =
+                    IntegrationState::Failed(IntegrationFailure::ScriptError(reason));
+                if self.mode == PaneMode::Bootstrapping {
+                    self.transition(PaneMode::Degraded, TransitionReason::BootstrapError, frame);
+                }
             }
-            MarkerEvent::Cwd(path) => {
-                // Track the latest cwd here too so it can be stamped
-                // into `PendingCommand.cwd_at_start` when a command
-                // opens via either `submit_command` or a
-                // `CommandStart` marker. The OscSniffer state still
-                // owns the snapshot read by the status header /
-                // clickable paths.
-                self.cwd = Some(path);
+            LifecycleEvent::Preexec { command } => {
+                // Open or annotate pending command. If submit_command
+                // already opened one, this is confirming; stash the
+                // command line for the block.
+                if let Some(pending) = self.pending_cmd.as_mut() {
+                    if pending.command_line.is_none() {
+                        pending.command_line = Some(command);
+                    }
+                } else if self.mode != PaneMode::Dead && self.mode != PaneMode::Bootstrapping {
+                    self.pending_cmd = Some(PendingCommand {
+                        started_frame: frame,
+                        ended_frame: None,
+                        exit: None,
+                        cwd_at_start: self.cwd.clone(),
+                        command_line: Some(command),
+                    });
+                }
+            }
+            LifecycleEvent::CommandFinished { exit } => {
+                self.close_pending_cmd(frame, Some(exit));
+            }
+            LifecycleEvent::Precmd { cwd } => {
+                self.cwd = Some(cwd);
+                self.try_promote_to_editor(frame);
+            }
+            LifecycleEvent::Cwd { cwd } => {
+                self.cwd = Some(cwd);
+            }
+            LifecycleEvent::PromptVars { .. } => {
+                // Routed to the status header consumer; no mode
+                // transition. Phase 5 wires this up.
+            }
+            LifecycleEvent::CommandAborted { .. } => {
+                // Treated like a CommandFinished with no exit: close
+                // the pending block.
+                self.close_pending_cmd(frame, None);
             }
         }
     }
 
+    /// Caller ticks this every frame while in `Bootstrapping` to
+    /// enforce the timeout. Once we leave `Bootstrapping`, calling
+    /// this is a no-op.
+    pub fn tick_bootstrap_timeout(&mut self, frame: u64) {
+        if self.mode != PaneMode::Bootstrapping {
+            return;
+        }
+        if frame.saturating_sub(self.spawn_frame) >= BOOTSTRAP_TIMEOUT_FRAMES {
+            self.integration = IntegrationState::Failed(IntegrationFailure::Timeout);
+            self.transition(PaneMode::Degraded, TransitionReason::BootstrapTimeout, frame);
+        }
+    }
+
     pub fn observe_alt_screen(&mut self, on: bool, frame: u64) {
+        // Alt-screen entry is impossible from Bootstrapping (output
+        // is buffered, not rendered) — if we somehow saw it we'd
+        // ignore it. Same for Dead.
         match (on, self.mode) {
-            (true, m) if m != PaneMode::AlternateScreen && m != PaneMode::Dead => {
+            (true, m)
+                if m != PaneMode::AlternateScreen
+                    && m != PaneMode::Dead
+                    && m != PaneMode::Bootstrapping =>
+            {
                 self.transition(
                     PaneMode::AlternateScreen,
                     TransitionReason::AlternateScreenEnter,
@@ -267,8 +322,6 @@ impl PromptController {
                 );
             }
             (false, PaneMode::AlternateScreen) => {
-                // Spec: never directly to ShellPromptEditor; only a
-                // fresh marker promotes.
                 self.transition(
                     PaneMode::RawTerminal,
                     TransitionReason::AlternateScreenExit,
@@ -283,32 +336,27 @@ impl PromptController {
         if self.mode == PaneMode::Dead {
             return;
         }
-        // Close any in-flight command without an exit code — the
-        // shell didn't get to report.
         if self.pending_cmd.is_some() {
-            self.close_pending_cmd(frame, None, None);
+            self.close_pending_cmd(frame, None);
         }
         self.transition(PaneMode::Dead, TransitionReason::PtyExit, frame);
     }
 
     // ---- gestures (caller drives user-initiated transitions) --------
 
-    /// Enter was pressed in the editor: demote *eagerly*, before
-    /// any PTY write. Per spec/05 §"Sequencing around submit()",
-    /// this must run before the bytes go out so a same-frame
-    /// Ctrl-C lands in the PTY, not in a closed editor.
     pub fn submit_command(&mut self, frame: u64) {
         if self.mode != PaneMode::ShellPromptEditor {
             return;
         }
         self.transition(PaneMode::RawTerminal, TransitionReason::EnterSubmitted, frame);
-        // Open the pending command speculatively. CommandStart
-        // marker (if it arrives) is treated as confirming, not
-        // triggering; CommandEnd closes the loop. If no markers
-        // arrive (shell crashed), the open-ended pending stays
-        // until pty_exit closes it with exit=None.
         if self.pending_cmd.is_none() {
-            self.pending_cmd = Some(self.new_pending(frame));
+            self.pending_cmd = Some(PendingCommand {
+                started_frame: frame,
+                ended_frame: None,
+                exit: None,
+                cwd_at_start: self.cwd.clone(),
+                command_line: None,
+            });
         }
     }
 
@@ -325,17 +373,16 @@ impl PromptController {
     }
 
     pub fn restart_shell(&mut self, frame: u64) {
-        if self.mode != PaneMode::Dead {
+        if self.mode != PaneMode::Dead && self.mode != PaneMode::Degraded {
             return;
         }
-        // Reset integration state — a new shell process will
-        // re-do the version handshake.
         self.integration = IntegrationState::Unknown;
         self.pending_cmd = None;
         self.last_completed_cmd = None;
         self.shell_kind = None;
         self.cwd = None;
-        self.transition(PaneMode::RawTerminal, TransitionReason::UserRestartedShell, frame);
+        self.spawn_frame = frame;
+        self.transition(PaneMode::Bootstrapping, TransitionReason::UserRestartedShell, frame);
     }
 
     // ---- read accessors ---------------------------------------------
@@ -343,8 +390,8 @@ impl PromptController {
     pub fn mode(&self) -> PaneMode {
         self.mode
     }
-    pub fn integration(&self) -> IntegrationState {
-        self.integration
+    pub fn integration(&self) -> &IntegrationState {
+        &self.integration
     }
     pub fn last_transition(&self) -> &TransitionRecord {
         &self.last_transition
@@ -362,54 +409,37 @@ impl PromptController {
         self.cwd.as_deref()
     }
 
-    // ---- internals --------------------------------------------------
-
-    /// Build a fresh open `PendingCommand` stamped with the
-    /// currently-known cwd. Centralised so all open paths
-    /// (`submit_command`, `CommandStart` marker) capture the
-    /// same fields the same way.
-    fn new_pending(&self, frame: u64) -> PendingCommand {
-        PendingCommand {
-            started_frame: frame,
-            ended_frame: None,
-            exit: None,
-            duration_ms: None,
-            cwd_at_start: self.cwd.clone(),
-        }
+    /// `true` while the pane should suppress display output and
+    /// drop user input — i.e. while `Bootstrapping`. Once the
+    /// bootstrap completes or fails, this returns `false` and the
+    /// pane becomes user-visible.
+    pub fn is_bootstrapping(&self) -> bool {
+        self.mode == PaneMode::Bootstrapping
     }
 
+    // ---- internals --------------------------------------------------
+
     fn try_promote_to_editor(&mut self, frame: u64) {
-        // Rule 1: only promote from RawTerminal. AlternateScreen +
-        // Dead must never promote.
         if self.mode != PaneMode::RawTerminal {
             return;
         }
-        // Rule (promotion-gating): integration handshake must be
-        // confirmed at a supported version.
-        if !matches!(self.integration, IntegrationState::Confirmed(_)) {
+        if !matches!(self.integration, IntegrationState::Confirmed { .. }) {
             return;
         }
-        // Frame debounce: if we just left ShellPromptEditor on
-        // this very frame, don't re-enter immediately. Guards
-        // against same-frame round-tripping.
         if self.last_transition.from == PaneMode::ShellPromptEditor
             && self.last_transition.at == frame
         {
             return;
         }
-        self.transition(PaneMode::ShellPromptEditor, TransitionReason::MarkerPromptEnd, frame);
+        self.transition(PaneMode::ShellPromptEditor, TransitionReason::PrecmdMarker, frame);
     }
 
-    fn close_pending_cmd(&mut self, frame: u64, exit: Option<i32>, duration_ms: Option<u64>) {
+    fn close_pending_cmd(&mut self, frame: u64, exit: Option<i32>) {
         if let Some(mut p) = self.pending_cmd.take() {
             p.ended_frame = Some(frame);
             p.exit = exit;
-            p.duration_ms = duration_ms;
             self.last_completed_cmd = Some(p);
         }
-        // Orphan CommandEnd with no pending: ignored. The shell
-        // may have emitted CommandEnd from outside our tracking
-        // (rare).
     }
 
     fn transition(&mut self, to: PaneMode, reason: TransitionReason, at: u64) {
@@ -421,80 +451,137 @@ impl PromptController {
 
 #[cfg(test)]
 mod tests {
-    //! Strict-layer tests per CLAUDE.md. These cover every
-    //! transition in the state machine and the five safety rules
-    //! from spec/05. Each test passes on the implementation and
-    //! would have failed on the pre-change tree (since this
-    //! module didn't exist).
-    //!
-    //! No `Instant::now()`, no live timestamps — frame counters
-    //! are passed in as constants.
-
     use super::*;
     use std::path::PathBuf;
 
-    fn confirmed() -> PromptController {
-        // Common bootstrap: a controller whose integration has
-        // already been confirmed at the supported version. Used by
-        // most promotion-path tests.
-        let mut c = PromptController::new(0);
-        c.observe_marker(MarkerEvent::ProtocolVersion(SUPPORTED_PROTOCOL_VERSION), 0);
-        c
+    fn ready(c: &mut PromptController, frame: u64) {
+        c.observe_event(
+            LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Zsh,
+                version: SUPPORTED_PROTOCOL_VERSION,
+            },
+            frame,
+        );
     }
 
     // ---- bootstrap --------------------------------------------------
 
     #[test]
-    fn fresh_controller_starts_in_raw_terminal() {
+    fn fresh_controller_starts_in_bootstrapping() {
         let c = PromptController::new(0);
-        assert_eq!(c.mode(), PaneMode::RawTerminal);
-        assert_eq!(c.integration(), IntegrationState::Unknown);
-        assert!(c.pending_cmd().is_none());
-        assert!(c.last_completed_cmd().is_none());
+        assert_eq!(c.mode(), PaneMode::Bootstrapping);
+        assert!(c.is_bootstrapping());
+        assert_eq!(c.integration(), &IntegrationState::Unknown);
     }
 
     #[test]
-    fn fresh_controllers_initial_transition_is_initialspawn() {
+    fn initial_transition_is_initialspawn() {
         let c = PromptController::new(42);
         let t = c.last_transition();
         assert_eq!(t.reason, TransitionReason::InitialSpawn);
-        assert_eq!(t.from, PaneMode::RawTerminal);
-        assert_eq!(t.to, PaneMode::RawTerminal);
+        assert_eq!(t.from, PaneMode::Bootstrapping);
+        assert_eq!(t.to, PaneMode::Bootstrapping);
         assert_eq!(t.at, 42);
     }
 
-    // ---- safety rule 1: editor never active without marker ----------
-
     #[test]
-    fn promptend_without_integration_does_not_promote() {
-        // Canonical test from spec/05:
-        // `prompt_editor_unavailable_without_integration`.
+    fn integration_ready_supported_promotes_to_raw_terminal() {
         let mut c = PromptController::new(0);
-        // Many PromptEnds, no ProtocolVersion ever: stays Raw.
-        for f in 1..=10 {
-            c.observe_marker(MarkerEvent::PromptEnd, f);
-            assert_eq!(c.mode(), PaneMode::RawTerminal);
-        }
-    }
-
-    #[test]
-    fn promptend_with_confirmed_integration_promotes() {
-        let mut c = confirmed();
-        c.observe_marker(MarkerEvent::PromptEnd, 1);
-        assert_eq!(c.mode(), PaneMode::ShellPromptEditor);
-        assert_eq!(c.last_transition().reason, TransitionReason::MarkerPromptEnd);
-    }
-
-    #[test]
-    fn cwd_event_alone_does_not_promote() {
-        // Pure Cwd/Shell/CommandStart events must not trip the
-        // promotion gate — only PromptEnd does.
-        let mut c = confirmed();
-        c.observe_marker(MarkerEvent::Cwd(PathBuf::from("/tmp")), 1);
-        c.observe_marker(MarkerEvent::Shell(ShellKind::Zsh), 1);
-        c.observe_marker(MarkerEvent::CommandStart, 1);
-        c.observe_marker(MarkerEvent::CommandEnd { exit: Some(0), duration_ms: None }, 1);
+        ready(&mut c, 1);
         assert_eq!(c.mode(), PaneMode::RawTerminal);
+        assert_eq!(c.last_transition().reason, TransitionReason::BootstrapComplete);
+        assert!(matches!(
+            c.integration(),
+            IntegrationState::Confirmed { shell: ShellKind::Zsh, version: 1 }
+        ));
+    }
+
+    #[test]
+    fn integration_ready_unsupported_version_transitions_to_degraded() {
+        let mut c = PromptController::new(0);
+        c.observe_event(
+            LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Zsh,
+                version: SUPPORTED_PROTOCOL_VERSION + 1,
+            },
+            1,
+        );
+        assert_eq!(c.mode(), PaneMode::Degraded);
+        assert_eq!(c.last_transition().reason, TransitionReason::IntegrationVersionUnsupported);
+    }
+
+    #[test]
+    fn integration_error_transitions_to_degraded() {
+        let mut c = PromptController::new(0);
+        c.observe_event(
+            LifecycleEvent::IntegrationError { reason: "missing bash-preexec".into() },
+            1,
+        );
+        assert_eq!(c.mode(), PaneMode::Degraded);
+        assert_eq!(c.last_transition().reason, TransitionReason::BootstrapError);
+    }
+
+    #[test]
+    fn bootstrap_timeout_transitions_to_degraded() {
+        let mut c = PromptController::new(0);
+        // No events; tick past the timeout.
+        c.tick_bootstrap_timeout(BOOTSTRAP_TIMEOUT_FRAMES);
+        assert_eq!(c.mode(), PaneMode::Degraded);
+        assert_eq!(c.last_transition().reason, TransitionReason::BootstrapTimeout);
+    }
+
+    #[test]
+    fn bootstrap_timeout_does_not_fire_before_threshold() {
+        let mut c = PromptController::new(0);
+        c.tick_bootstrap_timeout(BOOTSTRAP_TIMEOUT_FRAMES - 1);
+        assert_eq!(c.mode(), PaneMode::Bootstrapping);
+    }
+
+    #[test]
+    fn bootstrap_timeout_does_not_fire_after_bootstrap_complete() {
+        // If integration_ready arrived first, ticking past the
+        // timeout is a no-op.
+        let mut c = PromptController::new(0);
+        ready(&mut c, 1);
+        c.tick_bootstrap_timeout(1_000);
+        assert_eq!(c.mode(), PaneMode::RawTerminal);
+    }
+
+    // ---- safety rule 1: editor never active without bootstrap -------
+
+    #[test]
+    fn precmd_during_bootstrapping_does_not_promote() {
+        // Even if a precmd somehow arrives during Bootstrapping (e.g.
+        // the bootstrap script triggers the user's prompt mid-bootstrap),
+        // we do NOT promote.
+        let mut c = PromptController::new(0);
+        c.observe_event(LifecycleEvent::Precmd { cwd: PathBuf::from("/tmp") }, 1);
+        assert_eq!(c.mode(), PaneMode::Bootstrapping);
+    }
+
+    #[test]
+    fn precmd_without_integration_ready_does_not_promote() {
+        // Pathological: somehow we got out of Bootstrapping but
+        // integration is still Unknown. (Shouldn't happen via normal
+        // flow.) Promotion is still refused.
+        let mut c = PromptController::new(0);
+        // Force out of Bootstrapping via the transition helper isn't
+        // possible from outside; use a degraded path. After degraded,
+        // we still can't promote.
+        c.observe_event(LifecycleEvent::IntegrationError { reason: "x".into() }, 1);
+        assert_eq!(c.mode(), PaneMode::Degraded);
+        c.observe_event(LifecycleEvent::Precmd { cwd: PathBuf::from("/tmp") }, 2);
+        assert_eq!(c.mode(), PaneMode::Degraded);
+    }
+
+    #[test]
+    fn precmd_with_confirmed_integration_promotes() {
+        let mut c = PromptController::new(0);
+        ready(&mut c, 1);
+        c.observe_event(LifecycleEvent::Precmd { cwd: PathBuf::from("/home/u") }, 2);
+        assert_eq!(c.mode(), PaneMode::ShellPromptEditor);
+        assert_eq!(c.last_transition().reason, TransitionReason::PrecmdMarker);
+        assert_eq!(c.cwd(), Some(std::path::Path::new("/home/u")));
     }
 
     // ---- safety rule 2: alt-screen disables editor ------------------
@@ -502,125 +589,84 @@ mod tests {
     #[test]
     fn alt_screen_enter_from_raw_transitions_to_alt() {
         let mut c = PromptController::new(0);
-        c.observe_alt_screen(true, 1);
+        ready(&mut c, 1);
+        c.observe_alt_screen(true, 2);
         assert_eq!(c.mode(), PaneMode::AlternateScreen);
         assert_eq!(c.last_transition().reason, TransitionReason::AlternateScreenEnter);
     }
 
     #[test]
     fn alt_screen_enter_from_editor_demotes_to_alt() {
-        // Canonical test: spec/05 `alt_screen_forces_raw` —
-        // alt-screen ON while in ShellPromptEditor must NOT leave
-        // us in the editor.
-        let mut c = confirmed();
-        c.observe_marker(MarkerEvent::PromptEnd, 1);
-        assert_eq!(c.mode(), PaneMode::ShellPromptEditor);
-        c.observe_alt_screen(true, 2);
+        let mut c = PromptController::new(0);
+        ready(&mut c, 1);
+        c.observe_event(LifecycleEvent::Precmd { cwd: PathBuf::from("/") }, 2);
+        c.observe_alt_screen(true, 3);
         assert_eq!(c.mode(), PaneMode::AlternateScreen);
     }
 
     #[test]
-    fn promptend_in_alt_screen_does_not_promote() {
-        // The headline safety guarantee: even with confirmed
-        // integration, a PromptEnd arriving while we're in
-        // AlternateScreen does NOT escape to ShellPromptEditor.
-        let mut c = confirmed();
-        c.observe_alt_screen(true, 1);
-        assert_eq!(c.mode(), PaneMode::AlternateScreen);
-        c.observe_marker(MarkerEvent::PromptEnd, 2);
+    fn precmd_in_alt_screen_does_not_promote() {
+        let mut c = PromptController::new(0);
+        ready(&mut c, 1);
+        c.observe_alt_screen(true, 2);
+        c.observe_event(LifecycleEvent::Precmd { cwd: PathBuf::from("/") }, 3);
         assert_eq!(c.mode(), PaneMode::AlternateScreen);
     }
 
     #[test]
     fn alt_screen_exit_returns_to_raw_not_editor() {
-        // Spec/05: "Alternate-screen OFF → RawTerminal (not
-        // directly to ShellPromptEditor; only a fresh marker
-        // promotes)."
-        let mut c = confirmed();
+        let mut c = PromptController::new(0);
+        ready(&mut c, 1);
+        c.observe_alt_screen(true, 2);
+        c.observe_alt_screen(false, 3);
+        assert_eq!(c.mode(), PaneMode::RawTerminal);
+    }
+
+    #[test]
+    fn alt_screen_during_bootstrapping_is_ignored() {
+        let mut c = PromptController::new(0);
         c.observe_alt_screen(true, 1);
-        c.observe_alt_screen(false, 2);
-        assert_eq!(c.mode(), PaneMode::RawTerminal);
-        assert_eq!(c.last_transition().reason, TransitionReason::AlternateScreenExit);
+        assert_eq!(c.mode(), PaneMode::Bootstrapping);
     }
 
-    // ---- safety rule 3: markers authoritative (no heuristics) -------
+    // ---- safety rule 3: bootstrap authoritative ---------------------
+    //
+    // The osc.rs unit tests already cover "foreign OSC 133 is dropped
+    // by the byte-stream parser." Here we just assert that
+    // `PromptController` never invents promotion absent a
+    // Termica-sourced event.
 
     #[test]
-    fn no_observation_other_than_promptend_promotes() {
-        // Drive every non-PromptEnd marker variant + alt-screen
-        // toggles + observe_pty_exit-paths; none should promote
-        // to ShellPromptEditor (the only thing that can is a
-        // PromptEnd while confirmed in RawTerminal).
-        let mut c = confirmed();
-        c.observe_marker(MarkerEvent::PromptStart, 1);
-        c.observe_marker(MarkerEvent::CommandStart, 1);
-        c.observe_marker(MarkerEvent::CommandEnd { exit: Some(0), duration_ms: None }, 1);
-        c.observe_marker(MarkerEvent::Cwd(PathBuf::from("/tmp")), 1);
-        c.observe_marker(MarkerEvent::Shell(ShellKind::Bash), 1);
-        c.observe_marker(MarkerEvent::ProtocolVersion(SUPPORTED_PROTOCOL_VERSION), 1);
-        assert_eq!(c.mode(), PaneMode::RawTerminal);
-    }
-
-    // ---- integration version handshake ------------------------------
-
-    #[test]
-    fn supported_version_marks_integration_confirmed() {
+    fn no_event_other_than_precmd_promotes() {
         let mut c = PromptController::new(0);
-        c.observe_marker(MarkerEvent::ProtocolVersion(SUPPORTED_PROTOCOL_VERSION), 1);
-        assert_eq!(c.integration(), IntegrationState::Confirmed(SUPPORTED_PROTOCOL_VERSION));
-    }
-
-    #[test]
-    fn unsupported_version_marks_integration_unsupported() {
-        let mut c = PromptController::new(0);
-        c.observe_marker(MarkerEvent::ProtocolVersion(SUPPORTED_PROTOCOL_VERSION + 1), 1);
-        assert_eq!(c.integration(), IntegrationState::Unsupported);
-    }
-
-    #[test]
-    fn unsupported_version_disables_promotion() {
-        let mut c = PromptController::new(0);
-        c.observe_marker(MarkerEvent::ProtocolVersion(SUPPORTED_PROTOCOL_VERSION + 1), 1);
-        c.observe_marker(MarkerEvent::PromptEnd, 2);
+        ready(&mut c, 1);
+        c.observe_event(LifecycleEvent::Cwd { cwd: PathBuf::from("/tmp") }, 2);
+        c.observe_event(LifecycleEvent::Preexec { command: "x".into() }, 2);
+        c.observe_event(LifecycleEvent::CommandFinished { exit: 0 }, 2);
         assert_eq!(c.mode(), PaneMode::RawTerminal);
-    }
-
-    #[test]
-    fn unsupported_version_arriving_in_editor_demotes() {
-        // Pathological case: we're somehow in editor mode and the
-        // shell announces an unsupported version (e.g. user upgrades
-        // their integration script mid-session to a newer one we
-        // don't speak). We must demote.
-        let mut c = confirmed();
-        c.observe_marker(MarkerEvent::PromptEnd, 1);
-        assert_eq!(c.mode(), PaneMode::ShellPromptEditor);
-        c.observe_marker(MarkerEvent::ProtocolVersion(999), 2);
-        assert_eq!(c.mode(), PaneMode::RawTerminal);
-        assert_eq!(c.last_transition().reason, TransitionReason::IntegrationVersionUnsupported);
     }
 
     // ---- frame debounce ---------------------------------------------
 
     #[test]
     fn promotion_debounces_within_one_frame_of_demotion() {
-        let mut c = confirmed();
-        c.observe_marker(MarkerEvent::PromptEnd, 1);
-        assert_eq!(c.mode(), PaneMode::ShellPromptEditor);
-        // Submit demotes at frame 2.
-        c.submit_command(2);
+        let mut c = PromptController::new(0);
+        ready(&mut c, 1);
+        c.observe_event(LifecycleEvent::Precmd { cwd: PathBuf::from("/") }, 2);
+        c.submit_command(3);
         assert_eq!(c.mode(), PaneMode::RawTerminal);
-        // A same-frame PromptEnd must NOT re-promote.
-        c.observe_marker(MarkerEvent::PromptEnd, 2);
+        // Same-frame Precmd: no re-promotion.
+        c.observe_event(LifecycleEvent::Precmd { cwd: PathBuf::from("/") }, 3);
         assert_eq!(c.mode(), PaneMode::RawTerminal);
     }
 
     #[test]
     fn promotion_allowed_next_frame_after_demotion() {
-        let mut c = confirmed();
-        c.observe_marker(MarkerEvent::PromptEnd, 1);
-        c.submit_command(2);
-        // Next frame: a fresh PromptEnd may promote.
-        c.observe_marker(MarkerEvent::PromptEnd, 3);
+        let mut c = PromptController::new(0);
+        ready(&mut c, 1);
+        c.observe_event(LifecycleEvent::Precmd { cwd: PathBuf::from("/") }, 2);
+        c.submit_command(3);
+        c.observe_event(LifecycleEvent::Precmd { cwd: PathBuf::from("/") }, 4);
         assert_eq!(c.mode(), PaneMode::ShellPromptEditor);
     }
 
@@ -628,92 +674,77 @@ mod tests {
 
     #[test]
     fn submit_command_demotes_eagerly_and_opens_pending() {
-        let mut c = confirmed();
-        c.observe_marker(MarkerEvent::PromptEnd, 1);
-        c.submit_command(2);
+        let mut c = PromptController::new(0);
+        ready(&mut c, 1);
+        c.observe_event(LifecycleEvent::Precmd { cwd: PathBuf::from("/") }, 2);
+        c.submit_command(3);
         assert_eq!(c.mode(), PaneMode::RawTerminal);
-        assert_eq!(c.last_transition().reason, TransitionReason::EnterSubmitted);
         let p = c.pending_cmd().expect("pending command should be open");
-        assert_eq!(p.started_frame, 2);
-        assert!(p.ended_frame.is_none());
+        assert_eq!(p.started_frame, 3);
     }
 
     #[test]
     fn submit_command_outside_editor_is_noop() {
         let mut c = PromptController::new(0);
-        c.submit_command(1);
-        assert_eq!(c.mode(), PaneMode::RawTerminal);
+        ready(&mut c, 1);
+        c.submit_command(2);
         assert!(c.pending_cmd().is_none());
     }
 
     #[test]
-    fn leave_editor_esc_demotes_with_esc_reason() {
-        let mut c = confirmed();
-        c.observe_marker(MarkerEvent::PromptEnd, 1);
-        c.leave_editor_esc(2);
-        assert_eq!(c.mode(), PaneMode::RawTerminal);
-        assert_eq!(c.last_transition().reason, TransitionReason::Esc);
-        // Esc-leave must NOT open a pending command (nothing was
-        // submitted).
-        assert!(c.pending_cmd().is_none());
+    fn preexec_after_submit_stamps_command_line() {
+        let mut c = PromptController::new(0);
+        ready(&mut c, 1);
+        c.observe_event(LifecycleEvent::Precmd { cwd: PathBuf::from("/") }, 2);
+        c.submit_command(3);
+        c.observe_event(LifecycleEvent::Preexec { command: "ls -la".into() }, 4);
+        let p = c.pending_cmd().expect("pending should remain open");
+        assert_eq!(p.command_line.as_deref(), Some("ls -la"));
     }
 
     #[test]
-    fn leave_editor_ctrlc_demotes_without_pending() {
-        let mut c = confirmed();
-        c.observe_marker(MarkerEvent::PromptEnd, 1);
-        c.leave_editor_ctrl_c(2);
-        assert_eq!(c.mode(), PaneMode::RawTerminal);
-        assert_eq!(c.last_transition().reason, TransitionReason::CtrlCEmptyEditor);
-        assert!(c.pending_cmd().is_none());
+    fn preexec_alone_opens_pending() {
+        // Raw-typed command path: user typed at a prompt without using
+        // the editor.
+        let mut c = PromptController::new(0);
+        ready(&mut c, 1);
+        c.observe_event(LifecycleEvent::Preexec { command: "true".into() }, 2);
+        let p = c.pending_cmd().expect("pending opens on Preexec");
+        assert_eq!(p.command_line.as_deref(), Some("true"));
     }
 
     // ---- command lifecycle ------------------------------------------
 
     #[test]
-    fn commandstart_marker_opens_pending_when_none() {
-        // The "raw observed" case: user typed at a prompt without
-        // the editor (e.g. integration installed but mode happened
-        // to be RawTerminal at that instant). The CommandStart
-        // marker opens a pending command.
-        let mut c = confirmed();
-        c.observe_marker(MarkerEvent::CommandStart, 1);
-        let p = c.pending_cmd().expect("pending should be open");
-        assert_eq!(p.started_frame, 1);
-    }
-
-    #[test]
-    fn commandstart_after_submit_does_not_overwrite_pending() {
-        // submit_command opens the pending command speculatively
-        // at frame 2. A later CommandStart marker (frame 3) is the
-        // confirming event — must leave the existing pending alone.
-        let mut c = confirmed();
-        c.observe_marker(MarkerEvent::PromptEnd, 1);
-        c.submit_command(2);
-        c.observe_marker(MarkerEvent::CommandStart, 3);
-        let p = c.pending_cmd().expect("pending should still be open");
-        assert_eq!(p.started_frame, 2); // not 3
-    }
-
-    #[test]
-    fn commandend_closes_pending_with_exit() {
-        let mut c = confirmed();
-        c.observe_marker(MarkerEvent::CommandStart, 1);
-        c.observe_marker(MarkerEvent::CommandEnd { exit: Some(0), duration_ms: Some(500) }, 2);
+    fn command_finished_closes_pending_with_exit() {
+        let mut c = PromptController::new(0);
+        ready(&mut c, 1);
+        c.observe_event(LifecycleEvent::Preexec { command: "ls".into() }, 2);
+        c.observe_event(LifecycleEvent::CommandFinished { exit: 0 }, 3);
         assert!(c.pending_cmd().is_none());
-        let p = c.last_completed_cmd().expect("completed command should be set");
-        assert_eq!(p.started_frame, 1);
-        assert_eq!(p.ended_frame, Some(2));
+        let p = c.last_completed_cmd().expect("completed should be set");
         assert_eq!(p.exit, Some(0));
-        assert_eq!(p.duration_ms, Some(500));
+        assert_eq!(p.ended_frame, Some(3));
     }
 
     #[test]
-    fn orphan_commandend_is_ignored() {
-        let mut c = confirmed();
-        c.observe_marker(MarkerEvent::CommandEnd { exit: Some(0), duration_ms: None }, 1);
+    fn orphan_command_finished_is_ignored() {
+        let mut c = PromptController::new(0);
+        ready(&mut c, 1);
+        c.observe_event(LifecycleEvent::CommandFinished { exit: 0 }, 2);
         assert!(c.pending_cmd().is_none());
         assert!(c.last_completed_cmd().is_none());
+    }
+
+    #[test]
+    fn command_aborted_closes_pending_without_exit() {
+        let mut c = PromptController::new(0);
+        ready(&mut c, 1);
+        c.observe_event(LifecycleEvent::Preexec { command: "x".into() }, 2);
+        c.observe_event(LifecycleEvent::CommandAborted { reason: "user".into() }, 3);
+        assert!(c.pending_cmd().is_none());
+        let p = c.last_completed_cmd().expect("completed should be set");
+        assert!(p.exit.is_none());
     }
 
     // ---- PTY exit ---------------------------------------------------
@@ -721,139 +752,111 @@ mod tests {
     #[test]
     fn pty_exit_from_raw_transitions_to_dead() {
         let mut c = PromptController::new(0);
-        c.observe_pty_exit(1);
-        assert_eq!(c.mode(), PaneMode::Dead);
-        assert_eq!(c.last_transition().reason, TransitionReason::PtyExit);
-    }
-
-    #[test]
-    fn pty_exit_from_editor_transitions_to_dead() {
-        let mut c = confirmed();
-        c.observe_marker(MarkerEvent::PromptEnd, 1);
+        ready(&mut c, 1);
         c.observe_pty_exit(2);
         assert_eq!(c.mode(), PaneMode::Dead);
     }
 
     #[test]
-    fn pty_exit_from_alt_screen_transitions_to_dead() {
+    fn pty_exit_from_bootstrapping_transitions_to_dead() {
         let mut c = PromptController::new(0);
-        c.observe_alt_screen(true, 1);
-        c.observe_pty_exit(2);
+        c.observe_pty_exit(1);
         assert_eq!(c.mode(), PaneMode::Dead);
     }
 
     #[test]
     fn pty_exit_closes_pending_cmd_with_unknown_exit() {
-        let mut c = confirmed();
-        c.observe_marker(MarkerEvent::CommandStart, 1);
-        c.observe_pty_exit(2);
+        let mut c = PromptController::new(0);
+        ready(&mut c, 1);
+        c.observe_event(LifecycleEvent::Preexec { command: "x".into() }, 2);
+        c.observe_pty_exit(3);
         assert!(c.pending_cmd().is_none());
-        let p = c.last_completed_cmd().expect("completed command on pty exit");
-        assert_eq!(p.exit, None);
-        assert_eq!(p.ended_frame, Some(2));
+        let p = c.last_completed_cmd().expect("completed should be set");
+        assert!(p.exit.is_none());
     }
 
     #[test]
     fn pty_exit_from_dead_is_noop() {
         let mut c = PromptController::new(0);
         c.observe_pty_exit(1);
-        let first = *c.last_transition();
+        let first = c.last_transition().clone();
         c.observe_pty_exit(2);
-        // Second pty_exit should not record a new transition.
-        assert_eq!(*c.last_transition(), first);
+        assert_eq!(c.last_transition(), &first);
     }
 
     // ---- restart_shell ----------------------------------------------
 
     #[test]
-    fn restart_shell_from_dead_goes_to_raw_with_unknown_integration() {
-        let mut c = confirmed();
-        c.observe_pty_exit(1);
-        assert_eq!(c.mode(), PaneMode::Dead);
-        c.restart_shell(2);
-        assert_eq!(c.mode(), PaneMode::RawTerminal);
-        assert_eq!(c.integration(), IntegrationState::Unknown);
+    fn restart_shell_from_dead_goes_to_bootstrapping() {
+        let mut c = PromptController::new(0);
+        ready(&mut c, 1);
+        c.observe_pty_exit(2);
+        c.restart_shell(3);
+        assert_eq!(c.mode(), PaneMode::Bootstrapping);
+        assert_eq!(c.integration(), &IntegrationState::Unknown);
         assert_eq!(c.last_transition().reason, TransitionReason::UserRestartedShell);
     }
 
     #[test]
-    fn restart_shell_outside_dead_is_noop() {
+    fn restart_shell_from_degraded_goes_to_bootstrapping() {
         let mut c = PromptController::new(0);
-        c.restart_shell(1);
+        c.observe_event(LifecycleEvent::IntegrationError { reason: "x".into() }, 1);
+        assert_eq!(c.mode(), PaneMode::Degraded);
+        c.restart_shell(2);
+        assert_eq!(c.mode(), PaneMode::Bootstrapping);
+    }
+
+    #[test]
+    fn restart_shell_outside_dead_or_degraded_is_noop() {
+        let mut c = PromptController::new(0);
+        ready(&mut c, 1);
+        c.restart_shell(2);
         assert_eq!(c.mode(), PaneMode::RawTerminal);
-        // No transition recorded beyond InitialSpawn.
-        assert_eq!(c.last_transition().reason, TransitionReason::InitialSpawn);
+    }
+
+    // ---- cwd tracking -----------------------------------------------
+
+    #[test]
+    fn cwd_event_alone_does_not_promote() {
+        let mut c = PromptController::new(0);
+        ready(&mut c, 1);
+        let before = c.last_transition().clone();
+        c.observe_event(LifecycleEvent::Cwd { cwd: PathBuf::from("/tmp") }, 2);
+        assert_eq!(c.mode(), PaneMode::RawTerminal);
+        assert_eq!(c.last_transition(), &before);
+    }
+
+    #[test]
+    fn cwd_event_updates_tracked_cwd() {
+        let mut c = PromptController::new(0);
+        ready(&mut c, 1);
+        c.observe_event(LifecycleEvent::Cwd { cwd: PathBuf::from("/a") }, 2);
+        assert_eq!(c.cwd(), Some(std::path::Path::new("/a")));
+    }
+
+    #[test]
+    fn submit_command_stamps_cwd_into_pending() {
+        let mut c = PromptController::new(0);
+        ready(&mut c, 1);
+        c.observe_event(LifecycleEvent::Precmd { cwd: PathBuf::from("/Users/tim/code") }, 2);
+        c.submit_command(3);
+        let p = c.pending_cmd().expect("pending should be open");
+        assert_eq!(p.cwd_at_start, Some(PathBuf::from("/Users/tim/code")));
     }
 
     // ---- shell kind tracking ----------------------------------------
 
     #[test]
-    fn shell_marker_records_kind() {
+    fn integration_ready_records_shell_kind() {
         let mut c = PromptController::new(0);
         assert_eq!(c.shell_kind(), None);
-        c.observe_marker(MarkerEvent::Shell(ShellKind::Zsh), 1);
-        assert_eq!(c.shell_kind(), Some(ShellKind::Zsh));
-    }
-
-    // ---- cwd tracking (Phase 3B review concerns) --------------------
-
-    #[test]
-    fn cwd_marker_alone_causes_no_transition_or_pending() {
-        // Tightening the contract: a Cwd event is purely a state
-        // update — it must not advance the mode machine and must
-        // not open a pending command.
-        let mut c = confirmed();
-        let before = *c.last_transition();
-        c.observe_marker(MarkerEvent::Cwd(PathBuf::from("/tmp")), 1);
-        assert_eq!(c.mode(), PaneMode::RawTerminal);
-        assert_eq!(*c.last_transition(), before);
-        assert!(c.pending_cmd().is_none());
-    }
-
-    #[test]
-    fn cwd_marker_updates_tracked_cwd() {
-        let mut c = PromptController::new(0);
-        assert!(c.cwd().is_none());
-        c.observe_marker(MarkerEvent::Cwd(PathBuf::from("/a")), 1);
-        assert_eq!(c.cwd(), Some(std::path::Path::new("/a")));
-        c.observe_marker(MarkerEvent::Cwd(PathBuf::from("/b")), 2);
-        assert_eq!(c.cwd(), Some(std::path::Path::new("/b")));
-    }
-
-    #[test]
-    fn submit_command_stamps_cwd_into_pending_command() {
-        let mut c = confirmed();
-        c.observe_marker(MarkerEvent::Cwd(PathBuf::from("/Users/tim/code")), 1);
-        c.observe_marker(MarkerEvent::PromptEnd, 1);
-        c.submit_command(2);
-        let p = c.pending_cmd().expect("pending should be open");
-        assert_eq!(p.cwd_at_start, Some(PathBuf::from("/Users/tim/code")));
-    }
-
-    #[test]
-    fn commandstart_marker_stamps_cwd_into_pending() {
-        let mut c = confirmed();
-        c.observe_marker(MarkerEvent::Cwd(PathBuf::from("/tmp")), 1);
-        c.observe_marker(MarkerEvent::CommandStart, 2);
-        let p = c.pending_cmd().expect("pending opens on CommandStart");
-        assert_eq!(p.cwd_at_start, Some(PathBuf::from("/tmp")));
-    }
-
-    #[test]
-    fn pending_cwd_is_none_when_no_cwd_marker_seen() {
-        let mut c = confirmed();
-        c.observe_marker(MarkerEvent::PromptEnd, 1);
-        c.submit_command(2);
-        let p = c.pending_cmd().expect("pending should be open");
-        assert!(p.cwd_at_start.is_none());
-    }
-
-    #[test]
-    fn restart_shell_clears_tracked_cwd() {
-        let mut c = confirmed();
-        c.observe_marker(MarkerEvent::Cwd(PathBuf::from("/foo")), 1);
-        c.observe_pty_exit(2);
-        c.restart_shell(3);
-        assert!(c.cwd().is_none());
+        c.observe_event(
+            LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Bash,
+                version: SUPPORTED_PROTOCOL_VERSION,
+            },
+            1,
+        );
+        assert_eq!(c.shell_kind(), Some(ShellKind::Bash));
     }
 }

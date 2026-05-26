@@ -64,6 +64,7 @@ fn snapshot_central_panel_with_cwd() {
         cols: 80,
         cwd: Some(std::path::PathBuf::from("/Users/tim/git/enthal/termica")),
         screen_text: String::new(),
+        ..PaneView::default()
     };
     let mut harness = Harness::builder()
         .with_size(egui::Vec2::new(800.0, 150.0))

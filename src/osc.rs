@@ -1,10 +1,10 @@
-//! OSC sniffer.
+//! VT byte-stream sniffer.
 //!
 //! `alacritty_terminal` already drives a full VT parser to maintain
-//! the grid, but it discards OSC sequences it doesn't know about
-//! (notably OSC 7 — "current working directory", which most shells
-//! emit on `cd`). We need those for clickable paths and the status
-//! header.
+//! the grid, but it discards sequences it doesn't surface (OSC 7
+//! cwd-reporting, our DCS-JSON lifecycle messages). We need those
+//! for the status header, clickable paths, and the
+//! `PromptController` mode machine.
 //!
 //! Rather than fork or extend alacritty, we run a second thin VT
 //! parser in parallel. Each byte the terminal sees is also fed to
@@ -13,62 +13,86 @@
 //! the grid; alacritty stays the source of truth for everything
 //! else.
 //!
-//! Phase 1E-h: OSC 7 (cwd) only — exposed as the [`OscState::cwd`]
-//! snapshot.
-//! Phase 3A: also dispatch OSC 133 and OSC 1337-Termica via
-//! [`crate::markers::parse_osc_params`] into an event queue that
-//! consumers (the upcoming `PromptController`) can drain.
+//! What we extract:
+//!
+//! - **OSC 7** — `OSC 7 ; <file-url> ST`. Updates the [`OscState::cwd`]
+//!   snapshot consumed by the status header and clickable paths.
+//!   This is a v1-era signal kept for graceful degradation (it works
+//!   even before Termica's bootstrap completes, and works even when
+//!   the user's `.zshrc` happens to emit OSC 7 from a foreign shell-
+//!   integration script).
+//!
+//! - **DCS-JSON** — `ESC P Termica;<json> ESC \`. Termica's own
+//!   shell-integration protocol per spec/03. We buffer the DCS body
+//!   between `vte::Perform::hook` and `unhook` and hand the
+//!   completed body to [`crate::markers::parse_dcs_body`].
+//!
+//! Foreign OSC 133 / OSC 1337 sequences are **deliberately ignored**.
+//! See spec/05 safety rule 3.
 
 #![forbid(unsafe_code)]
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
-use crate::markers::{self, MarkerEvent};
+use crate::markers::{self, LifecycleEvent};
 
 /// Snapshot of the latest signals the [`OscSniffer`] has seen.
 #[derive(Debug, Default, Clone)]
 pub struct OscState {
     /// Most recent `OSC 7 ; <file-url-or-path> ST` payload, decoded
-    /// to an absolute path. `None` until the shell emits one (which
-    /// in zsh happens automatically on `cd`; in bash requires a
-    /// hook — see the Phase 3 integration script).
+    /// to an absolute path. `None` until the shell emits one.
     pub cwd: Option<PathBuf>,
 }
 
-/// VT byte-stream peeker.
-///
-/// Fed every byte the PTY produces, *before or after* alacritty's
-/// full parser — the order doesn't matter because we never touch
-/// the grid. Holds a small [`OscState`] that callers query each
-/// frame.
+/// VT byte-stream peeker. Holds a small [`OscState`] and a FIFO of
+/// [`LifecycleEvent`]s extracted from Termica DCS-JSON messages.
 pub struct OscSniffer {
     parser: vte::Parser,
     state: OscState,
-    /// FIFO of marker events extracted from OSC 133 / 1337-Termica
-    /// dispatches. Drained by [`Self::drain_events`]; size is bounded
-    /// only by how rarely consumers drain (in practice every frame).
-    events: VecDeque<MarkerEvent>,
+    /// FIFO of lifecycle events extracted from DCS-JSON dispatches.
+    /// Drained by [`Self::drain_events`]; size is bounded only by
+    /// how rarely consumers drain (in practice every frame).
+    events: VecDeque<LifecycleEvent>,
+    /// DCS body buffer. Accumulated between `vte::Perform::hook`
+    /// (start of DCS) and `unhook` (end of DCS). Always cleared on
+    /// hook so an incomplete prior sequence cannot bleed in.
+    ///
+    /// The DCS "final byte" (action character — `T` for our
+    /// `Termica;…` framing) is consumed by vte and reported via
+    /// `hook`'s `action` argument; we prepend it to the buffer
+    /// in `hook` so the body the parser sees starts with `Termica;`.
+    dcs_buf: Vec<u8>,
+    /// `true` while we are inside a DCS sequence (between `hook` and
+    /// `unhook`). Used to gate `put` byte accumulation.
+    in_dcs: bool,
 }
 
 impl OscSniffer {
-    /// Construct a sniffer with default state (no cwd yet, no
-    /// queued events).
+    /// Construct a sniffer with default state.
     pub fn new() -> Self {
-        Self { parser: vte::Parser::new(), state: OscState::default(), events: VecDeque::new() }
+        Self {
+            parser: vte::Parser::new(),
+            state: OscState::default(),
+            events: VecDeque::new(),
+            dcs_buf: Vec::new(),
+            in_dcs: false,
+        }
     }
 
-    /// Feed a single byte. Updates `self.state` and/or enqueues a
-    /// [`MarkerEvent`] if the byte completes a recognised OSC sequence.
+    /// Feed a single byte.
     pub fn feed_byte(&mut self, byte: u8) {
         self.feed(&[byte]);
     }
 
-    /// Feed a slice. `vte::Parser::advance` itself takes a slice; we
-    /// briefly wrap our state in a [`Performer`] for the call, then
-    /// read the result back.
+    /// Feed a slice.
     pub fn feed(&mut self, bytes: &[u8]) {
-        let mut perform = Performer { state: &mut self.state, events: &mut self.events };
+        let mut perform = Performer {
+            state: &mut self.state,
+            events: &mut self.events,
+            dcs_buf: &mut self.dcs_buf,
+            in_dcs: &mut self.in_dcs,
+        };
         self.parser.advance(&mut perform, bytes);
     }
 
@@ -77,10 +101,8 @@ impl OscSniffer {
         &self.state
     }
 
-    /// Drain all queued marker events. Order is preserved (the same
-    /// order the shell emitted them). Empty if no markers have
-    /// arrived since the last drain.
-    pub fn drain_events(&mut self) -> Vec<MarkerEvent> {
+    /// Drain all queued lifecycle events. Order is preserved.
+    pub fn drain_events(&mut self) -> Vec<LifecycleEvent> {
         self.events.drain(..).collect()
     }
 }
@@ -91,11 +113,13 @@ impl Default for OscSniffer {
     }
 }
 
-/// `vte::Perform` shim that pokes into a borrowed [`OscState`] and
-/// enqueues marker events.
+/// `vte::Perform` shim that pokes into the borrowed sniffer state
+/// fields.
 struct Performer<'a> {
     state: &'a mut OscState,
-    events: &'a mut VecDeque<MarkerEvent>,
+    events: &'a mut VecDeque<LifecycleEvent>,
+    dcs_buf: &'a mut Vec<u8>,
+    in_dcs: &'a mut bool,
 }
 
 impl<'a> vte::Perform for Performer<'a> {
@@ -103,23 +127,9 @@ impl<'a> vte::Perform for Performer<'a> {
         if params.is_empty() {
             return;
         }
-        // OSC 7 keeps its dedicated path: it updates the
-        // `state.cwd` snapshot that the status-header /
-        // clickable-paths code already consumes, but does NOT
-        // emit a `Cwd` marker event in Phase 3A. Reasons:
-        //   - There's no consumer of marker events yet (3B wires
-        //     the PromptController), so events would accumulate
-        //     unbounded in panes where the user `cd`s often.
-        //   - The current behavior is unchanged for status/header
-        //     consumers — no risk of double-handling.
-        // 3B (or later) can decide whether OSC 7 should also feed
-        // the marker stream alongside `TermicaCwd=`. Until then,
-        // `MarkerEvent::Cwd` fires only from `TermicaCwd=`.
-        //
-        // TODO(3B+): consider unifying these two paths by moving
-        // OSC 7 parsing into `markers::parse_osc_params` and
-        // deriving `state.cwd` from the event stream. Deferred so
-        // 3A stays surgical.
+        // OSC 7: cwd reporting. We accept it from any source — it's
+        // a state-snapshot signal for the status header / clickable
+        // paths and does not participate in mode transitions.
         if params[0] == b"7" && params.len() >= 2 {
             let payload = match std::str::from_utf8(params[1]) {
                 Ok(s) => s,
@@ -128,18 +138,52 @@ impl<'a> vte::Perform for Performer<'a> {
             if let Some(path) = parse_osc7_cwd(payload) {
                 self.state.cwd = Some(path);
             }
-            return;
         }
-        // OSC 133 / OSC 1337-Termica all flow through the marker
-        // parser. If it yields an event, we enqueue; if it also
-        // happens to carry a cwd (`TermicaCwd=…`), keep the state
-        // snapshot in sync so consumers that read `state.cwd`
-        // don't have to know which OSC source it came from.
-        if let Some(event) = markers::parse_osc_params(params) {
-            if let MarkerEvent::Cwd(path) = &event {
-                self.state.cwd = Some(path.clone());
+        // All other OSC numbers (133, 1337, etc.) are deliberately
+        // ignored. See spec/05 safety rule 3: Termica's bootstrap
+        // is the only source of truth for prompt-state transitions,
+        // and our protocol travels over DCS, not OSC.
+    }
+
+    fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, action: char) {
+        // Start of a DCS sequence. Reset buffer so a prior incomplete
+        // sequence cannot leak in, then seed with the action character
+        // (the "final byte" of the DCS introducer that vte consumes
+        // before invoking `put`). For our `ESC P Termica;…` framing
+        // the action is `T` — without prepending it, the body the
+        // parser sees would start with `ermica;` and our prefix check
+        // would silently fail. Putting it back lets `parse_dcs_body`
+        // see the full `Termica;` prefix it expects.
+        self.dcs_buf.clear();
+        let mut buf = [0u8; 4];
+        let s = action.encode_utf8(&mut buf);
+        self.dcs_buf.extend_from_slice(s.as_bytes());
+        *self.in_dcs = true;
+    }
+
+    fn put(&mut self, byte: u8) {
+        if *self.in_dcs {
+            self.dcs_buf.push(byte);
+        }
+    }
+
+    fn unhook(&mut self) {
+        if *self.in_dcs {
+            if let Some(event) = markers::parse_dcs_body(self.dcs_buf) {
+                // Lifecycle events that carry a cwd update the
+                // OscState snapshot too so consumers reading
+                // `state.cwd` don't have to know which channel it
+                // came from.
+                match &event {
+                    LifecycleEvent::Cwd { cwd } | LifecycleEvent::Precmd { cwd } => {
+                        self.state.cwd = Some(cwd.clone());
+                    }
+                    _ => {}
+                }
+                self.events.push_back(event);
             }
-            self.events.push_back(event);
+            self.dcs_buf.clear();
+            *self.in_dcs = false;
         }
     }
 }
@@ -156,9 +200,6 @@ impl<'a> vte::Perform for Performer<'a> {
 /// the payload is empty after decoding.
 pub fn parse_osc7_cwd(s: &str) -> Option<PathBuf> {
     let s = s.strip_prefix("file://").unwrap_or(s);
-    // If the prefix had `file://`, the hostname portion runs up to
-    // the first `/`. If there's no `file://` prefix at all, we
-    // already point at the path.
     let path = match s.find('/') {
         Some(idx) => &s[idx..],
         None => s,
@@ -169,8 +210,7 @@ pub fn parse_osc7_cwd(s: &str) -> Option<PathBuf> {
 
 /// Decode `%XX` triples to their raw byte values; pass non-encoded
 /// bytes through. Invalid `%XX` sequences are kept verbatim rather
-/// than dropped — better to display a slightly-mangled path than to
-/// silently lose data.
+/// than dropped.
 fn percent_decode_lossy(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -201,11 +241,10 @@ fn hex_value(c: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    //! OSC 7 is the only sequence the sniffer recognises today; these
-    //! tests pin the parse rules so Phase 3 marker work can extend
-    //! the dispatch without breaking what's there.
-
     use super::*;
+    use crate::markers::ShellKind;
+
+    // ---- OSC 7 parser (Phase 1E-h) ----------------------------------
 
     #[test]
     fn parse_osc7_strips_file_scheme_and_hostname() {
@@ -233,7 +272,6 @@ mod tests {
 
     #[test]
     fn parse_osc7_percent_decodes_unicode() {
-        // U+00E9 (é) is `%C3%A9` in URL encoding.
         let p = parse_osc7_cwd("file:///Users/tim/caf%C3%A9").unwrap();
         assert_eq!(p, PathBuf::from("/Users/tim/café"));
     }
@@ -241,21 +279,19 @@ mod tests {
     #[test]
     fn parse_osc7_returns_none_on_empty_payload() {
         assert!(parse_osc7_cwd("").is_none());
-        // After stripping file:// + empty hostname there's nothing
-        // left — same outcome.
         assert!(parse_osc7_cwd("file://").is_none());
     }
 
     #[test]
     fn parse_osc7_keeps_invalid_percent_escapes_verbatim() {
-        // `%ZZ` isn't valid hex; the bytes should pass through.
         let p = parse_osc7_cwd("file:///oops%ZZ").unwrap();
         assert_eq!(p, PathBuf::from("/oops%ZZ"));
     }
 
+    // ---- OSC 7 byte-stream wiring -----------------------------------
+
     #[test]
     fn sniffer_picks_up_osc7_via_full_byte_stream() {
-        // Synthesise a complete OSC 7 sequence terminated by BEL.
         let mut sniffer = OscSniffer::new();
         sniffer.feed(b"\x1b]7;file:///tmp/seen\x07");
         assert_eq!(sniffer.state().cwd, Some(PathBuf::from("/tmp/seen")));
@@ -263,8 +299,6 @@ mod tests {
 
     #[test]
     fn sniffer_picks_up_osc7_terminated_by_st() {
-        // OSC sequences can also be terminated by ESC \ (ST). vte
-        // handles both.
         let mut sniffer = OscSniffer::new();
         sniffer.feed(b"\x1b]7;file:///tmp/st-terminated\x1b\\");
         assert_eq!(sniffer.state().cwd, Some(PathBuf::from("/tmp/st-terminated")));
@@ -273,8 +307,7 @@ mod tests {
     #[test]
     fn sniffer_handles_osc7_split_across_feed_calls() {
         // Byte-by-byte feed must produce the same final state as one
-        // big slice. This is the canonical "marker bytes split across
-        // PTY reads" regression test, scoped to OSC 7.
+        // big slice.
         let bytes = b"\x1b]7;file:///tmp/split\x07";
         let mut sniffer = OscSniffer::new();
         for b in bytes {
@@ -286,12 +319,127 @@ mod tests {
     #[test]
     fn sniffer_ignores_unrelated_osc_codes() {
         let mut sniffer = OscSniffer::new();
-        // OSC 0 / OSC 2 are window-title; OSC 4 is palette. None
-        // should populate `cwd`.
         sniffer.feed(b"\x1b]0;some title\x07");
         sniffer.feed(b"\x1b]2;another title\x07");
         sniffer.feed(b"\x1b]4;1;rgb:ff/00/00\x07");
         assert!(sniffer.state().cwd.is_none());
+        assert!(sniffer.drain_events().is_empty());
+    }
+
+    #[test]
+    fn sniffer_ignores_foreign_osc_133() {
+        // Safety rule 3 (spec/05): we never trust OSC 133 — that's
+        // someone else's integration script and our prompt-editor
+        // safety must not depend on it.
+        let mut sniffer = OscSniffer::new();
+        sniffer.feed(b"\x1b]133;A\x07");
+        sniffer.feed(b"\x1b]133;B\x07");
+        sniffer.feed(b"\x1b]133;C\x07");
+        sniffer.feed(b"\x1b]133;D;0\x07");
+        assert!(sniffer.drain_events().is_empty());
+    }
+
+    #[test]
+    fn sniffer_ignores_foreign_osc_1337() {
+        // iTerm2-private namespace; not ours.
+        let mut sniffer = OscSniffer::new();
+        sniffer.feed(b"\x1b]1337;ShellIntegrationVersion=12\x07");
+        assert!(sniffer.drain_events().is_empty());
+    }
+
+    // ---- DCS-JSON byte-stream wiring (Phase 3C) ---------------------
+
+    #[test]
+    fn sniffer_emits_integration_ready_via_full_byte_stream() {
+        let mut sniffer = OscSniffer::new();
+        sniffer.feed(
+            b"\x1bPTermica;{\"type\":\"integration_ready\",\"session\":\"x\",\"value\":{\"shell\":\"zsh\",\"version\":1}}\x1b\\",
+        );
+        assert_eq!(
+            sniffer.drain_events(),
+            vec![LifecycleEvent::IntegrationReady { shell: ShellKind::Zsh, version: 1 }]
+        );
+    }
+
+    #[test]
+    fn sniffer_emits_full_command_lifecycle_in_order() {
+        // Walk a complete precmd → preexec → command_finished → precmd
+        // sequence and assert event ordering.
+        let mut sniffer = OscSniffer::new();
+        sniffer.feed(
+            b"\x1bPTermica;{\"type\":\"precmd\",\"session\":\"x\",\"value\":\"/home/u\"}\x1b\\",
+        );
+        sniffer
+            .feed(b"\x1bPTermica;{\"type\":\"preexec\",\"session\":\"x\",\"value\":\"ls\"}\x1b\\");
+        sniffer.feed(
+            b"\x1bPTermica;{\"type\":\"command_finished\",\"session\":\"x\",\"value\":0}\x1b\\",
+        );
+        sniffer.feed(
+            b"\x1bPTermica;{\"type\":\"precmd\",\"session\":\"x\",\"value\":\"/home/u\"}\x1b\\",
+        );
+        assert_eq!(
+            sniffer.drain_events(),
+            vec![
+                LifecycleEvent::Precmd { cwd: PathBuf::from("/home/u") },
+                LifecycleEvent::Preexec { command: "ls".into() },
+                LifecycleEvent::CommandFinished { exit: 0 },
+                LifecycleEvent::Precmd { cwd: PathBuf::from("/home/u") },
+            ]
+        );
+    }
+
+    #[test]
+    fn sniffer_precmd_updates_both_event_stream_and_osc_state_cwd() {
+        // Precmd carries the cwd; we mirror it into OscState so the
+        // status header doesn't need two sources.
+        let mut sniffer = OscSniffer::new();
+        sniffer.feed(
+            b"\x1bPTermica;{\"type\":\"precmd\",\"session\":\"x\",\"value\":\"/Users/tim/code\"}\x1b\\",
+        );
+        assert_eq!(sniffer.state().cwd, Some(PathBuf::from("/Users/tim/code")));
+        assert_eq!(
+            sniffer.drain_events(),
+            vec![LifecycleEvent::Precmd { cwd: PathBuf::from("/Users/tim/code") }]
+        );
+    }
+
+    #[test]
+    fn sniffer_dcs_split_across_feed_calls() {
+        // Split-read robustness — DCS sequence broken across reads
+        // must still produce exactly one event.
+        let bytes =
+            b"\x1bPTermica;{\"type\":\"integration_ready\",\"session\":\"x\",\"value\":{\"shell\":\"zsh\",\"version\":1}}\x1b\\";
+        let mut sniffer = OscSniffer::new();
+        for b in bytes {
+            sniffer.feed_byte(*b);
+        }
+        assert_eq!(
+            sniffer.drain_events(),
+            vec![LifecycleEvent::IntegrationReady { shell: ShellKind::Zsh, version: 1 }]
+        );
+    }
+
+    #[test]
+    fn sniffer_ignores_foreign_dcs_sequences() {
+        // Sixel graphics, Kitty graphics, and other DCS users will
+        // emit `ESC P ... ESC \` sequences without the Termica prefix.
+        // We must ignore them.
+        let mut sniffer = OscSniffer::new();
+        sniffer.feed(b"\x1bPq#0;2;0;0;0not-termica\x1b\\");
+        assert!(sniffer.drain_events().is_empty());
+    }
+
+    #[test]
+    fn drain_events_yields_then_empties_the_queue() {
+        let mut sniffer = OscSniffer::new();
+        sniffer
+            .feed(b"\x1bPTermica;{\"type\":\"precmd\",\"session\":\"x\",\"value\":\"/tmp\"}\x1b\\");
+        assert_eq!(
+            sniffer.drain_events(),
+            vec![LifecycleEvent::Precmd { cwd: PathBuf::from("/tmp") }]
+        );
+        // Second drain returns nothing.
+        assert!(sniffer.drain_events().is_empty());
     }
 
     #[test]
@@ -300,115 +448,5 @@ mod tests {
         sniffer.feed(b"\x1b]7;file:///one\x07");
         sniffer.feed(b"\x1b]7;file:///two\x07");
         assert_eq!(sniffer.state().cwd, Some(PathBuf::from("/two")));
-    }
-
-    // ---- marker event wiring (Phase 3A) -----------------------------
-    //
-    // The marker parser itself is unit-tested in `crate::markers`.
-    // These tests assert the END-TO-END byte-stream → drained-event
-    // path through the live `vte::Parser`, covering exactly the
-    // split-read robustness case spec/03 demands (and that we must
-    // not have any code matching marker patterns on the raw byte
-    // stream).
-
-    use crate::markers::{MarkerEvent, ShellKind};
-
-    #[test]
-    fn sniffer_emits_prompt_start_event_for_osc_133_a() {
-        let mut sniffer = OscSniffer::new();
-        sniffer.feed(b"\x1b]133;A\x07");
-        assert_eq!(sniffer.drain_events(), vec![MarkerEvent::PromptStart]);
-    }
-
-    #[test]
-    fn sniffer_emits_full_command_lifecycle_in_order() {
-        // Walk a complete A → B → C → D round-trip and assert the
-        // event ordering. This is the canonical "marker stream is
-        // ordered per-pane" check from spec/03.
-        let mut sniffer = OscSniffer::new();
-        sniffer.feed(b"\x1b]133;A\x07");
-        sniffer.feed(b"\x1b]133;B\x07");
-        sniffer.feed(b"\x1b]133;C\x07");
-        sniffer.feed(b"\x1b]133;D;0\x07");
-        assert_eq!(
-            sniffer.drain_events(),
-            vec![
-                MarkerEvent::PromptStart,
-                MarkerEvent::PromptEnd,
-                MarkerEvent::CommandStart,
-                MarkerEvent::CommandEnd { exit: Some(0), duration_ms: None },
-            ]
-        );
-    }
-
-    #[test]
-    fn sniffer_emits_protocol_version_and_shell_separately() {
-        let mut sniffer = OscSniffer::new();
-        sniffer.feed(b"\x1b]1337;TermicaVersion=1\x07");
-        sniffer.feed(b"\x1b]1337;TermicaShell=zsh\x07");
-        assert_eq!(
-            sniffer.drain_events(),
-            vec![MarkerEvent::ProtocolVersion(1), MarkerEvent::Shell(ShellKind::Zsh)]
-        );
-    }
-
-    #[test]
-    fn sniffer_termica_cwd_updates_both_event_stream_and_state() {
-        let mut sniffer = OscSniffer::new();
-        sniffer.feed(b"\x1b]1337;TermicaCwd=file:///Users/tim/code\x07");
-        assert_eq!(sniffer.state().cwd, Some(PathBuf::from("/Users/tim/code")));
-        assert_eq!(
-            sniffer.drain_events(),
-            vec![MarkerEvent::Cwd(PathBuf::from("/Users/tim/code"))]
-        );
-    }
-
-    #[test]
-    fn sniffer_osc7_updates_state_but_does_not_emit_a_marker_event() {
-        // Phase 3A scope: OSC 7 stays as a state-snapshot signal
-        // for the status header / clickable paths. It does NOT
-        // emit a marker event (yet) — see the rationale comment
-        // in `Performer::osc_dispatch`. 3B can revisit when there's
-        // a real consumer.
-        let mut sniffer = OscSniffer::new();
-        sniffer.feed(b"\x1b]7;file:///tmp/seen\x07");
-        assert_eq!(sniffer.state().cwd, Some(PathBuf::from("/tmp/seen")));
-        assert!(sniffer.drain_events().is_empty());
-    }
-
-    #[test]
-    fn sniffer_marker_events_survive_byte_by_byte_feed() {
-        // The split-read robustness contract from spec/03: an OSC
-        // sequence split across PTY reads must produce the exact
-        // same event as feeding it all at once. vte::Parser handles
-        // the state across calls; this test pins that contract
-        // through to the marker layer.
-        let bytes = b"\x1b]133;D;42\x07";
-        let mut sniffer = OscSniffer::new();
-        for b in bytes {
-            sniffer.feed_byte(*b);
-        }
-        assert_eq!(
-            sniffer.drain_events(),
-            vec![MarkerEvent::CommandEnd { exit: Some(42), duration_ms: None }]
-        );
-    }
-
-    #[test]
-    fn drain_events_yields_then_empties_the_queue() {
-        let mut sniffer = OscSniffer::new();
-        sniffer.feed(b"\x1b]133;A\x07");
-        assert_eq!(sniffer.drain_events(), vec![MarkerEvent::PromptStart]);
-        // Second drain returns nothing.
-        assert!(sniffer.drain_events().is_empty());
-    }
-
-    #[test]
-    fn unrelated_osc_codes_do_not_enqueue_marker_events() {
-        let mut sniffer = OscSniffer::new();
-        sniffer.feed(b"\x1b]0;some title\x07");
-        sniffer.feed(b"\x1b]2;another title\x07");
-        sniffer.feed(b"\x1b]4;1;rgb:ff/00/00\x07");
-        assert!(sniffer.drain_events().is_empty());
     }
 }
