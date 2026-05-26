@@ -52,6 +52,13 @@ vte = { version = "0.15", default-features = false }
 thiserror = "2"
 egui_tiles = "0.14"
 
+# Canonical home-directory lookup (rust-lang org). We use it to
+# resolve `$HOME` for the `~`-prefix substitution in tab titles. It
+# falls back to a passwd lookup when `HOME` isn't set and handles
+# the platform differences `std::env::home_dir` got wrong (which is
+# why that stdlib fn was deprecated).
+home = "0.5"
+
 # macOS-only: we need `EventLoopBuilderExtMacOS::with_default_menu(false)`
 # to disable winit's default app menubar. Its Quit item invokes
 # `[NSApplication terminate:]` directly, which bypasses our key

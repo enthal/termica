@@ -88,12 +88,13 @@ Sub-PRs:
   - Pane input is gated while any modal is up — keys, wheel, clicks, and focus grabs are suppressed so keystrokes intended for the modal don't leak to the PTY.
   - macOS: custom menubar via `muda`; winit's default Quit menu is disabled so its `[NSApp terminate:]` action can't bypass the quit-confirm modal. Custom About item opens a small in-app modal.
 - ✅ **2B — Spawn in cwd**: a new tab inherits its parent Tabs container's active pane's OSC 7 cwd; falls back to the termica process's cwd if none is known yet.
-- ⏳ **2C — Duplicate-here**: explicit "duplicate this pane in a new tab" affordance.
-- ⏳ **2D — Split snapshot tests**: `egui_kittest` snapshots for tabs + 2-pane horizontal split and tabs + 3-pane T-split.
+- ⏳ **2C — Split snapshot tests**: `egui_kittest` snapshots for tabs + 2-pane horizontal split and tabs + 3-pane T-split.
 
 **Acceptance:** multi-pane terminal workspace; layout operations don't drop pane state.
 
-**Status:** ✅ 2A shipped; 2B–2D outstanding before Phase 2 closes.
+**Status:** ✅ 2A + 2B shipped; 2C outstanding before Phase 2 closes.
+
+> A "duplicate-here" pane op was originally listed alongside spawn-in-cwd in the pre-breakout Phase 2 description (see the original [#2](https://github.com/enthal/termica/issues/2) acceptance criteria). After 2B shipped, the gap between "Cmd+T" and a hypothetical "duplicate this pane" collapsed — both produce a fresh shell in the same cwd, and shells can't share runtime env across forks anyway. Dropped from the roadmap; reframing as a keyboard split shortcut (à la iTerm2 Cmd+D) is the only flavor that would still be a distinct gesture, but drag-to-split already works and a hotkey can land later as needed.
 
 ### Phase 3 — Markers + mode machine
 

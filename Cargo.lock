@@ -3642,6 +3642,7 @@ dependencies = [
  "egui",
  "egui_kittest",
  "egui_tiles",
+ "home",
  "muda",
  "portable-pty",
  "thiserror 2.0.18",

@@ -534,16 +534,81 @@ pub fn match_pane_shortcut(
     }
 }
 
-/// Compute the tab title for a pane: cwd basename if the shell has
-/// reported an OSC-7 cwd, else a fallback `pane N`. Pure function
-/// so the rule is unit-testable without any egui plumbing.
-pub fn tab_title_for(pane_id: PaneId, cwd: Option<&Path>) -> String {
-    if let Some(c) = cwd
-        && let Some(name) = c.file_name()
-    {
-        return name.to_string_lossy().into_owned();
+/// Compute the tab title for a pane.
+///
+/// Rule, in order:
+/// 1. If the shell hasn't yet reported an OSC-7 cwd, fall back to
+///    `pane N` so the user has *something* to recognise the tab by.
+/// 2. Otherwise, return the cwd as an absolute path, with `$HOME`
+///    replaced by `~`:
+///    - `cwd == $HOME` → `~`
+///    - `cwd` is strictly inside `$HOME` → `~/relative/path`
+///    - cwd doesn't sit under `$HOME` (or `$HOME` is unknown) →
+///      the cwd as-is.
+///
+/// Edge cases that bit us in earlier drafts:
+/// - `$HOME` may or may not have a trailing slash (`/Users/tim`
+///   vs `/Users/tim/`); both should yield the same `~`-substitution.
+/// - `cwd` from OSC 7 may or may not have a trailing slash; we
+///   normalize both ends so `/Users/tim/` produces `~`, not `~/`.
+/// - `/Users/timjones` must NOT match the prefix `/Users/tim` —
+///   that would render `~jones` for an unrelated user's dir. The
+///   `rest.starts_with('/')` guard prevents that.
+///
+/// Pure function so the rule is unit-testable without any egui
+/// plumbing.
+pub fn tab_title_for(pane_id: PaneId, cwd: Option<&Path>, home: Option<&Path>) -> String {
+    let Some(c) = cwd else {
+        return format!("pane {}", pane_id.0);
+    };
+    let cwd_s = c.to_string_lossy();
+    // Normalize trailing slash on the cwd (but keep `/` itself).
+    let cwd_norm: &str = if cwd_s.as_ref() == "/" { "/" } else { cwd_s.trim_end_matches('/') };
+
+    let raw = if let Some(h) = home {
+        let home_s = h.to_string_lossy();
+        let home_norm = home_s.trim_end_matches('/');
+        if !home_norm.is_empty() {
+            if cwd_norm == home_norm {
+                "~".to_string()
+            } else if let Some(rest) = cwd_norm.strip_prefix(home_norm)
+                && rest.starts_with('/')
+            {
+                format!("~{rest}")
+            } else {
+                cwd_norm.to_string()
+            }
+        } else {
+            cwd_norm.to_string()
+        }
+    } else {
+        cwd_norm.to_string()
+    };
+
+    truncate_tab_title(&raw)
+}
+
+/// Maximum rendered width of a tab title, in chars. Titles longer
+/// than this collapse to `..` + their trailing portion, since the
+/// suffix (a leaf dir like `termica`, or a project subdir) is the
+/// part the user is actually trying to disambiguate by. Picked by
+/// eyeballing: 25 chars fits comfortably without forcing the tab
+/// strip to scroll on a default-size window.
+const MAX_TAB_TITLE_CHARS: usize = 25;
+
+/// Truncate a tab title to [`MAX_TAB_TITLE_CHARS`], preserving the
+/// *tail* of the string with a `..` prefix when truncation kicks
+/// in. Counting is in `char`s, not bytes, so a directory whose name
+/// happens to contain multi-byte UTF-8 doesn't get cut mid-codepoint.
+fn truncate_tab_title(s: &str) -> String {
+    let count = s.chars().count();
+    if count <= MAX_TAB_TITLE_CHARS {
+        return s.to_string();
     }
-    format!("pane {}", pane_id.0)
+    const ELLIPSIS: &str = "..";
+    let keep = MAX_TAB_TITLE_CHARS - ELLIPSIS.len();
+    let suffix: String = s.chars().skip(count - keep).collect();
+    format!("{ELLIPSIS}{suffix}")
 }
 
 /// Resolve the active pane id inside a Tabs container, if any. Pure
@@ -653,7 +718,7 @@ impl TermicaApp {
     /// Construct an app with one initial pane in a single Tabs
     /// container at the root of the tree.
     pub fn new() -> Self {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = home::home_dir();
         let mut app = Self {
             panes: HashMap::new(),
             tree: Tree::empty("termica-tree"),
@@ -1250,7 +1315,7 @@ struct TabBehavior<'a> {
 impl<'a> Behavior<PaneId> for TabBehavior<'a> {
     fn tab_title_for_pane(&mut self, pane_id: &PaneId) -> egui::WidgetText {
         let cwd = self.panes.get(pane_id).and_then(|s| s.session.terminal().cwd());
-        tab_title_for(*pane_id, cwd).into()
+        tab_title_for(*pane_id, cwd, self.home).into()
     }
 
     fn pane_ui(&mut self, ui: &mut egui::Ui, _tile_id: TileId, pane_id: &mut PaneId) -> UiResponse {
@@ -1351,7 +1416,7 @@ impl<'a> Behavior<PaneId> for TabBehavior<'a> {
         // (brighter bg + connecting hline). The focused-for-the-whole-
         // app indicator is the blue bottom border painted in
         // [`on_tab_button`] below.
-        egui::RichText::new(tab_title_for(*pane_id, cwd)).into()
+        egui::RichText::new(tab_title_for(*pane_id, cwd, self.home)).into()
     }
 
     fn on_tab_button(
@@ -1534,21 +1599,115 @@ mod tests {
     // --- tab title rule ----------------------------------------------
 
     #[test]
-    fn tab_title_uses_cwd_basename_when_known() {
-        let cwd = PathBuf::from("/Users/tim/git/enthal/termica");
-        assert_eq!(tab_title_for(PaneId(0), Some(&cwd)), "termica");
-    }
-
-    #[test]
     fn tab_title_falls_back_to_pane_n_when_cwd_unknown() {
-        assert_eq!(tab_title_for(PaneId(3), None), "pane 3");
+        assert_eq!(tab_title_for(PaneId(3), None, None), "pane 3");
     }
 
     #[test]
-    fn tab_title_falls_back_when_cwd_has_no_basename() {
-        // Filesystem root — file_name() returns None. We fall back.
-        let root = PathBuf::from("/");
-        assert_eq!(tab_title_for(PaneId(7), Some(&root)), "pane 7");
+    fn tab_title_uses_full_cwd_when_outside_home() {
+        let cwd = PathBuf::from("/tmp");
+        let home = PathBuf::from("/Users/tim");
+        assert_eq!(tab_title_for(PaneId(0), Some(&cwd), Some(&home)), "/tmp");
+    }
+
+    #[test]
+    fn tab_title_uses_full_cwd_when_home_unknown() {
+        // Short cwd so the truncation rule doesn't kick in and
+        // obscure what this test is asserting.
+        let cwd = PathBuf::from("/Users/tim/git");
+        assert_eq!(tab_title_for(PaneId(0), Some(&cwd), None), "/Users/tim/git");
+    }
+
+    #[test]
+    fn tab_title_substitutes_tilde_when_cwd_is_home() {
+        let cwd = PathBuf::from("/Users/tim");
+        let home = PathBuf::from("/Users/tim");
+        assert_eq!(tab_title_for(PaneId(0), Some(&cwd), Some(&home)), "~");
+    }
+
+    #[test]
+    fn tab_title_substitutes_tilde_with_subpath() {
+        let cwd = PathBuf::from("/Users/tim/git/enthal/termica");
+        let home = PathBuf::from("/Users/tim");
+        assert_eq!(tab_title_for(PaneId(0), Some(&cwd), Some(&home)), "~/git/enthal/termica");
+    }
+
+    #[test]
+    fn tab_title_tolerates_trailing_slash_on_home() {
+        let cwd = PathBuf::from("/Users/tim/git/enthal/termica");
+        let home = PathBuf::from("/Users/tim/");
+        assert_eq!(tab_title_for(PaneId(0), Some(&cwd), Some(&home)), "~/git/enthal/termica");
+    }
+
+    #[test]
+    fn tab_title_tolerates_trailing_slash_on_cwd_at_home() {
+        let cwd = PathBuf::from("/Users/tim/");
+        let home = PathBuf::from("/Users/tim");
+        assert_eq!(tab_title_for(PaneId(0), Some(&cwd), Some(&home)), "~");
+    }
+
+    #[test]
+    fn tab_title_does_not_match_sibling_user_dir_as_home() {
+        // The bug we're guarding against: HOME=/Users/tim must NOT
+        // match `/Users/timjones` as a "tim/jones" subdir and yield
+        // `~jones`. The next char after the prefix must be a `/`.
+        let cwd = PathBuf::from("/Users/timjones/work");
+        let home = PathBuf::from("/Users/tim");
+        assert_eq!(tab_title_for(PaneId(0), Some(&cwd), Some(&home)), "/Users/timjones/work");
+    }
+
+    #[test]
+    fn tab_title_returns_root_as_root() {
+        // `/` as the cwd renders as `/`, not as a fallback.
+        let cwd = PathBuf::from("/");
+        let home = PathBuf::from("/Users/tim");
+        assert_eq!(tab_title_for(PaneId(7), Some(&cwd), Some(&home)), "/");
+    }
+
+    #[test]
+    fn tab_title_unchanged_when_at_max_length() {
+        // Exactly 25 chars: `~/` (2) + 23-char dir name.
+        let cwd = PathBuf::from("/Users/tim/abcdefghijklmnopqrstuvw");
+        let home = PathBuf::from("/Users/tim");
+        let title = tab_title_for(PaneId(0), Some(&cwd), Some(&home));
+        assert_eq!(title.chars().count(), MAX_TAB_TITLE_CHARS);
+        assert_eq!(title, "~/abcdefghijklmnopqrstuvw");
+    }
+
+    #[test]
+    fn tab_title_truncates_long_titles_with_leading_ellipsis() {
+        // 42-char `~`-substituted title → expect 25 chars with `..`
+        // prefix and the last 23 chars retained.
+        let cwd = PathBuf::from("/Users/tim/very/long/path/with/lots/of/subdirs/here");
+        let home = PathBuf::from("/Users/tim");
+        let title = tab_title_for(PaneId(0), Some(&cwd), Some(&home));
+        assert_eq!(title.chars().count(), MAX_TAB_TITLE_CHARS);
+        assert!(title.starts_with(".."));
+        // Tail preserved — the user cares about the deepest dir.
+        assert!(title.ends_with("/here"));
+    }
+
+    #[test]
+    fn tab_title_truncates_unsubstituted_paths_too() {
+        // Outside `$HOME`, same rule applies.
+        let cwd = PathBuf::from("/var/log/very/long/path/under/system/dirs/please");
+        let home = PathBuf::from("/Users/tim");
+        let title = tab_title_for(PaneId(0), Some(&cwd), Some(&home));
+        assert_eq!(title.chars().count(), MAX_TAB_TITLE_CHARS);
+        assert!(title.starts_with(".."));
+    }
+
+    #[test]
+    fn tab_title_truncation_is_char_safe_for_multibyte() {
+        // A name longer than 25 with multi-byte chars must not be
+        // sliced mid-codepoint. Using accented chars: each `é` is
+        // 2 bytes but 1 char; `truncate_tab_title` counts in chars.
+        let s = "/Users/tim/répertoire-très-long-avec-accents-partout/";
+        let cwd = PathBuf::from(s);
+        let home = PathBuf::from("/Users/tim");
+        let title = tab_title_for(PaneId(0), Some(&cwd), Some(&home));
+        assert_eq!(title.chars().count(), MAX_TAB_TITLE_CHARS);
+        // If we'd sliced bytes, this would have panicked above.
     }
 
     // --- active pane resolution (Phase 2B spawn-in-cwd) -------------
