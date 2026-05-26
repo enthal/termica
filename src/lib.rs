@@ -1503,7 +1503,13 @@ pub fn run() -> eframe::Result<()> {
             // shell grid is visually jarring. The Phase 10 polish
             // pass can introduce a config-driven theme; for now
             // dark-only is the product.
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            //
+            // `set_theme` (not `set_visuals`) is the right call:
+            // it pins `Memory::theme_preference = Dark`, which is
+            // what egui resolves every frame. Using `set_visuals`
+            // works for one frame and then the system-theme
+            // follower overwrites it back.
+            cc.egui_ctx.set_theme(egui::Theme::Dark);
             #[cfg(target_os = "macos")]
             install_macos_menu();
             Ok(Box::new(TermicaApp::new()))
