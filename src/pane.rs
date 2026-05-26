@@ -66,6 +66,13 @@ pub struct PaneSession {
     /// `Some(Selection)` where anchor == head (i.e. a single click
     /// has begun a drag but the pointer hasn't moved yet).
     selection: Option<Selection>,
+    /// Latched true once `drain` has observed the reader thread's
+    /// `mpsc::Sender` disconnect — meaning the reader looped out
+    /// (PTY EOF or send error), which only happens after the
+    /// shell process exits and the kernel closes the master end.
+    /// Once latched, it stays true; consumers can poll
+    /// [`Self::is_exited`] once per frame and route to pane close.
+    exited: bool,
     // Held to keep the reader thread alive for the lifetime of this
     // session; we never `take` it. (See drop notes above.)
     _reader: JoinHandle<()>,
@@ -102,6 +109,7 @@ impl PaneSession {
             bytes_rx: rx,
             bytes_received: 0,
             selection: None,
+            exited: false,
             _reader: handle,
         })
     }
@@ -110,14 +118,42 @@ impl PaneSession {
     /// the terminal state. Returns the number of bytes consumed this
     /// call (0 if nothing was pending). Designed to be called once
     /// per UI frame.
+    ///
+    /// Also latches `self.exited` if the reader's `Sender` has been
+    /// dropped (which happens when the reader thread exits — only
+    /// after the PTY closes / the shell exits). Consumers route
+    /// exited panes to close on the next frame via
+    /// [`Self::is_exited`].
     pub fn drain(&mut self) -> usize {
         let mut consumed = 0usize;
-        while let Ok(chunk) = self.bytes_rx.try_recv() {
-            consumed += chunk.len();
-            self.bytes_received += chunk.len() as u64;
-            self.terminal.feed(&chunk);
+        loop {
+            match self.bytes_rx.try_recv() {
+                Ok(chunk) => {
+                    consumed += chunk.len();
+                    self.bytes_received += chunk.len() as u64;
+                    self.terminal.feed(&chunk);
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Reader thread has exited — PTY is closed.
+                    // Whatever bytes were already in the queue have
+                    // been drained above (try_recv returns Empty
+                    // before Disconnected when both apply); nothing
+                    // more is coming.
+                    self.exited = true;
+                    break;
+                }
+            }
         }
         consumed
+    }
+
+    /// `true` once the reader thread has observed PTY EOF and
+    /// exited — i.e. the shell process has terminated. Latched:
+    /// once true, stays true. Drained once per frame in
+    /// [`Self::drain`].
+    pub fn is_exited(&self) -> bool {
+        self.exited
     }
 
     /// Snapshot the parts of the session the UI cares about, without
@@ -347,5 +383,56 @@ mod tests {
             session.view().screen_text
         );
         let _ = session.write(b"\x03"); // Ctrl-C the sleep so the test ends fast
+    }
+
+    // ---- is_exited ---------------------------------------------------
+
+    #[test]
+    fn is_exited_is_false_before_pty_exits() {
+        // A still-running child means the reader thread is still
+        // attached; nothing has disconnected, so the flag stays
+        // false even after a drain or two.
+        let mut session = PaneSession::spawn(5, 40, &sh_c("sleep 5")).expect("spawn");
+        assert!(!session.is_exited(), "fresh session must not be exited");
+        for _ in 0..3 {
+            session.drain();
+            assert!(!session.is_exited(), "should still be running");
+        }
+        let _ = session.write(b"\x03"); // Ctrl-C so the sleep ends quickly
+    }
+
+    #[test]
+    fn is_exited_flips_true_after_child_exits() {
+        // A child that prints something and exits will cause the
+        // PTY to close, the reader thread to break the loop and
+        // drop its `Sender`, and the next `drain` to observe a
+        // `Disconnected` from `try_recv`.
+        let mut session = PaneSession::spawn(5, 40, &sh_c("printf bye; exit 0")).expect("spawn");
+        // Drain repeatedly until the flag latches or the deadline
+        // expires. We don't use `wait_for` here because we're
+        // asserting on `is_exited` rather than on a screen-text
+        // predicate.
+        let stop_at = Instant::now() + Duration::from_secs(2);
+        while !session.is_exited() && Instant::now() < stop_at {
+            session.drain();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(session.is_exited(), "PTY should have been observed closed by now");
+    }
+
+    #[test]
+    fn is_exited_stays_latched_across_drains() {
+        let mut session = PaneSession::spawn(5, 40, &sh_c("printf done; exit 0")).expect("spawn");
+        let stop_at = Instant::now() + Duration::from_secs(2);
+        while !session.is_exited() && Instant::now() < stop_at {
+            session.drain();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(session.is_exited());
+        // Subsequent drains must not flip the flag back off.
+        for _ in 0..5 {
+            session.drain();
+            assert!(session.is_exited());
+        }
     }
 }

@@ -977,6 +977,31 @@ impl eframe::App for TermicaApp {
             slot.ui.focused = false;
         }
 
+        // Auto-close panes whose shell process has exited. The
+        // shell `exit`ing (user typed exit, Ctrl+D, or `exit N`)
+        // closes the PTY; the reader thread sees EOF, drops its
+        // mpsc Sender, and `drain` above latches `is_exited`.
+        // Route those panes through the existing close path — no
+        // modal needed (nothing to confirm, the shell is gone).
+        // If this empties the workspace, fall through to Quit so
+        // we don't leave a tab-less window.
+        let exited_panes: Vec<PaneId> = self
+            .panes
+            .iter()
+            .filter_map(|(id, slot)| slot.session.is_exited().then_some(*id))
+            .collect();
+        if !exited_panes.is_empty() {
+            let live_after_close = self.panes.len().saturating_sub(exited_panes.len());
+            for pane_id in &exited_panes {
+                if let Some(tile) = self.tile_for_pane(*pane_id) {
+                    self.pending_closes.push(tile);
+                }
+            }
+            if live_after_close == 0 {
+                self.quit_requested = true;
+            }
+        }
+
         // Compute *before* `tree.ui()` so the modal's existence
         // gates this frame's pane input (otherwise keys leak to the
         // PTY before the modal renders below).
