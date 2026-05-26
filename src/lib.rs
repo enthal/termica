@@ -95,6 +95,11 @@ pub enum PaneAction {
     NextTab,
     /// Cmd+Shift+[ (macOS) / Ctrl+Shift+[ (Linux): previous tab.
     PrevTab,
+    /// Cmd+K (macOS) / Ctrl+Shift+K (Linux): full reset of the
+    /// focused pane — blank the viewport, drop scrollback, move
+    /// the cursor home. The shell process is untouched and will
+    /// redraw its prompt on the next prompt cycle.
+    ClearScrollback,
 }
 
 /// Per-pane UI interaction state. Each pane gets its own multi-
@@ -508,6 +513,7 @@ pub fn match_pane_shortcut(
             (egui::Key::T, false) => Some(PaneAction::NewTab),
             (egui::Key::W, false) => Some(PaneAction::CloseTab),
             (egui::Key::Q, false) => Some(PaneAction::Quit),
+            (egui::Key::K, false) => Some(PaneAction::ClearScrollback),
             (egui::Key::CloseBracket | egui::Key::CloseCurlyBracket, true) => {
                 Some(PaneAction::NextTab)
             }
@@ -528,6 +534,7 @@ pub fn match_pane_shortcut(
             egui::Key::T => Some(PaneAction::NewTab),
             egui::Key::W => Some(PaneAction::CloseTab),
             egui::Key::Q => Some(PaneAction::Quit),
+            egui::Key::K => Some(PaneAction::ClearScrollback),
             egui::Key::CloseBracket | egui::Key::CloseCurlyBracket => Some(PaneAction::NextTab),
             egui::Key::OpenBracket | egui::Key::OpenCurlyBracket => Some(PaneAction::PrevTab),
             _ => None,
@@ -839,6 +846,15 @@ impl TermicaApp {
             }
             PaneAction::Quit => {
                 self.quit_requested = true;
+            }
+            PaneAction::ClearScrollback => {
+                // Cmd+K: blank the viewport, drop scrollback, home
+                // the cursor. The shell is not signalled — it'll
+                // redraw its prompt on the next prompt cycle (or
+                // when the user presses Enter).
+                if let Some(slot) = self.panes.get_mut(&pane_id) {
+                    slot.session.terminal_mut().clear_all();
+                }
             }
         }
     }
@@ -1824,6 +1840,22 @@ mod tests {
     }
 
     #[test]
+    fn macos_cmd_k_maps_to_clear_scrollback() {
+        assert_eq!(
+            match_pane_shortcut(egui::Key::K, mac_cmd_only(), true),
+            Some(PaneAction::ClearScrollback)
+        );
+    }
+
+    #[test]
+    fn macos_cmd_shift_k_does_not_map() {
+        // Shift on top of Cmd+K is a different chord; we reserve
+        // it for future use. The matcher must not accept it as
+        // ClearScrollback.
+        assert_eq!(match_pane_shortcut(egui::Key::K, mac_cmd_shift(), true), None);
+    }
+
+    #[test]
     fn macos_cmd_shift_close_bracket_accepts_either_bracket_variant() {
         // With Shift held on a US keyboard, `]` becomes `}` and
         // egui reports `CloseCurlyBracket`. Both variants should
@@ -1896,6 +1928,14 @@ mod tests {
         assert_eq!(
             match_pane_shortcut(egui::Key::Q, linux_ctrl_shift(), false),
             Some(PaneAction::Quit)
+        );
+    }
+
+    #[test]
+    fn linux_ctrl_shift_k_maps_to_clear_scrollback() {
+        assert_eq!(
+            match_pane_shortcut(egui::Key::K, linux_ctrl_shift(), false),
+            Some(PaneAction::ClearScrollback)
         );
     }
 

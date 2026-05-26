@@ -1,4 +1,4 @@
-**← Previous:** [09 — Testing](09-testing.md) | **Next:** [SPEC index](../SPEC.md) ↑
+**← Previous:** [09 — Testing](09-testing.md) | **Next:** [11 — Keyboard shortcuts](11-keyboard-shortcuts.md) →
 
 # 10 — Roadmap
 
@@ -224,4 +224,4 @@ In rough priority order; each is its own future PR / Issue, none committed.
 
 ---
 
-**← Previous:** [09 — Testing](09-testing.md) | **Next:** [SPEC index](../SPEC.md) ↑
+**← Previous:** [09 — Testing](09-testing.md) | **Next:** [11 — Keyboard shortcuts](11-keyboard-shortcuts.md) →
