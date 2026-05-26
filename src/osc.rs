@@ -103,19 +103,30 @@ impl<'a> vte::Perform for Performer<'a> {
         if params.is_empty() {
             return;
         }
-        // OSC 7 keeps its dedicated path so that the
-        // status-header / clickable-paths code continues to read
-        // `state.cwd` directly. We also emit a `Cwd` marker event
-        // so that downstream consumers of the marker stream see
-        // OSC-7 cwd updates without having to poll the snapshot.
+        // OSC 7 keeps its dedicated path: it updates the
+        // `state.cwd` snapshot that the status-header /
+        // clickable-paths code already consumes, but does NOT
+        // emit a `Cwd` marker event in Phase 3A. Reasons:
+        //   - There's no consumer of marker events yet (3B wires
+        //     the PromptController), so events would accumulate
+        //     unbounded in panes where the user `cd`s often.
+        //   - The current behavior is unchanged for status/header
+        //     consumers — no risk of double-handling.
+        // 3B (or later) can decide whether OSC 7 should also feed
+        // the marker stream alongside `TermicaCwd=`. Until then,
+        // `MarkerEvent::Cwd` fires only from `TermicaCwd=`.
+        //
+        // TODO(3B+): consider unifying these two paths by moving
+        // OSC 7 parsing into `markers::parse_osc_params` and
+        // deriving `state.cwd` from the event stream. Deferred so
+        // 3A stays surgical.
         if params[0] == b"7" && params.len() >= 2 {
             let payload = match std::str::from_utf8(params[1]) {
                 Ok(s) => s,
                 Err(_) => return,
             };
             if let Some(path) = parse_osc7_cwd(payload) {
-                self.state.cwd = Some(path.clone());
-                self.events.push_back(MarkerEvent::Cwd(path));
+                self.state.cwd = Some(path);
             }
             return;
         }
@@ -325,7 +336,7 @@ mod tests {
                 MarkerEvent::PromptStart,
                 MarkerEvent::PromptEnd,
                 MarkerEvent::CommandStart,
-                MarkerEvent::CommandEnd { exit: 0, duration_ms: None },
+                MarkerEvent::CommandEnd { exit: Some(0), duration_ms: None },
             ]
         );
     }
@@ -353,15 +364,16 @@ mod tests {
     }
 
     #[test]
-    fn sniffer_osc7_also_emits_a_cwd_event() {
-        // OSC 7 has been part of the sniffer since Phase 1E-h; in
-        // Phase 3A we also surface it on the marker stream so a
-        // PromptController can react to `cd` even without
-        // TermicaCwd. The state snapshot is kept in sync too.
+    fn sniffer_osc7_updates_state_but_does_not_emit_a_marker_event() {
+        // Phase 3A scope: OSC 7 stays as a state-snapshot signal
+        // for the status header / clickable paths. It does NOT
+        // emit a marker event (yet) — see the rationale comment
+        // in `Performer::osc_dispatch`. 3B can revisit when there's
+        // a real consumer.
         let mut sniffer = OscSniffer::new();
         sniffer.feed(b"\x1b]7;file:///tmp/seen\x07");
         assert_eq!(sniffer.state().cwd, Some(PathBuf::from("/tmp/seen")));
-        assert_eq!(sniffer.drain_events(), vec![MarkerEvent::Cwd(PathBuf::from("/tmp/seen"))]);
+        assert!(sniffer.drain_events().is_empty());
     }
 
     #[test]
@@ -378,7 +390,7 @@ mod tests {
         }
         assert_eq!(
             sniffer.drain_events(),
-            vec![MarkerEvent::CommandEnd { exit: 42, duration_ms: None }]
+            vec![MarkerEvent::CommandEnd { exit: Some(42), duration_ms: None }]
         );
     }
 

@@ -37,14 +37,20 @@ pub enum MarkerEvent {
     /// run the command.
     CommandStart,
     /// `OSC 133 ; D ; <exit>` (with optional duration extension) —
-    /// command finished. `exit` is the integer exit status; the
-    /// shell may also append a duration in milliseconds.
-    CommandEnd { exit: i32, duration_ms: Option<u64> },
+    /// command finished. `exit` is the integer exit status if the
+    /// shell emitted a parseable value; `None` when the shell
+    /// emitted no exit at all or the value didn't parse. We use
+    /// `None` rather than a sentinel like `-1` because a real
+    /// process can also exit -1 and we don't want consumers to
+    /// confuse "missing" with "failed."
+    CommandEnd { exit: Option<i32>, duration_ms: Option<u64> },
     /// `OSC 1337 ; TermicaCwd=<file-uri>` — the shell's current
-    /// working directory at the moment of emission. `OSC 7` is
-    /// parsed elsewhere (in [`crate::osc`]) but ultimately produces
-    /// the same event so the consumer doesn't have to care which
-    /// source it came from.
+    /// working directory at the moment of emission. Note: OSC 7
+    /// (the de-facto cwd-reporting OSC) is parsed elsewhere in
+    /// [`crate::osc`] and currently only updates the `state.cwd`
+    /// snapshot — it does NOT produce a `Cwd` event in Phase 3A.
+    /// We may unify the two sources in a later phase once there's
+    /// a real marker-stream consumer that wants OSC 7 in-band.
     Cwd(PathBuf),
     /// `OSC 1337 ; TermicaVersion=<u32>` — the integration script's
     /// protocol version. The `PromptController` uses this to refuse
@@ -100,16 +106,18 @@ fn parse_osc_133(args: &[&[u8]]) -> Option<MarkerEvent> {
         b"C" => Some(MarkerEvent::CommandStart),
         b"D" => {
             // `D` carries an exit code in `args[1]`. Missing or
-            // unparseable → -1 (the "unknown" sentinel), since a
-            // default of 0 would silently lie that the command
-            // succeeded. The spec mentions optional duration; the
-            // sample integration scripts in spec/03 don't currently
-            // emit it, so we leave it `None` until they do.
+            // unparseable → `None` (the honest "unknown" value);
+            // we don't fall back to a sentinel like `-1` because
+            // a process can legitimately exit -1 and consumers
+            // would conflate that with "shell forgot to emit."
+            // The spec mentions an optional duration extension;
+            // the sample integration scripts in spec/03 don't
+            // currently emit it, so we leave it `None` until
+            // they do.
             let exit = args
                 .get(1)
                 .and_then(|b| std::str::from_utf8(b).ok())
-                .and_then(|s| s.parse::<i32>().ok())
-                .unwrap_or(-1);
+                .and_then(|s| s.parse::<i32>().ok());
             Some(MarkerEvent::CommandEnd { exit, duration_ms: None })
         }
         _ => None,
@@ -188,7 +196,7 @@ mod tests {
         let p = params_ref(&parts);
         assert_eq!(
             parse_osc_params(&p),
-            Some(MarkerEvent::CommandEnd { exit: 0, duration_ms: None })
+            Some(MarkerEvent::CommandEnd { exit: Some(0), duration_ms: None })
         );
     }
 
@@ -198,34 +206,35 @@ mod tests {
         let p = params_ref(&parts);
         assert_eq!(
             parse_osc_params(&p),
-            Some(MarkerEvent::CommandEnd { exit: 127, duration_ms: None })
+            Some(MarkerEvent::CommandEnd { exit: Some(127), duration_ms: None })
         );
     }
 
     #[test]
-    fn osc_133_d_without_exit_treats_as_unknown_status() {
+    fn osc_133_d_without_exit_is_none() {
         // Shells *should* always emit the exit; some implementations
-        // miss it. Falling back to `exit: 0` would be wrong (silently
-        // pretending the command succeeded); we treat the absence as
-        // a -1 sentinel since `Option<i32>` would balloon downstream
-        // consumers.
+        // miss it. We carry the absence honestly as `None` rather
+        // than falling back to `0` (which would lie that the command
+        // succeeded) or a sentinel like `-1` (which conflates with
+        // a real process exit -1).
         let parts = osc(&["133", "D"]);
         let p = params_ref(&parts);
         assert_eq!(
             parse_osc_params(&p),
-            Some(MarkerEvent::CommandEnd { exit: -1, duration_ms: None })
+            Some(MarkerEvent::CommandEnd { exit: None, duration_ms: None })
         );
     }
 
     #[test]
-    fn osc_133_d_with_garbage_exit_is_unknown_status() {
+    fn osc_133_d_with_garbage_exit_is_none() {
         // Defensive: a malformed exit code shouldn't crash the
-        // parser. Mark as unknown (-1) and move on.
+        // parser. Treat the same as a missing exit — honestly
+        // `None`, not a sentinel.
         let parts = osc(&["133", "D", "not-a-number"]);
         let p = params_ref(&parts);
         assert_eq!(
             parse_osc_params(&p),
-            Some(MarkerEvent::CommandEnd { exit: -1, duration_ms: None })
+            Some(MarkerEvent::CommandEnd { exit: None, duration_ms: None })
         );
     }
 
