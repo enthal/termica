@@ -59,6 +59,30 @@ egui_tiles = "0.14"
 # why that stdlib fn was deprecated).
 home = "0.5"
 
+# Phase 3C: JSON parsing for DCS-JSON shell-integration messages
+# (spec/03). We parse the bytes between `ESC P Termica;` and `ESC \`
+# as a single JSON object. `default-features = false` keeps the
+# `std` feature (which is what `default = ["std"]` is) since we are
+# always on std, and disables the `arbitrary_precision` feature we
+# don't need.
+serde_json = "1"
+
+# Phase 3E: per-session scratch directory for shell-integration
+# wrappers (zsh's `.zshrc` under our ZDOTDIR, bash's `--rcfile`).
+# These are regenerated on every spawn from `include_str!` constants
+# and read exactly once by the shell at startup — they have no
+# persistent value and don't belong in `directories::data_dir()`.
+# `tempfile::TempDir` auto-deletes on Drop, and we tie its lifetime
+# to `PaneSession` so the wrapper survives long enough for zsh /
+# bash to source it and disappears the moment the pane closes.
+tempfile = "3"
+
+# Phase 3E: UUIDv4 generation for TERMICA_SESSION_ID. Each spawned
+# shell carries a session ID in its environment; the integration
+# script echoes it back in every DCS-JSON message so messages from
+# a stale child can be discriminated.
+uuid = { version = "1", features = ["v4"] }
+
 # macOS-only: we need `EventLoopBuilderExtMacOS::with_default_menu(false)`
 # to disable winit's default app menubar. Its Quit item invokes
 # `[NSApplication terminate:]` directly, which bypasses our key

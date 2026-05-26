@@ -91,6 +91,13 @@ impl TerminalState {
         self.osc.state().cwd.as_deref()
     }
 
+    /// Drain all DCS-JSON lifecycle events that have been extracted
+    /// from the byte stream since the last drain. Empty if no events
+    /// are queued. Caller is the per-pane `PromptController`.
+    pub fn drain_lifecycle_events(&mut self) -> Vec<crate::markers::LifecycleEvent> {
+        self.osc.drain_events()
+    }
+
     /// Resize the grid in place. Unlike `TerminalState::new`, this
     /// preserves the existing screen contents — the cells in the
     /// overlap region keep their characters and styles. New cells

@@ -19,8 +19,10 @@ use std::thread::{self, JoinHandle};
 
 use alacritty_terminal::index::Point;
 
+use crate::integration::{ManagedSpawn, ShellSpec, managed_spawn_for, new_session_id};
 use crate::pty::{PtyConfig, PtyError, PtySession};
 use crate::selection::{self, Selection, SelectionMode};
+use crate::shell::{PaneMode, PromptController};
 use crate::terminal::TerminalState;
 
 /// Plain snapshot of what the UI needs to render this pane. No OS
@@ -37,14 +39,21 @@ pub struct PaneView {
     pub rows: u16,
     /// Cell-grid columns the PTY is currently sized to.
     pub cols: u16,
-    /// Most recent CWD reported via OSC 7 (or `None` if the shell
-    /// hasn't emitted one). zsh emits OSC 7 on `cd` by default;
-    /// bash needs a `PROMPT_COMMAND` hook to do the same.
+    /// Most recent CWD reported via OSC 7 / `Precmd` / `Cwd`
+    /// lifecycle events. `None` if the shell hasn't emitted one yet.
     pub cwd: Option<std::path::PathBuf>,
     /// Visible grid rendered as multi-line text. Convenient for
     /// `--dump-events`-style debugging; the real renderer paints
     /// cells directly via [`crate::render::paint_terminal`].
     pub screen_text: String,
+    /// Current pane mode per the `PromptController` state machine.
+    /// `None` only for `PaneView::default()` (snapshot tests); a
+    /// real `PaneSession::view()` always populates it.
+    pub mode: Option<PaneMode>,
+    /// `true` while the pane is in `Bootstrapping` mode — the
+    /// renderer should suppress the cell grid and show a placeholder
+    /// instead.
+    pub is_bootstrapping: bool,
 }
 
 /// Live session: one PTY + one [`TerminalState`] + the reader thread
@@ -60,28 +69,53 @@ pub struct PaneSession {
     terminal: TerminalState,
     bytes_rx: mpsc::Receiver<Vec<u8>>,
     bytes_received: u64,
-    /// Current mouse selection, if any. Anchored to absolute grid
-    /// `Point`s so the highlight stays glued to the right cells as
-    /// the user scrolls. `None` means "no selection" — distinct from
-    /// `Some(Selection)` where anchor == head (i.e. a single click
-    /// has begun a drag but the pointer hasn't moved yet).
     selection: Option<Selection>,
-    /// Latched true once `drain` has observed the reader thread's
-    /// `mpsc::Sender` disconnect — meaning the reader looped out
-    /// (PTY EOF or send error), which only happens after the
-    /// shell process exits and the kernel closes the master end.
-    /// Once latched, it stays true; consumers can poll
-    /// [`Self::is_exited`] once per frame and route to pane close.
     exited: bool,
-    // Held to keep the reader thread alive for the lifetime of this
-    // session; we never `take` it. (See drop notes above.)
     _reader: JoinHandle<()>,
+    /// Pane-mode state machine. Drives `Bootstrapping → RawTerminal`
+    /// on `IntegrationReady`, `RawTerminal → ShellPromptEditor` on
+    /// `Precmd`, etc. See [`crate::shell::PromptController`].
+    controller: PromptController,
+    /// Termica session ID, set in the spawned shell's environment as
+    /// `TERMICA_SESSION_ID` and echoed back in every lifecycle
+    /// message. Used today only for diagnostics; future work may
+    /// compare it against the `session` field on incoming events to
+    /// drop messages from stale children.
+    #[allow(dead_code)]
+    session_id: String,
+    /// Frame counter used by the `PromptController` for its
+    /// bootstrap timeout and frame-debounce logic. Incremented once
+    /// per `drain()` call.
+    frame: u64,
+    /// Last-seen alt-screen flag — debounces the `observe_alt_screen`
+    /// call on the controller so we only notify on transitions.
+    last_alt_screen: bool,
+    /// Owned per-spawn temp directory holding the wrapper file(s) the
+    /// shell sourced at startup (zsh's `.zshrc`, bash's `--rcfile`).
+    /// Kept here so its `Drop` fires when the pane closes — the
+    /// wrapper exists exactly as long as the pane that needs it.
+    /// `None` for fish (inline `--init-command`) and for `spawn()`
+    /// (test / low-level path).
+    #[allow(dead_code)]
+    wrapper_dir: Option<tempfile::TempDir>,
 }
 
 impl PaneSession {
     /// Spawn a shell, attach a freshly sized [`TerminalState`], and
-    /// start the background reader thread.
-    pub fn spawn(rows: u16, cols: u16, config: &PtyConfig) -> Result<Self, PtyError> {
+    /// start the background reader thread. Low-level constructor;
+    /// most callers want [`Self::spawn_managed`] instead, which
+    /// routes through the Phase 3 managed-startup machinery.
+    ///
+    /// `session_id` is exposed as the pane's `TERMICA_SESSION_ID`
+    /// for lifecycle-event diagnostics. Synthesise one via
+    /// [`crate::integration::new_session_id`] when a session ID
+    /// isn't already in hand.
+    pub fn spawn(
+        rows: u16,
+        cols: u16,
+        config: &PtyConfig,
+        session_id: String,
+    ) -> Result<Self, PtyError> {
         let mut pty = PtySession::spawn(config)?;
         let terminal = TerminalState::new(rows, cols);
 
@@ -111,7 +145,66 @@ impl PaneSession {
             selection: None,
             exited: false,
             _reader: handle,
+            // Low-level spawn: no managed bootstrap is in flight, so
+            // start the controller past `Bootstrapping` directly in
+            // `RawTerminal`. Callers using `spawn_managed` flip this
+            // back to the Bootstrapping start after construction.
+            controller: PromptController::new_no_bootstrap(0),
+            session_id,
+            frame: 0,
+            last_alt_screen: false,
+            wrapper_dir: None,
         })
+    }
+
+    /// Spawn a managed shell session per spec/03: build a
+    /// [`ManagedSpawn`] for `shell`, translate it to a [`PtyConfig`]
+    /// (with `cwd` from the caller if any), spawn via
+    /// [`Self::spawn`], then — for zsh — write the bootstrap to the
+    /// PTY's master end so the shell evaluates it before the first
+    /// user-visible prompt. Bash and fish embed the bootstrap via
+    /// their CLI flags and need no PTY-write.
+    ///
+    /// The pane enters `Bootstrapping` mode immediately; the
+    /// renderer should suppress display until `is_bootstrapping()`
+    /// reads `false` (i.e. the bootstrap has emitted
+    /// `integration_ready` or `Bootstrapping` has timed out into
+    /// `Degraded`).
+    pub fn spawn_managed(
+        rows: u16,
+        cols: u16,
+        shell: ShellSpec,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Result<Self, PtyError> {
+        let session_id = new_session_id();
+        let ManagedSpawn { argv, pty_bootstrap, env, wrapper_dir } =
+            managed_spawn_for(shell, &session_id)
+                .map_err(|e| PtyError::Os(format!("build managed spawn plan: {e}")))?;
+        let program = argv[0].clone();
+        let args: Vec<String> = argv[1..].to_vec();
+        let config = PtyConfig { program, args, env, cwd, rows, cols };
+        let mut session = Self::spawn(rows, cols, &config, session_id)?;
+        // Tie the wrapper TempDir's lifetime to the pane session.
+        // When the pane closes, the directory under $TMPDIR is
+        // recursively removed.
+        session.wrapper_dir = wrapper_dir;
+        // Override the default no-bootstrap controller with one that
+        // starts in `Bootstrapping`. The renderer will suppress the
+        // pane until `integration_ready` arrives or the timeout fires.
+        session.controller = PromptController::new(0);
+
+        if let Some(bootstrap) = pty_bootstrap {
+            // Write the bootstrap to the PTY as the first input the
+            // shell sees. zsh -g --no_rcs is interactive but has no
+            // init files loaded; it reads our bootstrap line-by-line,
+            // executes it (sources user's .zshenv → .zshrc → installs
+            // hooks → emits integration_ready), then waits for normal
+            // user input. The `PromptController` observes
+            // `IntegrationReady` and transitions out of Bootstrapping.
+            session.pty.write(bootstrap.as_bytes())?;
+        }
+
+        Ok(session)
     }
 
     /// Pull every chunk the reader thread has queued and feed it into
@@ -145,6 +238,40 @@ impl PaneSession {
                 }
             }
         }
+
+        // Advance the per-pane frame counter. Used by the controller
+        // for bootstrap timeout + frame-debounce. We tick once per
+        // drain regardless of whether bytes arrived — the controller
+        // measures elapsed time in frame ticks, not bytes seen.
+        self.frame = self.frame.saturating_add(1);
+
+        // Tick the bootstrap timeout. No-op once we leave
+        // Bootstrapping.
+        self.controller.tick_bootstrap_timeout(self.frame);
+
+        // Feed lifecycle events extracted from the byte stream into
+        // the controller. Order is preserved per spec/03.
+        for event in self.terminal.drain_lifecycle_events() {
+            self.controller.observe_event(event, self.frame);
+        }
+
+        // Track alt-screen transitions. The terminal flag is the
+        // source of truth (alacritty maintains it); we only notify
+        // the controller on edges.
+        let alt = self.terminal.is_alternate_screen();
+        if alt != self.last_alt_screen {
+            self.controller.observe_alt_screen(alt, self.frame);
+            self.last_alt_screen = alt;
+        }
+
+        // PTY exit is observed via `self.exited` (latched above)
+        // rather than as a one-shot signal here — the parent app
+        // already polls `is_exited` per frame to route pane close,
+        // so we notify the controller on the same edge.
+        if self.exited && self.controller.mode() != PaneMode::Dead {
+            self.controller.observe_pty_exit(self.frame);
+        }
+
         consumed
     }
 
@@ -161,19 +288,52 @@ impl PaneSession {
     pub fn view(&self) -> PaneView {
         use alacritty_terminal::grid::Dimensions;
         let grid = self.terminal.grid();
+        let mode = self.controller.mode();
         PaneView {
             bytes_received: self.bytes_received,
             alt_screen: self.terminal.is_alternate_screen(),
             rows: grid.screen_lines() as u16,
             cols: grid.columns() as u16,
-            cwd: self.terminal.cwd().map(|p| p.to_path_buf()),
+            cwd: self
+                .controller
+                .cwd()
+                .map(|p| p.to_path_buf())
+                .or_else(|| self.terminal.cwd().map(|p| p.to_path_buf())),
             screen_text: self.terminal.screen_text(),
+            mode: Some(mode),
+            is_bootstrapping: mode == PaneMode::Bootstrapping,
         }
     }
 
-    /// Write bytes to the PTY (e.g. keyboard input). Passed through
-    /// to [`PtySession::write`] verbatim.
+    /// Current pane mode per the `PromptController`. Reflects the
+    /// state machine in spec/05.
+    pub fn pane_mode(&self) -> PaneMode {
+        self.controller.mode()
+    }
+
+    /// `true` while the renderer should suppress this pane's display
+    /// (bootstrap noise) and the input layer should drop keystrokes.
+    /// Becomes `false` as soon as `integration_ready` arrives or the
+    /// bootstrap times out.
+    pub fn is_bootstrapping(&self) -> bool {
+        self.controller.is_bootstrapping()
+    }
+
+    /// Borrow the pane's `PromptController` (read-only).
+    pub fn controller(&self) -> &PromptController {
+        &self.controller
+    }
+
+    /// Write bytes to the PTY (e.g. keyboard input). Refuses to
+    /// write while the pane is in `Bootstrapping` — keystrokes would
+    /// race with the bootstrap script's own commands and corrupt
+    /// integration. Bootstrap delivery itself goes through
+    /// [`Self::spawn_managed`] which writes directly via the PTY
+    /// before `Bootstrapping` is observable.
     pub fn write(&mut self, bytes: &[u8]) -> Result<(), PtyError> {
+        if self.controller.is_bootstrapping() {
+            return Ok(());
+        }
         self.pty.write(bytes)
     }
 
@@ -293,7 +453,8 @@ mod tests {
     #[test]
     fn pipeline_routes_echo_output_into_the_terminal() {
         let mut session =
-            PaneSession::spawn(5, 40, &sh_c("printf hello-pipeline")).expect("spawn /bin/sh");
+            PaneSession::spawn(5, 40, &sh_c("printf hello-pipeline"), "test-session".into())
+                .expect("spawn /bin/sh");
         let view = wait_for(&mut session, Duration::from_secs(2), |v| {
             v.screen_text.contains("hello-pipeline")
         });
@@ -312,8 +473,13 @@ mod tests {
 
     #[test]
     fn bytes_received_accumulates_across_frames() {
-        let mut session = PaneSession::spawn(5, 40, &sh_c("printf one; printf two; printf three"))
-            .expect("spawn");
+        let mut session = PaneSession::spawn(
+            5,
+            40,
+            &sh_c("printf one; printf two; printf three"),
+            "test-session".into(),
+        )
+        .expect("spawn");
         let view =
             wait_for(&mut session, Duration::from_secs(2), |v| v.screen_text.contains("three"));
         let expected_min = "onetwothree".len() as u64;
@@ -330,7 +496,8 @@ mod tests {
     fn write_sends_input_to_the_child() {
         // `cat` echoes its stdin back to its stdout, so writing a
         // line that we then see on the screen proves the write path.
-        let mut session = PaneSession::spawn(5, 40, &sh_c("cat")).expect("spawn cat");
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c("cat"), "test-session".into()).expect("spawn cat");
         session.write(b"pipeline-write-marker\n").expect("write");
         let view = wait_for(&mut session, Duration::from_secs(2), |v| {
             v.screen_text.contains("pipeline-write-marker")
@@ -344,14 +511,16 @@ mod tests {
 
     #[test]
     fn view_alt_screen_starts_false() {
-        let session = PaneSession::spawn(5, 40, &sh_c("sleep 0.1")).expect("spawn");
+        let session =
+            PaneSession::spawn(5, 40, &sh_c("sleep 0.1"), "test-session".into()).expect("spawn");
         let view = session.view();
         assert!(!view.alt_screen);
     }
 
     #[test]
     fn drain_on_idle_session_returns_zero() {
-        let mut session = PaneSession::spawn(5, 40, &sh_c("sleep 0.2")).expect("spawn");
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c("sleep 0.2"), "test-session".into()).expect("spawn");
         // sleep gives no output; first drain should see nothing.
         assert_eq!(session.drain(), 0);
         assert_eq!(session.view().bytes_received, 0);
@@ -361,8 +530,13 @@ mod tests {
     fn resize_keeps_existing_output_on_screen() {
         // Spawn a shell that prints a marker and then idles, so we
         // can resize without races against the child exiting.
-        let mut session =
-            PaneSession::spawn(5, 40, &sh_c("printf survives-resize; sleep 1")).expect("spawn");
+        let mut session = PaneSession::spawn(
+            5,
+            40,
+            &sh_c("printf survives-resize; sleep 1"),
+            "test-session".into(),
+        )
+        .expect("spawn");
         let _ = wait_for(&mut session, Duration::from_secs(2), |v| {
             v.screen_text.contains("survives-resize")
         });
@@ -392,7 +566,8 @@ mod tests {
         // A still-running child means the reader thread is still
         // attached; nothing has disconnected, so the flag stays
         // false even after a drain or two.
-        let mut session = PaneSession::spawn(5, 40, &sh_c("sleep 5")).expect("spawn");
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c("sleep 5"), "test-session".into()).expect("spawn");
         assert!(!session.is_exited(), "fresh session must not be exited");
         for _ in 0..3 {
             session.drain();
@@ -407,7 +582,9 @@ mod tests {
         // PTY to close, the reader thread to break the loop and
         // drop its `Sender`, and the next `drain` to observe a
         // `Disconnected` from `try_recv`.
-        let mut session = PaneSession::spawn(5, 40, &sh_c("printf bye; exit 0")).expect("spawn");
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c("printf bye; exit 0"), "test-session".into())
+                .expect("spawn");
         // Drain repeatedly until the flag latches or the deadline
         // expires. We don't use `wait_for` here because we're
         // asserting on `is_exited` rather than on a screen-text
@@ -422,7 +599,9 @@ mod tests {
 
     #[test]
     fn is_exited_stays_latched_across_drains() {
-        let mut session = PaneSession::spawn(5, 40, &sh_c("printf done; exit 0")).expect("spawn");
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c("printf done; exit 0"), "test-session".into())
+                .expect("spawn");
         let stop_at = Instant::now() + Duration::from_secs(2);
         while !session.is_exited() && Instant::now() < stop_at {
             session.drain();

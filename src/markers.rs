@@ -1,339 +1,320 @@
-//! Shell-integration markers.
+//! Shell-integration lifecycle messages.
 //!
-//! Parses pre-assembled OSC parameter slices into [`MarkerEvent`]s.
-//! Two namespaces, per [spec/03](../spec/03-shell-integration.md):
+//! Per [spec/03](../spec/03-shell-integration.md), Termica's
+//! integration scripts emit lifecycle messages via DCS-JSON:
 //!
-//! 1. **OSC 133** — the FinalTerm / iTerm2 prompt-state convention.
-//! 2. **OSC 1337 ; Termica…=…** — Termica's extensions (riding the
-//!    iTerm2-private OSC namespace).
+//! ```text
+//! ESC P Termica;{"type":"...","session":"...","value":...} ESC \
+//! ```
 //!
-//! This module is **only the parser**. The byte-stream → OSC-param
-//! routing lives in [`crate::osc`] (a `vte::Perform` impl that
-//! dispatches the same params to both OSC 7 handling and to us
-//! via [`parse_osc_params`]). The strict "no raw-byte pattern
-//! matching" rule from the spec is enforced by giving the
-//! parser pre-assembled params it can't pretend are raw bytes.
+//! This module is **only the parser**. The byte-stream → DCS-body
+//! buffering and dispatch lives in [`crate::osc`] (a `vte::Perform`
+//! impl that buffers DCS bytes between `hook` and `unhook` and hands
+//! us the completed body via [`parse_dcs_body`]).
 //!
-//! Phase 3A scope: this file + integration into [`crate::osc`].
-//! Phase 3B will consume [`MarkerEvent`]s in the `PromptController`
-//! state machine.
+//! Strict rule from spec/03: no code anywhere in Termica scans the
+//! raw byte stream for marker patterns. The DCS framing is handled
+//! by `vte::Parser`; the JSON payload is parsed here via `serde_json`.
+//!
+//! Termica's parser ignores OSC 133 and OSC 1337 entirely. Foreign
+//! integration scripts (iTerm2 / WezTerm / kitty / Ghostty) may emit
+//! those into the byte stream from a user's `.zshrc`; Termica does
+//! not trust them. See spec/05 safety rule 3.
 
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
 
-/// Anything the shell told us via a marker OSC. The
-/// `PromptController` ([spec/05](../spec/05-pane-modes.md))
+/// One lifecycle message emitted by Termica's integration script.
+/// The `PromptController` ([spec/05](../spec/05-pane-modes.md))
 /// consumes these in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MarkerEvent {
-    /// `OSC 133 ; A` — shell is about to draw the prompt.
-    PromptStart,
-    /// `OSC 133 ; B` — prompt is drawn, shell is ready to read the
-    /// command line. This is the gate that promotes a pane into
-    /// `ShellPromptEditor` mode.
-    PromptEnd,
-    /// `OSC 133 ; C` — user pressed Enter; the shell is about to
-    /// run the command.
-    CommandStart,
-    /// `OSC 133 ; D ; <exit>` (with optional duration extension) —
-    /// command finished. `exit` is the integer exit status if the
-    /// shell emitted a parseable value; `None` when the shell
-    /// emitted no exit at all or the value didn't parse. We use
-    /// `None` rather than a sentinel like `-1` because a real
-    /// process can also exit -1 and we don't want consumers to
-    /// confuse "missing" with "failed."
-    CommandEnd { exit: Option<i32>, duration_ms: Option<u64> },
-    /// `OSC 1337 ; TermicaCwd=<file-uri>` — the shell's current
-    /// working directory at the moment of emission. Note: OSC 7
-    /// (the de-facto cwd-reporting OSC) is parsed elsewhere in
-    /// [`crate::osc`] and currently only updates the `state.cwd`
-    /// snapshot — it does NOT produce a `Cwd` event in Phase 3A.
-    /// We may unify the two sources in a later phase once there's
-    /// a real marker-stream consumer that wants OSC 7 in-band.
-    Cwd(PathBuf),
-    /// `OSC 1337 ; TermicaVersion=<u32>` — the integration script's
-    /// protocol version. The `PromptController` uses this to refuse
-    /// integration handshakes it can't speak.
-    ProtocolVersion(u32),
-    /// `OSC 1337 ; TermicaShell=<bash|zsh>` — which shell the
-    /// integration script announced. Decoupled from
-    /// `ProtocolVersion` because the script emits the two OSCs
-    /// separately and they don't arrive atomically.
-    Shell(ShellKind),
+pub enum LifecycleEvent {
+    /// `{"type":"integration_ready","value":{"shell":"zsh","version":1}}`
+    /// — the bootstrap completed successfully. Termica transitions
+    /// the pane from `Bootstrapping` → `RawTerminal` on receipt.
+    IntegrationReady { shell: ShellKind, version: u32 },
+    /// `{"type":"integration_error","value":"<reason>"}` — the
+    /// bootstrap detected a problem and chose to fail loud rather
+    /// than continue. Pane transitions to `Degraded`.
+    IntegrationError { reason: String },
+    /// `{"type":"preexec","value":"<command>"}` — about to execute
+    /// the command. Emitted by the shell-side preexec hook.
+    Preexec { command: String },
+    /// `{"type":"command_finished","value":<exit_int>}` — the
+    /// foreground command returned with this exit code.
+    CommandFinished { exit: i32 },
+    /// `{"type":"precmd","value":"<cwd>"}` — the shell is about to
+    /// draw the next prompt. The signal that promotes to
+    /// `ShellPromptEditor`.
+    Precmd { cwd: PathBuf },
+    /// `{"type":"cwd","value":"<cwd>"}` — optional standalone cwd
+    /// update outside the precmd flow.
+    Cwd { cwd: PathBuf },
+    /// `{"type":"prompt_vars","value":{...}}` — open-ended structured
+    /// prompt metadata (git branch, virtualenv, etc.) for the native
+    /// status header.
+    PromptVars { vars: serde_json::Map<String, serde_json::Value> },
+    /// `{"type":"command_aborted","value":"<reason>"}` — user cancelled
+    /// input before execution (Ctrl-C on empty editor, syntax error
+    /// rejected by shell, etc.).
+    CommandAborted { reason: String },
 }
 
-/// The shell kinds we recognise from `TermicaShell=…`. `Unknown`
-/// is reserved for values our parser doesn't know about yet, so
-/// callers can pattern-match exhaustively without losing information.
+/// The shell kinds recognised in the `integration_ready` payload.
+/// `Unknown` is reserved for values the parser doesn't know about
+/// yet, so callers can pattern-match exhaustively without losing
+/// information.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellKind {
     Bash,
     Zsh,
-    /// `TermicaShell=` with a value we don't have an enum variant
-    /// for. Carrying the raw bytes here would balloon the type;
-    /// the value is the protocol/identity signal anyway, and the
-    /// `Unknown` arm lets consumers fall back to safe defaults.
+    Fish,
     Unknown,
 }
 
-/// Parse a single dispatched OSC parameter list into a marker event.
+/// Parse a complete DCS body (the bytes between `ESC P` and `ESC \`)
+/// into a [`LifecycleEvent`] if it's one of ours.
 ///
-/// `params[0]` is the OSC number as bytes (e.g. `b"133"`). Subsequent
-/// elements are the ` ; `-separated payload pieces. Returns `None`
-/// for OSCs we don't recognise — including OSC 1337 sequences whose
-/// key isn't ours (those belong to iTerm2 and are not our concern).
-pub fn parse_osc_params(params: &[&[u8]]) -> Option<MarkerEvent> {
-    if params.is_empty() {
-        return None;
-    }
-    match params[0] {
-        b"133" => parse_osc_133(&params[1..]),
-        b"1337" => parse_osc_1337_termica(&params[1..]),
-        _ => None,
-    }
+/// Termica's framing requires the body to start with the literal
+/// ASCII `Termica;` followed by a single JSON object. Anything else
+/// (other tools' DCS sequences, malformed payloads, JSON we don't
+/// recognise) returns `None`.
+pub fn parse_dcs_body(body: &[u8]) -> Option<LifecycleEvent> {
+    let body = body.strip_prefix(b"Termica;")?;
+    let s = std::str::from_utf8(body).ok()?;
+    let value: serde_json::Value = serde_json::from_str(s).ok()?;
+    parse_message(&value)
 }
 
-/// Parse the params *after* the `133` number. `args[0]` is the
-/// subcommand letter (`A` / `B` / `C` / `D`); for `D` the next
-/// element is the exit code. We tolerate ASCII or UTF-8 byte
-/// payloads but the actual content is always ASCII per the spec.
-fn parse_osc_133(args: &[&[u8]]) -> Option<MarkerEvent> {
-    let letter = args.first()?;
-    match *letter {
-        b"A" => Some(MarkerEvent::PromptStart),
-        b"B" => Some(MarkerEvent::PromptEnd),
-        b"C" => Some(MarkerEvent::CommandStart),
-        b"D" => {
-            // `D` carries an exit code in `args[1]`. Missing or
-            // unparseable → `None` (the honest "unknown" value);
-            // we don't fall back to a sentinel like `-1` because
-            // a process can legitimately exit -1 and consumers
-            // would conflate that with "shell forgot to emit."
-            // The spec mentions an optional duration extension;
-            // the sample integration scripts in spec/03 don't
-            // currently emit it, so we leave it `None` until
-            // they do.
-            let exit = args
-                .get(1)
-                .and_then(|b| std::str::from_utf8(b).ok())
-                .and_then(|s| s.parse::<i32>().ok());
-            Some(MarkerEvent::CommandEnd { exit, duration_ms: None })
-        }
-        _ => None,
-    }
-}
-
-/// Parse the params *after* the `1337` number. We accept only the
-/// `key=value` shapes we own (`TermicaVersion=`, `TermicaShell=`,
-/// `TermicaCwd=`). Anything else is an iTerm2-private payload (or
-/// some other tool's extension) and we ignore it.
-fn parse_osc_1337_termica(args: &[&[u8]]) -> Option<MarkerEvent> {
-    // Each arg should be a `key=value` pair. We only ever emit one
-    // marker event per dispatch — the integration scripts emit one
-    // OSC 1337 per piece of data, so in practice `args.len() == 1`,
-    // but we scan defensively in case a shell ever batches.
-    for arg in args {
-        let s = std::str::from_utf8(arg).ok()?;
-        if let Some(v) = s.strip_prefix("TermicaVersion=") {
-            return v.parse::<u32>().ok().map(MarkerEvent::ProtocolVersion);
-        }
-        if let Some(v) = s.strip_prefix("TermicaShell=") {
-            let kind = match v {
+/// Parse a single JSON message object into a [`LifecycleEvent`].
+/// The expected shape is `{"type":"...","session":"...","value":...}`.
+/// We do not currently validate `session` (the consumer side may
+/// later compare against the spawn-time session ID to discard stale
+/// messages from a child that lingered after restart).
+fn parse_message(value: &serde_json::Value) -> Option<LifecycleEvent> {
+    let obj = value.as_object()?;
+    let type_str = obj.get("type")?.as_str()?;
+    let value = obj.get("value");
+    match type_str {
+        "integration_ready" => {
+            let v = value?.as_object()?;
+            let shell = match v.get("shell").and_then(|s| s.as_str())? {
                 "bash" => ShellKind::Bash,
                 "zsh" => ShellKind::Zsh,
+                "fish" => ShellKind::Fish,
                 _ => ShellKind::Unknown,
             };
-            return Some(MarkerEvent::Shell(kind));
+            let version = v.get("version").and_then(|n| n.as_u64())? as u32;
+            Some(LifecycleEvent::IntegrationReady { shell, version })
         }
-        if let Some(v) = s.strip_prefix("TermicaCwd=") {
-            return crate::osc::parse_osc7_cwd(v).map(MarkerEvent::Cwd);
+        "integration_error" => {
+            let reason = value?.as_str()?.to_string();
+            Some(LifecycleEvent::IntegrationError { reason })
         }
+        "preexec" => {
+            let command = value?.as_str()?.to_string();
+            Some(LifecycleEvent::Preexec { command })
+        }
+        "command_finished" => {
+            // Accept both integer and numeric-string forms.
+            let exit = match value? {
+                serde_json::Value::Number(n) => n.as_i64()? as i32,
+                serde_json::Value::String(s) => s.parse::<i32>().ok()?,
+                _ => return None,
+            };
+            Some(LifecycleEvent::CommandFinished { exit })
+        }
+        "precmd" => {
+            let cwd = PathBuf::from(value?.as_str()?);
+            Some(LifecycleEvent::Precmd { cwd })
+        }
+        "cwd" => {
+            let cwd = PathBuf::from(value?.as_str()?);
+            Some(LifecycleEvent::Cwd { cwd })
+        }
+        "prompt_vars" => {
+            let vars = value?.as_object()?.clone();
+            Some(LifecycleEvent::PromptVars { vars })
+        }
+        "command_aborted" => {
+            let reason = value?.as_str()?.to_string();
+            Some(LifecycleEvent::CommandAborted { reason })
+        }
+        _ => None,
     }
-    None
 }
 
 #[cfg(test)]
 mod tests {
+    //! Unit tests for the DCS-JSON parser. The byte-stream → DCS-body
+    //! buffering is tested via `crate::osc` integration tests; here
+    //! we test the parser in isolation by feeding it pre-assembled
+    //! bodies.
+
     use super::*;
 
-    // Helper: build the `params` shape vte::Perform receives so the
-    // test reads like "OSC 133; A".
-    fn osc(parts: &[&str]) -> Vec<Vec<u8>> {
-        parts.iter().map(|p| p.as_bytes().to_vec()).collect()
-    }
-
-    fn params_ref(parts: &[Vec<u8>]) -> Vec<&[u8]> {
-        parts.iter().map(|p| p.as_slice()).collect()
-    }
-
-    // ---- OSC 133 -----------------------------------------------------
-
-    #[test]
-    fn osc_133_a_is_prompt_start() {
-        let parts = osc(&["133", "A"]);
-        let p = params_ref(&parts);
-        assert_eq!(parse_osc_params(&p), Some(MarkerEvent::PromptStart));
+    fn body(json: &str) -> Vec<u8> {
+        let mut b = b"Termica;".to_vec();
+        b.extend_from_slice(json.as_bytes());
+        b
     }
 
     #[test]
-    fn osc_133_b_is_prompt_end() {
-        let parts = osc(&["133", "B"]);
-        let p = params_ref(&parts);
-        assert_eq!(parse_osc_params(&p), Some(MarkerEvent::PromptEnd));
-    }
-
-    #[test]
-    fn osc_133_c_is_command_start() {
-        let parts = osc(&["133", "C"]);
-        let p = params_ref(&parts);
-        assert_eq!(parse_osc_params(&p), Some(MarkerEvent::CommandStart));
-    }
-
-    #[test]
-    fn osc_133_d_with_zero_exit() {
-        let parts = osc(&["133", "D", "0"]);
-        let p = params_ref(&parts);
+    fn integration_ready_zsh_v1() {
+        let b = body(
+            r#"{"type":"integration_ready","session":"x","value":{"shell":"zsh","version":1}}"#,
+        );
         assert_eq!(
-            parse_osc_params(&p),
-            Some(MarkerEvent::CommandEnd { exit: Some(0), duration_ms: None })
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::IntegrationReady { shell: ShellKind::Zsh, version: 1 })
         );
     }
 
     #[test]
-    fn osc_133_d_with_nonzero_exit() {
-        let parts = osc(&["133", "D", "127"]);
-        let p = params_ref(&parts);
+    fn integration_ready_bash_v1() {
+        let b = body(
+            r#"{"type":"integration_ready","session":"x","value":{"shell":"bash","version":1}}"#,
+        );
         assert_eq!(
-            parse_osc_params(&p),
-            Some(MarkerEvent::CommandEnd { exit: Some(127), duration_ms: None })
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::IntegrationReady { shell: ShellKind::Bash, version: 1 })
         );
     }
 
     #[test]
-    fn osc_133_d_without_exit_is_none() {
-        // Shells *should* always emit the exit; some implementations
-        // miss it. We carry the absence honestly as `None` rather
-        // than falling back to `0` (which would lie that the command
-        // succeeded) or a sentinel like `-1` (which conflates with
-        // a real process exit -1).
-        let parts = osc(&["133", "D"]);
-        let p = params_ref(&parts);
+    fn integration_ready_fish_v1() {
+        let b = body(
+            r#"{"type":"integration_ready","session":"x","value":{"shell":"fish","version":1}}"#,
+        );
         assert_eq!(
-            parse_osc_params(&p),
-            Some(MarkerEvent::CommandEnd { exit: None, duration_ms: None })
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::IntegrationReady { shell: ShellKind::Fish, version: 1 })
         );
     }
 
     #[test]
-    fn osc_133_d_with_garbage_exit_is_none() {
-        // Defensive: a malformed exit code shouldn't crash the
-        // parser. Treat the same as a missing exit — honestly
-        // `None`, not a sentinel.
-        let parts = osc(&["133", "D", "not-a-number"]);
-        let p = params_ref(&parts);
+    fn integration_ready_unknown_shell_carries_through() {
+        let b = body(
+            r#"{"type":"integration_ready","session":"x","value":{"shell":"ksh","version":1}}"#,
+        );
         assert_eq!(
-            parse_osc_params(&p),
-            Some(MarkerEvent::CommandEnd { exit: None, duration_ms: None })
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::IntegrationReady { shell: ShellKind::Unknown, version: 1 })
         );
     }
 
     #[test]
-    fn osc_133_unknown_letter_is_ignored() {
-        // FinalTerm has additional letters (e.g. `E`) we don't
-        // recognise. Ignore rather than guess.
-        let parts = osc(&["133", "E"]);
-        let p = params_ref(&parts);
-        assert_eq!(parse_osc_params(&p), None);
-    }
-
-    // ---- OSC 1337 Termica… ------------------------------------------
-
-    #[test]
-    fn osc_1337_termica_version() {
-        let parts = osc(&["1337", "TermicaVersion=1"]);
-        let p = params_ref(&parts);
-        assert_eq!(parse_osc_params(&p), Some(MarkerEvent::ProtocolVersion(1)));
-    }
-
-    #[test]
-    fn osc_1337_termica_version_garbage_is_ignored() {
-        let parts = osc(&["1337", "TermicaVersion=not-a-number"]);
-        let p = params_ref(&parts);
-        assert_eq!(parse_osc_params(&p), None);
-    }
-
-    #[test]
-    fn osc_1337_termica_shell_bash() {
-        let parts = osc(&["1337", "TermicaShell=bash"]);
-        let p = params_ref(&parts);
-        assert_eq!(parse_osc_params(&p), Some(MarkerEvent::Shell(ShellKind::Bash)));
-    }
-
-    #[test]
-    fn osc_1337_termica_shell_zsh() {
-        let parts = osc(&["1337", "TermicaShell=zsh"]);
-        let p = params_ref(&parts);
-        assert_eq!(parse_osc_params(&p), Some(MarkerEvent::Shell(ShellKind::Zsh)));
-    }
-
-    #[test]
-    fn osc_1337_termica_shell_unknown_kind_carries_through() {
-        let parts = osc(&["1337", "TermicaShell=fish"]);
-        let p = params_ref(&parts);
-        assert_eq!(parse_osc_params(&p), Some(MarkerEvent::Shell(ShellKind::Unknown)));
-    }
-
-    #[test]
-    fn osc_1337_termica_cwd_with_file_uri() {
-        let parts = osc(&["1337", "TermicaCwd=file:///Users/tim/code"]);
-        let p = params_ref(&parts);
-        assert_eq!(parse_osc_params(&p), Some(MarkerEvent::Cwd(PathBuf::from("/Users/tim/code"))));
-    }
-
-    #[test]
-    fn osc_1337_termica_cwd_percent_decodes() {
-        // Spaces and Unicode must round-trip — the bash integration
-        // script percent-encodes them on the way out.
-        let parts = osc(&["1337", "TermicaCwd=file:///Users/tim/A%20space"]);
-        let p = params_ref(&parts);
+    fn integration_error_carries_reason() {
+        let b =
+            body(r#"{"type":"integration_error","session":"x","value":"bash-preexec.sh missing"}"#);
         assert_eq!(
-            parse_osc_params(&p),
-            Some(MarkerEvent::Cwd(PathBuf::from("/Users/tim/A space")))
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::IntegrationError { reason: "bash-preexec.sh missing".into() })
         );
     }
 
     #[test]
-    fn osc_1337_non_termica_key_is_ignored() {
-        // iTerm2's own keys ride OSC 1337 too. We don't claim them.
-        let parts = osc(&["1337", "RemoteHost=user@host"]);
-        let p = params_ref(&parts);
-        assert_eq!(parse_osc_params(&p), None);
+    fn preexec_command_string() {
+        let b = body(r#"{"type":"preexec","session":"x","value":"ls -la"}"#);
+        assert_eq!(parse_dcs_body(&b), Some(LifecycleEvent::Preexec { command: "ls -la".into() }));
     }
 
     #[test]
-    fn osc_1337_empty_payload_is_ignored() {
-        let parts = osc(&["1337"]);
-        let p = params_ref(&parts);
-        assert_eq!(parse_osc_params(&p), None);
+    fn command_finished_zero_exit() {
+        let b = body(r#"{"type":"command_finished","session":"x","value":0}"#);
+        assert_eq!(parse_dcs_body(&b), Some(LifecycleEvent::CommandFinished { exit: 0 }));
     }
 
-    // ---- top-level dispatch -----------------------------------------
+    #[test]
+    fn command_finished_nonzero_exit() {
+        let b = body(r#"{"type":"command_finished","session":"x","value":127}"#);
+        assert_eq!(parse_dcs_body(&b), Some(LifecycleEvent::CommandFinished { exit: 127 }));
+    }
 
     #[test]
-    fn unknown_osc_number_is_none() {
-        // OSC 0 (window title), OSC 2 (icon title), OSC 4 (palette)
-        // are all common; we must not claim them.
-        for n in ["0", "2", "4", "8", "52"] {
-            let parts = osc(&[n, "anything"]);
-            let p = params_ref(&parts);
-            assert_eq!(parse_osc_params(&p), None, "OSC {n} should not produce a marker");
+    fn command_finished_accepts_string_form() {
+        // Some shells emit `$?` as a string because of how printf
+        // sprintf-formats arguments. Be liberal in what we accept.
+        let b = body(r#"{"type":"command_finished","session":"x","value":"42"}"#);
+        assert_eq!(parse_dcs_body(&b), Some(LifecycleEvent::CommandFinished { exit: 42 }));
+    }
+
+    #[test]
+    fn precmd_carries_cwd() {
+        let b = body(r#"{"type":"precmd","session":"x","value":"/Users/tim/code"}"#);
+        assert_eq!(
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::Precmd { cwd: PathBuf::from("/Users/tim/code") })
+        );
+    }
+
+    #[test]
+    fn cwd_carries_cwd() {
+        let b = body(r#"{"type":"cwd","session":"x","value":"/tmp"}"#);
+        assert_eq!(parse_dcs_body(&b), Some(LifecycleEvent::Cwd { cwd: PathBuf::from("/tmp") }));
+    }
+
+    #[test]
+    fn prompt_vars_carries_object() {
+        let b = body(
+            r#"{"type":"prompt_vars","session":"x","value":{"git_branch":"main","git_dirty":false}}"#,
+        );
+        let parsed = parse_dcs_body(&b).expect("should parse");
+        match parsed {
+            LifecycleEvent::PromptVars { vars } => {
+                assert_eq!(vars.get("git_branch").and_then(|v| v.as_str()), Some("main"));
+                assert_eq!(vars.get("git_dirty").and_then(|v| v.as_bool()), Some(false));
+            }
+            other => panic!("expected PromptVars, got {other:?}"),
         }
     }
 
     #[test]
-    fn empty_params_is_none() {
-        let p: Vec<&[u8]> = Vec::new();
-        assert_eq!(parse_osc_params(&p), None);
+    fn command_aborted_carries_reason() {
+        let b = body(r#"{"type":"command_aborted","session":"x","value":"syntax error"}"#);
+        assert_eq!(
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::CommandAborted { reason: "syntax error".into() })
+        );
+    }
+
+    // ---- rejected payloads ------------------------------------------
+
+    #[test]
+    fn missing_termica_prefix_returns_none() {
+        // Foreign DCS sequence (e.g. Sixel, Kitty graphics) — body
+        // doesn't start with `Termica;`, so we ignore it.
+        let b = b"q...some-other-dcs-body".to_vec();
+        assert_eq!(parse_dcs_body(&b), None);
+    }
+
+    #[test]
+    fn malformed_json_returns_none() {
+        let b = body(r#"{"type":"integration_ready","value":{not json}"#);
+        assert_eq!(parse_dcs_body(&b), None);
+    }
+
+    #[test]
+    fn unknown_type_returns_none() {
+        let b = body(r#"{"type":"yolo","session":"x","value":42}"#);
+        assert_eq!(parse_dcs_body(&b), None);
+    }
+
+    #[test]
+    fn missing_type_field_returns_none() {
+        let b = body(r#"{"session":"x","value":42}"#);
+        assert_eq!(parse_dcs_body(&b), None);
+    }
+
+    #[test]
+    fn empty_body_returns_none() {
+        assert_eq!(parse_dcs_body(b""), None);
+    }
+
+    #[test]
+    fn termica_prefix_without_json_returns_none() {
+        let b = b"Termica;".to_vec();
+        assert_eq!(parse_dcs_body(&b), None);
     }
 }

@@ -6,221 +6,403 @@ The shell-integration layer is the bridge between an opaque PTY byte stream and 
 
 ## The principle
 
-> The shell emits **markers** that tell Termica what it's about to do. Termica never guesses.
+> The shell emits **lifecycle messages** that tell Termica what it's about to do. Termica never guesses.
 
-If a marker hasn't arrived, Termica assumes the worst (we're not at a prompt; the editor is unavailable). This is the single biggest correctness win in the design.
+If a lifecycle message hasn't arrived, Termica assumes the worst (we're not at a prompt; the editor is unavailable). This is the single biggest correctness win in the design.
 
-## Marker protocol
+A second, equally normative principle:
 
-Termica consumes two namespaces, in priority order:
+> **Termica installs the integration. Every time. On every shell start.**
 
-1. **OSC 133** — the de-facto-standard FinalTerm / iTerm2 / WezTerm / kitty prompt markers. Many users already have these in their shell rc from prior terminals. We get them for free.
-2. **OSC 1337 `Termica=…`** — Termica-private extensions for things OSC 133 doesn't cover (typed identifiers, version negotiation, command-id correlation).
+Termica does not require, ask, or rely on the user editing their dotfiles. Termica does not ride along on whatever foreign shell-integration scripts the user happens to have installed from iTerm2 / WezTerm / kitty / Ghostty. Termica's bootstrap is the only source of integration metadata it trusts. The byte stream may carry foreign OSC 133 sequences from other tools' scripts; Termica's parser ignores them.
 
-### OSC 133 — the standard set
+## The protocol: DCS-JSON
 
-| Marker | Meaning | Emitted at |
+Termica's shell-integration messages travel over **DCS** (Device Control String) escape sequences with a Termica-tagged JSON payload:
+
+```text
+ESC P Termica;<json> ESC \
+```
+
+- `ESC P` opens DCS.
+- `Termica;` is our literal namespace tag (a fixed ASCII prefix).
+- `<json>` is a single JSON object describing the event.
+- `ESC \` (ST) terminates.
+
+DCS rather than OSC because OSC is heavily contested (OSC 0/2 = title, OSC 4 = palette, OSC 7 = cwd, OSC 8 = hyperlinks, OSC 52 = clipboard, OSC 133 = FinalTerm prompts, OSC 1337 = iTerm2 private, OSC 777 = urxvt). DCS is genuinely device-metadata and we don't conflict with anyone.
+
+### Message schema
+
+Every Termica message is a JSON object with these fields:
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `type` | string | yes | The event kind (table below). |
+| `session` | string | yes | Termica session ID (UUID-shaped), echoed from `TERMICA_SESSION_ID` so messages from a stale spawned shell can be discriminated. |
+| `value` | string / number / object | depends on `type` | Payload. |
+
+Defined `type` values:
+
+| `type` | `value` shape | When the shell emits it |
 |---|---|---|
-| `OSC 133 ; A ST` | Prompt start | First byte of the prompt about to be drawn |
-| `OSC 133 ; B ST` | Prompt end (= command edit begin) | Just before the shell reads the user's command |
-| `OSC 133 ; C ST` | Command start (= shell about to run) | Right after the user presses Enter, before the command runs |
-| `OSC 133 ; D ; <exit> ST` | Command end | After the command returns; `<exit>` is the integer exit status |
+| `integration_ready` | `{"shell":"zsh", "version":1}` | End of bootstrap. The signal that ends `Bootstrapping` mode. |
+| `integration_error` | `{"reason":"<short>"}` | Bootstrap detected a problem and chose to fail loud rather than continue. Pane transitions to `Degraded`. |
+| `preexec` | command string | About to execute a command. |
+| `command_finished` | exit code (integer) | Foreground command returned. |
+| `precmd` | cwd path string | About to draw the next prompt. The signal that promotes to `ShellPromptEditor` ([05](05-pane-modes.md)). |
+| `cwd` | path string | Optional standalone cwd update outside the normal precmd flow (e.g. on prompt-side updates that don't go through precmd). |
+| `prompt_vars` | object | Optional structured prompt metadata (git branch, virtualenv, etc.) for the native status header. |
+| `command_aborted` | reason string | User cancelled input before execution (Ctrl-C on empty editor, etc.). |
 
-These are passed through the terminal layer to the marker stream and consumed; the bytes never appear on screen.
+`prompt_vars` is intentionally open-ended — the shell sends whatever it can cheaply derive; Termica consumes the keys it knows about (`cwd`, `git_branch`, `git_dirty`, `venv`, etc.) and ignores the rest.
 
-### OSC 1337 — Termica extensions
+### Parser requirements
 
-We follow the iTerm2-private OSC 1337 convention: `OSC 1337 ; key1=value1 ; key2=value2 ST`. Keys that begin with `Termica` are ours. We never collide with iTerm2 keys.
+The DCS parser is hosted in [`crate::markers`](../src/markers.rs) and consumed by [`crate::osc`](../src/osc.rs)'s `vte::Perform` impl (the same parallel-parser scaffolding used for OSC 7). The parser MUST:
 
-| Sequence | Meaning |
-|---|---|
-| `OSC 1337 ; TermicaVersion=1 ST` | Integration script protocol version. Required on first prompt; lets us refuse unknown versions cleanly. |
-| `OSC 1337 ; TermicaShell=zsh ST` | Self-reported shell kind (`bash` / `zsh`). |
-| `OSC 1337 ; TermicaCwd=<file-uri> ST` | Current working directory as a `file://` URL. Spaces/Unicode are URI-encoded. |
-| `OSC 1337 ; TermicaCmdId=<uuid> ST` | Termica-assigned command id, echoed back to correlate command_start ↔ command_end across interleaved background output. |
-| `OSC 1337 ; TermicaDuration=<ms> ST` | Optional, emitted alongside `D` if the shell can self-measure. |
+- Recognize `ESC P Termica;…ESC \` sequences in the byte stream.
+- Remove them from display output. The bytes never reach the cell grid.
+- Parse the JSON payload; route to the lifecycle event stream.
+- Tolerate partial reads / chunk boundaries: `vte::Parser` already buffers DCS across `advance()` calls.
+- Tolerate malformed JSON without panicking: drop the bad message, log via `tracing`, continue.
+- Preserve unrelated escape sequences for the renderer.
 
-`<file-uri>` matches RFC 8089 (e.g., `file:///Users/tim/git/termica`).
+**Strict rule:** no code anywhere in Termica scans the raw byte stream for marker patterns. The DCS framing and the JSON parsing are done by the same VT parser pipeline that drives the terminal grid.
 
-### Why two namespaces, not three
-
-We considered inventing a Termica-private OSC number. We rejected it for two reasons:
-
-1. **OSC 777 is taken** (urxvt / `dunstify` / notification daemons). We will not collide.
-2. **OSC 133 already exists** and is widely deployed; consuming it gives users a working prompt editor even when they haven't installed Termica's integration yet, because they probably ran iTerm2 or WezTerm before.
-
-By layering Termica extensions on top of the iTerm2-namespaced OSC 1337, we ride the convention without inventing one.
-
-### Split-read robustness
-
-OSC sequences can be split across PTY reads. Marker parsing happens inside `alacritty_terminal`'s VT parser, which already handles partial sequences correctly. Termica's marker consumer subscribes to fully-parsed OSC events, never to raw bytes.
-
-This is normative: **any code that watches the raw byte stream for marker patterns is a bug**. The only correct place to recognize a marker is after the VT parser has assembled it.
-
-### Marker stream
+### Lifecycle event stream
 
 ```rust
-pub enum MarkerEvent {
-    PromptStart,
-    PromptEnd,
-    CommandStart,
-    CommandEnd { exit: Option<i32>, duration_ms: Option<u64> },
-    Cwd(PathBuf),
-    ProtocolVersion(u32),
-    Shell(ShellKind),
+pub enum LifecycleEvent {
+    IntegrationReady { shell: ShellKind, version: u32 },
+    IntegrationError { reason: String },
+    Preexec { command: String },
+    CommandFinished { exit: i32 },
+    Precmd { cwd: PathBuf },
+    Cwd { cwd: PathBuf },
+    PromptVars { vars: serde_json::Map<String, serde_json::Value> },
+    CommandAborted { reason: String },
 }
 
 pub enum ShellKind {
     Bash,
     Zsh,
+    Fish,
     Unknown,
 }
-
-pub struct MarkerStream { /* mpsc-style rx */ }
 ```
 
-Order is preserved per-pane. The marker stream is the only input the `PromptController` ([05](05-pane-modes.md)) consumes besides PTY exit notifications.
+Order is preserved per-pane. The lifecycle event stream is the only input the `PromptController` ([05](05-pane-modes.md)) consumes besides PTY exit notifications.
 
-`ProtocolVersion` and `Shell` are intentionally separate events even though the integration script emits both at every `PromptStart`. The two OSC 1337 sequences don't arrive atomically and there is no per-prompt framing — modeling them as one aggregated event would force the parser to buffer state across OSCs and decide when to "flush." Separate events leave that aggregation (if anyone needs it) to the consumer; the parser stays stateless and each event corresponds one-to-one with an OSC the shell actually emitted.
+### What about OSC 133?
 
-`CommandStart` / `CommandEnd` carry no `cmd_id`. The original spec drafted `cmd_id: Option<CmdId>` to correlate the two across interleaved background output, but the integration scripts below do not emit `TermicaCmdId=` and there is no consumer in v1. When a future script grows that capability, we'll add the field with tests then; carrying a phantom `Option<CmdId>` today just confuses readers about what works.
+Foreign OSC 133 sequences may appear in the byte stream if the user has iTerm2 / WezTerm / kitty / Ghostty integration scripts loaded by their `.zshrc`. Termica's parser **ignores them**.
 
-`CommandEnd.exit` is `Option<i32>` rather than `i32`: shells *should* always emit the exit code on `OSC 133 ; D`, but some implementations miss it, and our parser refuses to fall back to a sentinel like `0` (which would lie that the command succeeded) or `-1` (which conflates with a real process exit -1). `None` is the honest "the shell didn't tell us" value.
+Reason: shell-integration safety depends on the integration script being one Termica controls. Foreign OSC 133 could be emitted by anything — a buggy script, a typo in a dotfile, a `cat` of a log file containing escape sequences. Trusting them would mean the prompt editor's safety depends on what a stranger's `.zshrc` happens to emit. CLAUDE.md's "Shell integration is the only source of truth for 'are we at a prompt?'" rule forbids the heuristic.
 
-`MarkerEvent::Cwd` corresponds to `OSC 1337 ; TermicaCwd=…`. OSC 7 — the de-facto cwd-reporting OSC that most shells already emit on `cd` — is parsed by the same VT byte pipeline but currently only updates a separate state snapshot (`OscState.cwd`) that the status header / clickable paths consume; it does NOT produce a `Cwd` marker event in Phase 3A. Future phases may unify the two sources once there's a marker-stream consumer that wants OSC 7 in-band.
+Termica's own bootstrap (described below) runs on every shell start. The DCS-JSON event stream it produces is the only one we trust.
 
-## Shell integration scripts
+### What about OSC 7?
 
-Termica ships two scripts. They are bundled as compile-time strings (`include_str!`) so the binary is self-contained and `termica install-integration` can always write the current version.
+OSC 7 (cwd reporting) is **kept** as a parallel signal, used only by the status header and clickable paths. It does not feed the `PromptController` and never participates in mode transitions. It exists because pre-bootstrap (during `Bootstrapping` mode) we still want a cwd snapshot in case the user has system-wide OSC 7 emission, and because the existing zsh OSC 7 hook is harmless.
 
-### `bash` integration (`termica-integration.bash`)
+## The bootstrap
 
-```bash
-# Termica integration, version 1.
-# Loaded by ~/.bashrc inside fences written by `termica install-integration`.
+Termica controls integration via **managed shell startup**: the shell is launched with automatic rc-file loading disabled (or replaced), and Termica's bootstrap runs the user's real configuration manually in a known order, then installs Termica's lifecycle hooks.
 
-# Bail if not running under Termica or already loaded.
-[[ -n "${TERMICA:-}" ]] || return 0
-[[ -n "${__TERMICA_LOADED:-}" ]] && return 0
-__TERMICA_LOADED=1
+The mechanism is shell-specific because the available CLI surface differs.
 
-__termica_osc() { printf '\033]%s\033\\' "$1"; }
-__termica_uri() { python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe="/"))' "$1"; }
+### Environment variables set by Termica before spawn
 
-__termica_prompt_start() {
-    __termica_osc "133;A"
-    __termica_osc "1337;TermicaVersion=1"
-    __termica_osc "1337;TermicaShell=bash"
-    __termica_osc "1337;TermicaCwd=file://$(hostname)$(__termica_uri "$PWD")"
-}
-__termica_prompt_end()   { __termica_osc "133;B"; }
-__termica_cmd_end()      {
-    local exit=$?
-    __termica_osc "133;D;${exit}"
-    return "$exit"
-}
-__termica_cmd_start()    { __termica_osc "133;C"; }
-
-# Bash: PROMPT_COMMAND runs after every command, PS0 prints just before
-# the command runs.
-PS0='$(__termica_cmd_start)'
-PROMPT_COMMAND='__termica_cmd_end; __termica_prompt_start'
-
-# Replace PS1 with a *minimal* marker-only prompt so the visible prompt
-# is owned by Termica's UI. The trailing `\$ ` is a fallback for when
-# Termica is not driving the UI (e.g. ssh from another terminal).
-PS1='\[$(__termica_prompt_end)\]\$ '
+```sh
+TERM_PROGRAM=Termica
+TERMICA_SESSION_ID=<uuid>
+TERMICA_INTEGRATION_VERSION=1
+TERMICA_SHELL_INTEGRATION=1
+TERMICA_INITIAL_WORKING_DIR=<cwd>
 ```
 
-Notes:
+Optional:
 
-- The script is bash-only by feature use (`PROMPT_COMMAND`, `PS0`). Fish and other shells are out of scope for v1.
-- The `python3` URL-quoter is a fallback; we will replace it with pure shell quoting in the real script.
-- Hostname is included in the file URI for ssh-aware future use; the local resolver ignores it for v1.
-- The `\$ ` fallback means: if a user runs `bash` inside Termica without integration, or starts the same bash in iTerm2, they still see something usable.
-
-### `zsh` integration (`termica-integration.zsh`)
-
-```zsh
-# Termica integration, version 1.
-[[ -n "${TERMICA:-}" ]] || return 0
-[[ -n "${__TERMICA_LOADED:-}" ]] && return 0
-__TERMICA_LOADED=1
-
-__termica_osc() { printf '\033]%s\033\\' "$1"; }
-
-__termica_precmd() {
-    local exit=$?
-    __termica_osc "133;D;${exit}"
-    __termica_osc "133;A"
-    __termica_osc "1337;TermicaVersion=1"
-    __termica_osc "1337;TermicaShell=zsh"
-    __termica_osc "1337;TermicaCwd=file://${HOST}${PWD}"   # zsh handles encoding adequately
-}
-__termica_preexec() { __termica_osc "133;C"; }
-
-autoload -Uz add-zsh-hook
-add-zsh-hook precmd  __termica_precmd
-add-zsh-hook preexec __termica_preexec
-
-# Marker-only prompt; visible prompt is Termica's UI.
-PROMPT=$'%{\e]133;B\a%}%# '
+```sh
+TERMICA_NO_SHELL_INTEGRATION=1   # opt-out; bootstrap is skipped entirely
 ```
 
-Zsh is cleaner here because `precmd` / `preexec` are first-class hooks.
+Env vars are how the **integration script** detects it's running inside Termica and selects behaviour. They cannot themselves install hooks — only shell code does that.
 
-### What the scripts deliberately don't do
+### Env vars set by the bootstrap (not exported)
 
-- No PS1 art. The visible prompt belongs to Termica's status header ([06](06-workspace-and-tiles.md)).
-- No completion forwarding. Tab completion in `ShellPromptEditor` is local in v1 ([04](04-prompt-editor.md)).
-- No history capture from the shell. Termica records its own history at the prompt-submit moment ([07](07-history-and-search.md)).
-- No background telemetry, no probe loops. The shell does nothing extra outside of prompt hooks.
+The bootstrap also sets a local flag inside the spawned shell to guard against double-bootstrap of *that shell*:
 
-## The installer
+- `TERMICA_BOOTSTRAPPED=1` — set as a shell-local variable, **not exported**.
 
-`termica install-integration` is a CLI subcommand on the main binary.
+This is **deliberately non-exported**. Two scenarios drive the choice:
 
-Responsibilities:
+1. **Nested Termica.** A user running `cargo run` (or any other process that itself spawns a managed Termica) from inside an already-bootstrapped Termica shell must get a fresh, fully-bootstrapped inner Termica. If `TERMICA_BOOTSTRAPPED` propagated to child processes, the inner Termica's spawned shell would see the flag, hit the bootstrap's double-bootstrap guard, return early, and skip integration entirely. The result: the inner Termica looks like a degraded terminal even though everything is configured correctly.
+2. **The flag's actual meaning.** `TERMICA_BOOTSTRAPPED` answers "did *this* shell process run our bootstrap?" — a per-shell-instance fact. It is not a "we're inside Termica" flag; `TERM_PROGRAM=Termica` already serves that purpose and is correctly inherited by children.
 
-1. Detect bash / zsh by inspecting `$SHELL` and offer both if both are present.
-2. For each shell, locate the canonical rc file (`~/.bashrc`, `~/.zshrc`); never `bash_profile` (it's not loaded for non-login terminals).
-3. Write the integration script to `$XDG_CONFIG_HOME/termica/integration.{bash,zsh}` (defaulting to `~/.config/termica/`).
-4. Append a fenced block to the rc file:
+A reader inspecting `TERMICA_BOOTSTRAPPED=1` and finding it true can therefore trust that the current shell has Termica's hooks installed. A reader looking for "am I in Termica?" should consult `TERM_PROGRAM`.
 
-    ```bash
-    # >>> termica integration (do not edit; managed by `termica install-integration`)
-    [ -n "$TERMICA" ] && [ -r "$HOME/.config/termica/integration.bash" ] && \
-        . "$HOME/.config/termica/integration.bash"
-    # <<< termica integration
-    ```
+### zsh — managed startup via ZDOTDIR-with-immediate-unset
 
-   The fence comments are exact strings; we detect existing fences and replace the block atomically. Upgrades are idempotent and visible in `git diff` of the rc file (good for users who version-control dotfiles).
+zsh has no `--init-file <path>` flag. Two realistic local bootstrap mechanisms exist:
 
-5. Print what was changed and exit 0.
+1. A startup-file wrapper such as `$ZDOTDIR`. **Chosen.**
+2. A hidden first-command bootstrap via PTY-write. **Rejected** after empirical testing: zsh's Zsh Line Editor (ZLE) intercepts PTY-stdin bytes as keystrokes once the shell is interactive, so a multi-line bootstrap written to the PTY ends up character-shuffled through line editing instead of executed as commands.
 
-When Termica spawns a shell, it sets `TERMICA=1` in the environment. The rc-side guard means the integration is a no-op for shells launched outside Termica.
+We do use ZDOTDIR, but we mitigate the "visible env-var mutation" concern by **unsetting ZDOTDIR immediately** at the top of our wrapper `.zshrc`, before any user code runs. The mutation window is the duration of zsh's own startup-file phase, during which only Termica-controlled code executes.
 
-## What if the script isn't installed?
+Procedure:
 
-The pane is still a real terminal. The prompt editor is simply never available — the `PromptController` stays in `RawTerminal` forever ([05](05-pane-modes.md)). The status header degrades to showing only what we can probe locally (cwd via `OSC 7` if the shell happens to emit it; otherwise inferred from process info).
+```text
+1. Materialise a wrapper directory under Termica's data dir
+   (e.g. ~/Library/Application Support/Termica/zsh-wrapper/).
+   Write Termica's bootstrap as `.zshrc` and an empty `.zshenv`.
 
-This is fine. The app is still useful. Installation upgrades it.
+2. Spawn `zsh -i` with `ZDOTDIR=<wrapper-dir>` in the child env.
+   The pane enters Bootstrapping (spec/05): display suppressed,
+   user keystrokes dropped.
+
+3. zsh follows its normal startup:
+     - Reads /etc/zshenv (system-wide; out of v1 scope, see below).
+     - Reads $ZDOTDIR/.zshenv → our empty file → no-op.
+     - For interactive: reads $ZDOTDIR/.zshrc → our wrapper.
+
+4. Our wrapper .zshrc:
+     a. Sets a TERMICA_BOOTSTRAPPED guard against double-load.
+     b. Immediately `unset ZDOTDIR` so user code never sees the
+        mutation.
+     c. Defines Termica helpers (DCS-JSON emit, JSON escape).
+     d. Sources `~/.zshenv` if it exists (zsh would normally have
+        done this but it sourced our empty wrapper .zshenv instead).
+     e. Re-evaluates effective ZDOTDIR — the user's .zshenv may have
+        set it. From here on, user config lives at
+        `${ZDOTDIR:-$HOME}/.zshrc`.
+     f. Sources `$ZDOTDIR/.zshrc` if it exists (similarly skipped by
+        zsh because of our ZDOTDIR override).
+     g. Defines preexec / precmd hook functions and calls
+        `termica_ensure_hooks` — idempotent reassertion after any
+        prompt framework (oh-my-zsh, p10k, etc.) has had its say.
+     h. Emits `integration_ready` over DCS-JSON.
+
+5. The pane transitions out of Bootstrapping. The first real prompt
+   is now drawn and the pane is in RawTerminal.
+```
+
+The bootstrap is a regular sourced file — comments work, multi-line constructs work, no shell tricks needed. ZLE is not involved (we are not writing to the PTY's stdin).
+
+`.zshenv` semantics are preserved by this flow:
+
+- Our managed interactive shell sources `~/.zshenv` (step 4b), matching what vanilla interactive zsh would do.
+- Non-interactive children of our managed shell (`zsh -c '…'` from a tool or agent) source `~/.zshenv` automatically via zsh's own startup. We do not touch this; zsh handles it.
+- `.zshrc` is sourced only for our interactive shell. Agent / tool children get `.zshenv` but not `.zshrc`, exactly as on a stock zsh install.
+
+**System files.** `/etc/zshenv` and `/etc/zshrc` are NOT sourced by the bootstrap in v1. They are normally read by zsh as part of startup but `--no_rcs` skips them. On macOS, `/etc/zshrc` runs `path_helper` and sets some default behaviour; this is a known gap for v1 and tracked in [10](10-roadmap.md). Users who need them can opt into a later compatibility flag. The most common reason `/etc/zshrc` matters — Apple's `TERM_PROGRAM=Apple_Terminal` gating — is irrelevant to us because we set `TERM_PROGRAM=Termica`.
+
+**Login shell.** v1 emulates interactive **non-login** zsh. Login-shell emulation (sourcing `.zprofile`, `.zlogin`, `.zlogout`) is a later compatibility mode.
+
+### bash — managed startup via `--rcfile`
+
+bash provides `--rcfile <path>`, which **replaces** `~/.bashrc` for that shell. We exploit this directly: generate a wrapper rcfile that sources Termica helpers, then sources the user's real `~/.bashrc`, then reasserts hooks.
+
+```text
+1. Generate a wrapper rcfile under Termica's data directory (per `directories`
+   crate: `~/Library/Application Support/Termica/` on macOS, `$XDG_DATA_HOME/
+   termica/` on Linux). The file content is deterministic and idempotent.
+
+2. Spawn `bash --noprofile --norc --rcfile <wrapper> -i`.
+
+3. Bash reads the wrapper at startup as if it were `~/.bashrc`. The wrapper:
+     a. Defines Termica helpers.
+     b. Includes the vendored bash-preexec compatibility layer (handles
+        DEBUG trap chaining, array-valued PROMPT_COMMAND, and the "no
+        preexec for the integration's own commands" filter).
+     c. Sources the user's real `~/.bashrc` if it exists.
+     d. Calls `termica_ensure_hooks` — reasserts `PROMPT_COMMAND` and
+        the `precmd` / `preexec` arrays after any user-side mutation.
+     e. Emits `integration_ready`.
+
+4. The wrapper runs as part of normal bash startup. No PTY-write needed.
+   The Bootstrapping pane-mode window is near-zero (the time between
+   bash starting and the wrapper finishing).
+```
+
+The wrapper rcfile is regenerated on every Termica launch (Termica owns the path; users don't edit it). The wrapper does not modify `~/.bashrc`.
+
+**bash-preexec.** We vendor [`bash-preexec.sh`](https://github.com/rcaloras/bash-preexec) (MIT-licensed, ~150 lines) as an `include_str!` constant. Reimplementing the DEBUG-trap recursion / command-substitution suppression logic is a known tar pit; vendoring is cleaner and the license is permissive.
+
+**Bash `/etc/bashrc`.** Same TBD as zsh's `/etc/zshrc` — not sourced in v1.
+
+### fish — managed startup with `--init-command`
+
+fish provides `--init-command 'shell code'` (`-C` short form) which runs before the first prompt. The mechanism is clean:
+
+```text
+1. Spawn `fish --no-config --init-command "$BOOTSTRAP" -i`.
+
+2. fish runs the init command, which:
+     a. Defines Termica helpers (fish syntax, not POSIX).
+     b. Sources `~/.config/fish/config.fish` if it exists.
+     c. Sources each `~/.config/fish/conf.d/*.fish` in the order fish
+        would have loaded them.
+     d. Defines event handlers via `function … --on-event fish_preexec`
+        (and `fish_postexec`, `fish_prompt`).
+     e. Emits `integration_ready`.
+
+3. As with bash, the Bootstrapping window is near-zero.
+```
+
+fish's event system is first-class; no DEBUG-trap acrobatics. The only fish-specific worry is JSON-escaping in fish syntax (different quoting rules), which gets its own helper.
+
+### Failure modes and timeouts
+
+The `Bootstrapping` window has a fixed timeout: **3 seconds**.
+
+If `integration_ready` does not arrive within 3 seconds of shell spawn:
+
+1. The pane transitions from `Bootstrapping` → `Degraded` ([05](05-pane-modes.md)).
+2. The display-suppression window ends. Whatever the shell printed during bootstrap is revealed to the user (so they can diagnose the failure).
+3. The `PromptController` stays in `RawTerminal` forever for that pane.
+4. A non-intrusive banner appears: "Termica integration unavailable; running as raw terminal."
+5. `restart_shell` clears `Degraded` and tries again.
+
+`integration_error` (emitted by the bootstrap itself on a detected problem) transitions to `Degraded` immediately, with the error reason in the banner.
+
+`TERMICA_NO_SHELL_INTEGRATION=1` skips the bootstrap entirely: the shell launches with normal rc loading (no `--no_rcs` / `--norc` / `--no-config`), the pane goes straight to `RawTerminal`, and integration is permanently unavailable for that pane. Provided as an escape hatch for debugging or for users whose rc files are too unusual to manage.
+
+### Naming and namespacing
+
+All shell functions, variables, and DCS payload markers use the `termica` namespace:
+
+```sh
+TERMICA_SESSION_ID
+TERMICA_INTEGRATION_VERSION
+TERMICA_SHELL_INTEGRATION
+termica_preexec
+termica_precmd
+termica_postexec
+termica_send_json_message
+termica_escape_json
+termica_ensure_hooks
+```
+
+Helpers are exported only where they need to be visible to subshells. Internal helpers stay unexported to keep the namespace inside spawned `zsh -c '…'` children clean.
+
+## What the scripts deliberately don't do
+
+- **No PS1 art / fancy prompts.** The visible prompt belongs to Termica's status header ([06](06-workspace-and-tiles.md)).
+- **No completion forwarding.** Tab completion in `ShellPromptEditor` is local in v1 ([04](04-prompt-editor.md)).
+- **No history capture from the shell.** Termica records its own history at submit time ([07](07-history-and-search.md)).
+- **No dotfile mutation.** Ever. The bootstrap mechanisms above are all in-memory or under Termica's data directory.
+- **No background telemetry, no probe loops.** The shell does the minimum required to make the protocol work, and nothing else.
 
 ## Version negotiation
 
-`TermicaVersion=N` on every prompt start lets future Termica releases reject incompatible integration scripts cleanly. Forward compatibility rules:
+`integration_ready` carries a `version` field. The bootstrap script's version is the integration-script protocol version, not the Termica app version.
 
-- If `N` is unknown (too new): pane stays in `RawTerminal`; a notification suggests upgrading Termica.
-- If `N` is too old: pane stays in `RawTerminal`; the installer can write the current script.
-- If `N` is supported but minor: full functionality, possibly with a debounced "upgrade available" hint.
+Forward compatibility rules:
 
-The version is just a `u32`. It bumps on any normative change to script behavior.
+- If `version` is unknown (too new for this Termica build): pane goes to `Degraded`; banner suggests upgrading Termica.
+- If `version` is too old: pane goes to `Degraded`; banner suggests reinstalling Termica (or running an upgrade subcommand once one exists).
+- If `version` is supported but minor: full functionality, possibly with a debounced "newer integration available" hint.
+
+The current version is `1`. It bumps on any normative change to script behaviour.
+
+## Native editor flow
+
+Termica's editor owns local command editing in `ShellPromptEditor` mode. The flow on Enter:
+
+```text
+1. Termica finalizes the editor buffer.
+2. Termica creates a pending command block (PromptController.submit_command,
+   demoting to RawTerminal first per spec/05).
+3. Termica writes the command text + newline to the PTY.
+4. The shell's `preexec` hook fires, emitting `preexec` over DCS-JSON.
+5. Output bytes are appended to the block.
+6. The shell's `precmd` hook fires after the command returns, emitting
+   `command_finished` then `precmd` over DCS-JSON.
+7. PromptController closes the pending command, promotes back to
+   ShellPromptEditor on the next precmd.
+```
+
+Termica knows when Enter was pressed and demotes the editor eagerly (spec/05). It still **waits for shell lifecycle confirmation** before treating the shell as idle again. This handles:
+
+- Rejected / incomplete multiline commands.
+- Syntax errors at the shell level.
+- Shell-side command rewriting (aliases, functions, shell widgets).
+- Pasted commands containing newlines.
+
+## Multiline commands
+
+Termica submits the entire editor buffer as one logical submission. The shell may not execute until the command is syntactically complete:
+
+```sh
+if true; then
+  echo hello
+fi
+```
+
+Expected behaviour:
+
+- One command block.
+- One execution event from the shell.
+- One `command_finished`.
+
+If the shell decides the input is incomplete (e.g. unclosed `if`), it emits a `command_aborted` and the block closes with no exit code. The next prompt re-opens normally.
+
+## Exit status
+
+The shell-side hook MUST capture `$?` immediately at the top of the precmd hook, before any helper command:
+
+```zsh
+termica_precmd() {
+    local exit_status=$?
+    termica_send_json_message "command_finished" "$exit_status"
+    # … further work after this is safe
+}
+```
+
+Same pattern in bash and fish. A test runs `true; false; sh -c 'exit 42'` and asserts the shell reports `0`, `1`, `42` in order.
+
+## Subshells, SSH, containers
+
+v1 scope: local zsh / bash / fish only. PTY-injection into nested shells is **not** v1.
+
+Behaviour when the user runs a recognised shell command (`zsh`, `bash`, `fish`) inside an already-managed Termica session:
+
+- The nested shell is detected by the absence of `TERMICA_BOOTSTRAPPED=1` (set by the outer shell's bootstrap).
+- The nested shell does not get Termica integration. Its prompts won't promote.
+- The pane mode-machine handles this naturally: nested shell prompts produce no DCS-JSON, so no promotion occurs; the user has a working but un-integrated nested shell.
+- Returning to the outer shell (via `exit`) restores integration because the outer shell's hooks were never affected.
+
+Post-MVP: detect nested-shell entry, send a fresh bootstrap into the nested shell over the PTY. Same hidden-bootstrap-state mechanism, just applied mid-session.
+
+## Debug surface
+
+A `--dump-events` flag (Phase 3H) writes the lifecycle event stream plus mode transitions to a file:
+
+```text
+[t=0.000ms] spawn pane=p1 shell=zsh argv=["zsh","-g","--no_rcs"]
+[t=0.012ms] mode=Bootstrapping reason=InitialSpawn
+[t=0.048ms] integration_ready shell=zsh version=1
+[t=0.048ms] mode=RawTerminal reason=BootstrapComplete
+[t=2.103ms] precmd cwd=/Users/tim
+[t=2.103ms] mode=ShellPromptEditor reason=PrecmdMarker
+[t=4.812ms] submit_command frame=…
+[t=4.812ms] mode=RawTerminal reason=EnterSubmitted
+[t=4.815ms] preexec cmd="ls -la"
+[t=4.852ms] command_finished exit=0
+[t=4.853ms] precmd cwd=/Users/tim
+[t=4.853ms] mode=ShellPromptEditor reason=PrecmdMarker
+```
+
+This is the diagnostic surface for debugging integration failures and is the primary tool for the test infrastructure ([09](09-testing.md)).
 
 ## Testing
 
-- **Integration tests** in `tests/` spawn `bash --rcfile <our-tmp-rc>` and `zsh -f -d` plus an env-injected source line; assert the resulting marker stream is exactly what we expect for a scripted sequence of inputs.
-- **Snapshot the rc-file mutation**: `termica install-integration` against a fixture rc file produces a deterministic diff; re-running it twice is a no-op.
-- **Marker fixtures** in `testdata/markers/<scenario>.bytes` — recorded byte streams from real shells with our integration loaded; replayed against the marker parser; expected `MarkerEvent` sequence asserted.
+- **Unit tests** ([`src/markers.rs`](../src/markers.rs)): DCS-JSON parser; every defined `type` value; malformed payloads; unknown `type` ignored; split-read robustness.
+- **Bootstrap script unit tests** ([`integration/*/tests/`](../integration/)): each shell's bootstrap script run in isolation with a captured "PTY" (pipe); assert the DCS-JSON sequence emitted matches the expected lifecycle for a scripted sequence of inputs.
+- **Integration tests** ([`tests/`](../tests/)): spawn real `zsh -g --no_rcs`, `bash --rcfile …`, `fish --no-config …`; run a scripted command sequence; assert the lifecycle event stream is exactly what we expect.
+- **Lifecycle fixtures** ([`testdata/lifecycle/<shell>/<scenario>.bytes`](../testdata/lifecycle/)): recorded byte streams from real shells with our bootstrap loaded; replayed against the parser; expected `LifecycleEvent` sequence asserted.
 
 ---
 

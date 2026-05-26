@@ -13,9 +13,9 @@ use eframe::egui;
 use egui_tiles::{Tile, TileId, Tiles, Tree};
 
 use crate::behavior::TabBehavior;
+use crate::integration::ShellSpec;
 use crate::pane::PaneSession;
 use crate::pane_slot::{PaneAction, PaneId, PaneSlot, PaneUiState};
-use crate::pty::PtyConfig;
 use crate::tab_title::active_pane_in_tabs;
 use crate::{MIN_COLS, MIN_ROWS};
 
@@ -135,7 +135,8 @@ impl TermicaApp {
 
     fn bootstrap(&mut self) {
         let pane_id = self.mint_pane_id();
-        let session = PaneSession::spawn(MIN_ROWS.max(24), MIN_COLS.max(80), &PtyConfig::default())
+        let shell = resolve_shell_from_env();
+        let session = PaneSession::spawn_managed(MIN_ROWS.max(24), MIN_COLS.max(80), shell, None)
             .expect("spawn initial pane");
         self.panes.insert(pane_id, PaneSlot { session, ui: PaneUiState::default() });
 
@@ -282,8 +283,8 @@ impl TermicaApp {
             .and_then(|slot| slot.session.terminal().cwd().map(|p| p.to_path_buf()));
 
         let pane_id = self.mint_pane_id();
-        let config = PtyConfig { cwd, ..PtyConfig::default() };
-        let session = match PaneSession::spawn(24, 80, &config) {
+        let shell = resolve_shell_from_env();
+        let session = match PaneSession::spawn_managed(24, 80, shell, cwd) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("termica: failed to spawn new pane: {e}");
@@ -702,4 +703,12 @@ impl eframe::App for TermicaApp {
         }
         self.panes.retain(|id, _| live_panes.contains(id));
     }
+}
+
+/// Resolve the user's preferred shell from `$SHELL`. Falls back to
+/// zsh if the env var isn't set (macOS default; sensible on Linux
+/// too since the managed-startup machinery handles bash & fish
+/// equivalently if the user has set `$SHELL`).
+fn resolve_shell_from_env() -> ShellSpec {
+    std::env::var("SHELL").map(|s| ShellSpec::from_shell_path(&s)).unwrap_or(ShellSpec::Zsh)
 }
