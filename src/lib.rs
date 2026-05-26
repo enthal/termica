@@ -29,6 +29,7 @@
 #![forbid(unsafe_code)]
 
 pub mod block;
+pub mod echo_suppress;
 pub mod events;
 pub mod input;
 pub mod integration;

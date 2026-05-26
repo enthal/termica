@@ -89,6 +89,11 @@ pub struct TerminalState {
     /// for OSC sequences alacritty discards (notably OSC 7 — cwd).
     /// See [`crate::osc`].
     osc: crate::osc::OscSniffer,
+    /// Echo suppression for the submit path (Phase 4C). Primed by
+    /// [`Self::prime_echo_suppression`]; consulted at the head of
+    /// [`Self::feed`] so the duplicate command bytes the kernel
+    /// echoes after a submit never reach the grid.
+    echo_suppress: crate::echo_suppress::EchoSuppressor,
 }
 
 impl TerminalState {
@@ -99,21 +104,50 @@ impl TerminalState {
         let term = Term::new(config, &size, NopListener);
         let parser = Processor::new();
         let osc = crate::osc::OscSniffer::new();
-        Self { term, parser, osc }
+        let echo_suppress = crate::echo_suppress::EchoSuppressor::new();
+        Self { term, parser, osc, echo_suppress }
     }
 
     /// Feed bytes into the VT parser. The grid mutates accordingly,
     /// and the OSC sniffer's state may update if an OSC 7 (or future
     /// Termica marker) is recognised.
     ///
+    /// **Echo suppression** (Phase 4C): if the suppressor is armed
+    /// (i.e. submit primed it with the bytes about to be echoed by
+    /// the kernel), this method drops the matching prefix BEFORE
+    /// the VT parser sees it. The suppression hook lives "above"
+    /// the parser per spec/04 — suppressed bytes never reach the
+    /// grid, never appear in OSC events, never count as input the
+    /// shell emitted.
+    ///
     /// Splitting a byte slice across multiple calls is safe — both
     /// parsers keep state across calls, so escape sequences split at
     /// any byte boundary still resolve correctly.
     pub fn feed(&mut self, bytes: &[u8]) {
-        for byte in bytes {
+        let surviving = if self.echo_suppress.is_armed() {
+            self.echo_suppress.filter(bytes)
+        } else {
+            bytes.to_vec()
+        };
+        for byte in &surviving {
             self.parser.advance(&mut self.term, &[*byte]);
             self.osc.feed_byte(*byte);
         }
+    }
+
+    /// Prime the echo suppressor with the bytes about to be written
+    /// to the PTY. Called by [`crate::pane::PaneSession::submit_editor_command`]
+    /// immediately before the PTY write so the suppressor is armed
+    /// before the kernel echo can land.
+    pub fn prime_echo_suppression(&mut self, bytes: &[u8]) {
+        self.echo_suppress.expect(bytes);
+    }
+
+    /// Read-only access to the suppressor — tests use this to
+    /// assert "armed after submit" without reaching for private
+    /// fields.
+    pub fn echo_suppressor(&self) -> &crate::echo_suppress::EchoSuppressor {
+        &self.echo_suppress
     }
 
     /// Most recent CWD reported via OSC 7, if any. Updates as the

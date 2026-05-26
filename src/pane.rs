@@ -423,6 +423,61 @@ impl PaneSession {
             && self.blocks.editor_on_tail().is_some()
     }
 
+    /// Submit the editor's current text to the PTY (spec/04
+    /// §"Submission semantics"). The order is load-bearing:
+    ///
+    /// 1. Take the editor text + clear the editor.
+    /// 2. **Eagerly demote** the controller to `RawTerminal` —
+    ///    from this instant onward, keystrokes go to the PTY (so a
+    ///    user's immediate Ctrl-C reaches the running command, not
+    ///    the closed editor).
+    /// 3. **Prime echo suppression** with the bytes about to be
+    ///    written, so the kernel's echo of the same bytes never
+    ///    reaches the grid.
+    /// 4. Write `<text>\r` to the PTY. CR (not LF) matches the
+    ///    [`crate::input::encode_key`] convention for `Enter`; the
+    ///    kernel's tty discipline translates CR→NL on the input
+    ///    side and echoes back with CRLF on the output side.
+    ///
+    /// Returns `Ok(())` on any path that completed, including the
+    /// "no editor" / "editor empty" no-ops. A `Err(PtyError)` is
+    /// only returned when the PTY write itself fails.
+    pub fn submit_editor_command(&mut self) -> Result<(), PtyError> {
+        // 1. Take the editor text. If there's no editor (the tail
+        //    isn't a `Prompt`), submit is a no-op. If the editor is
+        //    empty, we still send a bare `\r` so the shell sees a
+        //    blank line and emits the next prompt — that's what
+        //    pressing Enter on an empty shell prompt does in every
+        //    terminal.
+        let text = match self.blocks.editor_on_tail_mut() {
+            Some(editor) => {
+                let t = editor.text().to_string();
+                editor.clear();
+                t
+            }
+            None => return Ok(()),
+        };
+
+        // 2. Eager demote BEFORE the PTY write.
+        self.controller.submit_command(self.frame);
+        // Record the transition into the dump-events file so the
+        // submit gesture shows up in diagnostics.
+        if let Some(rec) = self.recorder.as_ref() {
+            let latest = self.controller.last_transition().at;
+            if latest != self.last_transition_at {
+                rec.record_transition(self.pane_id, self.controller.last_transition());
+                self.last_transition_at = latest;
+            }
+        }
+
+        // 3 & 4. Build the byte sequence, prime suppression, write.
+        let mut bytes = text.into_bytes();
+        bytes.push(b'\r');
+        self.terminal.prime_echo_suppression(&bytes);
+        self.pty.write(&bytes)?;
+        Ok(())
+    }
+
     /// Demote the pane out of `ShellPromptEditor` back to
     /// `RawTerminal` (the canonical "Esc on the editor" gesture per
     /// spec/05). Clears the editor buffer so the next promotion
@@ -701,6 +756,100 @@ mod tests {
             crate::block::Block::Running { command, .. } => assert_eq!(command, "ls -la"),
             other => panic!("expected Running, got {other:?}"),
         }
+    }
+
+    // ---- submit + echo suppression (Phase 4C) ----------------------
+    //
+    // The submit-path tests drive a real `cat` PTY: a DCS-JSON
+    // `integration_ready` + `precmd` marker pair flips the pane into
+    // `ShellPromptEditor` mode, then we type into the editor and
+    // `submit_editor_command`. The kernel echoes the submitted bytes
+    // back; cat ALSO echoes them as its stdout. The suppressor must
+    // strip the kernel echo so the grid shows the bytes only ONCE
+    // (from cat's output).
+
+    /// Compose the synthetic DCS-JSON sequence that gets the
+    /// controller into `ShellPromptEditor` from a fresh
+    /// `new_no_bootstrap` spawn: `integration_ready` confirms
+    /// integration, `precmd` promotes the mode.
+    fn dcs_promote_to_editor_cmd() -> String {
+        "printf '\\033PTermica;{\"type\":\"integration_ready\",\
+                  \"session\":\"t\",\"value\":{\"shell\":\"zsh\",\"version\":1}}\\033\\\\\
+                  \\033PTermica;{\"type\":\"precmd\",\
+                  \"session\":\"t\",\"value\":\"/tmp\"}\\033\\\\'; cat"
+            .to_string()
+    }
+
+    #[test]
+    fn submit_editor_command_demotes_mode_clears_editor_arms_suppressor() {
+        let cmd = dcs_promote_to_editor_cmd();
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c(&cmd), "t".into(), 0, None).expect("spawn");
+        // Wait for the Precmd → ShellPromptEditor transition.
+        let stop = Instant::now() + Duration::from_secs(2);
+        loop {
+            session.drain();
+            if session.editor_is_active() {
+                break;
+            }
+            if Instant::now() >= stop {
+                panic!(
+                    "never reached ShellPromptEditor; controller mode={:?}, integration={:?}",
+                    session.controller.mode(),
+                    session.controller.integration(),
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Type a command and submit.
+        session.editor_mut().unwrap().insert_str("hello");
+        session.submit_editor_command().expect("submit");
+        // Eager demote: mode flipped to RawTerminal before the
+        // PTY write returned.
+        assert_eq!(session.controller.mode(), PaneMode::RawTerminal);
+        // Editor cleared.
+        assert!(
+            session.blocks.editor_on_tail().unwrap().is_empty(),
+            "editor should be empty after submit"
+        );
+        // Suppressor armed with the bytes we wrote (8 = "hello\r"
+        // → 7 bytes after CR→CRLF expansion).
+        assert!(session.terminal.echo_suppressor().is_armed());
+        assert_eq!(session.terminal.echo_suppressor().pending_len(), 7);
+    }
+
+    #[test]
+    fn echo_suppression_prevents_duplicate_echo_in_grid() {
+        let cmd = dcs_promote_to_editor_cmd();
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c(&cmd), "t".into(), 0, None).expect("spawn");
+        // Reach ShellPromptEditor.
+        let stop = Instant::now() + Duration::from_secs(2);
+        loop {
+            session.drain();
+            if session.editor_is_active() {
+                break;
+            }
+            if Instant::now() >= stop {
+                panic!("editor never active");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        session.editor_mut().unwrap().insert_str("hello");
+        session.submit_editor_command().expect("submit");
+        // Wait for cat's output to come back (the only "hello"
+        // that should appear in the grid).
+        let view =
+            wait_for(&mut session, Duration::from_secs(2), |v| v.screen_text.contains("hello"));
+        // Count occurrences of "hello" — must be exactly one.
+        // Without suppression, we'd see TWO: the kernel echo and
+        // cat's output.
+        let count = view.screen_text.matches("hello").count();
+        assert_eq!(
+            count, 1,
+            "expected exactly one 'hello' in grid; got {} occurrences:\n{}",
+            count, view.screen_text
+        );
     }
 
     #[test]
