@@ -297,28 +297,23 @@ pub fn paint_styled_lines(ui: &mut egui::Ui, lines: &[StyledLine]) -> Response {
 
 /// Paint the [`PromptEditor`] inside its [`Block::Prompt`](crate::block::Block::Prompt).
 ///
-/// The editor lives at the bottom of a `Prompt` block — Phase 4B
-/// places it directly below the live `Term`'s paint. Each line of
-/// the buffer takes one monospace row; the cursor is a thin
-/// underline at the current char column, below the glyph row.
+/// Allocates space in `ui`'s current flow and paints there. The
+/// snapshot tests drive this overload because kittest wants a rect
+/// to claim for hit-testing. The live `render_pane` path uses
+/// [`paint_prompt_editor_at`] instead, with an absolute origin
+/// derived from the live `Term`'s cursor row — that's how the
+/// editor visually continues the shell's prompt line in Phase 4C.
 ///
 /// 4G adds the prompt chrome (the `❯` glyph, the cwd / branch /
 /// dirty chips); 4F adds selection rendering; 4H adds syntax
 /// highlighting. For now the editor paints unstyled `DEFAULT_FG`
 /// text on `DEFAULT_BG`.
-///
-/// Returns the painted [`egui::Response`] over the editor rect.
 pub fn paint_prompt_editor(ui: &mut egui::Ui, editor: &PromptEditor) -> Response {
     let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
     let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
     let row_h = ui.fonts_mut(|f| f.row_height(&font_id));
     let lines = editor.lines_with_cursor();
     let rows = lines.len().max(1);
-    // Width of the painted rect: enough room for the widest visible
-    // row + an extra cell to host the cursor when it sits at end of
-    // line. Reads from `ui.available_size` so resize doesn't clip
-    // the editor (its content width tracks the editor buffer; the
-    // pane width is enforced by the live `Term`'s paint above).
     let widest_chars = lines.iter().map(|l| l.text.chars().count()).max().unwrap_or(0);
     let cols = widest_chars + 1;
     let size = Vec2::new((cols as f32 * cell_w).max(cell_w), rows as f32 * row_h);
@@ -326,12 +321,30 @@ pub fn paint_prompt_editor(ui: &mut egui::Ui, editor: &PromptEditor) -> Response
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, DEFAULT_BG);
+    paint_prompt_editor_at(&painter, editor, rect.min, cell_w, row_h, &font_id);
+    response
+}
 
-    for (row_idx, line) in lines.iter().enumerate() {
-        let y = rect.min.y + row_idx as f32 * row_h;
+/// Paint the [`PromptEditor`] at an explicit origin using
+/// pre-computed monospace metrics. No `ui` allocation — the caller
+/// owns the layout. Used by the live `render_pane` path to overlay
+/// the editor on top of the live `Term`'s painted area starting at
+/// `(term_rect.min.x, term_rect.min.y + (cursor_row + 1) * row_h)`
+/// so the editor's first line sits immediately below the row holding
+/// the shell's prompt + cursor.
+pub fn paint_prompt_editor_at(
+    painter: &egui::Painter,
+    editor: &PromptEditor,
+    origin: Pos2,
+    cell_w: f32,
+    row_h: f32,
+    font_id: &FontId,
+) {
+    for (row_idx, line) in editor.lines_with_cursor().iter().enumerate() {
+        let y = origin.y + row_idx as f32 * row_h;
         if !line.text.is_empty() {
             painter.text(
-                Pos2::new(rect.min.x, y),
+                Pos2::new(origin.x, y),
                 egui::Align2::LEFT_TOP,
                 line.text,
                 font_id.clone(),
@@ -339,12 +352,11 @@ pub fn paint_prompt_editor(ui: &mut egui::Ui, editor: &PromptEditor) -> Response
             );
         }
         if line.cursor_on_line {
-            let cursor_x = rect.min.x + line.cursor_col_chars as f32 * cell_w;
+            let cursor_x = origin.x + line.cursor_col_chars as f32 * cell_w;
             let cursor_rect = Rect::from_min_size(Pos2::new(cursor_x, y), Vec2::new(cell_w, row_h));
             painter.rect_filled(cursor_rect, 0.0, CURSOR_COLOR);
         }
     }
-    response
 }
 
 /// Paint the semi-transparent selection rectangles.

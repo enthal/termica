@@ -86,6 +86,23 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
             if modifiers.command || modifiers.alt {
                 return false;
             }
+            // The keys that own `slot.session` mutably (submit,
+            // demote) are handled BEFORE the editor borrow so the
+            // borrow checker sees a clean window.
+            match key {
+                Key::Enter if !modifiers.shift => {
+                    // Plain Enter = submit (Phase 4C).
+                    let _ = slot.session.submit_editor_command();
+                    return true;
+                }
+                Key::Escape => {
+                    // Esc demotes back to `RawTerminal` per spec/05;
+                    // the editor's buffer is dropped.
+                    slot.session.leave_editor_esc();
+                    return true;
+                }
+                _ => {}
+            }
             let Some(editor) = slot.session.editor_mut() else { return false };
             match key {
                 Key::Backspace => {
@@ -117,23 +134,12 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
                     editor.move_end();
                     true
                 }
+                // Shift+Enter — bare Enter is already handled above.
                 Key::Enter => {
-                    if modifiers.shift {
-                        editor.insert_newline();
-                    }
-                    // Plain Enter is a placeholder in 4B; 4C wires
-                    // submit + echo suppression. Consume so the byte
-                    // doesn't reach the PTY (which would race with
-                    // the editor's state).
+                    editor.insert_newline();
                     true
                 }
-                Key::Escape => {
-                    // Esc demotes back to `RawTerminal` per spec/05;
-                    // the editor's buffer is dropped.
-                    slot.session.leave_editor_esc();
-                    true
-                }
-                // Tab is local completion in 4I; for 4B we consume
+                // Tab is local completion in 4I; for now we consume
                 // it to keep it out of the PTY (no-op).
                 Key::Tab => true,
                 _ => false,
@@ -355,19 +361,34 @@ pub fn render_pane(
                 highlighted_link,
             );
 
-            // ---- Prompt-block editor ------------------------------
+            // ---- Prompt-block editor overlay (Phase 4C layout fix) ----
             //
-            // Phase 4B: when the pane is at a confirmed shell prompt
-            // (`ShellPromptEditor` mode) the tail `Prompt` block has
-            // a live [`PromptEditor`]. Paint it directly below the
-            // live `Term`. The shell's actual prompt (e.g. "$ ")
-            // shows above; the editor's typed text shows below.
-            // 4D's fixed-footer layout will lock the editor to the
-            // viewport bottom; for 4B it just flows.
+            // The editor is conceptually part of the `Prompt` block.
+            // Phase 4B painted it below the live `Term` as a flow
+            // item; that pushed it off-screen because the live
+            // `Term` always allocates its full `screen_lines × cols`
+            // rect. Fix: overlay the editor on top of the live
+            // `Term`'s painted area, starting at the row immediately
+            // below the shell's cursor row. The rows below the
+            // cursor are alacritty-uninitialised blanks (the shell
+            // hasn't written there yet), so painting the editor on
+            // top doesn't hide any meaningful content. The result is
+            // the editor visually continues the shell's prompt line.
+            //
+            // 4D's fixed-footer layout will replace this overlay with
+            // a proper viewport-bottom anchor.
             if slot.session.editor_is_active()
                 && let Some(editor) = slot.session.blocks().editor_on_tail()
             {
-                let _ = render::paint_prompt_editor(ui, editor);
+                let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
+                let cursor_row =
+                    slot.session.terminal().cursor_position().map(|(row, _col)| row).unwrap_or(0);
+                let origin = egui::Pos2::new(
+                    rendered.response.rect.min.x,
+                    rendered.response.rect.min.y + (cursor_row + 1) as f32 * row_h,
+                );
+                let painter = ui.painter_at(rendered.response.rect);
+                render::paint_prompt_editor_at(&painter, editor, origin, cell_w, row_h, &font_id);
             }
 
             (rendered, links_in_view, highlighted_link.cloned())
