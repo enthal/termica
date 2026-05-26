@@ -1450,15 +1450,25 @@ impl<'a> Behavior<PaneId> for TabBehavior<'a> {
         let is_focused = matches!(tiles.get(tile_id), Some(Tile::Pane(pid))
             if self.focused_pane == Some(*pid));
         if is_focused {
-            let painter = response.ctx.layer_painter(response.layer_id);
-            let rect = response.rect;
-            let color = response.ctx.style().visuals.selection.bg_fill;
-            let stroke = egui::Stroke::new(2.5, color);
-            let y = rect.bottom() - 1.25;
-            painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], stroke);
+            paint_focused_tab_underline(&response);
         }
         response
     }
+}
+
+/// Paint the blue underline that marks the app-wide focused tab.
+/// Public + free-standing so snapshot tests can apply the same
+/// paint to a synthetic `egui_tiles::Tree` without standing up a
+/// full [`TermicaApp`]; the production caller is
+/// [`TabBehavior::on_tab_button`]. Single source of truth for the
+/// focus visual.
+pub fn paint_focused_tab_underline(response: &egui::Response) {
+    let painter = response.ctx.layer_painter(response.layer_id);
+    let rect = response.rect;
+    let color = response.ctx.style().visuals.selection.bg_fill;
+    let stroke = egui::Stroke::new(2.5, color);
+    let y = rect.bottom() - 1.25;
+    painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], stroke);
 }
 
 /// Run the native window. Used by `main` and any future end-to-end
@@ -1486,7 +1496,20 @@ pub fn run() -> eframe::Result<()> {
     eframe::run_native(
         "termica",
         options,
-        Box::new(|_cc| {
+        Box::new(|cc| {
+            // Force dark theme always, regardless of the system
+            // light/dark preference. Termica is a terminal — a
+            // light tab strip and panel chrome around a black
+            // shell grid is visually jarring. The Phase 10 polish
+            // pass can introduce a config-driven theme; for now
+            // dark-only is the product.
+            //
+            // `set_theme` (not `set_visuals`) is the right call:
+            // it pins `Memory::theme_preference = Dark`, which is
+            // what egui resolves every frame. Using `set_visuals`
+            // works for one frame and then the system-theme
+            // follower overwrites it back.
+            cc.egui_ctx.set_theme(egui::Theme::Dark);
             #[cfg(target_os = "macos")]
             install_macos_menu();
             Ok(Box::new(TermicaApp::new()))
