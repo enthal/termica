@@ -98,19 +98,19 @@ Sub-PRs:
 
 ### Phase 3 — Managed shell integration + mode machine
 
-**Design pivot (this PR):** the Phase 3A/3B work shipped an OSC 133 + OSC 1337-Termica marker pipeline and a four-mode `PromptController`. We pivoted in [spec/03](03-shell-integration.md) to a managed-shell-integration design (Warp-shaped): Termica controls bootstrap on every shell spawn via `--no_rcs` / `--rcfile` / `--no-config`, uses a DCS-JSON protocol it owns end-to-end, and ignores foreign OSC 133. The pane mode machine grows two new states (`Bootstrapping`, `Degraded` — see [05](05-pane-modes.md)). The "fenced-block dotfile installer" approach is dropped entirely.
+**Design pivot ([#45](https://github.com/enthal/termica/pull/45)):** the Phase 3A/3B work shipped an OSC 133 + OSC 1337-Termica marker pipeline and a four-mode `PromptController`. We pivoted in [spec/03](03-shell-integration.md) to a managed-shell-integration design: Termica controls bootstrap on every shell spawn via `ZDOTDIR` (zsh) / `--rcfile` (bash) / `--no-config --init-command` (fish), uses a DCS-JSON protocol it owns end-to-end, and ignores foreign OSC 133. The pane mode machine grows two new states (`Bootstrapping`, `Degraded` — see [05](05-pane-modes.md)). The "fenced-block dotfile installer" approach is dropped entirely.
 
 Code from 3A (`MarkerEvent`, OSC 133/1337 parser) and 3B (`PromptController`) is partially reused — the controller's state-machine shape survives; the event source switches from OSC markers to DCS-JSON lifecycle messages.
 
 Sub-PRs (reshaped):
 
-- ✅ **3A — Marker parser (legacy)**: OSC 133 + OSC 1337-`Termica=…` parsing in [`src/markers.rs`](../src/markers.rs); wired into [`OscSniffer`](../src/osc.rs). To be replaced by 3C.
+- ✅ **3A — Marker parser (legacy)**: OSC 133 + OSC 1337-`Termica=…` parsing in [`src/markers.rs`](../src/markers.rs); wired into [`OscSniffer`](../src/osc.rs). Replaced by 3C.
 - ✅ **3B — `PromptController` (legacy)**: four-mode state machine in [`src/shell.rs`](../src/shell.rs). State-machine shape preserved; expanded to six modes in 3C.
-- ⏳ **3C — DCS-JSON parser + extended `PromptController`** (this PR's code): replace OSC 133/1337 in [`src/markers.rs`](../src/markers.rs) + [`src/osc.rs`](../src/osc.rs) with a DCS-JSON parser; add `Bootstrapping` + `Degraded` modes to [`src/shell.rs`](../src/shell.rs); expand the strict-layer tests.
-- ⏳ **3D — Bootstrap scripts**: zsh / bash / fish bootstrap scripts under [`integration/`](../integration/) as `include_str!` constants; vendored bash-preexec.sh; unit tests per script (run under a real shell, assert DCS-JSON sequence).
-- ⏳ **3E — Managed-startup wrappers**: replace [`src/integration.rs`](../src/integration.rs)'s `$ZDOTDIR` mechanism with the managed-startup machinery: zsh hidden-bootstrap PTY-write, bash `--rcfile` wrapper file generation, fish `--init-command`. Use the [`directories`](https://crates.io/crates/directories) crate for cross-platform paths.
-- ⏳ **3F — Wire `PromptController` into `PaneSession`**: mode machine becomes the source of truth for "is this pane at a prompt?"; today's alt-screen heuristic retires. Bootstrap suppression integrates with the renderer.
-- ⏳ **3G — `--dump-events` flag**: writes the lifecycle event + mode-transition stream to a file for debugging.
+- ✅ **3C — DCS-JSON parser + extended `PromptController`** ([#45](https://github.com/enthal/termica/pull/45)): replaced OSC 133/1337 in [`src/markers.rs`](../src/markers.rs) + [`src/osc.rs`](../src/osc.rs) with a DCS-JSON parser; added `Bootstrapping` + `Degraded` modes to [`src/shell.rs`](../src/shell.rs).
+- ✅ **3D — Bootstrap scripts** ([#45](https://github.com/enthal/termica/pull/45)): zsh / bash / fish bootstrap scripts under [`integration/`](../integration/) as `include_str!` constants; vendored bash-preexec.sh.
+- ✅ **3E — Managed-startup wrappers** ([#45](https://github.com/enthal/termica/pull/45)): replaced `$ZDOTDIR` mechanism with managed-startup machinery in [`src/integration.rs`](../src/integration.rs): per-spawn `tempfile::TempDir` wrappers, `ZDOTDIR` for zsh, `--rcfile` for bash, `--init-command` for fish.
+- ✅ **3F — Wire `PromptController` into `PaneSession`** ([#45](https://github.com/enthal/termica/pull/45)): mode machine is the source of truth for "is this pane at a prompt?". Bootstrap suppression integrates with the renderer.
+- ✅ **3G — `TERMICA_DUMP_EVENTS` env var** (this PR): per-pane spawn / lifecycle / mode-transition / pty-exit stream written to a file for debugging. See [spec/03 "Debug surface"](03-shell-integration.md#debug-surface).
 
 The strict tests-first rule from [CLAUDE.md](../CLAUDE.md) applies to **the entire Phase 3 surface area** — every commit lands with tests that failed on the pre-change tree.
 
