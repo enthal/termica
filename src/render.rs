@@ -32,7 +32,7 @@ use eframe::egui::{self, Color32, FontId, Pos2, Rect, Response, Stroke, Vec2};
 
 use crate::links::LinkSpan;
 use crate::selection::{GridGeometry, Selection};
-use crate::terminal::TerminalState;
+use crate::terminal::{StyledLine, TerminalState};
 
 /// Font size in egui points. Tuned by eye for legibility on the
 /// terminals we tested against; configurable later.
@@ -231,6 +231,69 @@ pub fn paint_terminal(
     TerminalRender { response, geometry }
 }
 
+/// Paint a frozen sealed-block snapshot into `ui` at its current cursor.
+/// Allocates the exact space the snapshot needs (rows × widest-line
+/// columns at monospace metrics) and paints cell-by-cell, mirroring
+/// the [`paint_terminal`] loop minus the live-only concerns (selection,
+/// cursor, link hover, alt-screen border). Phase 4F adds cross-block
+/// selection; until then sealed blocks are static.
+///
+/// Returns the `Response` over the painted rect so the caller can
+/// chain interactions (Phase 4G adds click-to-collapse) once they
+/// exist; for 4A-render the response is unused.
+pub fn paint_styled_lines(ui: &mut egui::Ui, lines: &[StyledLine]) -> Response {
+    let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
+    let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
+    let row_h = ui.fonts_mut(|f| f.row_height(&font_id));
+    let cols = lines.iter().map(|l| l.cells.len()).max().unwrap_or(0);
+    let rows = lines.len();
+    let size = Vec2::new(cols as f32 * cell_w, rows as f32 * row_h);
+
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    if size.x > 0.0 && size.y > 0.0 {
+        painter.rect_filled(rect, 0.0, DEFAULT_BG);
+    }
+
+    for (row_idx, line) in lines.iter().enumerate() {
+        for (col, cell) in line.cells.iter().enumerate() {
+            let x = rect.min.x + col as f32 * cell_w;
+            let y = rect.min.y + row_idx as f32 * row_h;
+            let cell_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w, row_h));
+
+            let (fg, bg, paint_glyph) = cell_colors_for(cell.fg, cell.bg, cell.flags);
+            if let Some(c) = bg {
+                painter.rect_filled(cell_rect, 0.0, c);
+            }
+            if paint_glyph && cell.c != ' ' {
+                painter.text(
+                    Pos2::new(x, y),
+                    egui::Align2::LEFT_TOP,
+                    cell.c.to_string(),
+                    font_id.clone(),
+                    fg,
+                );
+            }
+            if cell.flags.intersects(Flags::ALL_UNDERLINES) {
+                let underline_y = y + row_h - 1.5;
+                painter.line_segment(
+                    [Pos2::new(x, underline_y), Pos2::new(x + cell_w, underline_y)],
+                    Stroke::new(1.0, fg),
+                );
+            }
+            if cell.flags.contains(Flags::STRIKEOUT) {
+                let strike_y = y + row_h * 0.5;
+                painter.line_segment(
+                    [Pos2::new(x, strike_y), Pos2::new(x + cell_w, strike_y)],
+                    Stroke::new(1.0, fg),
+                );
+            }
+        }
+    }
+    response
+}
+
 /// Paint the semi-transparent selection rectangles.
 ///
 /// Takes the `(start, end)` *effective* range already in reading
@@ -322,12 +385,20 @@ fn paint_link_underline(painter: &egui::Painter, link: &LinkSpan, g: GridGeometr
 /// `paint_terminal` skip per-cell background fills for default
 /// cells (the pane-wide fill already covered them).
 fn cell_colors(cell: &alacritty_terminal::term::cell::Cell) -> (Color32, Option<Color32>, bool) {
-    let mut fg = ansi_to_egui(cell.fg).unwrap_or(DEFAULT_FG);
+    cell_colors_for(cell.fg, cell.bg, cell.flags)
+}
+
+/// Compute the (fg, bg, paint_glyph) triple for a cell from its raw
+/// styling fields. Used by both the live-grid path
+/// ([`cell_colors`]) and the sealed-block snapshot path
+/// ([`paint_styled_lines`]) so both layers paint identically.
+fn cell_colors_for(fg: Color, bg: Color, flags: Flags) -> (Color32, Option<Color32>, bool) {
+    let mut fg = ansi_to_egui(fg).unwrap_or(DEFAULT_FG);
     // The default-bg case keeps `bg_opt = None` so the per-cell fill
     // is skipped; only solid-color backgrounds paint a rectangle.
-    let mut bg_opt = ansi_to_egui(cell.bg);
+    let mut bg_opt = ansi_to_egui(bg);
 
-    if cell.flags.contains(Flags::INVERSE) {
+    if flags.contains(Flags::INVERSE) {
         // After inversion, "default bg" becomes the actual fg color
         // and vice versa — neither side can be `None` anymore, so
         // when one was logical-default we substitute its visible
@@ -338,14 +409,14 @@ fn cell_colors(cell: &alacritty_terminal::term::cell::Cell) -> (Color32, Option<
         bg_opt = Some(prev_fg);
     }
 
-    if cell.flags.contains(Flags::DIM) {
+    if flags.contains(Flags::DIM) {
         fg = scale_brightness(fg, 0.5);
     }
-    if cell.flags.contains(Flags::BOLD) {
+    if flags.contains(Flags::BOLD) {
         fg = brighten_toward_white(fg, 0.3);
     }
 
-    let paint_glyph = !cell.flags.contains(Flags::HIDDEN);
+    let paint_glyph = !flags.contains(Flags::HIDDEN);
     (fg, bg_opt, paint_glyph)
 }
 

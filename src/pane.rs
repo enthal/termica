@@ -296,7 +296,7 @@ impl PaneSession {
             if let Some(rec) = self.recorder.as_ref() {
                 rec.record_lifecycle(self.pane_id, &event);
             }
-            self.blocks.observe_lifecycle_event(&event, &self.terminal, self.frame);
+            self.blocks.observe_lifecycle_event(&event, &mut self.terminal, self.frame);
             self.controller.observe_event(event, self.frame);
             self.record_pending_transitions();
         }
@@ -394,6 +394,15 @@ impl PaneSession {
     /// to assert the block-lifecycle wiring (Phase 4A-data).
     pub fn blocks(&self) -> &BlockStack {
         &self.blocks
+    }
+
+    /// Stable per-pane id. Used to salt egui widget IDs that may
+    /// otherwise collide when multiple panes are visible at once
+    /// (e.g. each pane's `ScrollArea` needs its own state — see the
+    /// "Duplicate widget IDs are a critical bug" callout in
+    /// CLAUDE.md).
+    pub fn pane_id(&self) -> u64 {
+        self.pane_id
     }
 
     /// Write bytes to the PTY (e.g. keyboard input). Refuses to
