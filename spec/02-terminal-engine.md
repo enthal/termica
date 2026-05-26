@@ -108,6 +108,42 @@ When `Term` reports `is_alternate_screen() = true`:
 - Input routing changes per [05](05-pane-modes.md).
 - On exit, mode returns to `RawTerminal` (never directly to `ShellPromptEditor` — only a fresh prompt marker can promote).
 
+### The block model: one live `Term`, many sealed snapshots
+
+A pane is **not** a single `Term` with one continuous scrollback. From the user's perspective, the pane is a vertical stack of **command blocks** ([04](04-prompt-editor.md)), each block being one command + its output. Internally:
+
+- **At most one `Term` is live per pane.** It belongs to the bottom block (`Running` while a command is executing; `Prompt` when the shell is idle). Every PTY byte arriving from the kernel feeds into this live `Term`.
+- **Older blocks are `Sealed`**: a frozen `Vec<StyledLine>` snapshot of the styled cells the `Term` accumulated during that command. Sealed blocks own no live state, no parser, no scrollback — just rendered content.
+
+Lifecycle:
+
+1. The pane spawns. The first block is `Prompt` with a fresh `Term`; bytes from the bootstrap feed in.
+2. `IntegrationReady` → the pane transitions out of `Bootstrapping` ([05](05-pane-modes.md)); the live `Term` continues fed.
+3. `Precmd` → the `Prompt` block is fully open, the editor is active.
+4. User submits a command (or `Preexec` arrives) → the `Prompt` block transforms into a `Running` block with the same live `Term`; the editor closes; PTY bytes from now on are the command's output.
+5. `CommandFinished` → the `Running` block is **sealed**: the `Term`'s visible-screen-plus-scrollback-since-block-start is snapshotted into a `Vec<StyledLine>` and stashed; the `Term` is then **reset** (cleared, scrollback dropped). A fresh `Prompt` block opens with the same `Term`, now empty.
+6. Repeat from 3.
+
+The reset on seal is what keeps memory bounded: a 50,000-line `wc -l < bigfile` produces a sealed block holding 50,000 `StyledLine`s, but the next command starts with a fresh empty `Term`. Sealed `StyledLine`s are cheap (no live parser state, no alacritty `Term` machinery — just text + attributes per cell).
+
+#### Alt-screen blocks have no transcript
+
+When a command enters alt-screen mode (vim / htop / less / fzf), the bytes go to the `Term`'s alt-screen buffer, which is independent of the scrollback. When the program exits and `CommandFinished` arrives, the sealed snapshot reflects only what was in the main screen — which is typically *nothing* (TUI programs don't push lines into scrollback). The block seals as "ran a TUI program, no transcript captured." This is the right behaviour: vim's editor state was never part of the transcript stream anyway.
+
+#### Why not one shared `Term` with virtual block boundaries?
+
+That alternative — keep one growing `Term`, record byte/line offsets at `Preexec` / `CommandFinished`, treat each block as a range — was considered and rejected:
+
+- Alt-screen is global to the `Term`. When vim enters alt-screen, the visible portion of the grid is replaced, including the chrome of currently-visible older blocks. We'd have to special-case the renderer.
+- Per-block scrollback is awkward when the scrollback is shared. Scrolling within one block would need custom line-range arithmetic on every wheel tick.
+- Memory grows unbounded for a long-running session (no opportunity to drop sealed content).
+
+The chosen design — one live `Term` for the active block, frozen `Vec<StyledLine>` for sealed blocks — gets clean alt-screen semantics for free and keeps memory predictable.
+
+#### Selection model is pane-level
+
+Selection coordinates are pane-level (`PaneCursor { block_id, line, col }`) per [04](04-prompt-editor.md), not `alacritty::Point`. Each block translates the slice of the selection that intersects it into a per-block highlight overlay. This is what lets the user drag-select across block boundaries; the cell renderer just gets a per-block selection range when it paints each block.
+
 ## Rendering
 
 The renderer paints the visible portion of the grid into an `egui::Painter`. Performance matters: the renderer must handle ≥ a screen of output per frame at 60 fps under load.

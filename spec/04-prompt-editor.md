@@ -171,22 +171,122 @@ See [07](07-history-and-search.md) for the history storage and scopes.
 - **Never** auto-corrects or auto-completes silently. The user always confirms.
 - **Never** opens or closes itself based on heuristics. The `PromptController` ([05](05-pane-modes.md)) owns visibility.
 
-## Visual structure
+## Visual structure: the block model
+
+The pane is **not** one big cell grid. It is a vertical stack of **blocks**, each block being one command + its decorations + its output area. The user reads / scrolls / selects through the stack; only the bottom block is "live" at any moment.
+
+### The three block states
+
+A block is one of three states, decided by the `PromptController` ([05](05-pane-modes.md)):
+
+```rust
+pub enum Block {
+    /// Shell is idle at a prompt. Editor active inside; chips
+    /// above the editor; lives glued to the viewport bottom.
+    Prompt { editor: PromptEditor, header: BlockHeader, started_at: Instant },
+
+    /// A command is executing. Dim header line with live duration
+    /// timer; bold command line; output streams in below.
+    Running { live_grid: TerminalState, header: BlockHeader, command: String, started_at: Instant },
+
+    /// Command finished. Frozen snapshot of styled lines, dim
+    /// header line with final duration + exit code; bold command.
+    Sealed {
+        header: BlockHeader,
+        command: String,
+        snapshot: Vec<StyledLine>,
+        duration: Duration,
+        exit: Option<i32>,
+    },
+}
+
+pub struct BlockHeader {
+    cwd: PathBuf,
+    git_branch: Option<String>,
+    git_dirty: Option<DirtySummary>,    // 1 • +3 -0 etc.
+}
+
+pub struct DirtySummary {
+    files_changed: u32,
+    lines_added: u32,
+    lines_removed: u32,
+}
+```
+
+A `PaneSession` owns `Vec<Block>` plus an `active: Option<BlockId>` pointing at the live one (always the last; `None` very briefly between command_finished and the next precmd).
+
+### Visual structure (three captures' worth of UI)
+
+Each block paints differently per state:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ [📂 ~/git/enthal/termica] [⎇ main] [±1] [✓ 0 in 2.3s]           │  ← status header [06]
-├─────────────────────────────────────────────────────────────────┤
-│ ❯ cargo test --workspace_                                       │  ← editor (when ShellPromptEditor)
-│                                                                 │
-│   ┌─────────────────────────────────────────────────────────┐   │
-│   │ Phase 1 transcript                                      │   │
-│   │ (last command's output, ANSI-styled, search-able)       │   │
-│   └─────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────── Sealed ─────────────────────────────┐
+│ ~/git/enthal/termica git:(main) 1 • +3 -0 (0.034s)             │  ← dim header line
+│ git status                                                     │  ← bold command
+│ On branch main                                                 │  ← frozen output
+│ Your branch is up to date with 'origin/main'.                  │
+└────────────────────────────────────────────────────────────────┘
+┌─────────────────────────── Running ────────────────────────────┐
+│ ~/git/enthal/termica git:(main) 1 • +3 -0 (11s)                │  ← dim header, live duration
+│ while true; do sleep 1; date; done                             │  ← bold command, frozen
+│ Tue May 26 10:07:52 PDT 2026                                   │  ← live output
+│ Tue May 26 10:07:53 PDT 2026                                   │
+│ ▌                                                              │  ← running-cursor glyph
+└────────────────────────────────────────────────────────────────┘
+┌─────────────────────────── Prompt ─────────────────────────────┐  ← glued to viewport bottom
+│ [📁 ~/git/enthal/termica] [ main] [1 • +3]                     │  ← decoration chips
+│ ❯ git status_                                                  │  ← editor (multiline expands here)
+└────────────────────────────────────────────────────────────────┘
 ```
 
-The `❯` is decorative. It is painted by Termica; it is **not** part of the editor text. The status header is a structured widget, not a `PS1` string ([06](06-workspace-and-tiles.md)).
+The chrome between blocks is non-text (thin separator + space). Selection (below) passes through it; copy-to-clipboard does not include it.
+
+The `❯` and the chips are decorative — painted by Termica, not the shell's `PS1`. The integration script intentionally minimises `PS1` so the shell's own prompt drawing doesn't visually conflict with Termica's chrome ([03](03-shell-integration.md)).
+
+## Layout: fixed-footer prompt, sticky-top header
+
+Three rules govern the per-frame layout pass:
+
+1. **The `Prompt` block is a fixed footer.** It's glued to the bottom of the pane viewport and does not scroll. Its height varies with the editor's line count (multiline grows it down; the scrollable area shrinks correspondingly). When the bottom block is `Running` or there is no bottom block, the footer area is unused and the scroll area extends to the pane bottom.
+
+2. **Older blocks scroll under the footer.** The remaining vertical (pane height minus footer height) is the scroll area. Mouse-wheel / arrow-key scroll moves blocks within this area. Blocks above the viewport top are clipped; the scroll position is pane-level, not per-block.
+
+3. **The top-most partially-visible block's header pins to the top edge.** If a block's body is visible but its header has scrolled above the viewport, the renderer paints that header pinned to the top edge of the scroll area for as long as the block's body intersects the viewport. Only one sticky header is shown at a time; once the body fully scrolls past, the *next* block's header takes its place. This is the same affordance iOS section headers use.
+
+The layout helper that decides which block is "sticky-eligible" and computes the inner-block scroll offset is the unit-testable boundary: pure math, no egui dependency, covered by tests that walk scroll positions through a synthetic block list.
+
+## Cross-block selection
+
+Selection coordinates are **pane-level**, not grid-level:
+
+```rust
+pub struct PaneSelection {
+    pub anchor: PaneCursor,
+    pub head:   PaneCursor,
+    pub mode:   SelectionMode,   // Char / Word / Line
+}
+
+pub struct PaneCursor {
+    pub block_id: BlockId,
+    pub line:     usize,         // line within the block's content (0-indexed)
+    pub col:      usize,         // grapheme cluster index on that line
+}
+```
+
+When the user drags across a block boundary, the selection logically spans all text content between anchor and head. Each block translates "is this cell within my piece of the selection?" to a per-block highlight. Block chrome (header + separator) is visually unhighlighted even when the selection passes over it.
+
+`Selection → text` walks blocks in anchor→head order, concatenating each block's `command + output` slice with a separating newline between blocks. Chrome is not included.
+
+## Resize: sealed blocks don't reflow
+
+Per-pane resize is asymmetric:
+
+- **`Running` and `Prompt` blocks** track the pane's current cell width, exactly like a normal terminal would. The live alacritty grid (in `Running`) re-flows; the editor (in `Prompt`) re-wraps.
+- **`Sealed` blocks keep their original cell width.** Their `Vec<StyledLine>` snapshot is frozen at the width the command saw. Resize is cheap (no re-rendering thousands of stored lines) and matches iTerm / Warp behaviour.
+
+A sealed block narrower than the current pane is left-aligned within its strip. A sealed block wider than the current pane horizontally scrolls (or hard-truncates — TBD by Phase 8's polish pass).
+
+The editor model and submit semantics described earlier in this document apply to the editor that lives **inside** the `Prompt` block. Everything else (the live cell grid, the sealed snapshots) belongs to the surrounding block infrastructure.
 
 ## Testing
 
