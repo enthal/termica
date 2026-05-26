@@ -1,0 +1,208 @@
+//! egui_tiles `Behavior` impl for Termica.
+//!
+//! [`TabBehavior`] is a per-frame shim that holds borrows into
+//! [`crate::app::TermicaApp`] so the Behavior callbacks can read pane
+//! state, draw pane UI, and stage tree mutations (deferred to after
+//! `tree.ui()` returns — egui_tiles forbids mutating the tree from
+//! inside a callback).
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use eframe::egui;
+use egui_tiles::{Behavior, Tile, TileId, Tiles, UiResponse};
+
+use crate::pane_slot::{PaneId, PaneSlot};
+use crate::render_pane::render_pane;
+use crate::tab_title::tab_title_for;
+
+/// Per-frame Behavior shim. Holds borrows into [`crate::app::TermicaApp`]
+/// so the Behavior callbacks can read pane state, draw pane UI, and
+/// stage tree mutations (deferred to after `tree.ui()`).
+pub(crate) struct TabBehavior<'a> {
+    pub(crate) panes: &'a mut HashMap<PaneId, PaneSlot>,
+    pub(crate) home: Option<&'a Path>,
+    pub(crate) ctx: &'a egui::Context,
+    /// The pane id whose keyboard focus we should advertise via tab
+    /// styling. Set by `TermicaApp::update` from the previous frame's
+    /// `slot.ui.focused`; one-frame lag is acceptable.
+    pub(crate) focused_pane: Option<PaneId>,
+    /// Set when the user clicks [+] in a tab strip. Read by
+    /// `TermicaApp::update` after `tree.ui()` returns.
+    pub(crate) new_tab_requested_in: Option<TileId>,
+    /// Tab close requests staged by `on_tab_close`. Drained and
+    /// applied by `TermicaApp::update` via [`egui_tiles::Tree::remove_recursively`]
+    /// so the parent's `children` and `active` references get
+    /// cleaned up properly.
+    pub(crate) pending_closes: &'a mut Vec<TileId>,
+    /// Same idea, but for tiles whose pane is running a program —
+    /// the close goes through the confirmation modal first.
+    pub(crate) pending_close_confirm: &'a mut Option<TileId>,
+    /// True when ANY modal (close-confirm or quit-confirm) is
+    /// currently showing. Forwarded to [`render_pane`] which uses it
+    /// to render the pane as inert: no keyboard to the PTY, no
+    /// wheel, no mouse selection, no focus grab. Without this, keys
+    /// the user thought were going to the modal (Enter, Esc, arrows)
+    /// reach the PTY because pane input is read before the modal
+    /// renders later in the frame.
+    pub(crate) modal_open: bool,
+}
+
+impl<'a> Behavior<PaneId> for TabBehavior<'a> {
+    fn tab_title_for_pane(&mut self, pane_id: &PaneId) -> egui::WidgetText {
+        let cwd = self.panes.get(pane_id).and_then(|s| s.session.terminal().cwd());
+        tab_title_for(*pane_id, cwd, self.home).into()
+    }
+
+    fn pane_ui(&mut self, ui: &mut egui::Ui, _tile_id: TileId, pane_id: &mut PaneId) -> UiResponse {
+        let Some(slot) = self.panes.get_mut(pane_id) else {
+            ui.label(format!("(pane {} gone)", pane_id.0));
+            return UiResponse::None;
+        };
+        // Salt every widget id under this pane by `PaneId` so a
+        // pane that ends up referenced from multiple tree slots —
+        // egui_tiles is permissive about this; we don't think it
+        // happens in our flow but the cost of being safe is zero —
+        // never collides on auto-generated ids. CLAUDE.md spells
+        // out the rule: assume any UI element can render twice in
+        // a frame and salt accordingly.
+        let modal_open = self.modal_open;
+        ui.push_id(("pane", pane_id.0), |ui| {
+            render_pane(ui, self.ctx, slot, self.home, modal_open);
+        });
+        UiResponse::None
+    }
+
+    fn is_tab_closable(&self, tiles: &Tiles<PaneId>, _tile_id: TileId) -> bool {
+        // Don't allow closing the very last tab — that would leave
+        // the app with no pane and no obvious way for the user to
+        // recover. A future PR can change this to either auto-spawn
+        // a new pane or quit the app on last-close.
+        tiles.iter().filter(|(_, t)| matches!(t, Tile::Pane(_))).count() > 1
+    }
+
+    fn on_tab_close(&mut self, tiles: &mut Tiles<PaneId>, tile_id: TileId) -> bool {
+        // **Don't** let egui_tiles call `tiles.remove(tile_id)` —
+        // that path doesn't clean up the parent Tabs container's
+        // `children` / `active` references, which leaves a stale
+        // pointer that blanks the pane area. Either route into the
+        // modal (if a program is running) or defer the removal to
+        // `TermicaApp::update` which uses
+        // [`egui_tiles::Tree::remove_recursively`] (the cleanup-correct path).
+        let running = matches!(tiles.get(tile_id), Some(Tile::Pane(pid))
+            if self.panes.get(pid).is_some_and(|s| s.session.terminal().is_alternate_screen()));
+        if running {
+            *self.pending_close_confirm = Some(tile_id);
+        } else {
+            self.pending_closes.push(tile_id);
+        }
+        false
+    }
+
+    fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
+        // By default egui_tiles prunes Tabs containers with only one
+        // child, which silently removes our tab strip whenever there's
+        // exactly one pane. We want the tab strip to ALWAYS be visible
+        // (so the `[+]` button is reachable and the user has a clear
+        // affordance for tabs even from the empty state) — hence
+        // `all_panes_must_have_tabs = true`, which the docs say wins
+        // over `prune_single_child_tabs`.
+        egui_tiles::SimplificationOptions { all_panes_must_have_tabs: true, ..Default::default() }
+    }
+
+    fn top_bar_right_ui(
+        &mut self,
+        _tiles: &Tiles<PaneId>,
+        ui: &mut egui::Ui,
+        tile_id: TileId,
+        _tabs: &egui_tiles::Tabs,
+        _scroll_offset: &mut f32,
+    ) {
+        // Stage the "new tab in this Tabs container" intent. The
+        // app applies it after `tree.ui()` so we don't mutate the
+        // tree from inside a Behavior callback.
+        if ui.button("+").on_hover_text("New tab").clicked() {
+            self.new_tab_requested_in = Some(tile_id);
+        }
+    }
+
+    // ---- Knauty-style tab styling --------------------------------
+    //
+    // Stay close to egui_tiles' defaults so the chrome doesn't
+    // shout. The only departures:
+    //
+    //   - Inactive tabs render their title in italic. Mirrors
+    //     Knauty's convention and makes "this is not the active
+    //     tab in this region" immediately legible.
+    //   - The active tab WHOSE PANE HOLDS KEYBOARD FOCUS renders
+    //     its title in bold. Same idea — subtle, no extra paint,
+    //     just font weight. With multiple split regions, the bold
+    //     tab tells you where your typing will land.
+    //
+    // No accent-colored outline / background tint. The previous
+    // version was too loud per UX review.
+
+    fn tab_title_for_tile(&mut self, tiles: &Tiles<PaneId>, tile_id: TileId) -> egui::WidgetText {
+        let Some(Tile::Pane(pane_id)) = tiles.get(tile_id) else {
+            return "?".into();
+        };
+        let cwd = self.panes.get(pane_id).and_then(|s| s.session.terminal().cwd());
+        // No styling on the text itself any more. Active-in-container
+        // is already differentiated by egui_tiles' default `tab_ui`
+        // (brighter bg + connecting hline). The focused-for-the-whole-
+        // app indicator is the blue bottom border painted in
+        // [`on_tab_button`] below.
+        egui::RichText::new(tab_title_for(*pane_id, cwd, self.home)).into()
+    }
+
+    fn on_tab_button(
+        &mut self,
+        tiles: &Tiles<PaneId>,
+        tile_id: TileId,
+        response: egui::Response,
+    ) -> egui::Response {
+        // Tab click → focus its pane. egui_tiles changes the parent
+        // Tabs.active only when the clicked tab is a *different*
+        // tile, so clicking the already-active tab would otherwise
+        // be a no-op — but the user expects clicking any tab to
+        // bring keyboard focus to its pane, exactly like clicking
+        // the pane's visible body does. We can't rely on the
+        // `now_active.difference(prev_active)` diff in `update`
+        // for this case because active didn't change.
+        if response.clicked()
+            && let Some(Tile::Pane(pane_id)) = tiles.get(tile_id)
+            && let Some(slot) = self.panes.get_mut(pane_id)
+        {
+            slot.ui.needs_focus = true;
+        }
+
+        // Paint a blue underline on the tab that owns app-wide
+        // keyboard focus. With multiple split regions each showing
+        // their own active tab, this is what tells the user "your
+        // typing lands HERE" at a glance. We paint into the same
+        // layer the tab was drawn on (via `layer_painter`) and on
+        // top of egui_tiles' own painted geometry — `on_tab_button`
+        // runs after the default `tab_ui` returns.
+        let is_focused = matches!(tiles.get(tile_id), Some(Tile::Pane(pid))
+            if self.focused_pane == Some(*pid));
+        if is_focused {
+            paint_focused_tab_underline(&response);
+        }
+        response
+    }
+}
+
+/// Paint the blue underline that marks the app-wide focused tab.
+/// Public + free-standing so snapshot tests can apply the same
+/// paint to a synthetic `egui_tiles::Tree` without standing up a
+/// full [`crate::app::TermicaApp`]; the production caller is
+/// [`TabBehavior::on_tab_button`]. Single source of truth for the
+/// focus visual.
+pub fn paint_focused_tab_underline(response: &egui::Response) {
+    let painter = response.ctx.layer_painter(response.layer_id);
+    let rect = response.rect;
+    let color = response.ctx.style().visuals.selection.bg_fill;
+    let stroke = egui::Stroke::new(2.5, color);
+    let y = rect.bottom() - 1.25;
+    painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], stroke);
+}
