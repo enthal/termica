@@ -60,6 +60,89 @@ pub fn paint_alt_screen_border(painter: &egui::Painter, grid_rect: egui::Rect) {
     );
 }
 
+/// Route one egui event to the pane's [`PromptEditor`](crate::prompt_editor).
+/// Returns `true` when the editor consumed the event (so the caller
+/// skips the PTY encoder path); `false` lets the caller try other
+/// routes. Phase 4B handles a minimal set: text insertion, basic
+/// cursor moves, `Backspace` / `Delete`, multiline `Shift+Enter`,
+/// the placeholder `Enter`, and `Esc` (which demotes via
+/// `PaneSession::leave_editor_esc`). History walk (Up/Down) and
+/// shift-selection are deferred to 4F/4J.
+fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
+    use egui::{Event, Key};
+    match event {
+        // Plain printable text from the OS IME / keyboard layout.
+        Event::Text(s) => {
+            if let Some(editor) = slot.session.editor_mut() {
+                editor.insert_str(s);
+            }
+            true
+        }
+        Event::Key { key, pressed: true, modifiers, .. } => {
+            // App-level shortcuts (Cmd+T etc.) and the copy shortcut
+            // are already handled earlier in the keyboard loop; here
+            // we only act on bare keys (no command/alt modifier).
+            // `Shift` is still legal — used for Shift+Enter.
+            if modifiers.command || modifiers.alt {
+                return false;
+            }
+            let Some(editor) = slot.session.editor_mut() else { return false };
+            match key {
+                Key::Backspace => {
+                    editor.backspace();
+                    true
+                }
+                Key::Delete => {
+                    editor.delete_forward();
+                    true
+                }
+                Key::ArrowLeft => {
+                    editor.move_left();
+                    true
+                }
+                Key::ArrowRight => {
+                    editor.move_right();
+                    true
+                }
+                // Up / Down: history walk lands in 4J; multi-line
+                // cursor row-nav also belongs there since it shares
+                // the column-preserving logic. No-op in 4B but
+                // *consumed* so the keys don't escape to the PTY.
+                Key::ArrowUp | Key::ArrowDown => true,
+                Key::Home => {
+                    editor.move_home();
+                    true
+                }
+                Key::End => {
+                    editor.move_end();
+                    true
+                }
+                Key::Enter => {
+                    if modifiers.shift {
+                        editor.insert_newline();
+                    }
+                    // Plain Enter is a placeholder in 4B; 4C wires
+                    // submit + echo suppression. Consume so the byte
+                    // doesn't reach the PTY (which would race with
+                    // the editor's state).
+                    true
+                }
+                Key::Escape => {
+                    // Esc demotes back to `RawTerminal` per spec/05;
+                    // the editor's buffer is dropped.
+                    slot.session.leave_editor_esc();
+                    true
+                }
+                // Tab is local completion in 4I; for 4B we consume
+                // it to keep it out of the PTY (no-op).
+                Key::Tab => true,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Spawn the OS's "open this URL or path" handler.
 ///
 /// macOS: `open <arg>`. Linux/BSD: `xdg-open <arg>`. The argument
@@ -271,6 +354,22 @@ pub fn render_pane(
                 selection.as_ref(),
                 highlighted_link,
             );
+
+            // ---- Prompt-block editor ------------------------------
+            //
+            // Phase 4B: when the pane is at a confirmed shell prompt
+            // (`ShellPromptEditor` mode) the tail `Prompt` block has
+            // a live [`PromptEditor`]. Paint it directly below the
+            // live `Term`. The shell's actual prompt (e.g. "$ ")
+            // shows above; the editor's typed text shows below.
+            // 4D's fixed-footer layout will lock the editor to the
+            // viewport bottom; for 4B it just flows.
+            if slot.session.editor_is_active()
+                && let Some(editor) = slot.session.blocks().editor_on_tail()
+            {
+                let _ = render::paint_prompt_editor(ui, editor);
+            }
+
             (rendered, links_in_view, highlighted_link.cloned())
         });
     let (rendered, links_in_view, highlighted_link) = scroll_inner.inner;
@@ -433,6 +532,7 @@ pub fn render_pane(
         }
 
         let modes = slot.session.terminal().modes();
+        let editor_active = slot.session.editor_is_active();
         for event in &events {
             // Belt and braces: skip the Ctrl+Shift+C key event so the
             // encoder never sees it (the encoder wouldn't emit bytes
@@ -441,6 +541,15 @@ pub fn render_pane(
                 && !is_macos
                 && input::is_copy_shortcut(*key, *modifiers, false)
             {
+                continue;
+            }
+            // Phase 4B: in `ShellPromptEditor` mode, keystrokes go to
+            // the native editor inside the `Prompt` block instead of
+            // straight to the PTY. The encoder is bypassed for these
+            // events — typing into the editor must NOT also echo to
+            // the shell. `apply_event_to_editor` returns `true` when
+            // it owned the event.
+            if editor_active && apply_event_to_editor(event, slot) {
                 continue;
             }
             if let Some(bytes) = input::encode_event(event, modes) {

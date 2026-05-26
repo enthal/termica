@@ -37,6 +37,7 @@ pub mod markers;
 pub mod osc;
 pub mod pane;
 pub mod paths;
+pub mod prompt_editor;
 pub mod pty;
 pub mod render;
 pub mod selection;
