@@ -65,7 +65,14 @@ home = "0.5"
 # `std` feature (which is what `default = ["std"]` is) since we are
 # always on std, and disables the `arbitrary_precision` feature we
 # don't need.
-serde_json = "1"
+#
+# `preserve_order` makes `serde_json::Map` insertion-ordered (backed
+# by `IndexMap`) instead of alpha-sorted (the default `BTreeMap`
+# backing). The `--dump-events` JSON Lines writer relies on this so
+# every record begins with `t`, `pane`, `kind` (the envelope) before
+# any per-kind fields — matches the schema example in spec/03 and
+# keeps `tail -f` readable.
+serde_json = { version = "1", features = ["preserve_order"] }
 
 # Phase 3E: per-session scratch directory for shell-integration
 # wrappers (zsh's `.zshrc` under our ZDOTDIR, bash's `--rcfile`).
