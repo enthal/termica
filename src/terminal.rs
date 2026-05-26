@@ -323,6 +323,54 @@ impl TerminalState {
         out
     }
 
+    /// Capture every row the live `Term` has emitted since its last
+    /// reset, top-to-bottom, as a [`Vec<StyledLine>`]. Used by the
+    /// block model to freeze a finished command's output before
+    /// resetting the `Term` for the next block.
+    ///
+    /// Rows iterated: the entire scrollback (`history_size` rows
+    /// above the viewport) followed by the visible rows up to and
+    /// including the cursor row. Trailing blank rows below the
+    /// cursor are excluded — those are "the area the next prompt
+    /// will draw into," not part of the just-finished command.
+    pub fn snapshot_lines_all(&self) -> Vec<StyledLine> {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line, Point};
+
+        let grid = self.term.grid();
+        let cols = grid.columns();
+        let history = grid.history_size() as i32;
+        let cursor_row = grid.cursor.point.line.0;
+        // Last row to include: the row the cursor is currently on.
+        // Anything below it is uninitialised "next-prompt area" we
+        // do not want in the sealed snapshot.
+        let last_line = cursor_row.max(-history);
+
+        let mut out = Vec::with_capacity((history + 1 + last_line.max(0)) as usize);
+        for line in (-history)..=last_line {
+            let mut cells = Vec::with_capacity(cols);
+            for col in 0..cols {
+                let p = Point::new(Line(line), Column(col));
+                let cell = &grid[p];
+                cells.push(StyledCell { c: cell.c, fg: cell.fg, bg: cell.bg, flags: cell.flags });
+            }
+            out.push(StyledLine { cells });
+        }
+        out
+    }
+
+    /// Drop everything in the grid and reset the cursor to (0, 0).
+    /// Called by the block model when a [`crate::block::Block::Running`]
+    /// seals: the snapshot is taken first via [`Self::snapshot_lines_all`],
+    /// then the `Term` is reset so the next block starts with a clean
+    /// slate.
+    ///
+    /// This is a wrapper over [`Self::clear_all`] for now; the name
+    /// expresses block-model intent and lets the impl evolve later.
+    pub fn reset_for_new_block(&mut self) {
+        self.clear_all();
+    }
+
     /// Render the current visible grid as plain UTF-8 text, one row
     /// per line, trailing whitespace preserved. Test-and-debug
     /// helper; the real renderer paints cells directly and never
@@ -506,6 +554,61 @@ mod tests {
         for line in &lines {
             assert_eq!(line.cells.len(), 20, "row should be padded to pane width");
         }
+    }
+
+    // ---- whole-Term snapshot + reset (Phase 4A-render) ------------
+
+    #[test]
+    fn snapshot_lines_all_captures_visible_content_up_to_cursor() {
+        let mut state = TerminalState::new(5, 20);
+        state.feed(b"alpha\r\nbeta\r\n");
+        let snap = state.snapshot_lines_all();
+        // Cursor is now on row 2 after two \r\n. Should capture rows
+        // 0, 1, 2 (alpha, beta, and the empty cursor row).
+        let joined: String =
+            snap.iter().map(|l| l.text_chars().collect::<String>()).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("alpha"), "missing first row: {joined:?}");
+        assert!(joined.contains("beta"), "missing second row: {joined:?}");
+    }
+
+    #[test]
+    fn snapshot_lines_all_excludes_uninitialised_rows_below_cursor() {
+        let mut state = TerminalState::new(10, 20);
+        state.feed(b"only-row\r\n");
+        // Cursor now on row 1; rows 2..=9 are blank "next area".
+        let snap = state.snapshot_lines_all();
+        assert!(snap.len() <= 2, "should only capture rows up to cursor; got {} rows", snap.len());
+        let joined: String =
+            snap.iter().map(|l| l.text_chars().collect::<String>()).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("only-row"));
+    }
+
+    #[test]
+    fn reset_for_new_block_clears_grid_and_cursor() {
+        let mut state = TerminalState::new(5, 20);
+        state.feed(b"content-to-erase\r\nmore-content\r\n");
+        state.reset_for_new_block();
+        let text = state.screen_text();
+        for (i, row) in text.lines().enumerate() {
+            assert!(
+                row.chars().all(|c| c == ' '),
+                "row {i} should be blank after reset, got: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_then_reset_leaves_term_empty_for_next_block() {
+        let mut state = TerminalState::new(5, 20);
+        state.feed(b"command-output\r\n");
+        let snap = state.snapshot_lines_all();
+        state.reset_for_new_block();
+        let joined: String =
+            snap.iter().map(|l| l.text_chars().collect::<String>()).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("command-output"), "snapshot lost: {joined:?}");
+        // After reset, feeding new content starts from row 0 again.
+        state.feed(b"next");
+        assert_row_contains(&state, 0, "next");
     }
 
     #[test]

@@ -19,22 +19,20 @@
 //!
 //! - The pane is born with exactly one `Prompt` block.
 //! - When [`LifecycleEvent::Preexec`] arrives, the live tail's
-//!   `Prompt` transforms into `Running`, carrying the command string
-//!   and the line offset at which the command's output begins.
+//!   `Prompt` transforms into `Running`, carrying the command string.
 //! - When [`LifecycleEvent::CommandFinished`] arrives, the live tail's
-//!   `Running` seals: its output (line range captured at start to the
-//!   current grid total-lines count) is snapshotted as a
-//!   `Vec<StyledLine>`, the exit code and duration are recorded, and
-//!   a fresh `Prompt` block is pushed.
+//!   `Running` seals: the whole live `Term` is snapshotted into a
+//!   `Vec<StyledLine>`, the `Term` is reset for the next block, the
+//!   exit code and duration are recorded, and a fresh `Prompt` block
+//!   is pushed.
 //!
 //! ## Why this module is self-contained
 //!
-//! `BlockStack::observe_lifecycle_event` takes a [`TerminalState`]
-//! reference so it can read line offsets and capture snapshots, but
-//! it never touches the renderer, never assumes egui, and never
-//! mutates state outside its own `Vec<Block>` (and the snapshot
-//! capture it reads). This is the strict-layer engine surface; tests
-//! drive it without a PTY.
+//! `BlockStack::observe_lifecycle_event` takes a `&mut TerminalState`
+//! so it can snapshot-and-reset the grid at seal time, but it never
+//! touches the renderer, never assumes egui, and never mutates state
+//! outside its own `Vec<Block>` (plus the terminal it's handed). This
+//! is the strict-layer engine surface; tests drive it without a PTY.
 
 #![forbid(unsafe_code)]
 
@@ -64,12 +62,12 @@ pub struct BlockHeader {
 ///   `Term` belongs to this block until [`LifecycleEvent::Preexec`]
 ///   arrives.
 /// - [`Block::Running`] — a command is executing. The same live
-///   `Term` continues to be fed. `output_start_line` records the
-///   grid total-line count at `Preexec` so the seal snapshot can
-///   slice exactly the lines this command produced.
+///   `Term` continues to be fed; bytes accumulate in the `Term`
+///   until `CommandFinished` snapshots and resets it.
 /// - [`Block::Sealed`] — the command has finished and its output is
 ///   a frozen `Vec<StyledLine>` snapshot. No live state remains in
-///   the block.
+///   the block. The live `Term` was reset after the snapshot was
+///   taken, so subsequent bytes start a fresh block at row 0.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
     Prompt {
@@ -85,10 +83,6 @@ pub enum Block {
         header: BlockHeader,
         command: String,
         started_at_frame: u64,
-        /// Total-line count in the live `Term`'s grid at the moment
-        /// `Preexec` arrived. Used at seal time to slice "just the
-        /// lines this command produced."
-        output_start_line: usize,
     },
     Sealed {
         id: BlockId,
@@ -168,8 +162,11 @@ impl BlockStack {
     }
 
     /// Apply one lifecycle event from the [`crate::shell::PromptController`].
-    /// `terminal` is read at the seal call so the snapshot reflects
-    /// the grid state at the instant `CommandFinished` was parsed.
+    ///
+    /// `terminal` is mutated only at the seal call (`CommandFinished`),
+    /// where we snapshot the whole grid into the sealed block and
+    /// reset the `Term` so the next block starts with a clean slate.
+    /// At `Preexec` we just flip the tail variant; no terminal access.
     ///
     /// Events that don't drive a block transition (e.g. `Precmd`,
     /// `IntegrationReady`, `PromptVars`, `Cwd`) are ignored here —
@@ -179,25 +176,23 @@ impl BlockStack {
     pub fn observe_lifecycle_event(
         &mut self,
         event: &LifecycleEvent,
-        terminal: &TerminalState,
+        terminal: &mut TerminalState,
         frame: u64,
     ) {
         match event {
-            LifecycleEvent::Preexec { command } => {
-                self.start_running(command.clone(), terminal, frame)
-            }
+            LifecycleEvent::Preexec { command } => self.start_running(command.clone(), frame),
             LifecycleEvent::CommandFinished { exit } => self.seal_running(*exit, terminal, frame),
             _ => {}
         }
     }
 
     /// `Preexec` arrived. If the tail is a `Prompt`, transform it
-    /// into a `Running` carrying the command string and the current
-    /// total-line offset. If the tail is already `Running` (e.g.
-    /// a stray `Preexec` from a nested context — see
+    /// into a `Running` carrying the command string. If the tail is
+    /// already `Running` (e.g. a stray `Preexec` from a nested
+    /// context — see
     /// [spec/03 §"Nested shells"](../spec/03-shell-integration.md)),
     /// ignore: only one command can be running at a time per pane.
-    fn start_running(&mut self, command: String, terminal: &TerminalState, frame: u64) {
+    fn start_running(&mut self, command: String, frame: u64) {
         let Some(tail) = self.blocks.last_mut() else { return };
         if !matches!(tail, Block::Prompt { .. }) {
             // Already running, or sealed (impossible by invariant
@@ -206,38 +201,33 @@ impl BlockStack {
             // a block boundary than corrupt the stack.
             return;
         }
-        let (id, header, _) = match tail {
-            Block::Prompt { id, header, started_at_frame } => {
-                (*id, header.clone(), *started_at_frame)
-            }
+        let (id, header) = match tail {
+            Block::Prompt { id, header, .. } => (*id, header.clone()),
             _ => unreachable!(),
         };
-        *tail = Block::Running {
-            id,
-            header,
-            command,
-            started_at_frame: frame,
-            output_start_line: terminal.total_lines_seen(),
-        };
+        *tail = Block::Running { id, header, command, started_at_frame: frame };
     }
 
     /// `CommandFinished` arrived. If the tail is `Running`, snapshot
-    /// the lines produced since `Preexec`, seal it, and push a fresh
-    /// `Prompt` block. If the tail is `Prompt` (a stray finish with
-    /// no prior `Preexec`), ignore: there's no command to seal.
-    fn seal_running(&mut self, exit: i32, terminal: &TerminalState, frame: u64) {
+    /// the whole live `Term`, seal the tail, reset the `Term` for the
+    /// next block, and push a fresh `Prompt`. If the tail is `Prompt`
+    /// (a stray finish with no prior `Preexec`), ignore: there's no
+    /// command to seal.
+    ///
+    /// Order matters: snapshot first, then reset. Otherwise the
+    /// sealed snapshot is empty.
+    fn seal_running(&mut self, exit: i32, terminal: &mut TerminalState, frame: u64) {
         let Some(tail) = self.blocks.last() else { return };
-        let Block::Running { id, header, command, started_at_frame, output_start_line } = tail
-        else {
+        let Block::Running { id, header, command, started_at_frame } = tail else {
             return;
         };
         let id = *id;
         let header = header.clone();
         let command = command.clone();
         let started = *started_at_frame;
-        let start_line = *output_start_line;
 
-        let snapshot = terminal.snapshot_lines_since(start_line);
+        let snapshot = terminal.snapshot_lines_all();
+        terminal.reset_for_new_block();
         let duration = Duration::from_secs(frame.saturating_sub(started));
 
         let sealed = Block::Sealed {
@@ -284,10 +274,10 @@ mod tests {
     #[test]
     fn preexec_transitions_tail_prompt_to_running() {
         let mut stack = fresh_stack();
-        let term = TerminalState::new(5, 20);
+        let mut term = TerminalState::new(5, 20);
         stack.observe_lifecycle_event(
             &LifecycleEvent::Preexec { command: "ls -la".into() },
-            &term,
+            &mut term,
             10,
         );
         assert_eq!(stack.len(), 1);
@@ -304,15 +294,15 @@ mod tests {
     #[test]
     fn preexec_when_tail_already_running_is_ignored() {
         let mut stack = fresh_stack();
-        let term = TerminalState::new(5, 20);
+        let mut term = TerminalState::new(5, 20);
         stack.observe_lifecycle_event(
             &LifecycleEvent::Preexec { command: "first".into() },
-            &term,
+            &mut term,
             10,
         );
         stack.observe_lifecycle_event(
             &LifecycleEvent::Preexec { command: "second-should-be-ignored".into() },
-            &term,
+            &mut term,
             11,
         );
         match stack.last().unwrap() {
@@ -325,13 +315,13 @@ mod tests {
     #[test]
     fn command_finished_seals_running_and_pushes_new_prompt() {
         let mut stack = fresh_stack();
-        let term = TerminalState::new(5, 20);
+        let mut term = TerminalState::new(5, 20);
         stack.observe_lifecycle_event(
             &LifecycleEvent::Preexec { command: "echo hi".into() },
-            &term,
+            &mut term,
             10,
         );
-        stack.observe_lifecycle_event(&LifecycleEvent::CommandFinished { exit: 0 }, &term, 20);
+        stack.observe_lifecycle_event(&LifecycleEvent::CommandFinished { exit: 0 }, &mut term, 20);
 
         assert_eq!(stack.len(), 2, "sealed + new prompt");
         // First (older) is sealed.
@@ -354,13 +344,13 @@ mod tests {
     #[test]
     fn command_finished_with_nonzero_exit_is_recorded() {
         let mut stack = fresh_stack();
-        let term = TerminalState::new(5, 20);
+        let mut term = TerminalState::new(5, 20);
         stack.observe_lifecycle_event(
             &LifecycleEvent::Preexec { command: "false".into() },
-            &term,
+            &mut term,
             0,
         );
-        stack.observe_lifecycle_event(&LifecycleEvent::CommandFinished { exit: 127 }, &term, 1);
+        stack.observe_lifecycle_event(&LifecycleEvent::CommandFinished { exit: 127 }, &mut term, 1);
         match stack.iter().next().unwrap() {
             Block::Sealed { exit, .. } => assert_eq!(*exit, Some(127)),
             other => panic!("expected Sealed, got {other:?}"),
@@ -370,8 +360,8 @@ mod tests {
     #[test]
     fn command_finished_without_prior_running_is_ignored() {
         let mut stack = fresh_stack();
-        let term = TerminalState::new(5, 20);
-        stack.observe_lifecycle_event(&LifecycleEvent::CommandFinished { exit: 0 }, &term, 5);
+        let mut term = TerminalState::new(5, 20);
+        stack.observe_lifecycle_event(&LifecycleEvent::CommandFinished { exit: 0 }, &mut term, 5);
         assert_eq!(stack.len(), 1, "stack unchanged");
         assert!(matches!(stack.last().unwrap(), Block::Prompt { .. }));
     }
@@ -379,16 +369,16 @@ mod tests {
     #[test]
     fn block_ids_are_monotonic_across_seal_cycles() {
         let mut stack = fresh_stack();
-        let term = TerminalState::new(5, 20);
+        let mut term = TerminalState::new(5, 20);
         for i in 0..5 {
             stack.observe_lifecycle_event(
                 &LifecycleEvent::Preexec { command: format!("cmd{i}") },
-                &term,
+                &mut term,
                 (i * 2) as u64,
             );
             stack.observe_lifecycle_event(
                 &LifecycleEvent::CommandFinished { exit: 0 },
-                &term,
+                &mut term,
                 (i * 2 + 1) as u64,
             );
         }
@@ -403,7 +393,7 @@ mod tests {
     #[test]
     fn unrelated_lifecycle_events_dont_change_the_stack() {
         let mut stack = fresh_stack();
-        let term = TerminalState::new(5, 20);
+        let mut term = TerminalState::new(5, 20);
         let before = stack.len();
         for ev in [
             LifecycleEvent::IntegrationReady { shell: ShellKind::Zsh, version: 1 },
@@ -413,50 +403,68 @@ mod tests {
             LifecycleEvent::IntegrationError { reason: "boom".into() },
             LifecycleEvent::CommandAborted { reason: "ctrl-c".into() },
         ] {
-            stack.observe_lifecycle_event(&ev, &term, 1);
+            stack.observe_lifecycle_event(&ev, &mut term, 1);
         }
         assert_eq!(stack.len(), before, "non-command events leave the stack alone");
     }
 
     #[test]
-    fn sealed_block_carries_a_snapshot_of_lines_produced_during_run() {
-        // Plant the previous prompt on row 0 and `\r\n` so the cursor
-        // sits at row 1 when Preexec fires — that's the typical shell
-        // shape (the user pressed Enter, the shell emitted a newline
-        // before invoking the preexec hook). The sealed snapshot must
-        // include the command's output but not the prior prompt on
-        // row 0.
+    fn sealed_block_carries_a_snapshot_of_command_output() {
         let mut term = TerminalState::new(5, 20);
-        term.feed(b"old-prompt$ \r\n");
         let mut stack = fresh_stack();
 
         stack.observe_lifecycle_event(
             &LifecycleEvent::Preexec { command: "echo hello".into() },
-            &term,
+            &mut term,
             10,
         );
 
-        // Now bytes produced *by the command*.
+        // Bytes produced by the running command.
         term.feed(b"hello\r\n");
 
-        stack.observe_lifecycle_event(&LifecycleEvent::CommandFinished { exit: 0 }, &term, 11);
+        stack.observe_lifecycle_event(&LifecycleEvent::CommandFinished { exit: 0 }, &mut term, 11);
 
         match stack.iter().next().unwrap() {
             Block::Sealed { snapshot, .. } => {
-                // The snapshot should contain "hello" somewhere, and
-                // should NOT contain "old-prompt$".
                 let joined: String = snapshot
                     .iter()
                     .map(|line| line.text_chars().collect::<String>())
                     .collect::<Vec<_>>()
                     .join("\n");
                 assert!(joined.contains("hello"), "snapshot missing command output: {joined:?}");
-                assert!(
-                    !joined.contains("old-prompt$"),
-                    "snapshot leaked pre-Preexec content: {joined:?}"
-                );
             }
             other => panic!("expected Sealed, got {other:?}"),
         }
+    }
+
+    /// The whole-Term-snapshot-then-reset model: after `CommandFinished`,
+    /// the live `Term` must be empty so the next block starts clean.
+    /// Spec/02 §"The block model: one live Term, many sealed snapshots".
+    #[test]
+    fn term_is_empty_after_seal() {
+        let mut term = TerminalState::new(5, 20);
+        let mut stack = fresh_stack();
+        stack.observe_lifecycle_event(
+            &LifecycleEvent::Preexec { command: "ls".into() },
+            &mut term,
+            1,
+        );
+        term.feed(b"a-file\r\nb-file\r\n");
+        stack.observe_lifecycle_event(&LifecycleEvent::CommandFinished { exit: 0 }, &mut term, 2);
+
+        let text = term.screen_text();
+        for (i, row) in text.lines().enumerate() {
+            assert!(
+                row.chars().all(|c| c == ' '),
+                "row {i} should be blank after seal+reset, got: {row:?}\nfull screen:\n{text}"
+            );
+        }
+        // And of course the next block's content lands at row 0.
+        term.feed(b"new-prompt$");
+        let text = term.screen_text();
+        assert!(
+            text.starts_with("new-prompt$"),
+            "next block content should land at row 0: {text:?}"
+        );
     }
 }

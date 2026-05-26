@@ -26,6 +26,17 @@ use termica::pane::PaneView;
 use termica::render;
 use termica::terminal::TerminalState;
 
+/// Build a sealed-block snapshot from synthetic bytes: feed bytes
+/// into a fresh `TerminalState`, then take a `snapshot_lines_all()`.
+/// This is the exact path `BlockStack::seal_running` walks at
+/// `CommandFinished` time, so the snapshot test paints what a real
+/// sealed block would.
+fn sealed_snapshot(rows: u16, cols: u16, bytes: &[u8]) -> Vec<termica::terminal::StyledLine> {
+    let mut t = TerminalState::new(rows, cols);
+    t.feed(bytes);
+    t.snapshot_lines_all()
+}
+
 // ---- status header fixtures ----------------------------------------------
 
 fn empty_view() -> PaneView {
@@ -260,4 +271,41 @@ fn snapshot_terminal_link_underline() {
             render::paint_terminal(ui, &term, None, Some(&link));
         });
     harness.snapshot("terminal_link_underline");
+}
+
+// ---- sealed-block snapshots (Phase 4A-render) ----------------------------
+//
+// When a command finishes, its output is frozen into a
+// `Vec<StyledLine>` and painted via `render::paint_styled_lines`.
+// These tests exercise that path directly so a regression in
+// sealed-block rendering shows up independently of the live-grid
+// `paint_terminal` snapshots.
+
+#[test]
+fn snapshot_paint_styled_lines_plain_text() {
+    let snapshot = sealed_snapshot(4, 40, b"$ echo hello\r\nhello\r\n");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 140.0)).build_ui(move |ui| {
+            let _ = render::paint_styled_lines(ui, &snapshot);
+        });
+    harness.snapshot("paint_styled_lines_plain_text");
+}
+
+#[test]
+fn snapshot_paint_styled_lines_with_ansi_colors() {
+    // Same colour exercise as the live-grid test, captured separately
+    // so the sealed-block path's colour resolution stays pinned to
+    // match the live path. They share `cell_colors_for`; this test
+    // proves that shared helper is wired in correctly here too.
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.extend_from_slice(b"\x1b[31mred\x1b[0m  ");
+    bytes.extend_from_slice(b"\x1b[32mgreen\x1b[0m  ");
+    bytes.extend_from_slice(b"\x1b[36;46m cyan-on-cyan-bg \x1b[0m");
+    bytes.extend_from_slice(b"\r\n");
+    let snapshot = sealed_snapshot(3, 50, &bytes);
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 100.0)).build_ui(move |ui| {
+            let _ = render::paint_styled_lines(ui, &snapshot);
+        });
+    harness.snapshot("paint_styled_lines_ansi_colors");
 }

@@ -189,51 +189,92 @@ pub fn render_pane(
         slot.ui.last_size = Some((rows, cols));
     }
 
-    // ---- clickable URLs + paths ---------------------------------
+    // ---- pane content: sealed blocks + live terminal -------------
     //
-    // Pre-compute geometry so the hover hit-test happens in the
-    // SAME frame as the paint — no one-frame lag on the
-    // Cmd-hover underline.
-    let display_offset = slot.session.terminal().display_offset() as i32;
-    let grid_rows = slot.session.terminal().grid().screen_lines();
-    let grid_cols = slot.session.terminal().grid().columns();
-    let origin = ui.next_widget_position();
-    let geom = selection::GridGeometry {
-        origin_x: origin.x,
-        origin_y: origin.y,
-        cell_w,
-        row_h,
-        display_offset,
-        screen_lines: grid_rows,
-        cols: grid_cols,
-    };
-
-    let grid_ref = slot.session.terminal().grid();
-    let mut links_in_view = links::scan_visible_links(grid_ref);
-    let cwd = slot.session.terminal().cwd().map(|p| p.to_path_buf());
-    let path_spans = paths::scan_visible_paths(grid_ref, cwd.as_deref(), home);
-    links_in_view.extend(path_spans);
-
+    // The pane is a stack of `Block`s ([`crate::block`]). Older
+    // blocks are `Sealed` (frozen `Vec<StyledLine>` snapshots);
+    // the tail block is the live `Term` (rendered by
+    // [`render::paint_terminal`] exactly as before). Everything is
+    // wrapped in a vertical `ScrollArea` that sticks to the bottom
+    // so the live terminal is in view by default; the user scrolls
+    // up to see older sealed blocks. ScrollArea handles mouse-wheel
+    // scrolling natively in the non-alt-screen path; the alt-screen
+    // path below intercepts the wheel and sends arrow keystrokes
+    // instead.
     let modifier_held = ctx.input(|i| i.modifiers.command);
     let pointer_pos = ctx.input(|i| i.pointer.latest_pos());
-
-    let hover_link: Option<LinkSpan> = pointer_pos.and_then(|pos| {
-        let in_grid = pos.x >= origin.x
-            && pos.x < origin.x + grid_cols as f32 * cell_w
-            && pos.y >= origin.y
-            && pos.y < origin.y + grid_rows as f32 * row_h;
-        if !in_grid {
-            return None;
-        }
-        let pt = pixel_to_grid_point(pos.x, pos.y, geom);
-        links_in_view.iter().find(|l| l.contains(pt)).cloned()
-    });
-    let highlighted_link = if modifier_held { hover_link.as_ref() } else { None };
-
-    // ---- terminal grid ------------------------------------------
     let selection = slot.session.selection().copied();
-    let rendered =
-        render::paint_terminal(ui, slot.session.terminal(), selection.as_ref(), highlighted_link);
+
+    let scroll_inner = egui::ScrollArea::vertical()
+        .id_salt(("pane-blocks", slot.session.pane_id()))
+        .stick_to_bottom(true)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            // ---- Sealed blocks ------------------------------------
+            //
+            // Painted top-to-bottom in flow. Each block is a frozen
+            // `Vec<StyledLine>` snapshot of the live `Term`'s content
+            // at the moment `CommandFinished` fired. Sealed blocks
+            // are not interactive in Phase 4A-render — cross-block
+            // selection lands in 4F.
+            for block in slot.session.blocks().iter() {
+                if let crate::block::Block::Sealed { snapshot, .. } = block {
+                    let _ = render::paint_styled_lines(ui, snapshot);
+                    // Thin separator gap between blocks; spec/04
+                    // §"Visual structure" calls for "non-text (thin
+                    // separator + space)".
+                    ui.add_space(4.0);
+                }
+            }
+
+            // ---- Live terminal ------------------------------------
+            //
+            // Pre-compute hover geometry so the hit-test happens in
+            // the same frame as the paint — no one-frame lag on the
+            // Cmd-hover underline.
+            let display_offset = slot.session.terminal().display_offset() as i32;
+            let grid_rows = slot.session.terminal().grid().screen_lines();
+            let grid_cols = slot.session.terminal().grid().columns();
+            let origin = ui.next_widget_position();
+            let geom = selection::GridGeometry {
+                origin_x: origin.x,
+                origin_y: origin.y,
+                cell_w,
+                row_h,
+                display_offset,
+                screen_lines: grid_rows,
+                cols: grid_cols,
+            };
+
+            let grid_ref = slot.session.terminal().grid();
+            let mut links_in_view = links::scan_visible_links(grid_ref);
+            let cwd = slot.session.terminal().cwd().map(|p| p.to_path_buf());
+            let path_spans = paths::scan_visible_paths(grid_ref, cwd.as_deref(), home);
+            links_in_view.extend(path_spans);
+
+            let hover_link: Option<LinkSpan> = pointer_pos.and_then(|pos| {
+                let in_grid = pos.x >= origin.x
+                    && pos.x < origin.x + grid_cols as f32 * cell_w
+                    && pos.y >= origin.y
+                    && pos.y < origin.y + grid_rows as f32 * row_h;
+                if !in_grid {
+                    return None;
+                }
+                let pt = pixel_to_grid_point(pos.x, pos.y, geom);
+                links_in_view.iter().find(|l| l.contains(pt)).cloned()
+            });
+            let highlighted_link = if modifier_held { hover_link.as_ref() } else { None };
+
+            let rendered = render::paint_terminal(
+                ui,
+                slot.session.terminal(),
+                selection.as_ref(),
+                highlighted_link,
+            );
+            (rendered, links_in_view, highlighted_link.cloned())
+        });
+    let (rendered, links_in_view, highlighted_link) = scroll_inner.inner;
+    let highlighted_link = highlighted_link.as_ref();
     if highlighted_link.is_some() {
         ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -409,20 +450,25 @@ pub fn render_pane(
     }
 
     // ---- mouse wheel, hover-gated -------------------------------
+    //
+    // Non-alt-screen scrolling is handled by the outer `ScrollArea`
+    // natively (4A-render replaced alacritty's internal scrollback
+    // with the block-stack history). The alt-screen case still
+    // intercepts wheel events here and forwards them as arrow
+    // keystrokes — that's what full-screen TTY programs (vim, less,
+    // htop, fzf) expect.
     if !modal_open && rendered.response.hovered() {
-        let scroll_delta_y = ctx.input(|i| i.smooth_scroll_delta.y);
-        if scroll_delta_y.abs() > 0.0 {
-            let lines = (scroll_delta_y / 50.0 * 3.0).round() as i32;
-            let alt_screen = slot.session.terminal().is_alternate_screen();
-            let modes = slot.session.terminal().modes();
-            match input::classify_wheel(lines, alt_screen, modes) {
-                Some(input::WheelOutcome::ScrollDisplay(lines)) => {
-                    slot.session.terminal_mut().scroll_display(lines);
-                }
-                Some(input::WheelOutcome::SendBytes(bytes)) => {
+        let alt_screen = slot.session.terminal().is_alternate_screen();
+        if alt_screen {
+            let scroll_delta_y = ctx.input(|i| i.smooth_scroll_delta.y);
+            if scroll_delta_y.abs() > 0.0 {
+                let lines = (scroll_delta_y / 50.0 * 3.0).round() as i32;
+                let modes = slot.session.terminal().modes();
+                if let Some(input::WheelOutcome::SendBytes(bytes)) =
+                    input::classify_wheel(lines, true, modes)
+                {
                     let _ = slot.session.write(&bytes);
                 }
-                None => {}
             }
         }
     }
