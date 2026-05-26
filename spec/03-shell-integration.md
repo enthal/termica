@@ -63,16 +63,27 @@ This is normative: **any code that watches the raw byte stream for marker patter
 pub enum MarkerEvent {
     PromptStart,
     PromptEnd,
-    CommandStart { cmd_id: Option<CmdId> },
-    CommandEnd { cmd_id: Option<CmdId>, exit: i32, duration_ms: Option<u64> },
+    CommandStart,
+    CommandEnd { exit: i32, duration_ms: Option<u64> },
     Cwd(PathBuf),
-    ShellAnnounce { kind: ShellKind, version: u32 },
+    ProtocolVersion(u32),
+    Shell(ShellKind),
+}
+
+pub enum ShellKind {
+    Bash,
+    Zsh,
+    Unknown,
 }
 
 pub struct MarkerStream { /* mpsc-style rx */ }
 ```
 
 Order is preserved per-pane. The marker stream is the only input the `PromptController` ([05](05-pane-modes.md)) consumes besides PTY exit notifications.
+
+`ProtocolVersion` and `Shell` are intentionally separate events even though the integration script emits both at every `PromptStart`. The two OSC 1337 sequences don't arrive atomically and there is no per-prompt framing — modeling them as one aggregated event would force the parser to buffer state across OSCs and decide when to "flush." Separate events leave that aggregation (if anyone needs it) to the consumer; the parser stays stateless and each event corresponds one-to-one with an OSC the shell actually emitted.
+
+`CommandStart` / `CommandEnd` carry no `cmd_id`. The original spec drafted `cmd_id: Option<CmdId>` to correlate the two across interleaved background output, but the integration scripts below do not emit `TermicaCmdId=` and there is no consumer in v1. When a future script grows that capability, we'll add the field with tests then; carrying a phantom `Option<CmdId>` today just confuses readers about what works.
 
 ## Shell integration scripts
 

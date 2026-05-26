@@ -15,6 +15,7 @@
 pub mod input;
 pub mod integration;
 pub mod links;
+pub mod markers;
 pub mod osc;
 pub mod pane;
 pub mod paths;
