@@ -124,6 +124,33 @@ local __termica_user_zdotdir="${ZDOTDIR:-$HOME}"
 #    our hooks would be gone; add-zsh-hook puts them back.
 termica_ensure_hooks
 
-# 5. Emit the gate-opening lifecycle message. Termica observes this
+# 5. Hand the line-editor and prompt-drawing role to Termica.
+#
+#    Per spec/04 ("Visual structure: the block model" + "The integration
+#    script intentionally minimises PS1 so the shell's own prompt
+#    drawing doesn't visually conflict with Termica's chrome"):
+#
+#    - PS1 / PS2 / RPROMPT cleared so zsh prints nothing where the
+#      shell prompt would be. Termica draws all prompt chrome via the
+#      block model (4G adds the cwd / branch / dirty chips).
+#    - `unsetopt zle` disables zsh's built-in line editor. Without
+#      ZLE, zsh leaves the tty in canonical mode (ICANON + ECHO):
+#      the kernel echoes each submitted line and zsh reads complete
+#      lines from stdin. That's the only setup where Termica's echo
+#      suppression in `EchoSuppressor` works deterministically —
+#      ZLE would otherwise redraw the command with terminal escapes
+#      that our prefix-match buffer can't anticipate. The Termica
+#      `PromptEditor` (Phase 4B) replaces the editing UX that ZLE
+#      was providing.
+#
+#    These are normative integration choices, not optional polish.
+#    Bash / fish equivalents (TODO in their respective bootstraps)
+#    will follow the same pattern.
+PS1=''
+PS2=''
+RPROMPT=''
+unsetopt zle 2>/dev/null || true
+
+# 6. Emit the gate-opening lifecycle message. Termica observes this
 #    and transitions the pane out of Bootstrapping.
 termica_emit_raw "integration_ready" "{\"shell\":\"zsh\",\"version\":${TERMICA_INTEGRATION_VERSION:-1}}"
