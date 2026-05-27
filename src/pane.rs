@@ -510,13 +510,34 @@ impl PaneSession {
         }
 
         // 3 & 4. Build the byte sequence, prime suppression, write.
-        // Remember the text so we can restore it into the editor if
-        // the shell tells us via a `Continuation` marker that its
-        // parser wants more input (e.g. submitted `echo 1 &&`
-        // without the right-hand side). Cleared in `drain` once a
-        // `Preexec` arrives (full command was complete).
-        self.last_submitted = Some(text.clone());
-        let mut bytes = text.into_bytes();
+        // Two cases:
+        //
+        // - First submit (no prior `last_submitted`): write the full
+        //   editor text + `\r`. Standard.
+        //
+        // - Submit after a `Continuation`: `last_submitted` holds the
+        //   text the shell already received (via earlier submit) and
+        //   the editor was re-populated with that text + `\n` so the
+        //   user could keep editing. Now the editor's text is
+        //   `<prev_sent>\n<new_lines>`. The shell ALREADY has
+        //   `<prev_sent>\n` buffered (it received that on the prior
+        //   submit and is waiting for more); we only need to send
+        //   `<new_lines>\r` — sending the whole thing would feed
+        //   `<prev_sent>` to the shell TWICE.
+        let to_send: String = match self.last_submitted.as_deref() {
+            Some(prev) if text.starts_with(prev) => {
+                // Strip the already-sent prefix + the separator \n
+                // the restore-on-continuation logic inserted.
+                let after = &text[prev.len()..];
+                after.strip_prefix('\n').unwrap_or(after).to_string()
+            }
+            _ => text.clone(),
+        };
+        // Track the full editor text (not `to_send`) so the next
+        // Continuation restore can put the right cumulative text
+        // back into the editor.
+        self.last_submitted = Some(text);
+        let mut bytes = to_send.into_bytes();
         bytes.push(b'\r');
         self.terminal.prime_echo_suppression(&bytes);
         self.pty.write(&bytes)?;
@@ -980,6 +1001,29 @@ mod tests {
         assert!(session.editor_is_active(), "editor should be active after continuation");
         let editor = session.blocks.editor_on_tail().expect("editor");
         assert_eq!(editor.text(), "echo 1 &&\n", "editor should hold submitted text + \\n");
+
+        // ---- Second submit after continuation: only the SUFFIX
+        // beyond `last_submitted` should reach the PTY. We don't
+        // have a clean handle on "what bytes were written" here, so
+        // we verify via the suppressor state: the suppressor is
+        // primed with the bytes we wrote + CRLF expansion. If the
+        // pane re-sent the full editor text, the pending-len would
+        // be much larger.
+        session.editor_mut().unwrap().insert_str("echo 2");
+        assert_eq!(session.blocks.editor_on_tail().unwrap().text(), "echo 1 &&\necho 2");
+        session.submit_editor_command().expect("second submit");
+        // We sent only "echo 2\r" (7 bytes). With \r → \r\n expansion
+        // the suppressor's pending length is 8 (e c h o ' ' 2 \r \n).
+        assert_eq!(
+            session.terminal.echo_suppressor().pending_len(),
+            8,
+            "second submit must send only the suffix beyond last_submitted (was 'echo 2\\r' → \
+             suppressor primed for 8 bytes), not the cumulative editor text"
+        );
+        // And `last_submitted` should now hold the full editor text
+        // so the next continuation restore picks up correctly.
+        assert_eq!(session.last_submitted.as_deref(), Some("echo 1 &&\necho 2"));
+
         // Bring the shell down quickly.
         let _ = session.write(b"\x03");
     }

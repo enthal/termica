@@ -72,12 +72,15 @@ impl EchoSuppressor {
     /// Prime the suppressor with the bytes we're about to write to
     /// the PTY. Replaces any prior expectation.
     ///
-    /// Each `\r` in `bytes` is translated to `\r\n` because the tty
-    /// driver's `ONLCR` output mode emits a newline after every CR.
+    /// Both `\r` and `\n` in `bytes` are translated to `\r\n` because
+    /// the tty driver's `ONLCR` flag (on by default) maps each `\n`
+    /// in echoed output to `\r\n`, and the kernel echoes typed `\r`
+    /// as `\r\n` too. We don't emit `\r\n` literally from submit, so
+    /// double-expansion isn't a risk in practice.
     pub fn expect(&mut self, bytes: &[u8]) {
         self.expected.clear();
         for &b in bytes {
-            if b == b'\r' {
+            if b == b'\r' || b == b'\n' {
                 self.expected.push_back(b'\r');
                 self.expected.push_back(b'\n');
             } else {
@@ -191,6 +194,17 @@ mod tests {
         // suppress.
         let out = s.filter(b"echOMUTANT\r");
         assert_eq!(out, b"OMUTANT\r", "mismatch byte and rest pass through");
+        assert!(!s.is_armed());
+    }
+
+    #[test]
+    fn newline_is_expected_as_crlf() {
+        // Submit "L1\nL2\r" (multi-line via Shift+Enter then bare
+        // Enter to submit); kernel ONLCR makes the echo "L1\r\nL2\r\n".
+        let mut s = EchoSuppressor::new();
+        s.expect(b"L1\nL2\r");
+        let out = s.filter(b"L1\r\nL2\r\n");
+        assert_eq!(out, b"", "embedded \\n must round-trip via \\r\\n");
         assert!(!s.is_armed());
     }
 
