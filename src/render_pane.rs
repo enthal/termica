@@ -93,6 +93,33 @@ impl EditorMotion {
     }
 }
 
+/// Compute the fixed-footer height for the [`Block::Prompt`] block
+/// per [spec/04 §"Layout"](../spec/04-prompt-editor.md#layout-fixed-footer-prompt-sticky-top-header).
+///
+/// The footer is the dedicated home for the editor: a cwd chip row
+/// (if a cwd is known) on top of one row per editor line. When the
+/// tail is **not** a `Prompt` or the editor is inactive (e.g.,
+/// bootstrapping, alt-screen, mode demote), there is no footer and
+/// the scroll area extends to the pane bottom — returns `0.0`.
+///
+/// Pure function; takes `row_h` so the caller controls the
+/// monospace row height it's currently painting with. The result
+/// is in egui logical pixels.
+pub fn compute_footer_height(
+    tail_is_prompt: bool,
+    editor_active: bool,
+    editor_lines: usize,
+    has_cwd: bool,
+    row_h: f32,
+) -> f32 {
+    if !tail_is_prompt || !editor_active {
+        return 0.0;
+    }
+    let editor_rows = editor_lines.max(1);
+    let chrome_rows = if has_cwd { 1 } else { 0 };
+    (chrome_rows + editor_rows) as f32 * row_h
+}
+
 /// Translate a `(Key, Modifiers)` pair into an [`EditorMotion`] +
 /// "extending" flag, honouring platform conventions:
 ///
@@ -443,10 +470,37 @@ pub fn render_pane(
     // click / drag handler below can hit-test against them. Empty in
     // alt-screen mode (we don't paint blocks at all there).
     let mut sealed_rects: Vec<(crate::block::BlockId, egui::Rect)> = Vec::new();
+
+    // Phase 4D — fixed-footer Prompt block. When the tail is a
+    // `Prompt` AND the editor is active, reserve a strip at the
+    // bottom for the editor + cwd chip; the scroll area shrinks
+    // correspondingly. Per spec/04 §"Layout: fixed-footer prompt".
+    let editor_lines = slot
+        .session
+        .blocks()
+        .editor_on_tail()
+        .map(|e| e.text().split('\n').count().max(1))
+        .unwrap_or(1);
+    let tail_is_prompt =
+        matches!(slot.session.blocks().last(), Some(crate::block::Block::Prompt { .. }));
+    let has_prompt_cwd = matches!(
+        slot.session.blocks().last(),
+        Some(crate::block::Block::Prompt { header, .. }) if header.cwd.is_some()
+    );
+    let footer_h = compute_footer_height(
+        tail_is_prompt && !in_alt_screen,
+        slot.session.editor_is_active() && !in_alt_screen,
+        editor_lines,
+        has_prompt_cwd,
+        row_h,
+    );
+    let scroll_max_h = (ui.available_height() - footer_h).max(0.0);
+
     let scroll_inner = egui::ScrollArea::vertical()
         .id_salt(("pane-blocks", slot.session.pane_id()))
         .stick_to_bottom(true)
         .auto_shrink([false, false])
+        .max_height(scroll_max_h)
         .show(ui, |ui| {
             if in_alt_screen {
                 // Don't paint blocks or the editor — let
@@ -498,14 +552,11 @@ pub fn render_pane(
                                 let _ = render::paint_command_label(ui, command);
                             }
                         }
-                        crate::block::Block::Prompt { header, .. } => {
-                            // The editor itself is overlaid on the
-                            // live `Term` after the loop; we paint
-                            // the cwd chip here as a flow item above
-                            // the live grid so it sits visually right
-                            // above the editor row. 4D's fixed-footer
-                            // model will land a proper chip strip.
-                            let _ = render::paint_block_header(ui, header.cwd.as_deref(), None);
+                        crate::block::Block::Prompt { .. } => {
+                            // The `Prompt` block's chrome lives in
+                            // the fixed footer below the scroll area
+                            // (Phase 4D); the editor itself paints
+                            // there too. Nothing to draw here.
                         }
                     }
                 }
@@ -562,47 +613,11 @@ pub fn render_pane(
                 hide_term_cursor,
             );
 
-            // ---- Prompt-block editor overlay (Phase 4C polish) -------
-            //
-            // The editor is conceptually part of the `Prompt` block.
-            // Overlay it on top of the live `Term`'s painted area
-            // starting AT the cursor row — the integration script
-            // clears `PS1` so the shell prints nothing where the
-            // prompt would have been, leaving the cursor row empty
-            // for the editor to occupy. The shell's own cursor is
-            // suppressed by `hide_term_cursor` above so only the
-            // editor's caret reads as active. 4D's fixed-footer
-            // layout will replace this overlay with a proper
-            // viewport-bottom anchor.
-            if !in_alt_screen
-                && slot.session.editor_is_active()
-                && let Some(editor) = slot.session.blocks().editor_on_tail()
-            {
-                let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
-                let cursor_row =
-                    slot.session.terminal().cursor_position().map(|(row, _col)| row).unwrap_or(0);
-                let origin = egui::Pos2::new(
-                    rendered.response.rect.min.x,
-                    rendered.response.rect.min.y + cursor_row as f32 * row_h,
-                );
-                // Caret blink: ~1.6 Hz square wave driven off
-                // egui's monotonic time. Request a repaint at the
-                // next half-cycle so the caret keeps toggling even
-                // when nothing else changes on screen.
-                let time = ctx.input(|i| i.time);
-                let caret_visible = (time * 1.6) as i64 % 2 == 0;
-                ctx.request_repaint_after(std::time::Duration::from_millis(312));
-                let painter = ui.painter_at(rendered.response.rect);
-                render::paint_prompt_editor_at(
-                    &painter,
-                    editor,
-                    origin,
-                    cell_w,
-                    row_h,
-                    &font_id,
-                    caret_visible,
-                );
-            }
+            // (Phase 4D) The editor + cwd chip have moved out of
+            // this scroll area; they paint in the fixed footer below
+            // it. The live `Term`'s cursor is still hidden by
+            // `hide_term_cursor` above so the empty `PS1=''` cursor
+            // row doesn't show a stray block.
 
             (rendered, links_in_view, highlighted_link.cloned())
         });
@@ -611,6 +626,57 @@ pub fn render_pane(
     if highlighted_link.is_some() {
         ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
     }
+
+    // ---- Phase 4D fixed-footer: cwd chip + editor ----------------
+    //
+    // The ScrollArea above was constrained to leave `footer_h` of
+    // vertical space at the bottom. Paint the prompt's cwd chip
+    // (when known) and then the editor here. `footer_rect` is the
+    // exact rect the editor occupies — used by the click / drag
+    // handlers below to translate pointer pixels to byte offsets.
+    let footer_rect: Option<egui::Rect> = if footer_h > 0.0 {
+        let chip_h = if has_prompt_cwd { row_h } else { 0.0 };
+        let editor_h = footer_h - chip_h;
+        let footer_origin = ui.next_widget_position();
+
+        if has_prompt_cwd
+            && let Some(crate::block::Block::Prompt { header, .. }) = slot.session.blocks().last()
+        {
+            let _ = render::paint_block_header(ui, header.cwd.as_deref(), None);
+        }
+
+        // Allocate the editor strip and paint into it. We use an
+        // explicit rect rather than `paint_prompt_editor` (which
+        // allocates its own size) so the click / drag hit-test rect
+        // matches exactly what we painted.
+        let editor_rect = egui::Rect::from_min_size(
+            egui::Pos2::new(footer_origin.x, footer_origin.y + chip_h),
+            egui::Vec2::new(ui.available_width(), editor_h),
+        );
+        let _ = ui.allocate_rect(editor_rect, egui::Sense::hover());
+
+        if let Some(editor) = slot.session.blocks().editor_on_tail() {
+            let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
+            // Caret blink: ~1.6 Hz square wave; request a repaint at
+            // the next half-cycle so it keeps toggling on idle.
+            let time = ctx.input(|i| i.time);
+            let caret_visible = (time * 1.6) as i64 % 2 == 0;
+            ctx.request_repaint_after(std::time::Duration::from_millis(312));
+            let painter = ui.painter_at(editor_rect);
+            render::paint_prompt_editor_at(
+                &painter,
+                editor,
+                editor_rect.min,
+                cell_w,
+                row_h,
+                &font_id,
+                caret_visible,
+            );
+        }
+        Some(editor_rect)
+    } else {
+        None
+    };
 
     // ---- alt-screen border --------------------------------------
     //
@@ -639,22 +705,12 @@ pub fn render_pane(
         (i.pointer.primary_pressed(), i.pointer.press_origin(), i.pointer.primary_down(), i.time)
     });
 
-    // Editor hit-area: the band of rows from the live `Term`'s
-    // cursor row downward by N rows (one per editor line). Clicks
-    // here route to the editor's cursor / selection, not alacritty's.
-    let editor_rect: Option<egui::Rect> = if slot.session.editor_is_active()
-        && let Some(editor) = slot.session.blocks().editor_on_tail()
-        && let Some((cursor_row, _)) = slot.session.terminal().cursor_position()
-    {
-        let editor_rows = editor.text().split('\n').count().max(1);
-        let origin_y = rendered.response.rect.min.y + cursor_row as f32 * row_h;
-        Some(egui::Rect::from_min_max(
-            egui::Pos2::new(rendered.response.rect.min.x, origin_y),
-            egui::Pos2::new(rendered.response.rect.max.x, origin_y + editor_rows as f32 * row_h),
-        ))
-    } else {
-        None
-    };
+    // Editor hit-area: the fixed footer below the scroll area.
+    // Phase 4D anchors the editor to the viewport bottom, so the
+    // hit-test rect is exactly the footer rect we painted above.
+    // `None` when no footer was painted (alt-screen, tail not
+    // Prompt, or editor inactive).
+    let editor_rect: Option<egui::Rect> = footer_rect;
 
     /// Translate a pointer pixel position inside the editor rect to
     /// a byte index in the editor's text. Out-of-rows clamps to end.
@@ -1107,6 +1163,41 @@ pub fn render_pane(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- compute_footer_height (Phase 4D) -----------------------------
+
+    #[test]
+    fn footer_is_zero_when_tail_is_not_prompt() {
+        assert_eq!(compute_footer_height(false, true, 1, true, 20.0), 0.0);
+    }
+
+    #[test]
+    fn footer_is_zero_when_editor_inactive() {
+        assert_eq!(compute_footer_height(true, false, 1, true, 20.0), 0.0);
+    }
+
+    #[test]
+    fn single_line_editor_with_cwd_yields_two_rows() {
+        // 1 chrome row (cwd chip) + 1 editor row = 2 rows.
+        assert_eq!(compute_footer_height(true, true, 1, true, 20.0), 40.0);
+    }
+
+    #[test]
+    fn single_line_editor_without_cwd_yields_one_row() {
+        // No chrome row when cwd is unknown.
+        assert_eq!(compute_footer_height(true, true, 1, false, 20.0), 20.0);
+    }
+
+    #[test]
+    fn three_line_editor_with_cwd_yields_four_rows() {
+        assert_eq!(compute_footer_height(true, true, 3, true, 20.0), 80.0);
+    }
+
+    #[test]
+    fn zero_editor_lines_treated_as_one() {
+        // An empty editor still needs a caret row.
+        assert_eq!(compute_footer_height(true, true, 0, true, 20.0), 40.0);
+    }
 
     // ---- classify_editor_motion (per-OS keybindings) -----------------
 
