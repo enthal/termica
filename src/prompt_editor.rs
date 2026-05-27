@@ -44,12 +44,21 @@
 /// Construct with [`PromptEditor::new`]; mutate via the operation
 /// methods. Direct field access is hidden so the cursor invariant
 /// stays unviolable.
+///
+/// Selection model: a single contiguous selection anchored at
+/// `selection_anchor` and extending to `cursor`. The two byte
+/// indices always lie on char boundaries. `selection_anchor.is_none()`
+/// means "no selection — just a cursor."
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PromptEditor {
     text: String,
     /// UTF-8 byte index into `text`, lying on a `char` boundary.
     /// `0 <= cursor <= text.len()`.
     cursor: usize,
+    /// Other end of the selection (the fixed end; `cursor` is the
+    /// active end that moves on extending operations). `None` ⇒ no
+    /// selection. Always on a char boundary when `Some`.
+    selection_anchor: Option<usize>,
 }
 
 impl PromptEditor {
@@ -78,23 +87,106 @@ impl PromptEditor {
         self.text.len()
     }
 
+    /// Effective selection range as `(min, max)` byte indices.
+    /// `None` when there is no selection (or it is degenerate —
+    /// anchor == cursor).
+    pub fn selection_range(&self) -> Option<(usize, usize)> {
+        let anchor = self.selection_anchor?;
+        if anchor == self.cursor {
+            None
+        } else {
+            Some((anchor.min(self.cursor), anchor.max(self.cursor)))
+        }
+    }
+
+    /// Currently-selected text as a `&str`. `None` when no
+    /// selection (or degenerate). Used by Cmd+C / Cmd+X.
+    pub fn selected_text(&self) -> Option<&str> {
+        let (start, end) = self.selection_range()?;
+        Some(&self.text[start..end])
+    }
+
+    /// True when a non-degenerate selection exists.
+    pub fn has_selection(&self) -> bool {
+        self.selection_range().is_some()
+    }
+
+    /// Clear any selection (cursor stays put).
+    pub fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    /// Anchor a selection at the current cursor position. Subsequent
+    /// `*_extending` moves extend the selection from this anchor.
+    /// Idempotent: re-anchoring at the same cursor is a no-op.
+    fn begin_selection_if_absent(&mut self) {
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.cursor);
+        }
+    }
+
+    /// Select the entire buffer. Cmd+A binding.
+    pub fn select_all(&mut self) {
+        if self.text.is_empty() {
+            return;
+        }
+        self.selection_anchor = Some(0);
+        self.cursor = self.text.len();
+    }
+
+    /// Delete the current selection. No-op when there is none.
+    /// Cursor lands at the start of where the selection was.
+    /// Used internally by insert/delete ops when a selection
+    /// exists, and externally by Cmd+X cut.
+    pub fn delete_selection(&mut self) -> bool {
+        let Some((start, end)) = self.selection_range() else {
+            return false;
+        };
+        self.text.replace_range(start..end, "");
+        self.cursor = start;
+        self.selection_anchor = None;
+        true
+    }
+
+    /// Move the cursor to an absolute byte index. Clamped to the
+    /// nearest char boundary at or below `byte_idx`. Clears the
+    /// selection. Mouse click handler routes here.
+    pub fn set_cursor(&mut self, byte_idx: usize) {
+        let clamped = clamp_to_char_boundary(&self.text, byte_idx);
+        self.cursor = clamped;
+        self.selection_anchor = None;
+    }
+
+    /// Move the cursor extending the selection. If no selection was
+    /// active, anchor at the current cursor first. Mouse drag handler
+    /// + Shift+arrow keys route here.
+    pub fn set_cursor_extending(&mut self, byte_idx: usize) {
+        self.begin_selection_if_absent();
+        self.cursor = clamp_to_char_boundary(&self.text, byte_idx);
+    }
+
     /// Clear the buffer and reset the cursor. Used by 4C's submit
     /// after the command has been sent to the PTY.
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
+        self.selection_anchor = None;
     }
 
     /// Insert one character at the cursor and advance the cursor
-    /// past it. Maintains the char-boundary invariant.
+    /// past it. If a selection exists, it's deleted first.
+    /// Maintains the char-boundary invariant.
     pub fn insert_char(&mut self, c: char) {
+        self.delete_selection();
         self.text.insert(self.cursor, c);
         self.cursor += c.len_utf8();
     }
 
-    /// Insert a string at the cursor. Each byte must form a valid
-    /// UTF-8 sequence with its neighbours (it's `&str`, so it does).
+    /// Insert a string at the cursor. If a selection exists, it's
+    /// deleted first. Each byte must form a valid UTF-8 sequence
+    /// with its neighbours (it's `&str`, so it does).
     pub fn insert_str(&mut self, s: &str) {
+        self.delete_selection();
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
     }
@@ -107,11 +199,13 @@ impl PromptEditor {
         self.insert_char('\n');
     }
 
-    /// Delete the character immediately before the cursor. No-op
-    /// when the cursor is at byte 0. Maintains the char-boundary
-    /// invariant by walking back to the previous boundary, not by
-    /// subtracting a fixed byte count.
+    /// Delete the character immediately before the cursor — OR, if
+    /// a selection exists, delete the selection. No-op when the
+    /// cursor is at byte 0 with no selection.
     pub fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor == 0 {
             return;
         }
@@ -120,9 +214,13 @@ impl PromptEditor {
         self.cursor = prev;
     }
 
-    /// Delete the character immediately after the cursor. No-op
-    /// when the cursor is at the end. The cursor position stays put.
+    /// Delete the character immediately after the cursor — OR, if a
+    /// selection exists, delete the selection. No-op when the cursor
+    /// is at the end with no selection.
     pub fn delete_forward(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor == self.text.len() {
             return;
         }
@@ -130,8 +228,24 @@ impl PromptEditor {
         self.text.replace_range(self.cursor..next, "");
     }
 
-    /// Move the cursor one character left. No-op at byte 0.
+    /// Move the cursor one character left. No-op at byte 0. Clears
+    /// any selection.
     pub fn move_left(&mut self) {
+        self.move_left_impl(false);
+    }
+
+    /// Move the cursor one character left, extending the selection.
+    /// Shift+Left binding.
+    pub fn move_left_extending(&mut self) {
+        self.move_left_impl(true);
+    }
+
+    fn move_left_impl(&mut self, extend: bool) {
+        if extend {
+            self.begin_selection_if_absent();
+        } else {
+            self.selection_anchor = None;
+        }
         if self.cursor == 0 {
             return;
         }
@@ -139,7 +253,23 @@ impl PromptEditor {
     }
 
     /// Move the cursor one character right. No-op at end of buffer.
+    /// Clears any selection.
     pub fn move_right(&mut self) {
+        self.move_right_impl(false);
+    }
+
+    /// Move the cursor one character right, extending the selection.
+    /// Shift+Right binding.
+    pub fn move_right_extending(&mut self) {
+        self.move_right_impl(true);
+    }
+
+    fn move_right_impl(&mut self, extend: bool) {
+        if extend {
+            self.begin_selection_if_absent();
+        } else {
+            self.selection_anchor = None;
+        }
         if self.cursor == self.text.len() {
             return;
         }
@@ -148,16 +278,45 @@ impl PromptEditor {
 
     /// Move the cursor to the start of the current line. A line is
     /// delimited by `\n`; cursor goes to either byte 0 or one past
-    /// the most recent `\n` at or before the cursor.
+    /// the most recent `\n` at or before the cursor. Clears
+    /// selection.
     pub fn move_home(&mut self) {
+        self.move_home_impl(false);
+    }
+
+    /// Move-home with selection extension.
+    pub fn move_home_extending(&mut self) {
+        self.move_home_impl(true);
+    }
+
+    fn move_home_impl(&mut self, extend: bool) {
+        if extend {
+            self.begin_selection_if_absent();
+        } else {
+            self.selection_anchor = None;
+        }
         let line_start = self.text[..self.cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
         self.cursor = line_start;
     }
 
     /// Move the cursor to the end of the current line. End is either
     /// the next `\n` (cursor lands on it, not past it) or
-    /// `text.len()`.
+    /// `text.len()`. Clears selection.
     pub fn move_end(&mut self) {
+        self.move_end_impl(false);
+    }
+
+    /// Move-end with selection extension.
+    pub fn move_end_extending(&mut self) {
+        self.move_end_impl(true);
+    }
+
+    fn move_end_impl(&mut self, extend: bool) {
+        if extend {
+            self.begin_selection_if_absent();
+        } else {
+            self.selection_anchor = None;
+        }
         let line_end = self.text[self.cursor..]
             .find('\n')
             .map(|off| self.cursor + off)
@@ -190,6 +349,53 @@ pub struct EditorLine<'a> {
     pub text: &'a str,
     pub cursor_col_chars: usize,
     pub cursor_on_line: bool,
+}
+
+/// Clamp `i` to a char boundary at or below itself. Returns `s.len()`
+/// when `i >= s.len()`. The clamp direction (toward zero) is the
+/// "land where the user pointed at or just before" convention that
+/// hit-tests want.
+pub fn clamp_to_char_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let mut j = i;
+    while !s.is_char_boundary(j) {
+        j -= 1;
+    }
+    j
+}
+
+/// Locate the byte index in `text` corresponding to the
+/// `(row, col_chars)` pair, where `row` is the index of the
+/// `\n`-delimited line and `col_chars` is the char-count within
+/// that line. Used to translate mouse coordinates into a byte
+/// index for [`PromptEditor::set_cursor`] /
+/// [`PromptEditor::set_cursor_extending`].
+///
+/// Out-of-range inputs clamp: row beyond the last line falls to
+/// the end of buffer; col beyond a line's length lands at the end
+/// of that line.
+pub fn byte_index_for_row_col(text: &str, row: usize, col_chars: usize) -> usize {
+    let mut byte_start = 0usize;
+    for (i, line) in text.split('\n').enumerate() {
+        let line_byte_len = line.len();
+        if i == row {
+            // Walk char-by-char counting columns.
+            let mut byte = byte_start;
+            for (col, (b, _c)) in line.char_indices().enumerate() {
+                if col == col_chars {
+                    return byte_start + b;
+                }
+                byte = byte_start + b + line[b..].chars().next().map_or(0, |c| c.len_utf8());
+            }
+            // Past the end of the line: land at the end (before \n
+            // if there is one).
+            return byte;
+        }
+        byte_start += line_byte_len + 1; // +1 for the \n
+    }
+    text.len()
 }
 
 /// Walk back from `i` to the previous `char` boundary in `s`. `i`
@@ -463,5 +669,164 @@ mod tests {
         assert!(e.is_empty());
         assert_eq!(e.cursor(), 0);
         assert_invariant(&e);
+    }
+
+    // ---- selection (Phase 4-editor-ergonomics) -----------------------
+
+    #[test]
+    fn fresh_editor_has_no_selection() {
+        let e = PromptEditor::new();
+        assert!(!e.has_selection());
+        assert_eq!(e.selected_text(), None);
+        assert_eq!(e.selection_range(), None);
+    }
+
+    #[test]
+    fn shift_arrow_extends_selection_from_cursor() {
+        let mut e = PromptEditor::new();
+        e.insert_str("abcdef");
+        e.move_home();
+        e.move_right_extending();
+        e.move_right_extending();
+        e.move_right_extending();
+        assert_eq!(e.selected_text(), Some("abc"));
+        assert_eq!(e.selection_range(), Some((0, 3)));
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn non_extending_move_clears_selection() {
+        let mut e = PromptEditor::new();
+        e.insert_str("abcdef");
+        e.move_home();
+        e.move_right_extending();
+        e.move_right_extending();
+        assert!(e.has_selection());
+        e.move_right();
+        assert!(!e.has_selection(), "plain move clears selection");
+    }
+
+    #[test]
+    fn select_all_covers_whole_buffer() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hello world");
+        e.select_all();
+        assert_eq!(e.selected_text(), Some("hello world"));
+        assert_eq!(e.cursor(), e.len_bytes(), "cursor lands at the end after select_all");
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn select_all_on_empty_is_noop() {
+        let mut e = PromptEditor::new();
+        e.select_all();
+        assert!(!e.has_selection());
+    }
+
+    #[test]
+    fn delete_selection_removes_range_and_lands_cursor_at_start() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hello world");
+        e.move_home();
+        e.move_right_extending(); // select "h"
+        e.move_right_extending(); // select "he"
+        e.move_right_extending(); // select "hel"
+        e.move_right_extending(); // select "hell"
+        e.move_right_extending(); // select "hello"
+        assert!(e.delete_selection());
+        assert_eq!(e.text(), " world");
+        assert_eq!(e.cursor(), 0);
+        assert!(!e.has_selection());
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn insert_with_selection_replaces_selection() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hello world");
+        e.select_all();
+        e.insert_str("bye");
+        assert_eq!(e.text(), "bye");
+        assert_eq!(e.cursor(), 3);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn backspace_with_selection_deletes_selection_not_one_char() {
+        let mut e = PromptEditor::new();
+        e.insert_str("abcdef");
+        e.move_home();
+        e.move_right_extending();
+        e.move_right_extending();
+        // Selection "ab".
+        e.backspace();
+        assert_eq!(e.text(), "cdef", "selection removed, not one extra char");
+        assert!(!e.has_selection());
+    }
+
+    #[test]
+    fn set_cursor_clears_selection_and_clamps_to_char_boundary() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hé"); // 'h' = 1 byte, 'é' = 2 bytes
+        e.select_all();
+        // Mouse-click lands mid-multi-byte char.
+        e.set_cursor(2); // byte 2 is inside 'é' — should clamp to byte 1.
+        assert_eq!(e.cursor(), 1);
+        assert!(!e.has_selection());
+    }
+
+    #[test]
+    fn set_cursor_extending_anchors_then_moves() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hello");
+        e.set_cursor(0);
+        e.set_cursor_extending(3);
+        assert_eq!(e.selected_text(), Some("hel"));
+        // Extending again moves the head, anchor stays.
+        e.set_cursor_extending(5);
+        assert_eq!(e.selected_text(), Some("hello"));
+    }
+
+    #[test]
+    fn clear_clears_selection_too() {
+        let mut e = PromptEditor::new();
+        e.insert_str("abc");
+        e.select_all();
+        e.clear();
+        assert!(!e.has_selection());
+        assert_eq!(e.cursor(), 0);
+    }
+
+    // ---- hit-test helpers ------------------------------------------
+
+    #[test]
+    fn byte_index_for_row_col_lands_at_char_boundary() {
+        let s = "hé\nfoo";
+        // (0, 0) -> 0; (0, 1) -> 1 (between 'h' and 'é'); (0, 2) ->
+        // 3 (end of "hé").
+        assert_eq!(byte_index_for_row_col(s, 0, 0), 0);
+        assert_eq!(byte_index_for_row_col(s, 0, 1), 1);
+        assert_eq!(byte_index_for_row_col(s, 0, 2), 3);
+        // Row 1.
+        assert_eq!(byte_index_for_row_col(s, 1, 0), 4);
+        assert_eq!(byte_index_for_row_col(s, 1, 3), 7);
+    }
+
+    #[test]
+    fn byte_index_for_row_col_clamps_past_line_end() {
+        let s = "ab\ncd";
+        // Col past line 0 end: lands at end of line 0 (before \n).
+        assert_eq!(byte_index_for_row_col(s, 0, 99), 2);
+    }
+
+    #[test]
+    fn clamp_to_char_boundary_lands_at_or_below() {
+        let s = "hé"; // bytes 0='h', 1=0xc3, 2=0xa9 (é).
+        assert_eq!(clamp_to_char_boundary(s, 0), 0);
+        assert_eq!(clamp_to_char_boundary(s, 1), 1);
+        // 2 is mid-char — clamp down to 1.
+        assert_eq!(clamp_to_char_boundary(s, 2), 1);
+        // Past end clamps to end.
+        assert_eq!(clamp_to_char_boundary(s, 99), 3);
     }
 }

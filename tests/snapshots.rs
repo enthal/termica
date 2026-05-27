@@ -390,6 +390,54 @@ fn snapshot_paint_command_label_multiline() {
 }
 
 #[test]
+fn snapshot_paint_prompt_editor_with_selection() {
+    // User typed text, then Shift+Home (or Cmd+A) to select all —
+    // selection rect should highlight the text behind the glyphs.
+    let mut editor = termica::prompt_editor::PromptEditor::new();
+    editor.insert_str("git status");
+    editor.select_all();
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(400.0, 80.0)).build_ui(move |ui| {
+            let _ = render::paint_prompt_editor(ui, &editor);
+        });
+    harness.snapshot("paint_prompt_editor_with_selection");
+}
+
+#[test]
+fn snapshot_paint_prompt_editor_partial_selection() {
+    // Cursor at byte 5, selection from byte 0 — should highlight
+    // "hello" but not " world".
+    let mut editor = termica::prompt_editor::PromptEditor::new();
+    editor.insert_str("hello world");
+    editor.set_cursor(0);
+    editor.set_cursor_extending(5);
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(400.0, 80.0)).build_ui(move |ui| {
+            let _ = render::paint_prompt_editor(ui, &editor);
+        });
+    harness.snapshot("paint_prompt_editor_partial_selection");
+}
+
+#[test]
+fn snapshot_paint_prompt_editor_multiline_selection() {
+    // Multi-line selection — selection extends past the first row's
+    // text + through to mid-second-row.
+    let mut editor = termica::prompt_editor::PromptEditor::new();
+    editor.insert_str("for f in *.rs; do");
+    editor.insert_newline();
+    editor.insert_str("  cat \"$f\"");
+    // Select from byte 4 ("f" in "for f") through byte ~22 ("cat" on
+    // line 2). Approximate; exact byte indices depend on string len.
+    editor.set_cursor(4);
+    editor.set_cursor_extending(22);
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(500.0, 100.0)).build_ui(move |ui| {
+            let _ = render::paint_prompt_editor(ui, &editor);
+        });
+    harness.snapshot("paint_prompt_editor_multiline_selection");
+}
+
+#[test]
 fn snapshot_paint_prompt_editor_multiline() {
     // Shift+Enter authored: two lines, cursor at the end of the
     // second line.

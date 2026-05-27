@@ -72,17 +72,35 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
     use egui::{Event, Key};
     match event {
         // Plain printable text from the OS IME / keyboard layout.
+        // If a selection is active, `insert_str` deletes it first.
         Event::Text(s) => {
             if let Some(editor) = slot.session.editor_mut() {
                 editor.insert_str(s);
             }
             true
         }
+        // Cmd+V (and middle-click paste) — egui pre-resolves the
+        // clipboard contents into this event. Editor consumes; the
+        // (unused-here) PTY paste path stays for `RawTerminal`.
+        Event::Paste(s) => {
+            if let Some(editor) = slot.session.editor_mut() {
+                editor.insert_str(s);
+            }
+            true
+        }
         Event::Key { key, pressed: true, modifiers, .. } => {
-            // App-level shortcuts (Cmd+T etc.) and the copy shortcut
-            // are already handled earlier in the keyboard loop; here
-            // we only act on bare keys (no command/alt modifier).
-            // `Shift` is still legal — used for Shift+Enter.
+            // Cmd+A — select all. Handled BEFORE the generic
+            // "any modifier → bypass" gate.
+            if modifiers.command && !modifiers.alt && matches!(key, Key::A) {
+                if let Some(editor) = slot.session.editor_mut() {
+                    editor.select_all();
+                }
+                return true;
+            }
+            // Alt + Cmd combos (other than select-all) bypass the
+            // editor — they belong to app-level shortcuts. Plain
+            // Cmd combos (Cmd+C/X) are handled in render_pane
+            // proper because they need `ctx` for clipboard access.
             if modifiers.command || modifiers.alt {
                 return false;
             }
@@ -105,13 +123,10 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
             // borrow checker sees a clean window.
             match key {
                 Key::Enter if !modifiers.shift => {
-                    // Plain Enter = submit (Phase 4C).
                     let _ = slot.session.submit_editor_command();
                     return true;
                 }
                 Key::Escape => {
-                    // Esc demotes back to `RawTerminal` per spec/05;
-                    // the editor's buffer is dropped.
                     slot.session.leave_editor_esc();
                     return true;
                 }
@@ -128,33 +143,42 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
                     true
                 }
                 Key::ArrowLeft => {
-                    editor.move_left();
+                    if modifiers.shift {
+                        editor.move_left_extending();
+                    } else {
+                        editor.move_left();
+                    }
                     true
                 }
                 Key::ArrowRight => {
-                    editor.move_right();
+                    if modifiers.shift {
+                        editor.move_right_extending();
+                    } else {
+                        editor.move_right();
+                    }
                     true
                 }
-                // Up / Down: history walk lands in 4J; multi-line
-                // cursor row-nav also belongs there since it shares
-                // the column-preserving logic. No-op in 4B but
-                // *consumed* so the keys don't escape to the PTY.
                 Key::ArrowUp | Key::ArrowDown => true,
                 Key::Home => {
-                    editor.move_home();
+                    if modifiers.shift {
+                        editor.move_home_extending();
+                    } else {
+                        editor.move_home();
+                    }
                     true
                 }
                 Key::End => {
-                    editor.move_end();
+                    if modifiers.shift {
+                        editor.move_end_extending();
+                    } else {
+                        editor.move_end();
+                    }
                     true
                 }
-                // Shift+Enter — bare Enter is already handled above.
                 Key::Enter => {
                     editor.insert_newline();
                     true
                 }
-                // Tab is local completion in 4I; for now we consume
-                // it to keep it out of the PTY (no-op).
                 Key::Tab => true,
                 _ => false,
             }
@@ -486,6 +510,39 @@ pub fn render_pane(
     let (primary_pressed, press_origin, now) =
         ctx.input(|i| (i.pointer.primary_pressed(), i.pointer.press_origin(), i.time));
 
+    // Editor hit-area: the band of rows from the live `Term`'s
+    // cursor row downward by N rows (one per editor line). Clicks
+    // here route to the editor's cursor / selection, not alacritty's.
+    let editor_rect: Option<egui::Rect> = if slot.session.editor_is_active()
+        && let Some(editor) = slot.session.blocks().editor_on_tail()
+        && let Some((cursor_row, _)) = slot.session.terminal().cursor_position()
+    {
+        let editor_rows = editor.text().split('\n').count().max(1);
+        let origin_y = rendered.response.rect.min.y + cursor_row as f32 * row_h;
+        Some(egui::Rect::from_min_max(
+            egui::Pos2::new(rendered.response.rect.min.x, origin_y),
+            egui::Pos2::new(rendered.response.rect.max.x, origin_y + editor_rows as f32 * row_h),
+        ))
+    } else {
+        None
+    };
+
+    /// Translate a pointer pixel position inside the editor rect to
+    /// a byte index in the editor's text. Out-of-rows clamps to end.
+    fn editor_byte_for_pos(
+        rect: egui::Rect,
+        pos: egui::Pos2,
+        editor_text: &str,
+        cell_w: f32,
+        row_h: f32,
+    ) -> usize {
+        let row = ((pos.y - rect.min.y) / row_h).max(0.0) as usize;
+        let col_chars = ((pos.x - rect.min.x) / cell_w).max(0.0).floor() as usize;
+        crate::prompt_editor::byte_index_for_row_col(editor_text, row, col_chars)
+    }
+
+    let click_in_editor = editor_rect.is_some_and(|r| press_origin.is_some_and(|p| r.contains(p)));
+
     if !modal_open
         && primary_pressed
         && let Some(pos) = press_origin
@@ -493,40 +550,73 @@ pub fn render_pane(
     {
         rendered.response.request_focus();
 
-        let press_pt = to_point(pos);
-        let link_under_press = links_in_view.iter().find(|l| l.contains(press_pt)).cloned();
-
-        if modifier_held && let Some(link) = link_under_press {
-            open_url(&link.url);
-        } else {
-            let dt = now - slot.ui.last_press_time;
-            let dist = (pos - slot.ui.last_press_pos).length();
-            if dt < MULTI_CLICK_WINDOW_SECS && dist < MULTI_CLICK_DISTANCE_PX {
-                slot.ui.click_count = (slot.ui.click_count + 1).min(3);
-            } else {
-                slot.ui.click_count = 1;
+        if click_in_editor && let Some(rect) = editor_rect {
+            // Editor click: hit-test → move cursor, clear selection.
+            // Multi-click word/line selection in the editor is a
+            // 4F-style follow-up (it needs the same shared
+            // PaneCursor model that cross-block selection will use);
+            // for this round, single-click only.
+            let editor_text = slot
+                .session
+                .blocks()
+                .editor_on_tail()
+                .map(|e| e.text().to_string())
+                .unwrap_or_default();
+            let byte = editor_byte_for_pos(rect, pos, &editor_text, cell_w, row_h);
+            if let Some(editor) = slot.session.editor_mut() {
+                editor.set_cursor(byte);
             }
-            slot.ui.last_press_time = now;
-            slot.ui.last_press_pos = pos;
+        } else {
+            let press_pt = to_point(pos);
+            let link_under_press = links_in_view.iter().find(|l| l.contains(press_pt)).cloned();
 
-            let mode = match slot.ui.click_count {
-                1 => SelectionMode::Char,
-                2 => SelectionMode::Word,
-                _ => SelectionMode::Line,
-            };
-            if mode == SelectionMode::Word
-                && let Some(link) = link_under_press
-            {
-                slot.session.start_url_selection(link.start, link.end);
+            if modifier_held && let Some(link) = link_under_press {
+                open_url(&link.url);
             } else {
-                slot.session.start_selection(to_point(pos), mode);
+                let dt = now - slot.ui.last_press_time;
+                let dist = (pos - slot.ui.last_press_pos).length();
+                if dt < MULTI_CLICK_WINDOW_SECS && dist < MULTI_CLICK_DISTANCE_PX {
+                    slot.ui.click_count = (slot.ui.click_count + 1).min(3);
+                } else {
+                    slot.ui.click_count = 1;
+                }
+                slot.ui.last_press_time = now;
+                slot.ui.last_press_pos = pos;
+
+                let mode = match slot.ui.click_count {
+                    1 => SelectionMode::Char,
+                    2 => SelectionMode::Word,
+                    _ => SelectionMode::Line,
+                };
+                if mode == SelectionMode::Word
+                    && let Some(link) = link_under_press
+                {
+                    slot.session.start_url_selection(link.start, link.end);
+                } else {
+                    slot.session.start_selection(to_point(pos), mode);
+                }
             }
         }
     } else if !modal_open
         && rendered.response.dragged()
         && let Some(pos) = rendered.response.interact_pointer_pos()
     {
-        slot.session.extend_selection(to_point(pos));
+        // Drag extends whichever selection was started on press —
+        // editor or alacritty, depending on where the press landed.
+        if click_in_editor && let Some(rect) = editor_rect {
+            let editor_text = slot
+                .session
+                .blocks()
+                .editor_on_tail()
+                .map(|e| e.text().to_string())
+                .unwrap_or_default();
+            let byte = editor_byte_for_pos(rect, pos, &editor_text, cell_w, row_h);
+            if let Some(editor) = slot.session.editor_mut() {
+                editor.set_cursor_extending(byte);
+            }
+        } else {
+            slot.session.extend_selection(to_point(pos));
+        }
     }
 
     // ---- focus transfer & bootstrap -----------------------------
@@ -594,7 +684,38 @@ pub fn render_pane(
             }
             _ => false,
         });
-        if copy_pressed && let Some(text) = slot.session.selection_text() {
+        // Cut shortcut: macOS sends `Event::Cut` from Cmd+X. Off-Mac
+        // we look for Ctrl+Shift+X. Cmd+X in the editor cuts the
+        // selection (copy then delete); outside editor mode it's a
+        // no-op for now (alacritty selection has no notion of cut).
+        let cut_pressed = events.iter().any(|e| match e {
+            egui::Event::Cut => is_macos,
+            egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                !is_macos
+                    && *key == egui::Key::X
+                    && modifiers.ctrl
+                    && modifiers.shift
+                    && !modifiers.alt
+                    && !modifiers.command
+            }
+            _ => false,
+        });
+
+        // Editor-mode clipboard ops: copy / cut act on the editor's
+        // selection when the editor is active. Outside editor mode
+        // the existing alacritty selection path stays in charge.
+        if slot.session.editor_is_active() {
+            if (copy_pressed || cut_pressed)
+                && let Some(text) =
+                    slot.session.blocks().editor_on_tail().and_then(|e| e.selected_text())
+            {
+                let owned = text.to_string();
+                ctx.copy_text(owned);
+                if cut_pressed && let Some(editor) = slot.session.editor_mut() {
+                    editor.delete_selection();
+                }
+            }
+        } else if copy_pressed && let Some(text) = slot.session.selection_text() {
             ctx.copy_text(text);
         }
 
