@@ -59,6 +59,16 @@ pub enum LifecycleEvent {
     /// input before execution (Ctrl-C on empty editor, syntax error
     /// rejected by shell, etc.).
     CommandAborted { reason: String },
+    /// `{"type":"continuation","value":""}` — emitted from the
+    /// shell's continuation prompt (zsh `PS2`, bash `PS2`) when the
+    /// parser sees an incomplete command (e.g. `echo 1 &&` —
+    /// trailing `&&` requires a right-hand side). The integration
+    /// script's `PS2` substitutes for the user-visible continuation
+    /// prompt with a Termica DCS marker; we use this to re-promote
+    /// the pane back to `ShellPromptEditor` so the user can keep
+    /// editing the multi-line command instead of typing into raw
+    /// mode. Spec/04 §"Submission semantics" subset.
+    Continuation,
 }
 
 /// The shell kinds recognised in the `integration_ready` payload.
@@ -140,6 +150,12 @@ fn parse_message(value: &serde_json::Value) -> Option<LifecycleEvent> {
         "command_aborted" => {
             let reason = value?.as_str()?.to_string();
             Some(LifecycleEvent::CommandAborted { reason })
+        }
+        "continuation" => {
+            // Value is intentionally empty — the message itself is
+            // the signal that the shell's parser is waiting for
+            // more input. No payload needed.
+            Some(LifecycleEvent::Continuation)
         }
         _ => None,
     }
@@ -299,6 +315,20 @@ mod tests {
     fn unknown_type_returns_none() {
         let b = body(r#"{"type":"yolo","session":"x","value":42}"#);
         assert_eq!(parse_dcs_body(&b), None);
+    }
+
+    #[test]
+    fn continuation_event_parses() {
+        let b = body(r#"{"type":"continuation","session":"x","value":""}"#);
+        assert_eq!(parse_dcs_body(&b), Some(LifecycleEvent::Continuation));
+    }
+
+    #[test]
+    fn continuation_event_parses_without_value() {
+        // The schema says `value` is optional for continuation —
+        // accept the form the shell actually emits.
+        let b = body(r#"{"type":"continuation","session":"x"}"#);
+        assert_eq!(parse_dcs_body(&b), Some(LifecycleEvent::Continuation));
     }
 
     #[test]

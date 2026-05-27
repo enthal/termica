@@ -123,6 +123,12 @@ pub enum TransitionReason {
     EnterSubmitted,
     CtrlCEmptyEditor,
     Esc,
+    /// `RawTerminal → ShellPromptEditor` because the shell emitted
+    /// its continuation prompt (`PS2`), which means it's waiting
+    /// for more input after an incomplete submit. Termica restores
+    /// the previously-submitted text into the editor with a trailing
+    /// newline so the user can keep typing the next line.
+    ContinuationMarker,
     AlternateScreenEnter,
     AlternateScreenExit,
     PtyExit,
@@ -289,6 +295,9 @@ impl PromptController {
                 // the pending block.
                 self.close_pending_cmd(frame, None);
             }
+            LifecycleEvent::Continuation => {
+                self.try_promote_to_editor_for_continuation(frame);
+            }
         }
     }
 
@@ -432,6 +441,34 @@ impl PromptController {
             return;
         }
         self.transition(PaneMode::ShellPromptEditor, TransitionReason::PrecmdMarker, frame);
+    }
+
+    /// `RawTerminal → ShellPromptEditor` driven by a continuation
+    /// marker (zsh `PS2` emitted as a DCS-JSON event). Differs from
+    /// [`Self::try_promote_to_editor`] in two ways:
+    ///
+    /// 1. **Gated on the prior transition reason.** Only re-promote
+    ///    if the user actually got to `RawTerminal` by submitting
+    ///    via the editor — if they pressed Esc to demote manually,
+    ///    they want raw mode and we mustn't yank them back.
+    /// 2. **No same-frame flap guard.** The submit and the
+    ///    continuation marker can land in the same frame (the
+    ///    shell's parser sees the incomplete command immediately).
+    ///    The transition is intentional, not flap.
+    fn try_promote_to_editor_for_continuation(&mut self, frame: u64) {
+        if self.mode != PaneMode::RawTerminal {
+            return;
+        }
+        if !matches!(self.integration, IntegrationState::Confirmed { .. }) {
+            return;
+        }
+        // Only re-promote when the immediate predecessor was a
+        // submit. Otherwise the user deliberately chose raw mode
+        // (Esc, Ctrl-C, etc.) and the editor should stay closed.
+        if self.last_transition.reason != TransitionReason::EnterSubmitted {
+            return;
+        }
+        self.transition(PaneMode::ShellPromptEditor, TransitionReason::ContinuationMarker, frame);
     }
 
     fn close_pending_cmd(&mut self, frame: u64, exit: Option<i32>) {
@@ -845,6 +882,77 @@ mod tests {
     }
 
     // ---- shell kind tracking ----------------------------------------
+
+    // ---- continuation marker (multi-line submit) --------------------
+
+    /// Helper: bring a fresh controller to `RawTerminal` with
+    /// integration confirmed, then submit a command. That puts the
+    /// controller in exactly the state our `Continuation` handler
+    /// expects to re-promote from.
+    fn controller_at_post_submit() -> PromptController {
+        let mut c = PromptController::new_no_bootstrap(0);
+        c.observe_event(
+            LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Zsh,
+                version: SUPPORTED_PROTOCOL_VERSION,
+            },
+            1,
+        );
+        c.observe_event(LifecycleEvent::Precmd { cwd: PathBuf::from("/tmp") }, 2);
+        assert_eq!(c.mode(), PaneMode::ShellPromptEditor);
+        c.submit_command(3);
+        assert_eq!(c.mode(), PaneMode::RawTerminal);
+        assert_eq!(c.last_transition().reason, TransitionReason::EnterSubmitted);
+        c
+    }
+
+    #[test]
+    fn continuation_after_submit_repromotes_to_editor() {
+        let mut c = controller_at_post_submit();
+        c.observe_event(LifecycleEvent::Continuation, 4);
+        assert_eq!(c.mode(), PaneMode::ShellPromptEditor);
+        assert_eq!(c.last_transition().reason, TransitionReason::ContinuationMarker);
+    }
+
+    #[test]
+    fn continuation_after_esc_demote_does_not_repromote() {
+        // User submitted, then Esc'd back to RawTerminal manually
+        // (well, actually we Esc only from ShellPromptEditor — but
+        // in a real session the equivalent is: integration_ready
+        // arrived, no Precmd yet, the user is happily typing in
+        // raw mode, and somehow a Continuation marker arrives.
+        // Re-promoting would yank them away from raw mode — bad.).
+        let mut c = PromptController::new_no_bootstrap(0);
+        c.observe_event(
+            LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Zsh,
+                version: SUPPORTED_PROTOCOL_VERSION,
+            },
+            1,
+        );
+        // Last transition is BootstrapComplete or similar — NOT
+        // EnterSubmitted. Continuation must be a no-op.
+        c.observe_event(LifecycleEvent::Continuation, 2);
+        assert_eq!(c.mode(), PaneMode::RawTerminal, "should not repromote without prior submit");
+    }
+
+    #[test]
+    fn continuation_when_integration_unconfirmed_is_noop() {
+        // Pre-integration-ready: integration is `Unknown`, gate is
+        // closed. A stray continuation marker can't matter yet.
+        let mut c = PromptController::new_no_bootstrap(0);
+        c.observe_event(LifecycleEvent::Continuation, 1);
+        assert_eq!(c.mode(), PaneMode::RawTerminal);
+    }
+
+    #[test]
+    fn continuation_from_alt_screen_is_noop() {
+        let mut c = controller_at_post_submit();
+        c.observe_alt_screen(true, 4);
+        assert_eq!(c.mode(), PaneMode::AlternateScreen);
+        c.observe_event(LifecycleEvent::Continuation, 5);
+        assert_eq!(c.mode(), PaneMode::AlternateScreen, "alt-screen must not repromote");
+    }
 
     #[test]
     fn integration_ready_records_shell_kind() {
