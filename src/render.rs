@@ -379,6 +379,62 @@ pub fn paint_prompt_editor_at(
     }
 }
 
+/// Paint a one-or-more-line command label in editor colors above the
+/// snapshot of the block that ran it.
+///
+/// With ZLE/readline disabled per spec/04, the kernel echo of the
+/// submitted bytes is suppressed by [`crate::echo_suppress::EchoSuppressor`]
+/// — which is correct for the live `Term`, but means the typed
+/// command never appears anywhere visible to the user. The sealed
+/// block stores the command string (`Block::Sealed.command`); this
+/// helper paints it as a teal header line so the user can see which
+/// command produced the output below. Same idea for `Running` —
+/// without this label the user sees output streaming but doesn't
+/// know which command is producing it.
+///
+/// 4G's prompt chrome lands the full header (cwd / branch / dirty
+/// chips + duration + exit code); this is the minimum viable subset
+/// of that work needed to make 4C feel usable.
+pub fn paint_command_label(ui: &mut egui::Ui, command: &str) -> Response {
+    let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
+    let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
+    let row_h = ui.fonts_mut(|f| f.row_height(&font_id));
+    let lines: Vec<&str> = command.split('\n').collect();
+    let cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0).max(1);
+    let rows = lines.len();
+    let size = Vec2::new(cols as f32 * cell_w, rows as f32 * row_h);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    for (i, line) in lines.iter().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        painter.text(
+            Pos2::new(rect.min.x, rect.min.y + i as f32 * row_h),
+            egui::Align2::LEFT_TOP,
+            line,
+            font_id.clone(),
+            EDITOR_FG,
+        );
+    }
+    response
+}
+
+/// Paint one finished command block: a teal command-label line above
+/// its frozen `Vec<StyledLine>` snapshot. The same helper is used by
+/// `render_pane` for live rendering and by snapshot tests so visual
+/// regressions in either path show up in the kittest goldens.
+///
+/// The caller is responsible for adding the inter-block separator
+/// (e.g. `ui.add_space(4.0)`); a sealed block on its own has no
+/// trailing gap.
+pub fn paint_sealed_block(ui: &mut egui::Ui, command: &str, snapshot: &[StyledLine]) {
+    if !command.is_empty() {
+        let _ = paint_command_label(ui, command);
+    }
+    let _ = paint_styled_lines(ui, snapshot);
+}
+
 /// Paint the semi-transparent selection rectangles.
 ///
 /// Takes the `(start, end)` *effective* range already in reading

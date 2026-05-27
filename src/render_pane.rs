@@ -299,20 +299,37 @@ pub fn render_pane(
         .stick_to_bottom(true)
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            // ---- Sealed blocks ------------------------------------
+            // ---- Block stack: command labels + snapshots ----------
             //
-            // Painted top-to-bottom in flow. Each block is a frozen
-            // `Vec<StyledLine>` snapshot of the live `Term`'s content
-            // at the moment `CommandFinished` fired. Sealed blocks
-            // are not interactive in Phase 4A-render — cross-block
-            // selection lands in 4F.
+            // Walk every block. For `Sealed`: paint the command line
+            // first (teal — the user's typed command, which kernel-
+            // echo-suppression hid from the snapshot), then the
+            // frozen `Vec<StyledLine>` snapshot of the output, then
+            // a thin separator gap. For `Running` (only at the tail
+            // by invariant): paint the command label — the live
+            // `Term` painted after the loop carries the output as
+            // it streams in. For `Prompt` (only at the tail): paint
+            // nothing here; the live `Term` shows the shell's idle
+            // area (empty with `PS1=''`) and the editor overlay
+            // paints on top after `paint_terminal`.
+            //
+            // 4G adds full header chrome (cwd / branch / dirty chips,
+            // duration, exit code) on top of these labels.
             for block in slot.session.blocks().iter() {
-                if let crate::block::Block::Sealed { snapshot, .. } = block {
-                    let _ = render::paint_styled_lines(ui, snapshot);
-                    // Thin separator gap between blocks; spec/04
-                    // §"Visual structure" calls for "non-text (thin
-                    // separator + space)".
-                    ui.add_space(4.0);
+                match block {
+                    crate::block::Block::Sealed { command, snapshot, .. } => {
+                        render::paint_sealed_block(ui, command, snapshot);
+                        // Thin separator gap — spec/04 §"Visual
+                        // structure" calls for "non-text (thin
+                        // separator + space)".
+                        ui.add_space(4.0);
+                    }
+                    crate::block::Block::Running { command, .. } => {
+                        if !command.is_empty() {
+                            let _ = render::paint_command_label(ui, command);
+                        }
+                    }
+                    crate::block::Block::Prompt { .. } => {}
                 }
             }
 

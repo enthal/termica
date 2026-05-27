@@ -333,6 +333,62 @@ fn snapshot_paint_prompt_editor_with_text_and_cursor_at_end() {
     harness.snapshot("paint_prompt_editor_typed");
 }
 
+// ---- whole-block snapshots (command + output together) -------------------
+
+#[test]
+fn snapshot_paint_sealed_block_echo() {
+    // The simplest end-to-end shape of a finished command: type
+    // `echo hello`, kernel runs it, snapshot freezes the output.
+    let snapshot = sealed_snapshot(3, 40, b"hello\r\n");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(500.0, 100.0)).build_ui(move |ui| {
+            render::paint_sealed_block(ui, "echo hello", &snapshot);
+        });
+    harness.snapshot("paint_sealed_block_echo");
+}
+
+#[test]
+fn snapshot_paint_sealed_block_ls_output() {
+    // Multiple output rows under a single command label. Mirrors
+    // what the user typically sees after `ls`.
+    let snapshot = sealed_snapshot(6, 40, b"Cargo.toml\r\nREADME.md\r\nsrc\r\ntests\r\n");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(500.0, 160.0)).build_ui(move |ui| {
+            render::paint_sealed_block(ui, "ls", &snapshot);
+        });
+    harness.snapshot("paint_sealed_block_ls_output");
+}
+
+#[test]
+fn snapshot_paint_sealed_block_multiline_command() {
+    // A `Shift+Enter`-authored multi-line command above its single-
+    // line output.
+    let snapshot = sealed_snapshot(3, 40, b"1\r\n2\r\n");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(500.0, 140.0)).build_ui(move |ui| {
+            render::paint_sealed_block(ui, "for i in 1 2; do\n  echo $i\ndone", &snapshot);
+        });
+    harness.snapshot("paint_sealed_block_multiline_command");
+}
+
+#[test]
+fn snapshot_paint_command_label_single_line() {
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(500.0, 40.0)).build_ui(move |ui| {
+            let _ = render::paint_command_label(ui, "git status");
+        });
+    harness.snapshot("paint_command_label_single_line");
+}
+
+#[test]
+fn snapshot_paint_command_label_multiline() {
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(500.0, 80.0)).build_ui(move |ui| {
+            let _ = render::paint_command_label(ui, "for f in *.rs; do\n  cat \"$f\"\ndone");
+        });
+    harness.snapshot("paint_command_label_multiline");
+}
+
 #[test]
 fn snapshot_paint_prompt_editor_multiline() {
     // Shift+Enter authored: two lines, cursor at the end of the
