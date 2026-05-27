@@ -8,6 +8,8 @@
 
 use eframe::egui;
 
+use crate::block::BlockId;
+use crate::block_selection::BlockCursor;
 use crate::pane::PaneSession;
 
 /// Typed pane identifier. Used both as the leaf payload inside
@@ -88,6 +90,15 @@ pub struct PaneUiState {
     /// drags. Cleared on a single click. Used only by
     /// `render_pane`'s editor-drag handler.
     pub(crate) editor_drag_anchor: Option<(usize, usize)>,
+    /// Same idea as `editor_drag_anchor`, but for a double/triple
+    /// click that landed inside a sealed block. `BlockId` pins the
+    /// drag to its origin block — pointer movements over other
+    /// blocks don't extend it (cross-block selection lands in a
+    /// follow-up). The two `BlockCursor`s are the start and end of
+    /// the originally-selected word / line on the anchor row, so
+    /// the drag handler can union them with the word / line under
+    /// the current pointer.
+    pub(crate) sealed_drag_anchor: Option<(BlockId, BlockCursor, BlockCursor)>,
 }
 
 /// One pane's full state: the OS-resource [`PaneSession`] (PTY +

@@ -20,7 +20,8 @@ use std::thread::{self, JoinHandle};
 
 use alacritty_terminal::index::Point;
 
-use crate::block::BlockStack;
+use crate::block::{Block, BlockStack};
+use crate::block_selection::BlockSelection;
 use crate::events::EventRecorder;
 use crate::integration::{ManagedSpawn, ShellSpec, managed_spawn_for, new_session_id};
 use crate::pty::{PtyConfig, PtyError, PtySession};
@@ -128,6 +129,12 @@ pub struct PaneSession {
     /// on the next normal `Preexec` (command completed without a
     /// continuation) — see [`Self::drain`].
     last_submitted: Option<String>,
+    /// Phase 4F: selection over one of the sealed blocks in
+    /// [`Self::blocks`]. Independent of [`Self::selection`] (which
+    /// covers the live alacritty grid). At most one of the two is
+    /// populated at any moment — the setters clear the other so the
+    /// user sees a single "current selection" across the pane.
+    block_selection: Option<BlockSelection>,
 }
 
 impl PaneSession {
@@ -191,6 +198,7 @@ impl PaneSession {
             pane_id,
             recorder,
             last_submitted: None,
+            block_selection: None,
         })
     }
 
@@ -615,6 +623,7 @@ impl PaneSession {
     /// [`SelectionMode::Line`].
     pub fn start_selection(&mut self, p: Point, mode: SelectionMode) {
         self.selection = Some(Selection::with_mode(p, mode));
+        self.block_selection = None;
     }
 
     /// Begin a fresh `Word`-mode selection whose anchor is glued to
@@ -624,6 +633,7 @@ impl PaneSession {
     /// pointer is on. See [`Selection::with_url_anchor`].
     pub fn start_url_selection(&mut self, link_start: Point, link_end: Point) {
         self.selection = Some(Selection::with_url_anchor(link_start, link_end));
+        self.block_selection = None;
     }
 
     /// Move the head of the current selection. No-op if there is no
@@ -650,6 +660,136 @@ impl PaneSession {
             return None;
         }
         Some(selection::selection_text(self.terminal.grid(), sel))
+    }
+
+    /// Current sealed-block selection (Phase 4F), or `None` when the
+    /// user hasn't started one — or when a more recent live-grid
+    /// selection cleared it.
+    pub fn block_selection(&self) -> Option<&BlockSelection> {
+        self.block_selection.as_ref()
+    }
+
+    /// Install a sealed-block selection, replacing any previous one
+    /// and clearing the live-grid selection so the pane only ever
+    /// shows a single "current selection."
+    pub fn set_block_selection(&mut self, sel: BlockSelection) {
+        self.selection = None;
+        self.block_selection = Some(sel);
+    }
+
+    /// Drop the sealed-block selection without touching live-grid
+    /// state. Called when a click lands outside any sealed block, or
+    /// before starting a new live-grid drag.
+    pub fn clear_block_selection(&mut self) {
+        self.block_selection = None;
+    }
+
+    /// Replace the endpoints of the current sealed-block selection
+    /// without changing `block_id`. No-op if no sealed-block
+    /// selection is active. Used by the drag handler so the
+    /// originating `block_id` stays pinned regardless of where the
+    /// pointer roams.
+    pub fn update_block_selection_endpoints(
+        &mut self,
+        anchor: crate::block_selection::BlockCursor,
+        head: crate::block_selection::BlockCursor,
+    ) {
+        if let Some(sel) = self.block_selection.as_mut() {
+            sel.anchor = anchor;
+            sel.head = head;
+        }
+    }
+
+    /// Materialise the text currently under the sealed-block
+    /// selection. Walks [`Self::blocks`] for the matching `block_id`
+    /// and slices its `snapshot`. Returns `None` when there is no
+    /// active block selection, the matching block has gone away, or
+    /// the selection is empty / falls outside the snapshot. Each row
+    /// is trimmed of trailing whitespace (the grid pads with spaces).
+    pub fn block_selection_text(&self) -> Option<String> {
+        let sel = self.block_selection.as_ref()?;
+        if sel.is_empty() {
+            return None;
+        }
+        for block in self.blocks.iter() {
+            if let Block::Sealed { id, snapshot, .. } = block
+                && *id == sel.block_id
+            {
+                let text = crate::block_selection::block_selection_text(snapshot, sel);
+                return if text.is_empty() { None } else { Some(text) };
+            }
+        }
+        None
+    }
+
+    /// Number of rows in the sealed snapshot for `block_id`, or `None`
+    /// if no sealed block has that id. Used by the click / drag
+    /// handler to clamp pointer rows that fall outside the block.
+    pub fn sealed_snapshot_rows(&self, block_id: crate::block::BlockId) -> Option<usize> {
+        for block in self.blocks.iter() {
+            if let Block::Sealed { id, snapshot, .. } = block
+                && *id == block_id
+            {
+                return Some(snapshot.len());
+            }
+        }
+        None
+    }
+
+    /// Length in cells of one row in a sealed block. `None` if no
+    /// sealed block has that id or `row` is past the snapshot.
+    pub fn sealed_row_len(&self, block_id: crate::block::BlockId, row: usize) -> Option<usize> {
+        for block in self.blocks.iter() {
+            if let Block::Sealed { id, snapshot, .. } = block
+                && *id == block_id
+            {
+                return snapshot.get(row).map(|l| l.cells.len());
+            }
+        }
+        None
+    }
+
+    /// Word range around `cursor` inside `block_id`'s snapshot. Both
+    /// endpoints share `cursor.row` and reside on a word boundary
+    /// per [`crate::prompt_editor::is_word_char`]. Returns `None`
+    /// when the block doesn't exist or the cursor lies past the row.
+    pub fn sealed_word_range(
+        &self,
+        block_id: crate::block::BlockId,
+        cursor: crate::block_selection::BlockCursor,
+    ) -> Option<(crate::block_selection::BlockCursor, crate::block_selection::BlockCursor)> {
+        use crate::block_selection::{BlockCursor, cell_word_range};
+        for block in self.blocks.iter() {
+            if let Block::Sealed { id, snapshot, .. } = block
+                && *id == block_id
+            {
+                let line = snapshot.get(cursor.row)?;
+                let (a, b) = cell_word_range(&line.cells, cursor.col);
+                return Some((BlockCursor::new(cursor.row, a), BlockCursor::new(cursor.row, b)));
+            }
+        }
+        None
+    }
+
+    /// Line range around `cursor.row` inside `block_id`'s snapshot
+    /// (full width — trailing whitespace included; copy trims). Both
+    /// endpoints share `cursor.row`.
+    pub fn sealed_line_range(
+        &self,
+        block_id: crate::block::BlockId,
+        cursor: crate::block_selection::BlockCursor,
+    ) -> Option<(crate::block_selection::BlockCursor, crate::block_selection::BlockCursor)> {
+        use crate::block_selection::{BlockCursor, cell_line_range};
+        for block in self.blocks.iter() {
+            if let Block::Sealed { id, snapshot, .. } = block
+                && *id == block_id
+            {
+                let line = snapshot.get(cursor.row)?;
+                let (a, b) = cell_line_range(&line.cells);
+                return Some((BlockCursor::new(cursor.row, a), BlockCursor::new(cursor.row, b)));
+            }
+        }
+        None
     }
 }
 
@@ -1175,5 +1315,95 @@ mod tests {
             body.contains("Dead") && body.contains("PtyExit"),
             "log should record the transition to Dead; got:\n{body}"
         );
+    }
+
+    // ---- Phase 4F sealed-block selection: cross-clearing invariants -
+
+    fn quiet_session() -> PaneSession {
+        PaneSession::spawn(5, 40, &sh_c("printf x"), "test-session".into(), 0, None)
+            .expect("spawn /bin/sh")
+    }
+
+    fn dummy_block_sel() -> crate::block_selection::BlockSelection {
+        use crate::block_selection::{BlockCursor, BlockSelection};
+        BlockSelection::new(
+            crate::block::BlockId(99),
+            BlockCursor::new(0, 0),
+            BlockCursor::new(0, 5),
+        )
+    }
+
+    #[test]
+    fn set_block_selection_clears_live_grid_selection() {
+        let mut session = quiet_session();
+        session.start_selection(
+            alacritty_terminal::index::Point {
+                line: alacritty_terminal::index::Line(0),
+                column: alacritty_terminal::index::Column(0),
+            },
+            crate::selection::SelectionMode::Char,
+        );
+        assert!(session.selection().is_some(), "precondition: live grid selection set");
+
+        session.set_block_selection(dummy_block_sel());
+
+        assert!(session.selection().is_none(), "live-grid selection should be cleared");
+        assert!(session.block_selection().is_some(), "block selection should be set");
+    }
+
+    #[test]
+    fn start_selection_clears_block_selection() {
+        let mut session = quiet_session();
+        session.set_block_selection(dummy_block_sel());
+        assert!(session.block_selection().is_some(), "precondition");
+
+        session.start_selection(
+            alacritty_terminal::index::Point {
+                line: alacritty_terminal::index::Line(0),
+                column: alacritty_terminal::index::Column(0),
+            },
+            crate::selection::SelectionMode::Char,
+        );
+
+        assert!(session.block_selection().is_none(), "block selection should be cleared");
+        assert!(session.selection().is_some(), "live-grid selection should be set");
+    }
+
+    #[test]
+    fn block_selection_text_returns_none_when_block_id_does_not_exist() {
+        let mut session = quiet_session();
+        // dummy_block_sel points at BlockId(99) — the fresh session
+        // only has a Prompt block at id 0, so the lookup misses.
+        session.set_block_selection(dummy_block_sel());
+        assert_eq!(session.block_selection_text(), None);
+    }
+
+    #[test]
+    fn update_block_selection_endpoints_preserves_block_id() {
+        use crate::block_selection::BlockCursor;
+        let mut session = quiet_session();
+        session.set_block_selection(dummy_block_sel());
+        let original_id = session.block_selection().unwrap().block_id;
+
+        session.update_block_selection_endpoints(BlockCursor::new(2, 3), BlockCursor::new(4, 7));
+
+        let sel = session.block_selection().expect("still set");
+        assert_eq!(sel.block_id, original_id, "block_id stays pinned");
+        assert_eq!(sel.anchor, BlockCursor::new(2, 3));
+        assert_eq!(sel.head, BlockCursor::new(4, 7));
+    }
+
+    #[test]
+    fn clear_block_selection_leaves_live_grid_alone() {
+        let mut session = quiet_session();
+        session.start_selection(
+            alacritty_terminal::index::Point {
+                line: alacritty_terminal::index::Line(0),
+                column: alacritty_terminal::index::Column(0),
+            },
+            crate::selection::SelectionMode::Char,
+        );
+        session.clear_block_selection();
+        assert!(session.selection().is_some(), "live-grid selection untouched");
     }
 }

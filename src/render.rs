@@ -30,6 +30,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Response, Stroke, Vec2};
 
+use crate::block_selection::BlockCursor;
 use crate::links::LinkSpan;
 use crate::prompt_editor::PromptEditor;
 use crate::selection::{GridGeometry, Selection};
@@ -264,7 +265,11 @@ pub fn paint_terminal(
 /// Returns the `Response` over the painted rect so the caller can
 /// chain interactions (Phase 4G adds click-to-collapse) once they
 /// exist; for 4A-render the response is unused.
-pub fn paint_styled_lines(ui: &mut egui::Ui, lines: &[StyledLine]) -> Response {
+pub fn paint_styled_lines(
+    ui: &mut egui::Ui,
+    lines: &[StyledLine],
+    selection: Option<(BlockCursor, BlockCursor)>,
+) -> Response {
     let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
     let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
     let row_h = ui.fonts_mut(|f| f.row_height(&font_id));
@@ -272,7 +277,7 @@ pub fn paint_styled_lines(ui: &mut egui::Ui, lines: &[StyledLine]) -> Response {
     let rows = lines.len();
     let size = Vec2::new(cols as f32 * cell_w, rows as f32 * row_h);
 
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
     let painter = ui.painter_at(rect);
 
     if size.x > 0.0 && size.y > 0.0 {
@@ -314,7 +319,60 @@ pub fn paint_styled_lines(ui: &mut egui::Ui, lines: &[StyledLine]) -> Response {
             }
         }
     }
+    if let Some((start, end)) = selection {
+        paint_block_selection_overlay(&painter, lines, rect, cell_w, row_h, start, end);
+    }
     response
+}
+
+/// Paint the teal selection overlay across a sealed block's rows.
+///
+/// `start` and `end` are already in reading order. Splits a
+/// multi-row selection into a partial first row, full middle rows,
+/// and a partial last row — the same shape as the live-grid
+/// [`paint_selection_overlay`] but in (row, col) space with no
+/// `display_offset` to translate.
+fn paint_block_selection_overlay(
+    painter: &egui::Painter,
+    lines: &[StyledLine],
+    rect: Rect,
+    cell_w: f32,
+    row_h: f32,
+    start: BlockCursor,
+    end: BlockCursor,
+) {
+    if start == end || lines.is_empty() {
+        return;
+    }
+    let last_row = end.row.min(lines.len() - 1);
+    if start.row > last_row {
+        return;
+    }
+    for (row, line) in lines.iter().enumerate().take(last_row + 1).skip(start.row) {
+        let row_len = line.cells.len();
+        let (col_lo, col_hi) = if start.row == end.row {
+            (start.col, end.col)
+        } else if row == start.row {
+            (start.col, row_len.max(start.col))
+        } else if row == end.row {
+            (0, end.col)
+        } else {
+            (0, row_len)
+        };
+        let col_hi = col_hi.min(row_len.max(col_lo));
+        if col_hi <= col_lo {
+            continue;
+        }
+        let x0 = rect.min.x + col_lo as f32 * cell_w;
+        let x1 = rect.min.x + col_hi as f32 * cell_w;
+        let y0 = rect.min.y + row as f32 * row_h;
+        let y1 = y0 + row_h;
+        painter.rect_filled(
+            Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)),
+            0.0,
+            SELECTION_COLOR,
+        );
+    }
 }
 
 /// Paint the [`PromptEditor`] inside its [`Block::Prompt`](crate::block::Block::Prompt).
@@ -493,11 +551,27 @@ pub fn paint_command_label(ui: &mut egui::Ui, command: &str) -> Response {
 /// The caller is responsible for adding the inter-block separator
 /// (e.g. `ui.add_space(4.0)`); a sealed block on its own has no
 /// trailing gap.
-pub fn paint_sealed_block(ui: &mut egui::Ui, command: &str, snapshot: &[StyledLine]) {
+///
+/// `selection`, when `Some`, paints a teal overlay across the
+/// covered cells in the snapshot. The caller is responsible for
+/// passing `Some` only when the selection belongs to *this* block;
+/// `paint_sealed_block` does not know its own [`crate::block::BlockId`].
+/// Endpoints must already be in reading order (start ≤ end).
+///
+/// Returns the [`Response`] over the *snapshot* region — i.e. the
+/// hit-testable rect for sealed-block selection. The command label
+/// region is excluded so that clicks on the label don't begin a
+/// selection that would visually start above the highlight.
+pub fn paint_sealed_block(
+    ui: &mut egui::Ui,
+    command: &str,
+    snapshot: &[StyledLine],
+    selection: Option<(BlockCursor, BlockCursor)>,
+) -> Response {
     if !command.is_empty() {
         let _ = paint_command_label(ui, command);
     }
-    let _ = paint_styled_lines(ui, snapshot);
+    paint_styled_lines(ui, snapshot, selection)
 }
 
 /// Paint the semi-transparent selection rectangles.

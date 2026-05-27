@@ -542,7 +542,12 @@ pub fn line_range_at(text: &str, byte_idx: usize) -> (usize, usize) {
 /// cursor moves and double-click word selection. Alphanumerics +
 /// underscore — matches most text editors' default and avoids the
 /// "what counts as punctuation" tar pit. Configurable later.
-fn is_word_char(c: char) -> bool {
+///
+/// Public so the sealed-block selection module
+/// ([`crate::block_selection`]) can apply the same predicate to
+/// `StyledCell.c` and stay aligned with the editor's notion of
+/// "word".
+pub fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
