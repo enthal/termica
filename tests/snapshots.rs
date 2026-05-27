@@ -286,7 +286,7 @@ fn snapshot_paint_styled_lines_plain_text() {
     let snapshot = sealed_snapshot(4, 40, b"$ echo hello\r\nhello\r\n");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 140.0)).build_ui(move |ui| {
-            let _ = render::paint_styled_lines(ui, &snapshot);
+            let _ = render::paint_styled_lines(ui, &snapshot, None);
         });
     harness.snapshot("paint_styled_lines_plain_text");
 }
@@ -305,7 +305,7 @@ fn snapshot_paint_styled_lines_with_ansi_colors() {
     let snapshot = sealed_snapshot(3, 50, &bytes);
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 100.0)).build_ui(move |ui| {
-            let _ = render::paint_styled_lines(ui, &snapshot);
+            let _ = render::paint_styled_lines(ui, &snapshot, None);
         });
     harness.snapshot("paint_styled_lines_ansi_colors");
 }
@@ -342,7 +342,7 @@ fn snapshot_paint_sealed_block_echo() {
     let snapshot = sealed_snapshot(3, 40, b"hello\r\n");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(500.0, 100.0)).build_ui(move |ui| {
-            render::paint_sealed_block(ui, "echo hello", &snapshot);
+            let _ = render::paint_sealed_block(ui, "echo hello", &snapshot, None);
         });
     harness.snapshot("paint_sealed_block_echo");
 }
@@ -354,7 +354,7 @@ fn snapshot_paint_sealed_block_ls_output() {
     let snapshot = sealed_snapshot(6, 40, b"Cargo.toml\r\nREADME.md\r\nsrc\r\ntests\r\n");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(500.0, 160.0)).build_ui(move |ui| {
-            render::paint_sealed_block(ui, "ls", &snapshot);
+            let _ = render::paint_sealed_block(ui, "ls", &snapshot, None);
         });
     harness.snapshot("paint_sealed_block_ls_output");
 }
@@ -366,7 +366,12 @@ fn snapshot_paint_sealed_block_multiline_command() {
     let snapshot = sealed_snapshot(3, 40, b"1\r\n2\r\n");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(500.0, 140.0)).build_ui(move |ui| {
-            render::paint_sealed_block(ui, "for i in 1 2; do\n  echo $i\ndone", &snapshot);
+            let _ = render::paint_sealed_block(
+                ui,
+                "for i in 1 2; do\n  echo $i\ndone",
+                &snapshot,
+                None,
+            );
         });
     harness.snapshot("paint_sealed_block_multiline_command");
 }
@@ -465,4 +470,50 @@ fn snapshot_paint_prompt_editor_cursor_mid_text() {
             let _ = render::paint_prompt_editor(ui, &editor);
         });
     harness.snapshot("paint_prompt_editor_cursor_mid_text");
+}
+
+// ---- sealed-block selection snapshots (Phase 4F) -------------------------
+//
+// `paint_styled_lines` and `paint_sealed_block` now accept an
+// optional `(BlockCursor, BlockCursor)` selection in reading order.
+// These tests pin the teal selection overlay across single-row,
+// partial-row, and multi-row shapes so changes to the overlay
+// rendering surface visually.
+
+#[test]
+fn snapshot_paint_styled_lines_with_single_row_selection() {
+    use termica::block_selection::BlockCursor;
+    let snapshot = sealed_snapshot(3, 40, b"hello world\r\n");
+    let sel = Some((BlockCursor::new(0, 6), BlockCursor::new(0, 11)));
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 80.0)).build_ui(move |ui| {
+            let _ = render::paint_styled_lines(ui, &snapshot, sel);
+        });
+    harness.snapshot("paint_styled_lines_single_row_selection");
+}
+
+#[test]
+fn snapshot_paint_styled_lines_with_multi_row_selection() {
+    use termica::block_selection::BlockCursor;
+    let snapshot = sealed_snapshot(5, 40, b"alpha\r\nbravo\r\ncharlie\r\n");
+    // Partial first row (col 2 → end), full middle row, partial last
+    // row (0 → col 4).
+    let sel = Some((BlockCursor::new(0, 2), BlockCursor::new(2, 4)));
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 140.0)).build_ui(move |ui| {
+            let _ = render::paint_styled_lines(ui, &snapshot, sel);
+        });
+    harness.snapshot("paint_styled_lines_multi_row_selection");
+}
+
+#[test]
+fn snapshot_paint_sealed_block_with_selection_inside_output() {
+    use termica::block_selection::BlockCursor;
+    let snapshot = sealed_snapshot(4, 40, b"Cargo.toml\r\nREADME.md\r\nsrc\r\n");
+    let sel = Some((BlockCursor::new(0, 0), BlockCursor::new(1, 9)));
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(500.0, 140.0)).build_ui(move |ui| {
+            let _ = render::paint_sealed_block(ui, "ls", &snapshot, sel);
+        });
+    harness.snapshot("paint_sealed_block_with_selection");
 }
