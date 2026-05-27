@@ -44,6 +44,7 @@ pub mod pty;
 pub mod render;
 pub mod selection;
 pub mod shell;
+pub mod shell_syntax;
 pub mod terminal;
 
 mod app;

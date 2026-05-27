@@ -474,6 +474,56 @@ fn snapshot_paint_prompt_editor_cursor_mid_text() {
     harness.snapshot("paint_prompt_editor_cursor_mid_text");
 }
 
+// ---- syntax-highlighting snapshots (Phase 4H) ---------------------------
+//
+// The editor now tokenizes its text via `crate::shell_syntax` and
+// paints each token in a kind-specific colour. These tests pin the
+// visual identity for the v1 token set so colour regressions surface.
+
+#[test]
+fn snapshot_paint_prompt_editor_command_with_flag() {
+    let mut editor = termica::prompt_editor::PromptEditor::new();
+    editor.insert_str("ls -la /tmp");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(500.0, 60.0)).build_ui(move |ui| {
+            let _ = render::paint_prompt_editor(ui, &editor);
+        });
+    harness.snapshot("paint_prompt_editor_command_with_flag");
+}
+
+#[test]
+fn snapshot_paint_prompt_editor_pipe_and_quotes() {
+    let mut editor = termica::prompt_editor::PromptEditor::new();
+    editor.insert_str("grep -i \"hello world\" foo.txt | wc -l");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(800.0, 60.0)).build_ui(move |ui| {
+            let _ = render::paint_prompt_editor(ui, &editor);
+        });
+    harness.snapshot("paint_prompt_editor_pipe_and_quotes");
+}
+
+#[test]
+fn snapshot_paint_prompt_editor_variable_and_redirect() {
+    let mut editor = termica::prompt_editor::PromptEditor::new();
+    editor.insert_str("echo $HOME > /tmp/out");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(600.0, 60.0)).build_ui(move |ui| {
+            let _ = render::paint_prompt_editor(ui, &editor);
+        });
+    harness.snapshot("paint_prompt_editor_variable_and_redirect");
+}
+
+#[test]
+fn snapshot_paint_prompt_editor_comment_at_end_of_line() {
+    let mut editor = termica::prompt_editor::PromptEditor::new();
+    editor.insert_str("ls -la # list everything");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(600.0, 60.0)).build_ui(move |ui| {
+            let _ = render::paint_prompt_editor(ui, &editor);
+        });
+    harness.snapshot("paint_prompt_editor_comment_at_end_of_line");
+}
+
 // ---- sealed-block selection snapshots (Phase 4F) -------------------------
 //
 // `paint_styled_lines` and `paint_sealed_block` now accept an
