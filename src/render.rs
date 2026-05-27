@@ -94,6 +94,38 @@ pub const EDITOR_CURSOR_COLOR: Color32 = Color32::from_rgba_premultiplied(0x4a, 
 /// when both areas exist on screen at once.
 pub const BLOCK_HEADER_FG: Color32 = Color32::from_rgb(0x80, 0x80, 0x80);
 
+/// Per-[`TokenKind`](crate::shell_syntax::TokenKind) colours for
+/// the editor's syntax highlighting (Phase 4H). Picked so the
+/// command word (amber) stands out as "the action," strings (green)
+/// and variables (lighter teal than `EDITOR_FG`) read as conventional
+/// syntax highlighting, separators and redirects (magenta) read as
+/// "structure," and comments (dim grey) clearly de-emphasise. Themable
+/// in Phase 10.
+pub const TOKEN_COMMAND_FG: Color32 = Color32::from_rgb(0xe8, 0xc6, 0x6e);
+pub const TOKEN_STRING_FG: Color32 = Color32::from_rgb(0xa3, 0xd5, 0x9a);
+pub const TOKEN_VARIABLE_FG: Color32 = Color32::from_rgb(0xb8, 0xe8, 0xf5);
+pub const TOKEN_PIPE_FG: Color32 = Color32::from_rgb(0xd6, 0x8f, 0xd8);
+pub const TOKEN_REDIRECT_FG: Color32 = Color32::from_rgb(0xd6, 0x8f, 0xd8);
+pub const TOKEN_FLAG_FG: Color32 = Color32::from_rgb(0xe8, 0xb5, 0x6e);
+pub const TOKEN_COMMENT_FG: Color32 = Color32::from_rgb(0x70, 0x70, 0x70);
+
+/// Map a [`TokenKind`](crate::shell_syntax::TokenKind) to the
+/// foreground colour the editor should paint with. `Word` falls
+/// back to [`EDITOR_FG`] — the default user-input teal.
+pub fn color_for_token_kind(kind: crate::shell_syntax::TokenKind) -> Color32 {
+    use crate::shell_syntax::TokenKind;
+    match kind {
+        TokenKind::Command => TOKEN_COMMAND_FG,
+        TokenKind::String => TOKEN_STRING_FG,
+        TokenKind::Variable => TOKEN_VARIABLE_FG,
+        TokenKind::Pipe => TOKEN_PIPE_FG,
+        TokenKind::Redirect => TOKEN_REDIRECT_FG,
+        TokenKind::Flag => TOKEN_FLAG_FG,
+        TokenKind::Comment => TOKEN_COMMENT_FG,
+        TokenKind::Word => EDITOR_FG,
+    }
+}
+
 /// Foreground for a non-zero exit code rendered on a sealed block's
 /// header line. Saturated red so failed commands are unmistakable
 /// in a long transcript. Theme polish lands in Phase 10.
@@ -442,12 +474,11 @@ pub fn paint_prompt_editor_at(
     font_id: &FontId,
     caret_visible: bool,
 ) {
-    // Resolve the selection range (if any) into byte indices, then
-    // map onto rows for per-row highlight rects below.
     let selection_bytes = editor.selection_range();
     let lines = editor.lines_with_cursor();
-    // Pre-compute (row, byte_range) for each row so the selection
-    // overlay can paint without re-walking the buffer.
+    let full_text = editor.text();
+    let tokens = crate::shell_syntax::tokenize(full_text);
+
     let mut row_byte_starts = Vec::with_capacity(lines.len());
     {
         let mut byte = 0usize;
@@ -459,22 +490,13 @@ pub fn paint_prompt_editor_at(
 
     for (row_idx, line) in lines.iter().enumerate() {
         let y = origin.y + row_idx as f32 * row_h;
+        let row_byte_start = row_byte_starts[row_idx];
+        let row_byte_end = row_byte_start + line.text.len();
 
-        // Selection overlay for this row, painted UNDER the glyphs
-        // so text stays legible. The overlay is a single rect from
-        // the row's start-of-selection char column to its end-of-
-        // selection char column.
+        // Selection overlay UNDER the glyphs so text stays legible.
         if let Some((sel_start, sel_end)) = selection_bytes {
-            let row_byte_start = row_byte_starts[row_idx];
-            let row_byte_end = row_byte_start + line.text.len();
-            // Clip selection to this row.
             let clip_start = sel_start.max(row_byte_start);
             let clip_end = sel_end.min(row_byte_end);
-            // Special case: a multi-line selection's middle rows
-            // and trailing-newline rows should extend visually
-            // through the trailing newline. We give the row an
-            // extra cell of highlight whenever the selection
-            // continues past this row.
             let extends_past = sel_end > row_byte_end;
             if clip_start < clip_end || extends_past {
                 let sel_start_chars = line.text[..clip_start - row_byte_start].chars().count();
@@ -493,15 +515,52 @@ pub fn paint_prompt_editor_at(
             }
         }
 
+        // Paint tokens that intersect this row. Tokens are emitted
+        // in source order with no overlap, so we can iterate them
+        // once and skip out-of-row entries. Whitespace gaps between
+        // tokens don't need painting (they're spaces / tabs with no
+        // glyphs to draw).
         if !line.text.is_empty() {
-            painter.text(
-                Pos2::new(origin.x, y),
-                egui::Align2::LEFT_TOP,
-                line.text,
-                font_id.clone(),
-                EDITOR_FG,
-            );
+            // Fallback: if no token covers a character of this row,
+            // paint the whole row in EDITOR_FG so we never lose
+            // glyphs (e.g. a tokenizer regression on exotic input).
+            // We track whether any token painted; if not, paint the
+            // whole row. Token painting suffices in practice because
+            // every non-whitespace byte gets emitted as some kind.
+            let mut painted_any = false;
+            for token in &tokens {
+                if token.range.end <= row_byte_start || token.range.start >= row_byte_end {
+                    continue;
+                }
+                let clip_start = token.range.start.max(row_byte_start);
+                let clip_end = token.range.end.min(row_byte_end);
+                let text_slice = &full_text[clip_start..clip_end];
+                if text_slice.is_empty() {
+                    continue;
+                }
+                let col_chars = line.text[..clip_start - row_byte_start].chars().count();
+                let x = origin.x + col_chars as f32 * cell_w;
+                let color = color_for_token_kind(token.kind);
+                painter.text(
+                    Pos2::new(x, y),
+                    egui::Align2::LEFT_TOP,
+                    text_slice,
+                    font_id.clone(),
+                    color,
+                );
+                painted_any = true;
+            }
+            if !painted_any {
+                painter.text(
+                    Pos2::new(origin.x, y),
+                    egui::Align2::LEFT_TOP,
+                    line.text,
+                    font_id.clone(),
+                    EDITOR_FG,
+                );
+            }
         }
+
         if caret_visible && line.cursor_on_line {
             // Thin vertical-bar caret (line cursor), not a block —
             // the user asked for a familiar text-editor caret. The
