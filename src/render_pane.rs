@@ -60,6 +60,92 @@ pub fn paint_alt_screen_border(painter: &egui::Painter, grid_rect: egui::Rect) {
     );
 }
 
+/// One word / line / document move within the editor, abstracted
+/// away from the platform-specific key binding that triggered it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorMotion {
+    WordLeft,
+    WordRight,
+    LineStart,
+    LineEnd,
+    DocStart,
+    DocEnd,
+}
+
+impl EditorMotion {
+    /// Apply this motion to `editor`, extending the selection when
+    /// `extending` is `true` (Shift was held).
+    fn apply(self, editor: &mut crate::prompt_editor::PromptEditor, extending: bool) {
+        match (self, extending) {
+            (EditorMotion::WordLeft, false) => editor.move_word_left(),
+            (EditorMotion::WordLeft, true) => editor.move_word_left_extending(),
+            (EditorMotion::WordRight, false) => editor.move_word_right(),
+            (EditorMotion::WordRight, true) => editor.move_word_right_extending(),
+            (EditorMotion::LineStart, false) => editor.move_home(),
+            (EditorMotion::LineStart, true) => editor.move_home_extending(),
+            (EditorMotion::LineEnd, false) => editor.move_end(),
+            (EditorMotion::LineEnd, true) => editor.move_end_extending(),
+            (EditorMotion::DocStart, false) => editor.move_doc_start(),
+            (EditorMotion::DocStart, true) => editor.move_doc_start_extending(),
+            (EditorMotion::DocEnd, false) => editor.move_doc_end(),
+            (EditorMotion::DocEnd, true) => editor.move_doc_end_extending(),
+        }
+    }
+}
+
+/// Translate a `(Key, Modifiers)` pair into an [`EditorMotion`] +
+/// "extending" flag, honouring platform conventions:
+///
+/// - **macOS**: Option+arrow = word, Cmd+Left/Right = line, Cmd+Up/Down = doc.
+/// - **Linux / Windows**: Ctrl+arrow = word, Ctrl+Home/End = doc.
+///   Line-scope moves use the bare `Home` / `End` keys (already
+///   handled by the editor's plain `move_home` / `move_end` path).
+///
+/// Bare `Shift` toggles "extending"; the result combines with the
+/// motion. Returns `None` for any key/modifier combo that isn't a
+/// boundary move.
+fn classify_editor_motion(
+    key: egui::Key,
+    modifiers: egui::Modifiers,
+    is_macos: bool,
+) -> Option<(EditorMotion, bool)> {
+    use egui::Key;
+    let extending = modifiers.shift;
+    if is_macos {
+        // macOS: Option (alt) without Cmd → word. Cmd (command)
+        // without Option → line / doc.
+        if modifiers.alt && !modifiers.command {
+            return match key {
+                Key::ArrowLeft => Some((EditorMotion::WordLeft, extending)),
+                Key::ArrowRight => Some((EditorMotion::WordRight, extending)),
+                _ => None,
+            };
+        }
+        if modifiers.command && !modifiers.alt {
+            return match key {
+                Key::ArrowLeft => Some((EditorMotion::LineStart, extending)),
+                Key::ArrowRight => Some((EditorMotion::LineEnd, extending)),
+                Key::ArrowUp => Some((EditorMotion::DocStart, extending)),
+                Key::ArrowDown => Some((EditorMotion::DocEnd, extending)),
+                _ => None,
+            };
+        }
+    } else {
+        // Linux / Windows: Ctrl drives both. Distinguish by key:
+        // arrows = word, Home / End = doc.
+        if modifiers.ctrl && !modifiers.alt {
+            return match key {
+                Key::ArrowLeft => Some((EditorMotion::WordLeft, extending)),
+                Key::ArrowRight => Some((EditorMotion::WordRight, extending)),
+                Key::Home => Some((EditorMotion::DocStart, extending)),
+                Key::End => Some((EditorMotion::DocEnd, extending)),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
 /// Route one egui event to the pane's [`PromptEditor`](crate::prompt_editor).
 /// Returns `true` when the editor consumed the event (so the caller
 /// skips the PTY encoder path); `false` lets the caller try other
@@ -97,10 +183,19 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
                 }
                 return true;
             }
-            // Alt + Cmd combos (other than select-all) bypass the
-            // editor — they belong to app-level shortcuts. Plain
-            // Cmd combos (Cmd+C/X) are handled in render_pane
-            // proper because they need `ctx` for clipboard access.
+            // Word / line / doc boundary moves. Bindings differ by
+            // OS — `classify_editor_motion` encodes both conventions.
+            if let Some((motion, extending)) =
+                classify_editor_motion(*key, *modifiers, cfg!(target_os = "macos"))
+                && let Some(editor) = slot.session.editor_mut()
+            {
+                motion.apply(editor, extending);
+                return true;
+            }
+            // Alt + Cmd combos (other than the moves above) bypass
+            // the editor — they belong to app-level shortcuts. Plain
+            // Cmd combos (Cmd+C/X) are handled in render_pane proper
+            // because they need `ctx` for clipboard access.
             if modifiers.command || modifiers.alt {
                 return false;
             }
@@ -551,11 +646,19 @@ pub fn render_pane(
         rendered.response.request_focus();
 
         if click_in_editor && let Some(rect) = editor_rect {
-            // Editor click: hit-test → move cursor, clear selection.
-            // Multi-click word/line selection in the editor is a
-            // 4F-style follow-up (it needs the same shared
-            // PaneCursor model that cross-block selection will use);
-            // for this round, single-click only.
+            // Editor click. Single → place cursor; double → select
+            // word; triple → select line. Same multi-click counter
+            // the alacritty path uses.
+            let dt = now - slot.ui.last_press_time;
+            let dist = (pos - slot.ui.last_press_pos).length();
+            if dt < MULTI_CLICK_WINDOW_SECS && dist < MULTI_CLICK_DISTANCE_PX {
+                slot.ui.click_count = (slot.ui.click_count + 1).min(3);
+            } else {
+                slot.ui.click_count = 1;
+            }
+            slot.ui.last_press_time = now;
+            slot.ui.last_press_pos = pos;
+
             let editor_text = slot
                 .session
                 .blocks()
@@ -564,7 +667,11 @@ pub fn render_pane(
                 .unwrap_or_default();
             let byte = editor_byte_for_pos(rect, pos, &editor_text, cell_w, row_h);
             if let Some(editor) = slot.session.editor_mut() {
-                editor.set_cursor(byte);
+                match slot.ui.click_count {
+                    1 => editor.set_cursor(byte),
+                    2 => editor.select_word_at(byte),
+                    _ => editor.select_line_at(byte),
+                }
             }
         } else {
             let press_pt = to_point(pos);
@@ -789,6 +896,105 @@ pub fn render_pane(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- classify_editor_motion (per-OS keybindings) -----------------
+
+    fn mods(ctrl: bool, alt: bool, shift: bool, command: bool) -> egui::Modifiers {
+        egui::Modifiers { ctrl, alt, shift, command, mac_cmd: false }
+    }
+
+    #[test]
+    fn classify_macos_option_arrow_is_word_move() {
+        let m = mods(false, true, false, false);
+        assert_eq!(
+            classify_editor_motion(egui::Key::ArrowLeft, m, true),
+            Some((EditorMotion::WordLeft, false))
+        );
+        assert_eq!(
+            classify_editor_motion(egui::Key::ArrowRight, m, true),
+            Some((EditorMotion::WordRight, false))
+        );
+    }
+
+    #[test]
+    fn classify_macos_cmd_arrow_is_line_or_doc_move() {
+        let m = mods(false, false, false, true);
+        assert_eq!(
+            classify_editor_motion(egui::Key::ArrowLeft, m, true),
+            Some((EditorMotion::LineStart, false))
+        );
+        assert_eq!(
+            classify_editor_motion(egui::Key::ArrowRight, m, true),
+            Some((EditorMotion::LineEnd, false))
+        );
+        assert_eq!(
+            classify_editor_motion(egui::Key::ArrowUp, m, true),
+            Some((EditorMotion::DocStart, false))
+        );
+        assert_eq!(
+            classify_editor_motion(egui::Key::ArrowDown, m, true),
+            Some((EditorMotion::DocEnd, false))
+        );
+    }
+
+    #[test]
+    fn classify_macos_shift_toggles_extending() {
+        let m = mods(false, true, true, false); // Option+Shift
+        assert_eq!(
+            classify_editor_motion(egui::Key::ArrowLeft, m, true),
+            Some((EditorMotion::WordLeft, true))
+        );
+    }
+
+    #[test]
+    fn classify_linux_ctrl_arrow_is_word_move() {
+        let m = mods(true, false, false, false);
+        assert_eq!(
+            classify_editor_motion(egui::Key::ArrowLeft, m, false),
+            Some((EditorMotion::WordLeft, false))
+        );
+        assert_eq!(
+            classify_editor_motion(egui::Key::ArrowRight, m, false),
+            Some((EditorMotion::WordRight, false))
+        );
+    }
+
+    #[test]
+    fn classify_linux_ctrl_home_end_is_doc_move() {
+        let m = mods(true, false, false, false);
+        assert_eq!(
+            classify_editor_motion(egui::Key::Home, m, false),
+            Some((EditorMotion::DocStart, false))
+        );
+        assert_eq!(
+            classify_editor_motion(egui::Key::End, m, false),
+            Some((EditorMotion::DocEnd, false))
+        );
+    }
+
+    #[test]
+    fn classify_linux_ctrl_shift_extends() {
+        let m = mods(true, false, true, false);
+        assert_eq!(
+            classify_editor_motion(egui::Key::ArrowRight, m, false),
+            Some((EditorMotion::WordRight, true))
+        );
+    }
+
+    #[test]
+    fn classify_bare_arrow_returns_none() {
+        let m = mods(false, false, false, false);
+        assert_eq!(classify_editor_motion(egui::Key::ArrowLeft, m, true), None);
+        assert_eq!(classify_editor_motion(egui::Key::ArrowLeft, m, false), None);
+    }
+
+    #[test]
+    fn classify_macos_option_and_cmd_together_returns_none() {
+        // Option+Cmd+arrow is reserved for OS-level / app-level
+        // shortcuts on macOS; editor shouldn't claim it.
+        let m = mods(false, true, false, true);
+        assert_eq!(classify_editor_motion(egui::Key::ArrowLeft, m, true), None);
+    }
 
     #[test]
     fn cells_from_pixels_floors_dimensions() {
