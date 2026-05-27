@@ -354,29 +354,31 @@ pub fn render_pane(
             });
             let highlighted_link = if modifier_held { hover_link.as_ref() } else { None };
 
+            // Hide the live `Term`'s cursor when the editor is
+            // active — otherwise the user sees TWO cursors (the
+            // shell's one and the editor's overlay). The editor's
+            // cursor is the real input caret in this mode.
+            let hide_term_cursor = slot.session.editor_is_active();
             let rendered = render::paint_terminal(
                 ui,
                 slot.session.terminal(),
                 selection.as_ref(),
                 highlighted_link,
+                hide_term_cursor,
             );
 
-            // ---- Prompt-block editor overlay (Phase 4C layout fix) ----
+            // ---- Prompt-block editor overlay (Phase 4C polish) -------
             //
             // The editor is conceptually part of the `Prompt` block.
-            // Phase 4B painted it below the live `Term` as a flow
-            // item; that pushed it off-screen because the live
-            // `Term` always allocates its full `screen_lines × cols`
-            // rect. Fix: overlay the editor on top of the live
-            // `Term`'s painted area, starting at the row immediately
-            // below the shell's cursor row. The rows below the
-            // cursor are alacritty-uninitialised blanks (the shell
-            // hasn't written there yet), so painting the editor on
-            // top doesn't hide any meaningful content. The result is
-            // the editor visually continues the shell's prompt line.
-            //
-            // 4D's fixed-footer layout will replace this overlay with
-            // a proper viewport-bottom anchor.
+            // Overlay it on top of the live `Term`'s painted area
+            // starting AT the cursor row — the integration script
+            // clears `PS1` so the shell prints nothing where the
+            // prompt would have been, leaving the cursor row empty
+            // for the editor to occupy. The shell's own cursor is
+            // suppressed by `hide_term_cursor` above so only the
+            // editor's caret reads as active. 4D's fixed-footer
+            // layout will replace this overlay with a proper
+            // viewport-bottom anchor.
             if slot.session.editor_is_active()
                 && let Some(editor) = slot.session.blocks().editor_on_tail()
             {
@@ -385,7 +387,7 @@ pub fn render_pane(
                     slot.session.terminal().cursor_position().map(|(row, _col)| row).unwrap_or(0);
                 let origin = egui::Pos2::new(
                     rendered.response.rect.min.x,
-                    rendered.response.rect.min.y + (cursor_row + 1) as f32 * row_h,
+                    rendered.response.rect.min.y + cursor_row as f32 * row_h,
                 );
                 let painter = ui.painter_at(rendered.response.rect);
                 render::paint_prompt_editor_at(&painter, editor, origin, cell_w, row_h, &font_id);

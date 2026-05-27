@@ -93,6 +93,15 @@ end
 
 set -e __termica_user_config_dir
 
+# TODO: Phase 4C polish. Equivalent to the zsh/bash treatment —
+# clear `fish_prompt` / `fish_right_prompt` and disable fish's
+# built-in line editor so Termica's `PromptEditor` is the only line
+# editor active and our `EchoSuppressor` works against the kernel
+# echo. fish's edit model is more idiomatic than bash readline /
+# zsh ZLE so this needs a small design pass. Until then, fish panes
+# work but display zsh-style duplicated echo from fish's own line
+# editor.
+
 # Determine integration protocol version (env-provided, default 1).
 set -l __termica_version $TERMICA_INTEGRATION_VERSION
 test -z "$__termica_version"; and set __termica_version 1

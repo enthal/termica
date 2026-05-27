@@ -65,6 +65,24 @@ pub const SELECTION_COLOR: Color32 = Color32::from_rgba_premultiplied(0x3a, 0x60
 /// readable. Phase 10 will make this themable.
 pub const LINK_UNDERLINE_COLOR: Color32 = Color32::from_rgb(0x7c, 0xa9, 0xff);
 
+/// Foreground for user-entered text inside the [`PromptEditor`].
+/// Visually distinct from `DEFAULT_FG` (which paints shell output)
+/// so a screenshot makes immediately clear which characters the user
+/// typed vs. which the shell wrote back. A bright teal — the same
+/// hue family as `ALT_SCREEN_BORDER_COLOR` so the "Termica owns
+/// this region" cue is consistent. 4G's prompt chrome will likely
+/// retune all of these together; the precise value is intentionally
+/// not sacred.
+pub const EDITOR_FG: Color32 = Color32::from_rgb(0x6e, 0xd0, 0xe8);
+
+/// Cursor block colour inside the editor. Saturated teal at higher
+/// alpha than the live-grid `CURSOR_COLOR` so the user's input
+/// caret reads as the *active* cursor whenever the editor is on
+/// screen. (The live grid's cursor is suppressed by
+/// `paint_terminal`'s `hide_cursor` flag in editor mode, so there
+/// can never be two cursors painted at once.)
+pub const EDITOR_CURSOR_COLOR: Color32 = Color32::from_rgba_premultiplied(0x4a, 0xa8, 0xc0, 0xa0);
+
 /// Result of one paint pass over the terminal grid.
 ///
 /// The caller (the eframe app) uses this to do hit-testing for the
@@ -99,6 +117,7 @@ pub fn paint_terminal(
     term: &TerminalState,
     selection: Option<&Selection>,
     hover_link: Option<&LinkSpan>,
+    hide_cursor: bool,
 ) -> TerminalRender {
     let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
     // `glyph_width` / `row_height` mutate the font cache as they go,
@@ -220,7 +239,8 @@ pub fn paint_terminal(
     // will move ownership of cursor visibility to the prompt-editor
     // when we're at a trusted shell prompt; until then the renderer
     // simply mirrors what the terminal mode flags say.
-    if term.is_cursor_visible()
+    if !hide_cursor
+        && term.is_cursor_visible()
         && let Some((row, col)) = term.cursor_position()
     {
         let x = rect.min.x + col as f32 * cell_w;
@@ -348,13 +368,13 @@ pub fn paint_prompt_editor_at(
                 egui::Align2::LEFT_TOP,
                 line.text,
                 font_id.clone(),
-                DEFAULT_FG,
+                EDITOR_FG,
             );
         }
         if line.cursor_on_line {
             let cursor_x = origin.x + line.cursor_col_chars as f32 * cell_w;
             let cursor_rect = Rect::from_min_size(Pos2::new(cursor_x, y), Vec2::new(cell_w, row_h));
-            painter.rect_filled(cursor_rect, 0.0, CURSOR_COLOR);
+            painter.rect_filled(cursor_rect, 0.0, EDITOR_CURSOR_COLOR);
         }
     }
 }

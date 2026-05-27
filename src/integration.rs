@@ -191,10 +191,22 @@ fn managed_spawn_for_inner(
             // --rcfile is documented to do); the wrapper itself
             // sources the user's real `~/.bashrc` from inside, so the
             // user's config still runs in the right order.
+            //
+            // `--noediting` disables readline. Per spec/04, Termica's
+            // `PromptEditor` (Phase 4B) is the line editor; readline
+            // would race with it for the tty (readline puts the tty
+            // in raw mode and redraws the command line with escape
+            // sequences that defeat our prefix-match echo
+            // suppression). Without readline, bash reads canonical-
+            // mode lines from the kernel; the kernel's deterministic
+            // ECHO is what our `EchoSuppressor` is designed for. The
+            // wrapper bootstrap also clears `PS1` so bash never
+            // prints a competing prompt.
             Ok(ManagedSpawn {
                 argv: vec![
                     "bash".into(),
                     "--noprofile".into(),
+                    "--noediting".into(),
                     "--rcfile".into(),
                     wrapper_str,
                     "-i".into(),

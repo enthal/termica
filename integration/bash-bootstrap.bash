@@ -127,5 +127,16 @@ fi
 # Reassert hooks after user config has had its chance.
 termica_ensure_hooks
 
+# Hand the prompt-drawing role to Termica. Per spec/04 ("The
+# integration script intentionally minimises PS1"). bash is already
+# launched with `--noediting` (see src/integration.rs) so readline
+# is off and the tty stays in canonical mode — kernel ECHO does the
+# echoing, Termica's `EchoSuppressor` filters the kernel echo, and
+# Termica's `PromptEditor` (Phase 4B) is the only line editor on
+# screen. PS2 is the continuation prompt; clearing it keeps
+# multi-line submits visually clean once 4D wires multiline expand.
+PS1=''
+PS2=''
+
 # Emit the gate-opening lifecycle message.
 termica_emit_raw "integration_ready" "{\"shell\":\"bash\",\"version\":${TERMICA_INTEGRATION_VERSION:-1}}"
