@@ -75,12 +75,14 @@ pub const LINK_UNDERLINE_COLOR: Color32 = Color32::from_rgb(0x7c, 0xa9, 0xff);
 /// not sacred.
 pub const EDITOR_FG: Color32 = Color32::from_rgb(0x6e, 0xd0, 0xe8);
 
-/// Cursor block colour inside the editor. Saturated teal at higher
-/// alpha than the live-grid `CURSOR_COLOR` so the user's input
-/// caret reads as the *active* cursor whenever the editor is on
-/// screen. (The live grid's cursor is suppressed by
+/// Caret colour inside the editor. The editor draws a thin
+/// vertical-bar caret (not a block) that blinks at ~1.6 Hz; this is
+/// the colour for the "visible" half of the blink cycle. Saturated
+/// teal at higher alpha than the live-grid `CURSOR_COLOR` so the
+/// user's input caret reads as the *active* cursor whenever the
+/// editor is on screen. The live grid's cursor is suppressed by
 /// `paint_terminal`'s `hide_cursor` flag in editor mode, so there
-/// can never be two cursors painted at once.)
+/// can never be two cursors painted at once.
 pub const EDITOR_CURSOR_COLOR: Color32 = Color32::from_rgba_premultiplied(0x4a, 0xa8, 0xc0, 0xa0);
 
 /// Result of one paint pass over the terminal grid.
@@ -341,7 +343,10 @@ pub fn paint_prompt_editor(ui: &mut egui::Ui, editor: &PromptEditor) -> Response
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, DEFAULT_BG);
-    paint_prompt_editor_at(&painter, editor, rect.min, cell_w, row_h, &font_id);
+    // Snapshot tests always paint the cursor — they pin the rendered
+    // state of the editor including its caret. The blink phase only
+    // applies to the live render path.
+    paint_prompt_editor_at(&painter, editor, rect.min, cell_w, row_h, &font_id, true);
     response
 }
 
@@ -352,6 +357,11 @@ pub fn paint_prompt_editor(ui: &mut egui::Ui, editor: &PromptEditor) -> Response
 /// `(term_rect.min.x, term_rect.min.y + (cursor_row + 1) * row_h)`
 /// so the editor's first line sits immediately below the row holding
 /// the shell's prompt + cursor.
+/// Width of the editor's blinking line caret, in egui logical
+/// pixels. Two pixels reads as a thin bar without being invisible
+/// at low DPI.
+const EDITOR_CARET_WIDTH: f32 = 2.0;
+
 pub fn paint_prompt_editor_at(
     painter: &egui::Painter,
     editor: &PromptEditor,
@@ -359,6 +369,7 @@ pub fn paint_prompt_editor_at(
     cell_w: f32,
     row_h: f32,
     font_id: &FontId,
+    caret_visible: bool,
 ) {
     for (row_idx, line) in editor.lines_with_cursor().iter().enumerate() {
         let y = origin.y + row_idx as f32 * row_h;
@@ -371,9 +382,14 @@ pub fn paint_prompt_editor_at(
                 EDITOR_FG,
             );
         }
-        if line.cursor_on_line {
+        if caret_visible && line.cursor_on_line {
+            // Thin vertical-bar caret (line cursor), not a block —
+            // the user asked for a familiar text-editor caret. The
+            // live render path drives `caret_visible` on a wall-
+            // clock blink cycle; snapshot tests pass `true`.
             let cursor_x = origin.x + line.cursor_col_chars as f32 * cell_w;
-            let cursor_rect = Rect::from_min_size(Pos2::new(cursor_x, y), Vec2::new(cell_w, row_h));
+            let cursor_rect =
+                Rect::from_min_size(Pos2::new(cursor_x, y), Vec2::new(EDITOR_CARET_WIDTH, row_h));
             painter.rect_filled(cursor_rect, 0.0, EDITOR_CURSOR_COLOR);
         }
     }

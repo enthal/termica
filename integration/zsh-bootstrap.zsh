@@ -151,6 +151,15 @@ PS2=''
 RPROMPT=''
 unsetopt zle 2>/dev/null || true
 
+# zsh's `prompt_sp` (default on) detects when a command's output ends
+# without a trailing newline and prints a reverse-color `%` followed
+# by enough spaces to push the cursor to column 0. Useful in a normal
+# terminal; visual noise inside a Termica sealed block (the `%` shows
+# up as `hi%` after `echo -n hi`). `prompt_cr` is the sibling that
+# emits a `\r` before each prompt. With our empty PS1 neither does
+# anything useful — and `prompt_sp`'s output corrupts our snapshot.
+unsetopt prompt_sp prompt_cr 2>/dev/null || true
+
 # 6. Emit the gate-opening lifecycle message. Termica observes this
 #    and transitions the pane out of Bootstrapping.
 termica_emit_raw "integration_ready" "{\"shell\":\"zsh\",\"version\":${TERMICA_INTEGRATION_VERSION:-1}}"

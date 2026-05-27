@@ -390,6 +390,14 @@ impl TerminalState {
             }
             out.push(StyledLine { cells });
         }
+        // Trim trailing fully-blank rows. After `command\r\n` the
+        // shell's cursor sits on the row below, which is blank and
+        // belongs to the next block — not this command's output.
+        // Without this trim, every sealed block carries an extra
+        // empty row at the bottom.
+        while out.last().is_some_and(|l| l.cells.iter().all(|c| c.c == ' ')) {
+            out.pop();
+        }
         out
     }
 
@@ -603,6 +611,19 @@ mod tests {
             snap.iter().map(|l| l.text_chars().collect::<String>()).collect::<Vec<_>>().join("\n");
         assert!(joined.contains("alpha"), "missing first row: {joined:?}");
         assert!(joined.contains("beta"), "missing second row: {joined:?}");
+    }
+
+    #[test]
+    fn snapshot_lines_all_trims_trailing_blank_row_after_command_newline() {
+        // After `printf "hi\r\n"` the cursor sits on row 1, col 0 —
+        // a blank row that should NOT appear in the sealed snapshot.
+        let mut state = TerminalState::new(5, 20);
+        state.feed(b"hi\r\n");
+        let snap = state.snapshot_lines_all();
+        assert_eq!(snap.len(), 1, "trailing blank row should be trimmed: got {} rows", snap.len());
+        let joined: String =
+            snap.iter().map(|l| l.text_chars().collect::<String>()).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("hi"));
     }
 
     #[test]
