@@ -147,7 +147,21 @@ termica_ensure_hooks
 #    Bash / fish equivalents (TODO in their respective bootstraps)
 #    will follow the same pattern.
 PS1=''
-PS2=''
+# PS2 is zsh's continuation prompt — emitted every time the parser
+# sees an incomplete command (e.g. `echo 1 &&` with no right-hand
+# side, an unterminated quote, an open `{`). We piggyback on it as
+# a "shell is waiting for more input" signal: Termica catches the
+# DCS-JSON `continuation` marker and re-promotes the pane back to
+# `ShellPromptEditor`, restoring the submitted text + `\n` into the
+# editor so the user can keep editing the multi-line command.
+#
+# `%{...%}` wraps non-printing sequences so zsh's prompt-width math
+# stays correct. We build the literal byte sequence once via
+# `printf` (which deterministically interprets the `\033` and `\\`
+# escapes) and bake it into PS2; using inline `$'...'` quoting was
+# fragile under string concatenation (the second `'...'` chunk
+# wasn't ANSI-C quoted, so the escapes there came through literal).
+PS2=$(printf '%%{\033PTermica;{"type":"continuation","session":"%s","value":""}\033\\%%}' "${TERMICA_SESSION_ID:-}")
 RPROMPT=''
 unsetopt zle 2>/dev/null || true
 

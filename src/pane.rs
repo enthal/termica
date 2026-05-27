@@ -118,6 +118,16 @@ pub struct PaneSession {
     /// `TERMICA_DUMP_EVENTS=<path>` was set at startup. All panes
     /// in the same Termica process write to the same file.
     recorder: Option<Arc<EventRecorder>>,
+    /// Text of the most recently submitted editor command, stashed
+    /// at submit time and consumed at most once when the shell emits
+    /// a [`LifecycleEvent::Continuation`] (its parser saw an
+    /// incomplete command and wants more input). When that happens
+    /// we re-promote the pane to `ShellPromptEditor` and restore
+    /// this text into the editor with a trailing `\n` so the user
+    /// can keep typing the rest of the multi-line command. Cleared
+    /// on the next normal `Preexec` (command completed without a
+    /// continuation) — see [`Self::drain`].
+    last_submitted: Option<String>,
 }
 
 impl PaneSession {
@@ -180,6 +190,7 @@ impl PaneSession {
             wrapper_dir: None,
             pane_id,
             recorder,
+            last_submitted: None,
         })
     }
 
@@ -295,6 +306,34 @@ impl PaneSession {
         for event in self.terminal.drain_lifecycle_events() {
             if let Some(rec) = self.recorder.as_ref() {
                 rec.record_lifecycle(self.pane_id, &event);
+            }
+            // Multi-line continuation: if the shell's parser saw an
+            // incomplete command after submit and emitted `PS2` (as
+            // our DCS marker), restore the previously-submitted text
+            // into the editor with a trailing `\n` so the user can
+            // keep typing the next line. The controller will flip
+            // mode back to `ShellPromptEditor` for us in
+            // `observe_event` below. Order matters: restore first,
+            // then transition — the editor must be populated before
+            // any frame sees `editor_is_active()` go true.
+            //
+            // We DON'T clear `last_submitted` here, because a single
+            // multi-line command may yield several `Continuation`
+            // events as the user keeps adding more lines that are
+            // also incomplete. Cleared on `Preexec` (full command
+            // about to run) instead.
+            if matches!(event, crate::markers::LifecycleEvent::Continuation)
+                && let Some(text) = self.last_submitted.as_ref()
+                && let Some(editor) = self.blocks.editor_on_tail_mut()
+            {
+                editor.clear();
+                editor.insert_str(text);
+                editor.insert_newline();
+            }
+            // `Preexec` = the shell actually started executing the
+            // command, so any pending continuation state is moot.
+            if matches!(event, crate::markers::LifecycleEvent::Preexec { .. }) {
+                self.last_submitted = None;
             }
             self.blocks.observe_lifecycle_event(&event, &mut self.terminal, self.frame);
             self.controller.observe_event(event, self.frame);
@@ -471,7 +510,34 @@ impl PaneSession {
         }
 
         // 3 & 4. Build the byte sequence, prime suppression, write.
-        let mut bytes = text.into_bytes();
+        // Two cases:
+        //
+        // - First submit (no prior `last_submitted`): write the full
+        //   editor text + `\r`. Standard.
+        //
+        // - Submit after a `Continuation`: `last_submitted` holds the
+        //   text the shell already received (via earlier submit) and
+        //   the editor was re-populated with that text + `\n` so the
+        //   user could keep editing. Now the editor's text is
+        //   `<prev_sent>\n<new_lines>`. The shell ALREADY has
+        //   `<prev_sent>\n` buffered (it received that on the prior
+        //   submit and is waiting for more); we only need to send
+        //   `<new_lines>\r` — sending the whole thing would feed
+        //   `<prev_sent>` to the shell TWICE.
+        let to_send: String = match self.last_submitted.as_deref() {
+            Some(prev) if text.starts_with(prev) => {
+                // Strip the already-sent prefix + the separator \n
+                // the restore-on-continuation logic inserted.
+                let after = &text[prev.len()..];
+                after.strip_prefix('\n').unwrap_or(after).to_string()
+            }
+            _ => text.clone(),
+        };
+        // Track the full editor text (not `to_send`) so the next
+        // Continuation restore can put the right cumulative text
+        // back into the editor.
+        self.last_submitted = Some(text);
+        let mut bytes = to_send.into_bytes();
         bytes.push(b'\r');
         self.terminal.prime_echo_suppression(&bytes);
         self.pty.write(&bytes)?;
@@ -850,6 +916,116 @@ mod tests {
             "expected exactly one 'hello' in grid; got {} occurrences:\n{}",
             count, view.screen_text
         );
+    }
+
+    #[test]
+    fn continuation_event_restores_editor_text_with_newline() {
+        // Drive the full continuation flow: get to ShellPromptEditor,
+        // submit `echo 1 &&` (which the SHELL would parse as
+        // incomplete), then synthesise a `continuation` DCS event
+        // arriving from the PTY. The pane's drain must:
+        //   1. Re-populate the editor with `echo 1 &&\n`.
+        //   2. Flip mode back to `ShellPromptEditor`.
+        let printf_continuation = "printf '\\033PTermica;{\"type\":\"continuation\",\
+                                    \"session\":\"t\",\"value\":\"\"}\\033\\\\'";
+        // The integration markers, then sleep (so the test process
+        // is alive), then on stdin we'll later submit + drive the
+        // continuation marker via a separate write.
+        let cmd = format!("{}; {}; sleep 5", dcs_promote_to_editor_cmd(), printf_continuation);
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c(&cmd), "t".into(), 0, None).expect("spawn");
+
+        // Wait for the integration/precmd markers AND the
+        // continuation marker (the printf above) — all delivered as
+        // PTY output before sleep blocks.
+        //
+        // After both, the controller should:
+        //   - Be in ShellPromptEditor (precmd) initially.
+        //   - Stay or return to ShellPromptEditor after continuation.
+        let stop = Instant::now() + Duration::from_secs(3);
+        loop {
+            session.drain();
+            // Once we've received the continuation, mode is editor
+            // and the controller's last transition reason is
+            // ContinuationMarker — but we only assert that after we
+            // do a manual submit. Here, just wait for the printfs
+            // to land in the byte stream.
+            if session.view().bytes_received >= 100 || Instant::now() >= stop {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Now type into the editor and submit, then artificially
+        // inject another continuation via the shell's stdin (we
+        // can't easily get zsh to emit PS2 in this test harness
+        // because zsh isn't actually our spawned process — we
+        // spawned `/bin/sh -c`. So we test the wiring end-to-end
+        // by injecting the DCS bytes through the PTY directly).
+        //
+        // Make the editor active and put a fake "submitted" state:
+        assert!(session.editor_is_active(), "editor should be active after precmd");
+        session.editor_mut().unwrap().insert_str("echo 1 &&");
+        session.submit_editor_command().expect("submit");
+        assert_eq!(session.controller.mode(), PaneMode::RawTerminal);
+        assert!(session.last_submitted.as_deref() == Some("echo 1 &&"));
+
+        // Inject a continuation DCS marker by feeding bytes
+        // straight into the terminal parser. (Writing to the PTY
+        // master sends bytes to the shell's stdin; in canonical
+        // mode the kernel only echoes complete lines, and our
+        // continuation marker has no trailing `\n` — so the echo
+        // wouldn't surface back through the master read end for
+        // drain to see. Direct feed exercises the same code path
+        // that real shell-emitted continuation bytes would hit.)
+        let cont_bytes =
+            b"\x1bPTermica;{\"type\":\"continuation\",\"session\":\"t\",\"value\":\"\"}\x1b\\";
+        session.terminal_mut().feed(cont_bytes);
+        let stop = Instant::now() + Duration::from_secs(3);
+        loop {
+            session.drain();
+            if session.controller.last_transition().reason
+                == crate::shell::TransitionReason::ContinuationMarker
+            {
+                break;
+            }
+            if Instant::now() >= stop {
+                panic!(
+                    "ContinuationMarker transition never recorded; mode={:?}, last_transition={:?}",
+                    session.controller.mode(),
+                    session.controller.last_transition(),
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Editor is now back, populated with the submitted text + \n.
+        assert!(session.editor_is_active(), "editor should be active after continuation");
+        let editor = session.blocks.editor_on_tail().expect("editor");
+        assert_eq!(editor.text(), "echo 1 &&\n", "editor should hold submitted text + \\n");
+
+        // ---- Second submit after continuation: only the SUFFIX
+        // beyond `last_submitted` should reach the PTY. We don't
+        // have a clean handle on "what bytes were written" here, so
+        // we verify via the suppressor state: the suppressor is
+        // primed with the bytes we wrote + CRLF expansion. If the
+        // pane re-sent the full editor text, the pending-len would
+        // be much larger.
+        session.editor_mut().unwrap().insert_str("echo 2");
+        assert_eq!(session.blocks.editor_on_tail().unwrap().text(), "echo 1 &&\necho 2");
+        session.submit_editor_command().expect("second submit");
+        // We sent only "echo 2\r" (7 bytes). With \r → \r\n expansion
+        // the suppressor's pending length is 8 (e c h o ' ' 2 \r \n).
+        assert_eq!(
+            session.terminal.echo_suppressor().pending_len(),
+            8,
+            "second submit must send only the suffix beyond last_submitted (was 'echo 2\\r' → \
+             suppressor primed for 8 bytes), not the cumulative editor text"
+        );
+        // And `last_submitted` should now hold the full editor text
+        // so the next continuation restore picks up correctly.
+        assert_eq!(session.last_submitted.as_deref(), Some("echo 1 &&\necho 2"));
+
+        // Bring the shell down quickly.
+        let _ = session.write(b"\x03");
     }
 
     #[test]

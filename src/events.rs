@@ -258,6 +258,9 @@ fn lifecycle_to_json(event: &LifecycleEvent, obj: &mut serde_json::Map<String, s
             obj.insert("event".into(), json!("CommandAborted"));
             obj.insert("reason".into(), json!(reason));
         }
+        LifecycleEvent::Continuation => {
+            obj.insert("event".into(), json!("Continuation"));
+        }
     }
 }
 
