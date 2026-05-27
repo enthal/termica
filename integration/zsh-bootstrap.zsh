@@ -156,12 +156,12 @@ PS1=''
 # editor so the user can keep editing the multi-line command.
 #
 # `%{...%}` wraps non-printing sequences so zsh's prompt-width math
-# stays correct. The DCS body is the same shape as our other
-# integration markers (see `termica_emit_raw` above) but built with
-# inline escape literals because `PS2` is expanded each time it
-# prints — calling a helper would invoke the function then; we want
-# the bytes baked in once at bootstrap time.
-PS2=$'%{\033PTermica;{"type":"continuation","session":"'"${TERMICA_SESSION_ID:-}"'","value":""}\033\\\\%}'
+# stays correct. We build the literal byte sequence once via
+# `printf` (which deterministically interprets the `\033` and `\\`
+# escapes) and bake it into PS2; using inline `$'...'` quoting was
+# fragile under string concatenation (the second `'...'` chunk
+# wasn't ANSI-C quoted, so the escapes there came through literal).
+PS2=$(printf '%%{\033PTermica;{"type":"continuation","session":"%s","value":""}\033\\%%}' "${TERMICA_SESSION_ID:-}")
 RPROMPT=''
 unsetopt zle 2>/dev/null || true
 

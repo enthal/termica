@@ -133,10 +133,16 @@ termica_ensure_hooks
 # is off and the tty stays in canonical mode — kernel ECHO does the
 # echoing, Termica's `EchoSuppressor` filters the kernel echo, and
 # Termica's `PromptEditor` (Phase 4B) is the only line editor on
-# screen. PS2 is the continuation prompt; clearing it keeps
-# multi-line submits visually clean once 4D wires multiline expand.
+# screen.
 PS1=''
-PS2=''
+# PS2 is bash's continuation prompt — emitted when the parser sees
+# an incomplete command. Mirror the zsh-bootstrap treatment: have
+# bash emit a Termica DCS-JSON `continuation` marker so the editor
+# re-promotes with the submitted text restored. `\[...\]` is bash's
+# equivalent of zsh's `%{...%}` — wraps non-printing sequences so
+# prompt-width math doesn't count them. `printf` builds the literal
+# bytes once at bootstrap time and bakes them into PS2.
+PS2=$(printf '\[\033PTermica;{"type":"continuation","session":"%s","value":""}\033\\\]' "${TERMICA_SESSION_ID:-}")
 
 # Emit the gate-opening lifecycle message.
 termica_emit_raw "integration_ready" "{\"shell\":\"bash\",\"version\":${TERMICA_INTEGRATION_VERSION:-1}}"
