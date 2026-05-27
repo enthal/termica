@@ -342,7 +342,7 @@ fn snapshot_paint_sealed_block_echo() {
     let snapshot = sealed_snapshot(3, 40, b"hello\r\n");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(500.0, 100.0)).build_ui(move |ui| {
-            let _ = render::paint_sealed_block(ui, "echo hello", &snapshot, None);
+            let _ = render::paint_sealed_block(ui, "echo hello", &snapshot, None, None, Some(0));
         });
     harness.snapshot("paint_sealed_block_echo");
 }
@@ -354,7 +354,7 @@ fn snapshot_paint_sealed_block_ls_output() {
     let snapshot = sealed_snapshot(6, 40, b"Cargo.toml\r\nREADME.md\r\nsrc\r\ntests\r\n");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(500.0, 160.0)).build_ui(move |ui| {
-            let _ = render::paint_sealed_block(ui, "ls", &snapshot, None);
+            let _ = render::paint_sealed_block(ui, "ls", &snapshot, None, None, Some(0));
         });
     harness.snapshot("paint_sealed_block_ls_output");
 }
@@ -371,6 +371,8 @@ fn snapshot_paint_sealed_block_multiline_command() {
                 "for i in 1 2; do\n  echo $i\ndone",
                 &snapshot,
                 None,
+                None,
+                Some(0),
             );
         });
     harness.snapshot("paint_sealed_block_multiline_command");
@@ -506,6 +508,60 @@ fn snapshot_paint_styled_lines_with_multi_row_selection() {
     harness.snapshot("paint_styled_lines_multi_row_selection");
 }
 
+// ---- block-header chrome (Phase 4G) -------------------------------------
+//
+// `paint_block_header` renders a dim cwd line plus optional red
+// "exit N" annotation for non-zero exits. `paint_sealed_block` now
+// stacks header → command label → snapshot.
+
+#[test]
+fn snapshot_paint_block_header_cwd_only() {
+    let cwd = std::path::PathBuf::from("/Users/tim/git/enthal/termica");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 40.0)).build_ui(move |ui| {
+            let _ = render::paint_block_header(ui, Some(cwd.as_path()), None);
+        });
+    harness.snapshot("paint_block_header_cwd_only");
+}
+
+#[test]
+fn snapshot_paint_block_header_zero_exit_hides_exit_chip() {
+    let cwd = std::path::PathBuf::from("/Users/tim/git/enthal/termica");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 40.0)).build_ui(move |ui| {
+            let _ = render::paint_block_header(ui, Some(cwd.as_path()), Some(0));
+        });
+    harness.snapshot("paint_block_header_zero_exit");
+}
+
+#[test]
+fn snapshot_paint_block_header_nonzero_exit_shows_red_annotation() {
+    let cwd = std::path::PathBuf::from("/Users/tim/git/enthal/termica");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 40.0)).build_ui(move |ui| {
+            let _ = render::paint_block_header(ui, Some(cwd.as_path()), Some(127));
+        });
+    harness.snapshot("paint_block_header_nonzero_exit");
+}
+
+#[test]
+fn snapshot_paint_sealed_block_with_header_and_failed_exit() {
+    let cwd = std::path::PathBuf::from("/Users/tim/git/enthal/termica");
+    let snapshot = sealed_snapshot(3, 40, b"command not found: blarg\r\n");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 140.0)).build_ui(move |ui| {
+            let _ = render::paint_sealed_block(
+                ui,
+                "blarg",
+                &snapshot,
+                None,
+                Some(cwd.as_path()),
+                Some(127),
+            );
+        });
+    harness.snapshot("paint_sealed_block_with_header_and_failed_exit");
+}
+
 #[test]
 fn snapshot_paint_sealed_block_with_selection_inside_output() {
     use termica::block_selection::BlockCursor;
@@ -513,7 +569,7 @@ fn snapshot_paint_sealed_block_with_selection_inside_output() {
     let sel = Some((BlockCursor::new(0, 0), BlockCursor::new(1, 9)));
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(500.0, 140.0)).build_ui(move |ui| {
-            let _ = render::paint_sealed_block(ui, "ls", &snapshot, sel);
+            let _ = render::paint_sealed_block(ui, "ls", &snapshot, sel, None, Some(0));
         });
     harness.snapshot("paint_sealed_block_with_selection");
 }

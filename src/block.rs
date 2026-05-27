@@ -179,11 +179,14 @@ impl BlockStack {
     /// reset the `Term` so the next block starts with a clean slate.
     /// At `Preexec` we just flip the tail variant; no terminal access.
     ///
-    /// Events that don't drive a block transition (e.g. `Precmd`,
-    /// `IntegrationReady`, `PromptVars`, `Cwd`) are ignored here —
-    /// they are the controller's concern, not the stack's. The
-    /// stack tracks the *command-run* lifecycle, which is just
-    /// `Preexec` → `CommandFinished`.
+    /// `Precmd` and `Cwd` events update the **tail block's** header
+    /// cwd (Phase 4G) — only when the tail is a `Prompt`. A `Running`
+    /// block's header is the cwd at command-start and is never
+    /// rewritten mid-execution.
+    ///
+    /// Other lifecycle events (`IntegrationReady`, `PromptVars`,
+    /// `IntegrationError`, `CommandAborted`) are the controller's
+    /// concern, not the stack's; they leave the stack alone.
     pub fn observe_lifecycle_event(
         &mut self,
         event: &LifecycleEvent,
@@ -193,7 +196,25 @@ impl BlockStack {
         match event {
             LifecycleEvent::Preexec { command } => self.start_running(command.clone(), frame),
             LifecycleEvent::CommandFinished { exit } => self.seal_running(*exit, terminal, frame),
+            LifecycleEvent::Precmd { cwd } | LifecycleEvent::Cwd { cwd } => {
+                self.update_tail_cwd(cwd.clone());
+            }
             _ => {}
+        }
+    }
+
+    /// Update the live tail block's `BlockHeader.cwd` when the shell
+    /// reports a new working directory.
+    ///
+    /// Applied to `Prompt` (the next command will run here) and
+    /// **ignored** for `Running` blocks: a running command's cwd is
+    /// the cwd that was current at `Preexec`, even if the program
+    /// re-emits a `Cwd` marker mid-execution. Sealed headers are
+    /// frozen and never updated.
+    fn update_tail_cwd(&mut self, cwd: PathBuf) {
+        let Some(tail) = self.blocks.last_mut() else { return };
+        if let Block::Prompt { header, .. } = tail {
+            header.cwd = Some(cwd);
         }
     }
 
@@ -479,6 +500,114 @@ mod tests {
         assert_eq!(ids, sorted, "ids in iter order are monotonic");
         // Five cycles produced five sealed blocks + one tail Prompt.
         assert_eq!(stack.len(), 6);
+    }
+
+    // ---- Phase 4G header chrome: cwd tracking ------------------------
+
+    #[test]
+    fn precmd_event_populates_prompt_header_cwd() {
+        let mut stack = fresh_stack();
+        let mut term = TerminalState::new(5, 20);
+        // Default header has no cwd.
+        match stack.last().unwrap() {
+            Block::Prompt { header, .. } => assert!(header.cwd.is_none()),
+            _ => panic!("Prompt tail"),
+        }
+        stack.observe_lifecycle_event(
+            &LifecycleEvent::Precmd { cwd: "/Users/tim/code".into() },
+            &mut term,
+            1,
+        );
+        match stack.last().unwrap() {
+            Block::Prompt { header, .. } => {
+                assert_eq!(header.cwd.as_deref(), Some(std::path::Path::new("/Users/tim/code")));
+            }
+            _ => panic!("Prompt tail"),
+        }
+    }
+
+    #[test]
+    fn cwd_event_updates_tail_header_after_cd_during_prompt() {
+        let mut stack = fresh_stack();
+        let mut term = TerminalState::new(5, 20);
+        // User typed `cd /tmp` in a prior block; shell emits Cwd
+        // immediately after to announce the new dir.
+        stack.observe_lifecycle_event(&LifecycleEvent::Cwd { cwd: "/tmp".into() }, &mut term, 1);
+        match stack.last().unwrap() {
+            Block::Prompt { header, .. } => {
+                assert_eq!(header.cwd.as_deref(), Some(std::path::Path::new("/tmp")));
+            }
+            _ => panic!("Prompt tail"),
+        }
+    }
+
+    #[test]
+    fn prompt_cwd_inherits_through_preexec_to_running() {
+        let mut stack = fresh_stack();
+        let mut term = TerminalState::new(5, 20);
+        stack.observe_lifecycle_event(
+            &LifecycleEvent::Precmd { cwd: "/Users/tim".into() },
+            &mut term,
+            1,
+        );
+        stack.observe_lifecycle_event(
+            &LifecycleEvent::Preexec { command: "ls".into() },
+            &mut term,
+            2,
+        );
+        match stack.last().unwrap() {
+            Block::Running { header, .. } => {
+                assert_eq!(header.cwd.as_deref(), Some(std::path::Path::new("/Users/tim")));
+            }
+            _ => panic!("Running tail"),
+        }
+    }
+
+    #[test]
+    fn running_cwd_carries_into_sealed_at_command_finished() {
+        let mut stack = fresh_stack();
+        let mut term = TerminalState::new(5, 20);
+        stack.observe_lifecycle_event(&LifecycleEvent::Precmd { cwd: "/x".into() }, &mut term, 1);
+        stack.observe_lifecycle_event(
+            &LifecycleEvent::Preexec { command: "true".into() },
+            &mut term,
+            2,
+        );
+        stack.observe_lifecycle_event(&LifecycleEvent::CommandFinished { exit: 0 }, &mut term, 3);
+        // Sealed (first), then new Prompt (tail).
+        match stack.iter().next().unwrap() {
+            Block::Sealed { header, .. } => {
+                assert_eq!(header.cwd.as_deref(), Some(std::path::Path::new("/x")));
+            }
+            _ => panic!("first should be Sealed"),
+        }
+    }
+
+    #[test]
+    fn cwd_update_during_running_does_not_mutate_the_running_header() {
+        // While a command is executing it may print bytes that re-
+        // emit a Cwd marker (rare, but possible). The Running header
+        // is the cwd at command-start and shouldn't drift; only the
+        // *next* Prompt should reflect any new cwd.
+        let mut stack = fresh_stack();
+        let mut term = TerminalState::new(5, 20);
+        stack.observe_lifecycle_event(&LifecycleEvent::Precmd { cwd: "/a".into() }, &mut term, 1);
+        stack.observe_lifecycle_event(
+            &LifecycleEvent::Preexec { command: "any".into() },
+            &mut term,
+            2,
+        );
+        stack.observe_lifecycle_event(&LifecycleEvent::Cwd { cwd: "/b".into() }, &mut term, 3);
+        match stack.last().unwrap() {
+            Block::Running { header, .. } => {
+                assert_eq!(
+                    header.cwd.as_deref(),
+                    Some(std::path::Path::new("/a")),
+                    "Running header keeps the cwd that was current at Preexec"
+                );
+            }
+            _ => panic!("Running tail"),
+        }
     }
 
     #[test]

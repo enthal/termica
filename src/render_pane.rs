@@ -466,28 +466,47 @@ pub fn render_pane(
                 // area (empty with `PS1=''`) and the editor overlay
                 // paints on top after `paint_terminal`.
                 //
-                // 4G adds full header chrome (cwd / branch / dirty chips,
-                // duration, exit code) on top of these labels.
+                // Phase 4G renders a dim cwd header line above each
+                // block; sealed blocks add a red "exit N" annotation
+                // for non-zero exits. Git branch / dirty / live
+                // duration chips defer to Phase 5's async-probe surface.
                 for block in slot.session.blocks().iter() {
                     match block {
-                        crate::block::Block::Sealed { id, command, snapshot, .. } => {
+                        crate::block::Block::Sealed {
+                            id, command, snapshot, header, exit, ..
+                        } => {
                             let sel_for_this = block_sel
                                 .filter(|s| s.block_id == *id && !s.is_empty())
                                 .map(|s| s.ordered());
-                            let resp =
-                                render::paint_sealed_block(ui, command, snapshot, sel_for_this);
+                            let resp = render::paint_sealed_block(
+                                ui,
+                                command,
+                                snapshot,
+                                sel_for_this,
+                                header.cwd.as_deref(),
+                                *exit,
+                            );
                             sealed_rects.push((*id, resp.rect));
                             // Thin separator gap — spec/04 §"Visual
                             // structure" calls for "non-text (thin
                             // separator + space)".
                             ui.add_space(4.0);
                         }
-                        crate::block::Block::Running { command, .. } => {
+                        crate::block::Block::Running { command, header, .. } => {
+                            let _ = render::paint_block_header(ui, header.cwd.as_deref(), None);
                             if !command.is_empty() {
                                 let _ = render::paint_command_label(ui, command);
                             }
                         }
-                        crate::block::Block::Prompt { .. } => {}
+                        crate::block::Block::Prompt { header, .. } => {
+                            // The editor itself is overlaid on the
+                            // live `Term` after the loop; we paint
+                            // the cwd chip here as a flow item above
+                            // the live grid so it sits visually right
+                            // above the editor row. 4D's fixed-footer
+                            // model will land a proper chip strip.
+                            let _ = render::paint_block_header(ui, header.cwd.as_deref(), None);
+                        }
                     }
                 }
             } // end of `if !in_alt_screen { ... }`
