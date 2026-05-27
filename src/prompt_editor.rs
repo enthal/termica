@@ -324,6 +324,162 @@ impl PromptEditor {
         self.cursor = line_end;
     }
 
+    /// Move to the start of the previous word boundary. Macros
+    /// macOS's Option+Left convention: skip any non-word chars
+    /// behind the cursor, then skip word chars behind the cursor.
+    /// Lands at the start of the word the cursor was in (or the
+    /// previous word, if the cursor was on whitespace).
+    pub fn move_word_left(&mut self) {
+        self.move_word_left_impl(false);
+    }
+
+    /// Option+Shift+Left: word-left with selection extension.
+    pub fn move_word_left_extending(&mut self) {
+        self.move_word_left_impl(true);
+    }
+
+    fn move_word_left_impl(&mut self, extend: bool) {
+        if extend {
+            self.begin_selection_if_absent();
+        } else {
+            self.selection_anchor = None;
+        }
+        let mut i = self.cursor;
+        // Skip non-word chars going back.
+        while i > 0 {
+            let prev = prev_char_boundary(&self.text, i);
+            let c = self.text[prev..i].chars().next().unwrap();
+            if is_word_char(c) {
+                break;
+            }
+            i = prev;
+        }
+        // Then skip word chars going back.
+        while i > 0 {
+            let prev = prev_char_boundary(&self.text, i);
+            let c = self.text[prev..i].chars().next().unwrap();
+            if !is_word_char(c) {
+                break;
+            }
+            i = prev;
+        }
+        self.cursor = i;
+    }
+
+    /// Move to the end of the next word boundary. macOS Option+Right.
+    pub fn move_word_right(&mut self) {
+        self.move_word_right_impl(false);
+    }
+
+    /// Option+Shift+Right: word-right with selection extension.
+    pub fn move_word_right_extending(&mut self) {
+        self.move_word_right_impl(true);
+    }
+
+    fn move_word_right_impl(&mut self, extend: bool) {
+        if extend {
+            self.begin_selection_if_absent();
+        } else {
+            self.selection_anchor = None;
+        }
+        let mut i = self.cursor;
+        // Skip non-word chars going forward.
+        while i < self.text.len() {
+            let c = self.text[i..].chars().next().unwrap();
+            if is_word_char(c) {
+                break;
+            }
+            i += c.len_utf8();
+        }
+        // Then skip word chars going forward.
+        while i < self.text.len() {
+            let c = self.text[i..].chars().next().unwrap();
+            if !is_word_char(c) {
+                break;
+            }
+            i += c.len_utf8();
+        }
+        self.cursor = i;
+    }
+
+    /// Move to byte 0. macOS Cmd+Up convention.
+    pub fn move_doc_start(&mut self) {
+        self.selection_anchor = None;
+        self.cursor = 0;
+    }
+
+    /// Cmd+Shift+Up: doc-start with selection extension.
+    pub fn move_doc_start_extending(&mut self) {
+        self.begin_selection_if_absent();
+        self.cursor = 0;
+    }
+
+    /// Move to end of buffer. macOS Cmd+Down.
+    pub fn move_doc_end(&mut self) {
+        self.selection_anchor = None;
+        self.cursor = self.text.len();
+    }
+
+    /// Cmd+Shift+Down: doc-end with selection extension.
+    pub fn move_doc_end_extending(&mut self) {
+        self.begin_selection_if_absent();
+        self.cursor = self.text.len();
+    }
+
+    /// Select the word containing or touching `byte_idx`. If the
+    /// position is on whitespace, the result is a degenerate
+    /// (empty) selection at that position — matches the macOS
+    /// double-click-on-space behaviour (no selection, just cursor).
+    /// Double-click handler routes here.
+    pub fn select_word_at(&mut self, byte_idx: usize) {
+        let byte_idx = clamp_to_char_boundary(&self.text, byte_idx);
+        // Find word boundaries either side of byte_idx.
+        // Left bound: walk back while prev char is word.
+        let mut start = byte_idx;
+        while start > 0 {
+            let prev = prev_char_boundary(&self.text, start);
+            let c = self.text[prev..start].chars().next().unwrap();
+            if !is_word_char(c) {
+                break;
+            }
+            start = prev;
+        }
+        // Right bound: walk forward while current char is word.
+        let mut end = byte_idx;
+        while end < self.text.len() {
+            let c = self.text[end..].chars().next().unwrap();
+            if !is_word_char(c) {
+                break;
+            }
+            end += c.len_utf8();
+        }
+        if start == end {
+            // Clicked on whitespace — no word here. Place cursor,
+            // no selection.
+            self.cursor = byte_idx;
+            self.selection_anchor = None;
+        } else {
+            self.selection_anchor = Some(start);
+            self.cursor = end;
+        }
+    }
+
+    /// Select the entire line containing `byte_idx`. Includes any
+    /// trailing `\n` so a triple-click + copy lifts a complete line.
+    /// Triple-click handler routes here.
+    pub fn select_line_at(&mut self, byte_idx: usize) {
+        let byte_idx = clamp_to_char_boundary(&self.text, byte_idx);
+        let start = self.text[..byte_idx].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        // Include the trailing \n if there is one — gives copy/cut
+        // the standard "whole line" semantics.
+        let end = match self.text[byte_idx..].find('\n') {
+            Some(off) => byte_idx + off + 1,
+            None => self.text.len(),
+        };
+        self.selection_anchor = Some(start);
+        self.cursor = end;
+    }
+
     /// Iterate the editor's content split on `\n`, yielding `(line,
     /// is_cursor_on_this_line, cursor_col_in_chars)`. Used by the
     /// renderer; column is a **char count**, not a byte count.
@@ -349,6 +505,14 @@ pub struct EditorLine<'a> {
     pub text: &'a str,
     pub cursor_col_chars: usize,
     pub cursor_on_line: bool,
+}
+
+/// True when `c` should count as part of a "word" for word-boundary
+/// cursor moves and double-click word selection. Alphanumerics +
+/// underscore — matches most text editors' default and avoids the
+/// "what counts as punctuation" tar pit. Configurable later.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 /// Clamp `i` to a char boundary at or below itself. Returns `s.len()`
@@ -817,6 +981,152 @@ mod tests {
         let s = "ab\ncd";
         // Col past line 0 end: lands at end of line 0 (before \n).
         assert_eq!(byte_index_for_row_col(s, 0, 99), 2);
+    }
+
+    // ---- word-boundary moves ---------------------------------------
+
+    #[test]
+    fn move_word_right_skips_then_lands_after_word() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hello world foo");
+        e.set_cursor(0);
+        e.move_word_right();
+        assert_eq!(e.cursor(), 5, "after 'hello'");
+        e.move_word_right();
+        assert_eq!(e.cursor(), 11, "after 'world'");
+        e.move_word_right();
+        assert_eq!(e.cursor(), 15, "after 'foo' (end)");
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn move_word_right_skips_leading_whitespace() {
+        let mut e = PromptEditor::new();
+        e.insert_str("   abc   def");
+        e.set_cursor(0);
+        e.move_word_right();
+        assert_eq!(e.cursor(), 6, "after 'abc' (after skipping leading spaces and 'abc')");
+    }
+
+    #[test]
+    fn move_word_left_lands_at_start_of_word() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hello world foo");
+        e.move_word_left();
+        assert_eq!(e.cursor(), 12, "start of 'foo'");
+        e.move_word_left();
+        assert_eq!(e.cursor(), 6, "start of 'world'");
+        e.move_word_left();
+        assert_eq!(e.cursor(), 0, "start of 'hello'");
+    }
+
+    #[test]
+    fn move_word_extending_builds_a_selection() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hello world");
+        e.set_cursor(0);
+        e.move_word_right_extending();
+        assert_eq!(e.selected_text(), Some("hello"));
+        e.move_word_right_extending();
+        assert_eq!(e.selected_text(), Some("hello world"));
+    }
+
+    #[test]
+    fn move_word_handles_underscores_as_word_chars() {
+        let mut e = PromptEditor::new();
+        e.insert_str("foo_bar baz");
+        e.set_cursor(0);
+        e.move_word_right();
+        assert_eq!(e.cursor(), 7, "underscore stays inside the word");
+    }
+
+    #[test]
+    fn move_word_handles_punctuation_as_separator() {
+        let mut e = PromptEditor::new();
+        e.insert_str("foo.bar baz");
+        e.set_cursor(0);
+        e.move_word_right();
+        assert_eq!(e.cursor(), 3, "dot is non-word; word ends here");
+    }
+
+    #[test]
+    fn move_word_at_buffer_ends_is_clamped() {
+        let mut e = PromptEditor::new();
+        e.insert_str("abc");
+        e.set_cursor(3);
+        e.move_word_right();
+        assert_eq!(e.cursor(), 3, "no-op at end");
+        e.set_cursor(0);
+        e.move_word_left();
+        assert_eq!(e.cursor(), 0, "no-op at start");
+    }
+
+    // ---- doc-boundary moves ----------------------------------------
+
+    #[test]
+    fn move_doc_start_and_end() {
+        let mut e = PromptEditor::new();
+        e.insert_str("line one\nline two\nline three");
+        // Land cursor mid-buffer.
+        e.set_cursor(10);
+        e.move_doc_start();
+        assert_eq!(e.cursor(), 0);
+        e.move_doc_end();
+        assert_eq!(e.cursor(), e.len_bytes());
+    }
+
+    #[test]
+    fn move_doc_extending_builds_selection_from_anchor() {
+        let mut e = PromptEditor::new();
+        e.insert_str("abcdef");
+        e.set_cursor(3);
+        e.move_doc_start_extending();
+        assert_eq!(e.selected_text(), Some("abc"));
+        e.move_doc_end_extending();
+        assert_eq!(e.selected_text(), Some("def"), "anchor stays at 3; head moved to end");
+    }
+
+    // ---- click-selection helpers -----------------------------------
+
+    #[test]
+    fn select_word_at_grabs_surrounding_word() {
+        let mut e = PromptEditor::new();
+        e.insert_str("the quick brown fox");
+        e.select_word_at(6); // position within "quick"
+        assert_eq!(e.selected_text(), Some("quick"));
+    }
+
+    #[test]
+    fn select_word_at_boundary_grabs_word_to_the_right() {
+        let mut e = PromptEditor::new();
+        e.insert_str("the quick brown");
+        e.select_word_at(4); // exactly at 'q'
+        assert_eq!(e.selected_text(), Some("quick"));
+    }
+
+    #[test]
+    fn select_word_at_on_whitespace_makes_no_selection() {
+        let mut e = PromptEditor::new();
+        e.insert_str("the   quick");
+        e.select_word_at(5); // mid-whitespace
+        assert!(!e.has_selection());
+        assert_eq!(e.cursor(), 5);
+    }
+
+    #[test]
+    fn select_line_at_grabs_full_line_with_newline() {
+        let mut e = PromptEditor::new();
+        e.insert_str("first line\nsecond line\nthird");
+        e.select_line_at(15); // somewhere in "second line"
+        assert_eq!(e.selected_text(), Some("second line\n"));
+    }
+
+    #[test]
+    fn select_line_at_on_last_line_grabs_to_end() {
+        let mut e = PromptEditor::new();
+        e.insert_str("only one line");
+        e.select_line_at(4);
+        assert_eq!(e.selected_text(), Some("only one line"));
     }
 
     #[test]
