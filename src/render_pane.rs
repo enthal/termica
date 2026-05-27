@@ -86,6 +86,20 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
             if modifiers.command || modifiers.alt {
                 return false;
             }
+            // Consume the Ctrl combos that are Termica-editor
+            // territory but not yet wired (history walk → 4J,
+            // completion → 4I). Without consuming, ZLE-off shells
+            // receive the raw `\x12` / `\x10` / `\x0e` bytes and the
+            // kernel echoes them as `^R` / `^P` / `^N` literals into
+            // the live `Term` — visible noise. `Ctrl+C` (`\x03`,
+            // SIGINT) and `Ctrl+D` (`\x04`, EOF) deliberately stay
+            // PTY-bound per spec/04.
+            if modifiers.ctrl
+                && !modifiers.shift
+                && matches!(key, Key::R | Key::P | Key::N | Key::S | Key::G)
+            {
+                return true;
+            }
             // The keys that own `slot.session` mutably (submit,
             // demote) are handled BEFORE the editor borrow so the
             // borrow checker sees a clean window.
@@ -294,44 +308,56 @@ pub fn render_pane(
     let pointer_pos = ctx.input(|i| i.pointer.latest_pos());
     let selection = slot.session.selection().copied();
 
+    // Alt-screen mode (vim / less / htop / fzf / ssh-with-TUI):
+    // the program below owns the whole grid and manages its own
+    // scrolling. Termica's block model and editor have no role
+    // here — both are hidden so the user sees what they'd see in
+    // any other modern terminal. The flag is re-evaluated per
+    // frame; on exit we fall back to the normal block layout.
+    let in_alt_screen = view.alt_screen;
     let scroll_inner = egui::ScrollArea::vertical()
         .id_salt(("pane-blocks", slot.session.pane_id()))
         .stick_to_bottom(true)
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            // ---- Block stack: command labels + snapshots ----------
-            //
-            // Walk every block. For `Sealed`: paint the command line
-            // first (teal — the user's typed command, which kernel-
-            // echo-suppression hid from the snapshot), then the
-            // frozen `Vec<StyledLine>` snapshot of the output, then
-            // a thin separator gap. For `Running` (only at the tail
-            // by invariant): paint the command label — the live
-            // `Term` painted after the loop carries the output as
-            // it streams in. For `Prompt` (only at the tail): paint
-            // nothing here; the live `Term` shows the shell's idle
-            // area (empty with `PS1=''`) and the editor overlay
-            // paints on top after `paint_terminal`.
-            //
-            // 4G adds full header chrome (cwd / branch / dirty chips,
-            // duration, exit code) on top of these labels.
-            for block in slot.session.blocks().iter() {
-                match block {
-                    crate::block::Block::Sealed { command, snapshot, .. } => {
-                        render::paint_sealed_block(ui, command, snapshot);
-                        // Thin separator gap — spec/04 §"Visual
-                        // structure" calls for "non-text (thin
-                        // separator + space)".
-                        ui.add_space(4.0);
-                    }
-                    crate::block::Block::Running { command, .. } => {
-                        if !command.is_empty() {
-                            let _ = render::paint_command_label(ui, command);
+            if in_alt_screen {
+                // Don't paint blocks or the editor — let
+                // paint_terminal below claim the full pane.
+            } else {
+                // ---- Block stack: command labels + snapshots ----------
+                //
+                // Walk every block. For `Sealed`: paint the command line
+                // first (teal — the user's typed command, which kernel-
+                // echo-suppression hid from the snapshot), then the
+                // frozen `Vec<StyledLine>` snapshot of the output, then
+                // a thin separator gap. For `Running` (only at the tail
+                // by invariant): paint the command label — the live
+                // `Term` painted after the loop carries the output as
+                // it streams in. For `Prompt` (only at the tail): paint
+                // nothing here; the live `Term` shows the shell's idle
+                // area (empty with `PS1=''`) and the editor overlay
+                // paints on top after `paint_terminal`.
+                //
+                // 4G adds full header chrome (cwd / branch / dirty chips,
+                // duration, exit code) on top of these labels.
+                for block in slot.session.blocks().iter() {
+                    match block {
+                        crate::block::Block::Sealed { command, snapshot, .. } => {
+                            render::paint_sealed_block(ui, command, snapshot);
+                            // Thin separator gap — spec/04 §"Visual
+                            // structure" calls for "non-text (thin
+                            // separator + space)".
+                            ui.add_space(4.0);
                         }
+                        crate::block::Block::Running { command, .. } => {
+                            if !command.is_empty() {
+                                let _ = render::paint_command_label(ui, command);
+                            }
+                        }
+                        crate::block::Block::Prompt { .. } => {}
                     }
-                    crate::block::Block::Prompt { .. } => {}
                 }
-            }
+            } // end of `if !in_alt_screen { ... }`
 
             // ---- Live terminal ------------------------------------
             //
@@ -396,7 +422,8 @@ pub fn render_pane(
             // editor's caret reads as active. 4D's fixed-footer
             // layout will replace this overlay with a proper
             // viewport-bottom anchor.
-            if slot.session.editor_is_active()
+            if !in_alt_screen
+                && slot.session.editor_is_active()
                 && let Some(editor) = slot.session.blocks().editor_on_tail()
             {
                 let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
@@ -406,8 +433,23 @@ pub fn render_pane(
                     rendered.response.rect.min.x,
                     rendered.response.rect.min.y + cursor_row as f32 * row_h,
                 );
+                // Caret blink: ~1.6 Hz square wave driven off
+                // egui's monotonic time. Request a repaint at the
+                // next half-cycle so the caret keeps toggling even
+                // when nothing else changes on screen.
+                let time = ctx.input(|i| i.time);
+                let caret_visible = (time * 1.6) as i64 % 2 == 0;
+                ctx.request_repaint_after(std::time::Duration::from_millis(312));
                 let painter = ui.painter_at(rendered.response.rect);
-                render::paint_prompt_editor_at(&painter, editor, origin, cell_w, row_h, &font_id);
+                render::paint_prompt_editor_at(
+                    &painter,
+                    editor,
+                    origin,
+                    cell_w,
+                    row_h,
+                    &font_id,
+                    caret_visible,
+                );
             }
 
             (rendered, links_in_view, highlighted_link.cloned())
