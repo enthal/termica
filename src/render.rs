@@ -371,8 +371,57 @@ pub fn paint_prompt_editor_at(
     font_id: &FontId,
     caret_visible: bool,
 ) {
-    for (row_idx, line) in editor.lines_with_cursor().iter().enumerate() {
+    // Resolve the selection range (if any) into byte indices, then
+    // map onto rows for per-row highlight rects below.
+    let selection_bytes = editor.selection_range();
+    let lines = editor.lines_with_cursor();
+    // Pre-compute (row, byte_range) for each row so the selection
+    // overlay can paint without re-walking the buffer.
+    let mut row_byte_starts = Vec::with_capacity(lines.len());
+    {
+        let mut byte = 0usize;
+        for line in &lines {
+            row_byte_starts.push(byte);
+            byte += line.text.len() + 1; // +1 for the \n
+        }
+    }
+
+    for (row_idx, line) in lines.iter().enumerate() {
         let y = origin.y + row_idx as f32 * row_h;
+
+        // Selection overlay for this row, painted UNDER the glyphs
+        // so text stays legible. The overlay is a single rect from
+        // the row's start-of-selection char column to its end-of-
+        // selection char column.
+        if let Some((sel_start, sel_end)) = selection_bytes {
+            let row_byte_start = row_byte_starts[row_idx];
+            let row_byte_end = row_byte_start + line.text.len();
+            // Clip selection to this row.
+            let clip_start = sel_start.max(row_byte_start);
+            let clip_end = sel_end.min(row_byte_end);
+            // Special case: a multi-line selection's middle rows
+            // and trailing-newline rows should extend visually
+            // through the trailing newline. We give the row an
+            // extra cell of highlight whenever the selection
+            // continues past this row.
+            let extends_past = sel_end > row_byte_end;
+            if clip_start < clip_end || extends_past {
+                let sel_start_chars = line.text[..clip_start - row_byte_start].chars().count();
+                let sel_end_chars = if extends_past {
+                    line.text.chars().count() + 1 // +1 cell for the \n
+                } else {
+                    line.text[..clip_end - row_byte_start].chars().count()
+                };
+                let x_start = origin.x + sel_start_chars as f32 * cell_w;
+                let x_end = origin.x + sel_end_chars as f32 * cell_w;
+                let rect = Rect::from_min_max(
+                    Pos2::new(x_start, y),
+                    Pos2::new(x_end.max(x_start + cell_w * 0.25), y + row_h),
+                );
+                painter.rect_filled(rect, 0.0, SELECTION_COLOR);
+            }
+        }
+
         if !line.text.is_empty() {
             painter.text(
                 Pos2::new(origin.x, y),
