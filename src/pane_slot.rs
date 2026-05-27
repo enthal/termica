@@ -80,6 +80,14 @@ pub struct PaneUiState {
     /// `tree.ui()` returns; `render_pane` sets it when it sees
     /// the matching shortcut in the focused pane's event stream.
     pub pending_action: Option<PaneAction>,
+    /// Anchor byte range remembered when a double or triple click
+    /// landed in the editor: the original word / line that the
+    /// user clicked on. Subsequent drag expands the selection so
+    /// it always covers the original anchor range PLUS every word
+    /// (or line) the pointer has touched since. `None` between
+    /// drags. Cleared on a single click. Used only by
+    /// `render_pane`'s editor-drag handler.
+    pub(crate) editor_drag_anchor: Option<(usize, usize)>,
 }
 
 /// One pane's full state: the OS-resource [`PaneSession`] (PTY +

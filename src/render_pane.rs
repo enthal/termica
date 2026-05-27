@@ -666,6 +666,13 @@ pub fn render_pane(
                 .map(|e| e.text().to_string())
                 .unwrap_or_default();
             let byte = editor_byte_for_pos(rect, pos, &editor_text, cell_w, row_h);
+            // Compute and remember the original anchor range so the
+            // drag handler can extend selection by word / line.
+            slot.ui.editor_drag_anchor = match slot.ui.click_count {
+                2 => Some(crate::prompt_editor::word_range_at(&editor_text, byte)),
+                3 => Some(crate::prompt_editor::line_range_at(&editor_text, byte)),
+                _ => None,
+            };
             if let Some(editor) = slot.session.editor_mut() {
                 match slot.ui.click_count {
                     1 => editor.set_cursor(byte),
@@ -718,8 +725,39 @@ pub fn render_pane(
                 .map(|e| e.text().to_string())
                 .unwrap_or_default();
             let byte = editor_byte_for_pos(rect, pos, &editor_text, cell_w, row_h);
-            if let Some(editor) = slot.session.editor_mut() {
-                editor.set_cursor_extending(byte);
+            // Mode of extension is determined by the click_count
+            // at press time (which `slot.ui.click_count` still
+            // holds during this drag — it's only reset on the next
+            // press):
+            //
+            // - 1 (single click): char-by-char extension via
+            //   `set_cursor_extending` (existing).
+            // - 2 (double click): selection grows / shrinks by
+            //   WORDS — always cover the originally-clicked word
+            //   plus every word the pointer touches.
+            // - 3 (triple click): same idea for lines.
+            match (slot.ui.click_count, slot.ui.editor_drag_anchor) {
+                (2, Some(anchor)) => {
+                    let cur = crate::prompt_editor::word_range_at(&editor_text, byte);
+                    let start = anchor.0.min(cur.0);
+                    let end = anchor.1.max(cur.1);
+                    if let Some(editor) = slot.session.editor_mut() {
+                        editor.set_selection(start, end);
+                    }
+                }
+                (3, Some(anchor)) => {
+                    let cur = crate::prompt_editor::line_range_at(&editor_text, byte);
+                    let start = anchor.0.min(cur.0);
+                    let end = anchor.1.max(cur.1);
+                    if let Some(editor) = slot.session.editor_mut() {
+                        editor.set_selection(start, end);
+                    }
+                }
+                _ => {
+                    if let Some(editor) = slot.session.editor_mut() {
+                        editor.set_cursor_extending(byte);
+                    }
+                }
             }
         } else {
             slot.session.extend_selection(to_point(pos));

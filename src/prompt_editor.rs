@@ -426,6 +426,23 @@ impl PromptEditor {
         self.cursor = self.text.len();
     }
 
+    /// Set the selection to an explicit byte range. Both endpoints
+    /// are clamped to char boundaries. `anchor == head` produces a
+    /// degenerate (empty) selection and just moves the cursor. The
+    /// editor renderer's drag handler uses this for word- and line-
+    /// expansion drags.
+    pub fn set_selection(&mut self, anchor: usize, head: usize) {
+        let anchor = clamp_to_char_boundary(&self.text, anchor);
+        let head = clamp_to_char_boundary(&self.text, head);
+        if anchor == head {
+            self.cursor = anchor;
+            self.selection_anchor = None;
+        } else {
+            self.selection_anchor = Some(anchor);
+            self.cursor = head;
+        }
+    }
+
     /// Select the word containing or touching `byte_idx`. If the
     /// position is on whitespace, the result is a degenerate
     /// (empty) selection at that position — matches the macOS
@@ -433,29 +450,8 @@ impl PromptEditor {
     /// Double-click handler routes here.
     pub fn select_word_at(&mut self, byte_idx: usize) {
         let byte_idx = clamp_to_char_boundary(&self.text, byte_idx);
-        // Find word boundaries either side of byte_idx.
-        // Left bound: walk back while prev char is word.
-        let mut start = byte_idx;
-        while start > 0 {
-            let prev = prev_char_boundary(&self.text, start);
-            let c = self.text[prev..start].chars().next().unwrap();
-            if !is_word_char(c) {
-                break;
-            }
-            start = prev;
-        }
-        // Right bound: walk forward while current char is word.
-        let mut end = byte_idx;
-        while end < self.text.len() {
-            let c = self.text[end..].chars().next().unwrap();
-            if !is_word_char(c) {
-                break;
-            }
-            end += c.len_utf8();
-        }
+        let (start, end) = word_range_at(&self.text, byte_idx);
         if start == end {
-            // Clicked on whitespace — no word here. Place cursor,
-            // no selection.
             self.cursor = byte_idx;
             self.selection_anchor = None;
         } else {
@@ -469,13 +465,7 @@ impl PromptEditor {
     /// Triple-click handler routes here.
     pub fn select_line_at(&mut self, byte_idx: usize) {
         let byte_idx = clamp_to_char_boundary(&self.text, byte_idx);
-        let start = self.text[..byte_idx].rfind('\n').map(|i| i + 1).unwrap_or(0);
-        // Include the trailing \n if there is one — gives copy/cut
-        // the standard "whole line" semantics.
-        let end = match self.text[byte_idx..].find('\n') {
-            Some(off) => byte_idx + off + 1,
-            None => self.text.len(),
-        };
+        let (start, end) = line_range_at(&self.text, byte_idx);
         self.selection_anchor = Some(start);
         self.cursor = end;
     }
@@ -505,6 +495,47 @@ pub struct EditorLine<'a> {
     pub text: &'a str,
     pub cursor_col_chars: usize,
     pub cursor_on_line: bool,
+}
+
+/// Return the `(start, end)` byte indices of the word containing or
+/// touching `byte_idx` in `text`. Returns `(byte_idx, byte_idx)`
+/// (empty range) when the position is on whitespace / a non-word
+/// char. `byte_idx` must already be on a char boundary.
+///
+/// Public because the drag-by-word handler in `render_pane` needs
+/// to compute word ranges at the pointer position to extend a
+/// double-click selection.
+pub fn word_range_at(text: &str, byte_idx: usize) -> (usize, usize) {
+    let mut start = byte_idx;
+    while start > 0 {
+        let prev = prev_char_boundary(text, start);
+        let c = text[prev..start].chars().next().unwrap();
+        if !is_word_char(c) {
+            break;
+        }
+        start = prev;
+    }
+    let mut end = byte_idx;
+    while end < text.len() {
+        let c = text[end..].chars().next().unwrap();
+        if !is_word_char(c) {
+            break;
+        }
+        end += c.len_utf8();
+    }
+    (start, end)
+}
+
+/// Return the `(start, end)` byte indices of the line containing
+/// `byte_idx` in `text`. End includes the trailing `\n` if present.
+/// Public for the drag-by-line handler.
+pub fn line_range_at(text: &str, byte_idx: usize) -> (usize, usize) {
+    let start = text[..byte_idx].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let end = match text[byte_idx..].find('\n') {
+        Some(off) => byte_idx + off + 1,
+        None => text.len(),
+    };
+    (start, end)
 }
 
 /// True when `c` should count as part of a "word" for word-boundary
@@ -1127,6 +1158,72 @@ mod tests {
         e.insert_str("only one line");
         e.select_line_at(4);
         assert_eq!(e.selected_text(), Some("only one line"));
+    }
+
+    // ---- helper range computations (used by drag-by-word/line) -----
+
+    #[test]
+    fn word_range_at_returns_word_bounds() {
+        let s = "the quick brown fox";
+        assert_eq!(word_range_at(s, 0), (0, 3)); // inside "the"
+        assert_eq!(word_range_at(s, 5), (4, 9)); // inside "quick"
+        assert_eq!(word_range_at(s, 10), (10, 15)); // start of "brown"
+    }
+
+    #[test]
+    fn word_range_at_middle_of_whitespace_is_empty() {
+        // Three spaces between words; byte 4 is truly in the middle
+        // of the whitespace run with non-word chars on both sides.
+        let s = "abc   def";
+        assert_eq!(word_range_at(s, 4), (4, 4));
+    }
+
+    #[test]
+    fn word_range_at_boundary_selects_left_word() {
+        // Byte position immediately AFTER a word: walk-back grabs
+        // the word. Matches macOS double-click-immediately-after-
+        // word behaviour.
+        let s = "abc def";
+        assert_eq!(word_range_at(s, 3), (0, 3));
+    }
+
+    #[test]
+    fn line_range_at_returns_line_bounds_with_trailing_newline() {
+        let s = "first\nsecond\nthird";
+        assert_eq!(line_range_at(s, 0), (0, 6)); // "first\n"
+        assert_eq!(line_range_at(s, 8), (6, 13)); // "second\n"
+        assert_eq!(line_range_at(s, 15), (13, 18)); // "third" (no newline at end)
+    }
+
+    // ---- set_selection -------------------------------------------------
+
+    #[test]
+    fn set_selection_anchors_and_heads_at_explicit_bytes() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hello world");
+        e.set_selection(2, 7);
+        assert_eq!(e.selected_text(), Some("llo w"));
+        assert_eq!(e.cursor(), 7);
+    }
+
+    #[test]
+    fn set_selection_with_equal_bytes_clears_selection() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hello");
+        e.select_all();
+        assert!(e.has_selection());
+        e.set_selection(3, 3);
+        assert!(!e.has_selection());
+        assert_eq!(e.cursor(), 3);
+    }
+
+    #[test]
+    fn set_selection_clamps_to_char_boundary() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hé"); // 'h' = 1 byte, 'é' = 2 bytes; total 3
+        // 2 is mid-é — clamp anchor to 1, head to 3 (end).
+        e.set_selection(2, 99);
+        assert_eq!(e.selection_range(), Some((1, 3)));
     }
 
     #[test]
