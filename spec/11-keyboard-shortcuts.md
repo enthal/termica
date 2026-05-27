@@ -40,20 +40,43 @@ Window controls (via the macOS menubar; Phase 2A):
 | `Cmd+H` | Hide Termica. |
 | `Cmd+Opt+H` | Hide other applications. |
 
-## Planned (Phase 3 onward)
+## Editor (Phase 4, shipped piece by piece)
 
-The full list with phase ownership. **None of these are wired today.**
+These chords are only active when the focused pane is in `ShellPromptEditor` and the live block is `Prompt`. They are owned by [`src/render_pane.rs::apply_event_to_editor`](../src/render_pane.rs) and routed through [`src/prompt_editor.rs`](../src/prompt_editor.rs); the OS-specific motion keys are classified by [`classify_editor_motion`](../src/render_pane.rs) and unit-tested with both `is_macos = true` and `is_macos = false` paths.
+
+| Shortcut (macOS) | Shortcut (Linux / Windows) | Action | Status |
+|---|---|---|---|
+| `Enter` | `Enter` | Submit the command. Eager demote, then PTY write. | ✅ Phase 4C ([#54](https://github.com/enthal/termica/pull/54)) |
+| `Shift+Enter` | `Shift+Enter` | Insert a newline (multiline edit). | ✅ Phase 4B ([#53](https://github.com/enthal/termica/pull/53)) |
+| `Esc` | `Esc` | Leave editor; demote to `RawTerminal`. | ✅ Phase 4B |
+| `Cmd+A` | `Ctrl+A` | Select all editor contents. | ✅ Phase 4D-poly ([#59](https://github.com/enthal/termica/pull/59)) |
+| `Cmd+C / V / X` | `Ctrl+C / V / X` | Copy / paste / cut from the editor's selection. | ✅ Phase 4D-poly ([#59](https://github.com/enthal/termica/pull/59)) |
+| Arrow ← / → | Arrow ← / → | Move caret one char (with `Shift` extends selection). | ✅ Phase 4B |
+| `Option+ArrowLeft` / `Option+ArrowRight` | `Ctrl+ArrowLeft` / `Ctrl+ArrowRight` | Move caret by word boundary (with `Shift` extends selection). | ✅ Phase 4D-poly ([#60](https://github.com/enthal/termica/pull/60)) |
+| `Cmd+ArrowLeft` / `Cmd+ArrowRight` | `Home` / `End` | Move caret to line start / end (with `Shift` extends selection). | ✅ Phase 4D-poly ([#60](https://github.com/enthal/termica/pull/60)) |
+| `Cmd+ArrowUp` / `Cmd+ArrowDown` | `Ctrl+Home` / `Ctrl+End` | Move caret to document start / end (with `Shift` extends selection). | ✅ Phase 4D-poly ([#60](https://github.com/enthal/termica/pull/60)) |
+| `Ctrl+C` on empty editor | `Ctrl+C` on empty editor | Leave editor; send SIGINT. | ⏳ Phase 4 polish |
+| `Ctrl+D` on empty editor | `Ctrl+D` on empty editor | Send EOF to the shell (`exit` semantics). | ⏳ Phase 4 polish |
+| `Up` / `Down` | `Up` / `Down` | Walk pane-local history. | ⏳ Phase 4J / 6 |
+| `Tab` | `Tab` | Local completion (paths + history + `$PATH`). | ⏳ Phase 4I |
+| `Ctrl+R` / `Ctrl+P` / `Ctrl+N` / `Ctrl+S` / `Ctrl+G` | same | Consumed by the editor (no PTY leak) but no-op until [4J](10-roadmap.md#phase-4--editor-at-prompt-block-model-pivot) wires history walk + Ctrl+R popup. | ✅ Phase 4 polish ([#57](https://github.com/enthal/termica/pull/57)) |
+
+Mouse (editor):
+
+| Gesture | Action | Status |
+|---|---|---|
+| Click in editor | Place caret at the hit byte; clear selection. | ✅ ([#59](https://github.com/enthal/termica/pull/59)) |
+| Drag in editor | Extend selection by **character**. | ✅ ([#59](https://github.com/enthal/termica/pull/59)) |
+| Double-click | Select word under pointer (uses `word_range_at`). | ✅ ([#60](https://github.com/enthal/termica/pull/60)) |
+| Triple-click | Select line under pointer (uses `line_range_at`). | ✅ ([#60](https://github.com/enthal/termica/pull/60)) |
+| Double-click + drag | Extend selection by **word**: rolling union of anchor word ∪ word under pointer. | ✅ ([#61](https://github.com/enthal/termica/pull/61)) |
+| Triple-click + drag | Same as double-click + drag but by **line**. | ✅ ([#61](https://github.com/enthal/termica/pull/61)) |
+
+## Planned (everything else)
 
 | Shortcut | Action | Phase |
 |---|---|---|
-| `Enter` (in editor) | Submit the command. Eager demote, then PTY write. | Phase 4 |
-| `Shift+Enter` (in editor) | Insert a newline (multiline edit). | Phase 4 |
-| `Esc` (in editor) | Leave editor; demote to `RawTerminal`. | Phase 4 |
-| `Ctrl+C` (in editor, empty) | Leave editor; send SIGINT. | Phase 4 |
-| `Ctrl+D` (in editor, empty) | Send EOF to the shell (`exit` semantics). | Phase 4 |
-| `Up` / `Down` (in editor) | Walk pane-local history. | Phase 4 / 6 |
-| `Tab` (in editor) | Local completion (paths + history + `$PATH`). | Phase 4 |
-| `Ctrl+R` | Global command-history popup. Fuzzy match. | Phase 6 |
+| Continuation marker re-entry | After a submit, a DCS-JSON `continuation` event from the shell (`PS2` fired) re-promotes the editor and restores `last_submitted + "\n"`; only the suffix beyond `last_submitted` is sent on the next submit. | ✅ Phase 4C polish ([#58](https://github.com/enthal/termica/pull/58)) |
 | `Cmd+F` / `Ctrl+F` | In-pane find overlay (literal / case-insensitive / regex / fuzzy). | Phase 8 |
 | `Cmd+P` / `Ctrl+P` | Command palette. | Post-MVP |
 
