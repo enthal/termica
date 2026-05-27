@@ -86,6 +86,19 @@ pub const EDITOR_FG: Color32 = Color32::from_rgb(0x6e, 0xd0, 0xe8);
 /// can never be two cursors painted at once.
 pub const EDITOR_CURSOR_COLOR: Color32 = Color32::from_rgba_premultiplied(0x4a, 0xa8, 0xc0, 0xa0);
 
+/// Foreground for the dim header line above each block. Roughly
+/// "muted grey" against `DEFAULT_BG` — readable but unmistakably
+/// secondary to the command + output text below. 4G renders cwd
+/// in this colour; Phase 5 will use the same hue family for the
+/// status-header chips, so the visual identity stays consistent
+/// when both areas exist on screen at once.
+pub const BLOCK_HEADER_FG: Color32 = Color32::from_rgb(0x80, 0x80, 0x80);
+
+/// Foreground for a non-zero exit code rendered on a sealed block's
+/// header line. Saturated red so failed commands are unmistakable
+/// in a long transcript. Theme polish lands in Phase 10.
+pub const BLOCK_HEADER_EXIT_FAIL_FG: Color32 = Color32::from_rgb(0xe0, 0x70, 0x70);
+
 /// Result of one paint pass over the terminal grid.
 ///
 /// The caller (the eframe app) uses this to do hit-testing for the
@@ -502,6 +515,82 @@ pub fn paint_prompt_editor_at(
     }
 }
 
+/// Paint the dim header line above a block: cwd on the left, an
+/// optional "exit N" annotation on the right.
+///
+/// The first piece of [4G](../spec/10-roadmap.md#phase-4--editor-at-prompt-block-model-pivot)
+/// block chrome. Renders **only** the cwd today; the git branch and
+/// dirty-summary chips that spec/04 §"Visual structure" calls for
+/// live in Phase 5's async-probe surface (`termica-context`). Live
+/// duration timers for `Running` blocks also defer to that phase —
+/// the wall-clock plumbing isn't in place yet.
+///
+/// Format:
+///
+/// ```text
+/// <cwd>                 exit <n>   ← red, only when exit != 0
+/// ```
+///
+/// When `cwd` is `None` *and* there's nothing to show on the right
+/// (no non-zero `exit`), nothing is painted at all — the header
+/// line is skipped entirely so the block looks identical to the
+/// pre-4G layout.
+pub fn paint_block_header(
+    ui: &mut egui::Ui,
+    cwd: Option<&std::path::Path>,
+    exit: Option<i32>,
+) -> Option<Response> {
+    let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
+    let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
+    let row_h = ui.fonts_mut(|f| f.row_height(&font_id));
+
+    let cwd_text = cwd.map(|p| p.display().to_string()).unwrap_or_default();
+    let show_exit = matches!(exit, Some(n) if n != 0);
+    let exit_text = match exit {
+        Some(n) if n != 0 => format!("exit {n}"),
+        _ => String::new(),
+    };
+
+    if cwd_text.is_empty() && !show_exit {
+        // Nothing to render. We deliberately allocate **nothing** —
+        // not even a zero-sized rect — because egui inserts an
+        // `item_spacing` gap after every allocated widget, and a
+        // gratuitous gap above each block (cwd is None until shell
+        // integration confirms) would shift the entire visual layout.
+        return None;
+    }
+
+    let total_chars =
+        cwd_text.chars().count() + if show_exit { exit_text.chars().count() + 2 } else { 0 };
+    let size = Vec2::new((total_chars as f32 * cell_w).max(cell_w), row_h);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    if !cwd_text.is_empty() {
+        painter.text(
+            Pos2::new(rect.min.x, rect.min.y),
+            egui::Align2::LEFT_TOP,
+            &cwd_text,
+            font_id.clone(),
+            BLOCK_HEADER_FG,
+        );
+    }
+    if show_exit {
+        // Two-cell gap between cwd and exit text — keeps them
+        // visually distinct without leaning on a separator glyph
+        // (which would be Unicode and forbidden per CLAUDE.md).
+        let exit_x = rect.min.x + (cwd_text.chars().count() + 2) as f32 * cell_w;
+        painter.text(
+            Pos2::new(exit_x, rect.min.y),
+            egui::Align2::LEFT_TOP,
+            &exit_text,
+            font_id,
+            BLOCK_HEADER_EXIT_FAIL_FG,
+        );
+    }
+    Some(response)
+}
+
 /// Paint a one-or-more-line command label in editor colors above the
 /// snapshot of the block that ran it.
 ///
@@ -515,9 +604,9 @@ pub fn paint_prompt_editor_at(
 /// without this label the user sees output streaming but doesn't
 /// know which command is producing it.
 ///
-/// 4G's prompt chrome lands the full header (cwd / branch / dirty
-/// chips + duration + exit code); this is the minimum viable subset
-/// of that work needed to make 4C feel usable.
+/// The dim cwd / exit header above the command label is painted
+/// separately by [`paint_block_header`]; this helper handles the
+/// command line itself.
 pub fn paint_command_label(ui: &mut egui::Ui, command: &str) -> Response {
     let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
     let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
@@ -567,7 +656,10 @@ pub fn paint_sealed_block(
     command: &str,
     snapshot: &[StyledLine],
     selection: Option<(BlockCursor, BlockCursor)>,
+    cwd: Option<&std::path::Path>,
+    exit: Option<i32>,
 ) -> Response {
+    let _ = paint_block_header(ui, cwd, exit);
     if !command.is_empty() {
         let _ = paint_command_label(ui, command);
     }
