@@ -46,26 +46,46 @@ The cursor is a UTF-8 **byte index** that always lies on a `char` boundary. Sele
 
 ### Editing keystrokes (in `ShellPromptEditor`)
 
-Standard text-editor mapping, OS-aware:
+Standard text-editor mapping, OS-aware. macOS uses `Option`/`Cmd`; Linux/Windows uses `Ctrl`. The `Shift` modifier on any motion below extends the current selection from the existing anchor to the new cursor position rather than collapsing it.
 
-| Key | macOS / Linux |
-|---|---|
-| Arrow / Home / End | Move cursor; with Shift extends selection |
-| Cmd/Ctrl + Arrow | Word / line jumps |
-| Cmd/Ctrl + A | Select all |
-| Cmd/Ctrl + Z / Shift+Z | Undo / redo |
-| Cmd/Ctrl + C / V / X | Copy / paste / cut |
-| Delete / Backspace | Per-grapheme delete (not per-byte) |
-| Enter | Submit (see below) |
-| Shift+Enter | Insert newline (multiline) |
-| Tab | Local completion popup |
-| Ctrl+R | History popup (fuzzy search) |
-| Up / Down | History walk (pane-local first), unless completion popup is open |
-| Esc | Dismiss popup; if no popup, no-op |
-| Ctrl+C on empty editor | Send SIGINT to PTY (terminal-mode parity) |
-| Ctrl+D on empty editor | Send EOF to PTY (terminal-mode parity) |
+| Action | macOS | Linux / Windows |
+|---|---|---|
+| Move cursor one char | Arrow ← / → | Arrow ← / → |
+| Move cursor one line | Arrow ↑ / ↓ | Arrow ↑ / ↓ |
+| Move to line start / end | `Home` / `End` (also `Cmd + ←` / `Cmd + →`) | `Home` / `End` |
+| Move by word | `Option + ← / →` | `Ctrl + ← / →` |
+| Move to document start / end | `Cmd + ↑` / `Cmd + ↓` | `Ctrl + Home` / `Ctrl + End` |
+| Select all | `Cmd + A` | `Ctrl + A` |
+| Undo / redo (Phase 4 polish) | `Cmd + Z` / `Cmd + Shift + Z` | `Ctrl + Z` / `Ctrl + Shift + Z` |
+| Copy / paste / cut | `Cmd + C / V / X` | `Ctrl + C / V / X` |
+| Delete / Backspace | Per-grapheme delete (not per-byte) — same on both | same |
+| Enter | Submit (see below) | same |
+| Shift + Enter | Insert newline (multiline) | same |
+| Tab | Local completion popup ([Phase 4I](10-roadmap.md#phase-4--editor-at-prompt-block-model-pivot)) | same |
+| Ctrl + R | History popup (fuzzy search; [Phase 4J](10-roadmap.md#phase-4--editor-at-prompt-block-model-pivot)) | same |
+| Up / Down | History walk (pane-local first), unless completion popup is open | same |
+| Esc | Dismiss popup; if no popup, leave editor → demote to `RawTerminal` | same |
+| Ctrl + C on empty editor | Send SIGINT to PTY (terminal-mode parity) | same |
+| Ctrl + D on empty editor | Send EOF to PTY (terminal-mode parity) | same |
+
+The matching matrix lives in [`classify_editor_motion`](../src/render_pane.rs); both branches are unit-tested with the `is_macos` flag flipped explicitly so each OS's convention is verified on every CI run, not only on the host that runs CI. New motion keys are added there first, with tests, before any new row appears above.
+
+Shell-binding keys (`Ctrl+R`, `Ctrl+P`, `Ctrl+N`, `Ctrl+S`, `Ctrl+G`) are **consumed without effect** in the editor today: they don't reach the PTY (the editor swallows them) and they don't fire any app behaviour either, until [4J](10-roadmap.md#phase-4--editor-at-prompt-block-model-pivot) ships history walk and Ctrl+R popup. This is deliberate: forwarding them would leak literal `^R` glyphs into the editor while the user's muscle memory hasn't been wired up yet.
 
 `Ctrl+L` is a config decision: clear visible transcript ("editor convention") or send the bytes (`\f`) to the shell ("terminal convention"). Default: clear visible transcript, configurable.
+
+### Mouse in the editor
+
+| Gesture | Effect |
+|---|---|
+| Click | Place caret; clear selection |
+| Drag | Extend selection by **character** |
+| Double-click | Select the word under the pointer |
+| Double-click + drag | Extend selection by **word**: each word the pointer enters is added to (or trimmed from) the selection; the anchor is the original double-clicked word, so the selection always covers `min(anchor_start, current_start) … max(anchor_end, current_end)` |
+| Triple-click | Select the line under the pointer |
+| Triple-click + drag | Same as double-click + drag but by **line** |
+
+The word / line range helpers (`word_range_at`, `line_range_at` in [`src/prompt_editor.rs`](../src/prompt_editor.rs)) are pure functions, unit-tested, and shared between the press handler and the drag handler so single-click → drag and double/triple-click → drag agree on what a "word" or a "line" is. The per-pane anchor range (`PaneUiState::editor_drag_anchor`) is cleared on a single click so the next drag starts in character mode again.
 
 ### Multiline editing
 
@@ -106,6 +126,29 @@ fn submit(pane: &mut Pane) {
 ```
 
 The eager demotion in step 1 is the safety invariant: if the user immediately mashes Ctrl-C, it MUST reach the running command, not the editor.
+
+### Multi-line continuation (PS2 marker)
+
+When the user presses Enter on a command the shell considers incomplete (`echo 1 &&` → shell wants more; here-docs; unclosed quotes), the shell prints its **continuation prompt** (`PS2` in bash/zsh) and stays in line-reading mode. Termica's integration script overrides `PS2` to emit a DCS-JSON **continuation marker** instead of the conventional `>` glyph:
+
+```jsonc
+// emitted by the shell whenever PS2 fires
+{ "type": "continuation", "session": "<id>" }
+```
+
+The parser surfaces this as `LifecycleEvent::Continuation` ([`src/markers.rs`](../src/markers.rs)). On reception the `PromptController` calls `try_promote_to_editor_for_continuation`, which re-promotes to `ShellPromptEditor` **only if** `last_transition.reason == EnterSubmitted` — i.e. the immediately-preceding demote came from a real submit, not from an `Esc` or any other path. (If the user explicitly `Esc`'d out of the editor, a continuation marker must not yank them back in.)
+
+When the editor reopens, the `PaneSession` restores the editor's text to `last_submitted + "\n"` and places the caret at the end so the user can resume typing on the next line. This effectively turns the "shell wanted more" path into "we hand the editor back, now multi-line."
+
+The submit path is **suffix-only on the second submit**:
+
+- `submit_editor_command` remembers the full text in `last_submitted: Option<String>`.
+- On the next submit, if the new editor text begins with `last_submitted`, only the **suffix beyond it** is written to the PTY (with a leading `\n` stripped, since the restore added one). The shell already received the prefix on the first submit; resending it would duplicate every line, and the `EchoSuppressor` (which was primed for the first half) would mismatch and disengage.
+- `last_submitted` is cleared on the next `Preexec` lifecycle event — i.e., the shell has actually started executing a complete command, so the multi-line dance is over.
+
+`EchoSuppressor::expect` treats both `\n` and `\r` in the expected stream as `\r\n` because the kernel's tty discipline applies ONLCR to **every** echoed newline, not only the trailing one. Without this rule the second multi-line submit would have a partially-matching prefix and disengage suppression mid-stream, leaking the second segment as duplicate echo into the running block.
+
+The two PR references for this surface area are [#58](https://github.com/enthal/termica/pull/58) (continuation event + restore) and [#54](https://github.com/enthal/termica/pull/54) (the underlying eager-demote + echo-suppression scaffolding).
 
 ## Echo handling
 
@@ -290,10 +333,10 @@ The editor model and submit semantics described earlier in this document apply t
 
 ## Testing
 
-- **Unit (strict)**: every `PromptEditor` operation has a unit test asserting cursor / selection / undo / dirty-flag state.
-- **Unit (strict)**: `submit()` ordering — eager mode transition occurs before PTY write; echo suppression is primed before the write; history recording happens after.
-- **Snapshot (egui_kittest)**: editor at various states (empty, mid-edit, with selection, with completion popup, multiline) renders deterministically.
-- **Integration**: with a real shell, submit a command and assert the duplicate echo never appears in the transcript.
+- **Unit (strict)**: every `PromptEditor` operation has a unit test asserting cursor / selection / undo / dirty-flag state. `classify_editor_motion` is tested with both `is_macos = true` and `is_macos = false`. `word_range_at` and `line_range_at` are tested independently so the press and drag handlers can rely on the same boundary rules.
+- **Unit (strict)**: `submit()` ordering — eager mode transition occurs before PTY write; echo suppression is primed before the write; history recording happens after. The continuation flow (`Continuation` lifecycle event re-promotes only when the prior reason was `EnterSubmitted`; restored text is `last_submitted + "\n"`; subsequent submit sends only the suffix beyond `last_submitted`) is covered by its own strict-layer tests in [`src/pane.rs`](../src/pane.rs) and [`src/shell.rs`](../src/shell.rs).
+- **Snapshot (egui_kittest)**: editor at various states (empty, mid-edit, with full selection, with partial selection, with multiline selection, with completion popup, multiline command) renders deterministically. Sealed-block paint (command label + frozen output) and prompt-editor caret (blinking 2px line caret in `EDITOR_CURSOR_COLOR`) have their own snapshot tests.
+- **Integration**: with a real shell, submit a command and assert the duplicate echo never appears in the transcript. Multi-line commands (`echo 1 &&` → `echo 2`) assert that the second submit sends only the suffix and the sealed block contains no duplicate prefix.
 
 ---
 
