@@ -92,14 +92,25 @@ impl EditorMotion {
     }
 }
 
+/// Extra vertical pixels added to the editor footer below the last
+/// row, so glyph descenders (`p`, `g`, `y`, `q`) clear the bottom
+/// of the pane instead of being clipped off. egui's `row_height`
+/// from the monospace font sometimes returns just ascent + descent
+/// with no leading, and the painter clips at the rect bottom — so
+/// the visible footprint of the last row's descenders gets cut off
+/// by one or two pixels. Empirically tuned; not a unit of the font.
+pub const FOOTER_DESCENDER_PAD: f32 = 4.0;
+
 /// Compute the fixed-footer height for the [`Block::Prompt`] block
 /// per [spec/04 §"Layout"](../spec/04-prompt-editor.md#layout-fixed-footer-prompt-sticky-top-header).
 ///
 /// The footer is the dedicated home for the editor: a cwd chip row
-/// (if a cwd is known) on top of one row per editor line. When the
-/// tail is **not** a `Prompt` or the editor is inactive (e.g.,
-/// bootstrapping, alt-screen, mode demote), there is no footer and
-/// the scroll area extends to the pane bottom — returns `0.0`.
+/// (if a cwd is known) on top of one row per editor line, plus
+/// [`FOOTER_DESCENDER_PAD`] at the bottom so descenders don't clip.
+/// When the tail is **not** a `Prompt` or the editor is inactive
+/// (e.g., bootstrapping, alt-screen, mode demote), there is no
+/// footer and the scroll area extends to the pane bottom — returns
+/// `0.0`.
 ///
 /// Pure function; takes `row_h` so the caller controls the
 /// monospace row height it's currently painting with. The result
@@ -116,7 +127,7 @@ pub fn compute_footer_height(
     }
     let editor_rows = editor_lines.max(1);
     let chrome_rows = if has_cwd { 1 } else { 0 };
-    (chrome_rows + editor_rows) as f32 * row_h
+    (chrome_rows + editor_rows) as f32 * row_h + FOOTER_DESCENDER_PAD
 }
 
 /// Translate a `(Key, Modifiers)` pair into an [`EditorMotion`] +
@@ -216,6 +227,30 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
                 && let Some(editor) = slot.session.editor_mut()
             {
                 motion.apply(editor, extending);
+                return true;
+            }
+            // Word-grained delete. macOS: Option+Backspace deletes
+            // left, Option+Fn+Delete deletes right. Linux: Ctrl
+            // +Backspace / Ctrl+Delete. Handled BEFORE the generic
+            // "alt / cmd → bypass" gate below so the editor still
+            // sees the delete.
+            let is_macos = cfg!(target_os = "macos");
+            let word_delete_left = if is_macos {
+                modifiers.alt && !modifiers.command && matches!(key, Key::Backspace)
+            } else {
+                modifiers.ctrl && !modifiers.alt && matches!(key, Key::Backspace)
+            };
+            let word_delete_right = if is_macos {
+                modifiers.alt && !modifiers.command && matches!(key, Key::Delete)
+            } else {
+                modifiers.ctrl && !modifiers.alt && matches!(key, Key::Delete)
+            };
+            if word_delete_left && let Some(editor) = slot.session.editor_mut() {
+                editor.delete_word_left();
+                return true;
+            }
+            if word_delete_right && let Some(editor) = slot.session.editor_mut() {
+                editor.delete_word_right();
                 return true;
             }
             // Alt + Cmd combos (other than the moves above) bypass
@@ -694,12 +729,14 @@ pub fn render_pane(
         // Allocate the editor strip and paint into it. We use an
         // explicit rect rather than `paint_prompt_editor` (which
         // allocates its own size) so the click / drag hit-test rect
-        // matches exactly what we painted.
+        // matches exactly what we painted. `Sense::click_and_drag`
+        // is required: without it, presses inside the editor footer
+        // are not registered by the mouse handler below.
         let editor_rect = egui::Rect::from_min_size(
             egui::Pos2::new(footer_origin.x, footer_origin.y + chip_h),
             egui::Vec2::new(ui.available_width(), editor_h),
         );
-        let _ = ui.allocate_rect(editor_rect, egui::Sense::hover());
+        let _ = ui.allocate_rect(editor_rect, egui::Sense::click_and_drag());
 
         if let Some(editor) = slot.session.blocks().editor_on_tail() {
             let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
@@ -708,9 +745,14 @@ pub fn render_pane(
             let time = ctx.input(|i| i.time);
             let caret_visible = (time * 1.6) as i64 % 2 == 0;
             ctx.request_repaint_after(std::time::Duration::from_millis(312));
-            let painter = ui.painter_at(editor_rect);
+            // Use `ui.painter()` (unclipped to the current ui) rather
+            // than `painter_at(editor_rect)` so descender pixels
+            // (`p`, `g`, `y`, `q`) clear the rect's bottom edge
+            // instead of being clipped off. The footer reserves
+            // `FOOTER_DESCENDER_PAD` extra pixels below the last row
+            // for exactly this overflow.
             render::paint_prompt_editor_at(
-                &painter,
+                ui.painter(),
                 editor,
                 editor_rect.min,
                 cell_w,
@@ -810,7 +852,9 @@ pub fn render_pane(
     if !modal_open
         && primary_pressed
         && let Some(pos) = press_origin
-        && (rendered.response.rect.contains(pos) || press_in_sealed_block.is_some())
+        && (rendered.response.rect.contains(pos)
+            || press_in_sealed_block.is_some()
+            || editor_rect.is_some_and(|r| r.contains(pos)))
     {
         rendered.response.request_focus();
 
@@ -936,52 +980,50 @@ pub fn render_pane(
         && rendered.response.dragged()
         && let Some(pos) = rendered.response.interact_pointer_pos()
     {
-        // Drag extends whichever selection was started on press —
-        // editor or alacritty, depending on where the press landed.
-        if click_in_editor && let Some(rect) = editor_rect {
-            let editor_text = slot
-                .session
-                .blocks()
-                .editor_on_tail()
-                .map(|e| e.text().to_string())
-                .unwrap_or_default();
-            let byte = editor_byte_for_pos(rect, pos, &editor_text, cell_w, row_h);
-            // Mode of extension is determined by the click_count
-            // at press time (which `slot.ui.click_count` still
-            // holds during this drag — it's only reset on the next
-            // press):
-            //
-            // - 1 (single click): char-by-char extension via
-            //   `set_cursor_extending` (existing).
-            // - 2 (double click): selection grows / shrinks by
-            //   WORDS — always cover the originally-clicked word
-            //   plus every word the pointer touches.
-            // - 3 (triple click): same idea for lines.
-            match (slot.ui.click_count, slot.ui.editor_drag_anchor) {
-                (2, Some(anchor)) => {
-                    let cur = crate::prompt_editor::word_range_at(&editor_text, byte);
-                    let start = anchor.0.min(cur.0);
-                    let end = anchor.1.max(cur.1);
-                    if let Some(editor) = slot.session.editor_mut() {
-                        editor.set_selection(start, end);
-                    }
-                }
-                (3, Some(anchor)) => {
-                    let cur = crate::prompt_editor::line_range_at(&editor_text, byte);
-                    let start = anchor.0.min(cur.0);
-                    let end = anchor.1.max(cur.1);
-                    if let Some(editor) = slot.session.editor_mut() {
-                        editor.set_selection(start, end);
-                    }
-                }
-                _ => {
-                    if let Some(editor) = slot.session.editor_mut() {
-                        editor.set_cursor_extending(byte);
-                    }
+        // Live-grid drag. The editor lives on a different widget
+        // (the fixed footer) and routes through its own branch
+        // below; sealed-block drags route through a third branch.
+        slot.session.extend_selection(to_point(pos));
+    } else if !modal_open
+        && primary_down
+        && click_in_editor
+        && let Some(rect) = editor_rect
+        && let Some(pos) = ctx.input(|i| i.pointer.interact_pos())
+    {
+        // Editor drag. `rendered.response.dragged()` is false here
+        // because the press landed on the editor footer's widget,
+        // not the live-Term widget. Drive extension off `primary_down`
+        // + `click_in_editor` so the editor still receives drag
+        // updates throughout the gesture.
+        let editor_text = slot
+            .session
+            .blocks()
+            .editor_on_tail()
+            .map(|e| e.text().to_string())
+            .unwrap_or_default();
+        let byte = editor_byte_for_pos(rect, pos, &editor_text, cell_w, row_h);
+        match (slot.ui.click_count, slot.ui.editor_drag_anchor) {
+            (2, Some(anchor)) => {
+                let cur = crate::prompt_editor::word_range_at(&editor_text, byte);
+                let start = anchor.0.min(cur.0);
+                let end = anchor.1.max(cur.1);
+                if let Some(editor) = slot.session.editor_mut() {
+                    editor.set_selection(start, end);
                 }
             }
-        } else {
-            slot.session.extend_selection(to_point(pos));
+            (3, Some(anchor)) => {
+                let cur = crate::prompt_editor::line_range_at(&editor_text, byte);
+                let start = anchor.0.min(cur.0);
+                let end = anchor.1.max(cur.1);
+                if let Some(editor) = slot.session.editor_mut() {
+                    editor.set_selection(start, end);
+                }
+            }
+            _ => {
+                if let Some(editor) = slot.session.editor_mut() {
+                    editor.set_cursor_extending(byte);
+                }
+            }
         }
     } else if !modal_open
         && primary_down
@@ -1223,26 +1265,26 @@ mod tests {
     }
 
     #[test]
-    fn single_line_editor_with_cwd_yields_two_rows() {
-        // 1 chrome row (cwd chip) + 1 editor row = 2 rows.
-        assert_eq!(compute_footer_height(true, true, 1, true, 20.0), 40.0);
+    fn single_line_editor_with_cwd_yields_two_rows_plus_descender_pad() {
+        // 1 chrome row (cwd chip) + 1 editor row + descender pad.
+        assert_eq!(compute_footer_height(true, true, 1, true, 20.0), 40.0 + FOOTER_DESCENDER_PAD);
     }
 
     #[test]
-    fn single_line_editor_without_cwd_yields_one_row() {
+    fn single_line_editor_without_cwd_yields_one_row_plus_descender_pad() {
         // No chrome row when cwd is unknown.
-        assert_eq!(compute_footer_height(true, true, 1, false, 20.0), 20.0);
+        assert_eq!(compute_footer_height(true, true, 1, false, 20.0), 20.0 + FOOTER_DESCENDER_PAD);
     }
 
     #[test]
-    fn three_line_editor_with_cwd_yields_four_rows() {
-        assert_eq!(compute_footer_height(true, true, 3, true, 20.0), 80.0);
+    fn three_line_editor_with_cwd_yields_four_rows_plus_descender_pad() {
+        assert_eq!(compute_footer_height(true, true, 3, true, 20.0), 80.0 + FOOTER_DESCENDER_PAD);
     }
 
     #[test]
     fn zero_editor_lines_treated_as_one() {
         // An empty editor still needs a caret row.
-        assert_eq!(compute_footer_height(true, true, 0, true, 20.0), 40.0);
+        assert_eq!(compute_footer_height(true, true, 0, true, 20.0), 40.0 + FOOTER_DESCENDER_PAD);
     }
 
     // ---- classify_editor_motion (per-OS keybindings) -----------------
