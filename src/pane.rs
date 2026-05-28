@@ -712,58 +712,84 @@ impl PaneSession {
             return None;
         }
         for block in self.blocks.iter() {
-            if let Block::Sealed { id, snapshot, .. } = block
+            if let Block::Sealed { id, command, snapshot, .. } = block
                 && *id == sel.block_id
             {
-                let text = crate::block_selection::block_selection_text(snapshot, sel);
+                let text = crate::block_selection::block_selection_text(command, snapshot, sel);
                 return if text.is_empty() { None } else { Some(text) };
             }
         }
         None
     }
 
-    /// Number of rows in the sealed snapshot for `block_id`, or `None`
-    /// if no sealed block has that id. Used by the click / drag
-    /// handler to clamp pointer rows that fall outside the block.
-    pub fn sealed_snapshot_rows(&self, block_id: crate::block::BlockId) -> Option<usize> {
+    /// Number of rows in a sealed block: `(command_lines, snapshot_lines)`.
+    /// The unified row space is `0..command_lines` for the command
+    /// label and `command_lines..(command_lines + snapshot_lines)`
+    /// for the output snapshot. `None` if no sealed block has that
+    /// id.
+    pub fn sealed_block_rows(&self, block_id: crate::block::BlockId) -> Option<(usize, usize)> {
         for block in self.blocks.iter() {
-            if let Block::Sealed { id, snapshot, .. } = block
+            if let Block::Sealed { id, command, snapshot, .. } = block
                 && *id == block_id
             {
-                return Some(snapshot.len());
+                let cmd_lines = if command.is_empty() { 0 } else { command.split('\n').count() };
+                return Some((cmd_lines, snapshot.len()));
             }
         }
         None
     }
 
-    /// Length in cells of one row in a sealed block. `None` if no
-    /// sealed block has that id or `row` is past the snapshot.
+    /// Length of `row` in the sealed block's unified row space. The
+    /// row is checked against the command label first, then the
+    /// snapshot. `None` if no sealed block has that id or the row
+    /// is past the end.
     pub fn sealed_row_len(&self, block_id: crate::block::BlockId, row: usize) -> Option<usize> {
         for block in self.blocks.iter() {
-            if let Block::Sealed { id, snapshot, .. } = block
+            if let Block::Sealed { id, command, snapshot, .. } = block
                 && *id == block_id
             {
-                return snapshot.get(row).map(|l| l.cells.len());
+                let cmd_lines: Vec<&str> =
+                    if command.is_empty() { Vec::new() } else { command.split('\n').collect() };
+                if row < cmd_lines.len() {
+                    return Some(cmd_lines[row].chars().count());
+                }
+                let snap_row = row - cmd_lines.len();
+                return snapshot.get(snap_row).map(|l| l.cells.len());
             }
         }
         None
     }
 
-    /// Word range around `cursor` inside `block_id`'s snapshot. Both
-    /// endpoints share `cursor.row` and reside on a word boundary
-    /// per [`crate::prompt_editor::is_word_char`]. Returns `None`
-    /// when the block doesn't exist or the cursor lies past the row.
+    /// Word range around `cursor` inside `block_id`'s unified row
+    /// space. Word ranges never cross the command/snapshot boundary
+    /// — words in the command label resolve against the command
+    /// text; words in the snapshot resolve against the snapshot
+    /// cells. Both endpoints share `cursor.row`. Returns `None`
+    /// when the block doesn't exist or the row is past the end.
     pub fn sealed_word_range(
         &self,
         block_id: crate::block::BlockId,
         cursor: crate::block_selection::BlockCursor,
     ) -> Option<(crate::block_selection::BlockCursor, crate::block_selection::BlockCursor)> {
         use crate::block_selection::{BlockCursor, cell_word_range};
+        use crate::prompt_editor::is_word_char;
         for block in self.blocks.iter() {
-            if let Block::Sealed { id, snapshot, .. } = block
+            if let Block::Sealed { id, command, snapshot, .. } = block
                 && *id == block_id
             {
-                let line = snapshot.get(cursor.row)?;
+                let cmd_lines: Vec<&str> =
+                    if command.is_empty() { Vec::new() } else { command.split('\n').collect() };
+                if cursor.row < cmd_lines.len() {
+                    let line = cmd_lines[cursor.row];
+                    let chars: Vec<char> = line.chars().collect();
+                    let (a, b) = word_range_in_chars(&chars, cursor.col, is_word_char);
+                    return Some((
+                        BlockCursor::new(cursor.row, a),
+                        BlockCursor::new(cursor.row, b),
+                    ));
+                }
+                let snap_row = cursor.row - cmd_lines.len();
+                let line = snapshot.get(snap_row)?;
                 let (a, b) = cell_word_range(&line.cells, cursor.col);
                 return Some((BlockCursor::new(cursor.row, a), BlockCursor::new(cursor.row, b)));
             }
@@ -771,9 +797,9 @@ impl PaneSession {
         None
     }
 
-    /// Line range around `cursor.row` inside `block_id`'s snapshot
-    /// (full width — trailing whitespace included; copy trims). Both
-    /// endpoints share `cursor.row`.
+    /// Line range for the row under `cursor` inside `block_id`'s
+    /// unified row space. Full row width — trailing whitespace
+    /// included; copy trims. Both endpoints share `cursor.row`.
     pub fn sealed_line_range(
         &self,
         block_id: crate::block::BlockId,
@@ -781,16 +807,52 @@ impl PaneSession {
     ) -> Option<(crate::block_selection::BlockCursor, crate::block_selection::BlockCursor)> {
         use crate::block_selection::{BlockCursor, cell_line_range};
         for block in self.blocks.iter() {
-            if let Block::Sealed { id, snapshot, .. } = block
+            if let Block::Sealed { id, command, snapshot, .. } = block
                 && *id == block_id
             {
-                let line = snapshot.get(cursor.row)?;
+                let cmd_lines: Vec<&str> =
+                    if command.is_empty() { Vec::new() } else { command.split('\n').collect() };
+                if cursor.row < cmd_lines.len() {
+                    let len = cmd_lines[cursor.row].chars().count();
+                    return Some((
+                        BlockCursor::new(cursor.row, 0),
+                        BlockCursor::new(cursor.row, len),
+                    ));
+                }
+                let snap_row = cursor.row - cmd_lines.len();
+                let line = snapshot.get(snap_row)?;
                 let (a, b) = cell_line_range(&line.cells);
                 return Some((BlockCursor::new(cursor.row, a), BlockCursor::new(cursor.row, b)));
             }
         }
         None
     }
+}
+
+/// Word range for `col` (a char index) in `chars`, using the
+/// shared `is_word_char` predicate. Used by command-label
+/// selection where we have a `&str` rather than `&[StyledCell]`.
+/// Returns `(col, col)` for non-word positions or past the end.
+fn word_range_in_chars(
+    chars: &[char],
+    col: usize,
+    is_word_char: fn(char) -> bool,
+) -> (usize, usize) {
+    if col >= chars.len() {
+        return (col, col);
+    }
+    if !is_word_char(chars[col]) {
+        return (col, col);
+    }
+    let mut start = col;
+    while start > 0 && is_word_char(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = col;
+    while end < chars.len() && is_word_char(chars[end]) {
+        end += 1;
+    }
+    (start, end)
 }
 
 #[cfg(test)]

@@ -482,7 +482,11 @@ pub fn render_pane(
     // Capture each sealed block's painted rect during the loop so the
     // click / drag handler below can hit-test against them. Empty in
     // alt-screen mode (we don't paint blocks at all there).
-    let mut sealed_rects: Vec<(crate::block::BlockId, egui::Rect)> = Vec::new();
+    // Each entry: (block_id, full rect of command + snapshot region,
+    // command-line count). The command_lines value lets the click /
+    // drag handler translate pointer y into the block's unified row
+    // space (rows 0..command_lines = command label, rest = snapshot).
+    let mut sealed_rects: Vec<(crate::block::BlockId, egui::Rect, usize)> = Vec::new();
 
     // Phase 4D — fixed-footer Prompt block. When the tail is a
     // `Prompt` AND the editor is active, reserve a strip at the
@@ -591,7 +595,7 @@ pub fn render_pane(
                             let sel_for_this = block_sel
                                 .filter(|s| s.block_id == *id && !s.is_empty())
                                 .map(|s| s.ordered());
-                            let resp = render::paint_sealed_block(
+                            let sealed_render = render::paint_sealed_block(
                                 ui,
                                 command,
                                 snapshot,
@@ -600,7 +604,11 @@ pub fn render_pane(
                                 home,
                                 *exit,
                             );
-                            sealed_rects.push((*id, resp.rect));
+                            sealed_rects.push((
+                                *id,
+                                sealed_render.rect,
+                                sealed_render.command_lines,
+                            ));
                             // Thin separator gap — spec/04 §"Visual
                             // structure" calls for "non-text (thin
                             // separator + space)".
@@ -839,29 +847,32 @@ pub fn render_pane(
     // so a press on a sealed snapshot doesn't fall through to the
     // live-grid path. The editor overlay takes precedence (it's
     // painted on top of the live `Term`'s prompt row).
-    let press_in_sealed_block: Option<(crate::block::BlockId, egui::Rect)> =
+    // `(block_id, full block rect, command_lines)` — the
+    // command_lines value lets `sealed_cursor_for_pos` translate y
+    // into the unified row space (command label rows come first).
+    let press_in_sealed_block: Option<(crate::block::BlockId, egui::Rect, usize)> =
         if !click_in_editor && let Some(pos) = press_origin {
-            sealed_rects.iter().find(|(_, r)| r.contains(pos)).copied()
+            sealed_rects.iter().find(|(_, r, _)| r.contains(pos)).copied()
         } else {
             None
         };
 
     /// Translate a pointer pixel position inside a sealed-block rect
-    /// to a `BlockCursor` (row, col). Clamps to the block's bounds —
-    /// pointer above → (0, 0); below → (last_row, last_col); to the
-    /// left → col 0; to the right → row_len. Out-of-rows clamps the
-    /// row; per-row col is clamped by the caller using
-    /// `sealed_row_len`.
+    /// to a `BlockCursor` in the block's unified row space (rows
+    /// `0..command_lines` = command label; rest = snapshot). Clamps
+    /// to the block's bounds — pointer above → row 0; below → last
+    /// row; left → col 0; right → row_len. Per-row col is clamped
+    /// by the caller via `sealed_row_len`.
     fn sealed_cursor_for_pos(
         rect: egui::Rect,
         pos: egui::Pos2,
         cell_w: f32,
         row_h: f32,
-        block_rows: usize,
+        total_rows: usize,
     ) -> crate::block_selection::BlockCursor {
         let dy = (pos.y - rect.min.y).max(0.0);
         let dx = (pos.x - rect.min.x).max(0.0);
-        let row = ((dy / row_h) as usize).min(block_rows.saturating_sub(1));
+        let row = ((dy / row_h) as usize).min(total_rows.saturating_sub(1));
         let col = (dx / cell_w) as usize;
         crate::block_selection::BlockCursor::new(row, col)
     }
@@ -875,7 +886,7 @@ pub fn render_pane(
     {
         rendered.response.request_focus();
 
-        if let Some((block_id, block_rect)) = press_in_sealed_block {
+        if let Some((block_id, block_rect, _cmd_lines)) = press_in_sealed_block {
             // Sealed-block press. Single → place an empty selection
             // at the clicked cell (drag extends it); double → select
             // the word; triple → select the line. Same multi-click
@@ -890,8 +901,10 @@ pub fn render_pane(
             slot.ui.last_press_time = now;
             slot.ui.last_press_pos = pos;
 
-            let rows = slot.session.sealed_snapshot_rows(block_id).unwrap_or(0);
-            let mut cursor = sealed_cursor_for_pos(block_rect, pos, cell_w, row_h, rows);
+            let (cmd_lines, snap_lines) =
+                slot.session.sealed_block_rows(block_id).unwrap_or((0, 0));
+            let total_rows = cmd_lines + snap_lines;
+            let mut cursor = sealed_cursor_for_pos(block_rect, pos, cell_w, row_h, total_rows);
             // Clamp col to the per-row length so an empty / short row
             // doesn't yield a col past the end.
             if let Some(row_len) = slot.session.sealed_row_len(block_id, cursor.row) {
@@ -1044,7 +1057,7 @@ pub fn render_pane(
         }
     } else if !modal_open
         && primary_down
-        && let Some((block_id, block_rect)) = press_in_sealed_block
+        && let Some((block_id, block_rect, _cmd_lines)) = press_in_sealed_block
         && let Some(sel) = slot.session.block_selection().copied()
         && sel.block_id == block_id
         && let Some(pos) = ctx.input(|i| i.pointer.interact_pos())
@@ -1056,8 +1069,9 @@ pub fn render_pane(
         // `BlockSelection`'s `block_id` to make sure we're still
         // tracking the block where the press began. Cross-block drag
         // is deferred to a follow-up.
-        let rows = slot.session.sealed_snapshot_rows(block_id).unwrap_or(0);
-        let mut cursor = sealed_cursor_for_pos(block_rect, pos, cell_w, row_h, rows);
+        let (cl, sl) = slot.session.sealed_block_rows(block_id).unwrap_or((0, 0));
+        let total_rows = cl + sl;
+        let mut cursor = sealed_cursor_for_pos(block_rect, pos, cell_w, row_h, total_rows);
         if let Some(row_len) = slot.session.sealed_row_len(block_id, cursor.row) {
             cursor.col = cursor.col.min(row_len);
         }

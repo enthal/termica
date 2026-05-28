@@ -96,44 +96,75 @@ pub fn cell_line_range(line: &[StyledCell]) -> (usize, usize) {
     (0, line.len())
 }
 
-/// Extract text covered by `sel` from `snapshot`. Multi-row
-/// selections concatenate rows with `\n`. Trailing whitespace on
-/// each row is trimmed so that copy-to-clipboard payloads don't
-/// carry the grid's space-padding all the way to the right margin.
+/// Extract text covered by `sel` from a sealed block's unified
+/// row space: rows `0..command_lines` come from `command` (split
+/// on `\n`); rows `command_lines..` come from `snapshot`. Multi-
+/// row selections concatenate with `\n`; trailing whitespace on
+/// each row is trimmed so copy-to-clipboard payloads don't carry
+/// the grid's space-padding to the right margin.
 ///
-/// `sel.block_id` is **not** validated against the snapshot — the
+/// `sel.block_id` is **not** validated against the inputs — the
 /// caller is expected to have looked the matching `Block::Sealed`
 /// up by id already. Returns an empty string for empty selections
-/// and for ranges that fall entirely outside the snapshot.
-pub fn block_selection_text(snapshot: &[StyledLine], sel: &BlockSelection) -> String {
+/// and for ranges that fall entirely outside the block.
+pub fn block_selection_text(
+    command: &str,
+    snapshot: &[StyledLine],
+    sel: &BlockSelection,
+) -> String {
     if sel.is_empty() {
         return String::new();
     }
     let (start, end) = sel.ordered();
-    let mut out = String::new();
-    let last_row = end.row.min(snapshot.len().saturating_sub(1));
+    let cmd_lines: Vec<&str> =
+        if command.is_empty() { Vec::new() } else { command.split('\n').collect() };
+    let total_rows = cmd_lines.len() + snapshot.len();
+    if total_rows == 0 {
+        return String::new();
+    }
+    let last_row = end.row.min(total_rows - 1);
     if start.row > last_row {
-        return out;
+        return String::new();
     }
 
+    let mut out = String::new();
     for row in start.row..=last_row {
-        let line = match snapshot.get(row) {
-            Some(l) => l,
-            None => continue,
+        let row_len_chars = if row < cmd_lines.len() {
+            cmd_lines[row].chars().count()
+        } else {
+            snapshot.get(row - cmd_lines.len()).map(|l| l.cells.len()).unwrap_or(0)
         };
         let (col_lo, col_hi) = if start.row == end.row {
             (start.col, end.col)
         } else if row == start.row {
-            (start.col, line.cells.len())
+            (start.col, row_len_chars)
         } else if row == end.row {
             (0, end.col)
         } else {
-            (0, line.cells.len())
+            (0, row_len_chars)
         };
-        let col_lo = col_lo.min(line.cells.len());
-        let col_hi = col_hi.min(line.cells.len()).max(col_lo);
-        let slice: String =
-            line.cells[col_lo..col_hi].iter().map(|c| c.c).collect::<String>().trim_end().into();
+        let col_lo = col_lo.min(row_len_chars);
+        let col_hi = col_hi.min(row_len_chars).max(col_lo);
+
+        let slice: String = if row < cmd_lines.len() {
+            // Command lines are stored as `&str` with `char`-level
+            // semantics; col_lo / col_hi count chars. Walk
+            // char_indices to find the byte range.
+            let line = cmd_lines[row];
+            let chars: Vec<(usize, char)> = line.char_indices().collect();
+            let start_b = chars.get(col_lo).map(|(b, _)| *b).unwrap_or(line.len());
+            let end_b = chars.get(col_hi).map(|(b, _)| *b).unwrap_or(line.len());
+            line[start_b..end_b].trim_end().to_string()
+        } else {
+            let line = &snapshot[row - cmd_lines.len()];
+            line.cells[col_lo..col_hi]
+                .iter()
+                .map(|c| c.c)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+
         if row > start.row {
             out.push('\n');
         }
@@ -255,21 +286,21 @@ mod tests {
     #[test]
     fn selection_text_single_row_partial() {
         let s = snap(&["hello world"]);
-        let text = block_selection_text(&s, &sel((0, 6), (0, 11)));
+        let text = block_selection_text("", &s, &sel((0, 6), (0, 11)));
         assert_eq!(text, "world");
     }
 
     #[test]
     fn selection_text_single_row_handles_reversed_endpoints() {
         let s = snap(&["hello world"]);
-        let text = block_selection_text(&s, &sel((0, 11), (0, 6)));
+        let text = block_selection_text("", &s, &sel((0, 11), (0, 6)));
         assert_eq!(text, "world");
     }
 
     #[test]
     fn selection_text_multi_row_joins_with_newlines() {
         let s = snap(&["line one", "line two", "line three"]);
-        let text = block_selection_text(&s, &sel((0, 5), (2, 4)));
+        let text = block_selection_text("", &s, &sel((0, 5), (2, 4)));
         assert_eq!(text, "one\nline two\nline");
     }
 
@@ -278,26 +309,62 @@ mod tests {
         // Grid rows are padded to width with spaces; copy should
         // omit that padding.
         let s = snap(&["hi      ", "there   "]);
-        let text = block_selection_text(&s, &sel((0, 0), (1, 8)));
+        let text = block_selection_text("", &s, &sel((0, 0), (1, 8)));
         assert_eq!(text, "hi\nthere");
     }
 
     #[test]
     fn selection_text_empty_when_anchor_equals_head() {
         let s = snap(&["abc"]);
-        assert_eq!(block_selection_text(&s, &sel((0, 1), (0, 1))), "");
+        assert_eq!(block_selection_text("", &s, &sel((0, 1), (0, 1))), "");
     }
 
     #[test]
     fn selection_text_clamps_cols_past_row_end() {
         let s = snap(&["abc"]);
-        let text = block_selection_text(&s, &sel((0, 0), (0, 99)));
+        let text = block_selection_text("", &s, &sel((0, 0), (0, 99)));
         assert_eq!(text, "abc");
     }
 
     #[test]
     fn selection_text_returns_empty_when_start_row_past_snapshot() {
         let s = snap(&["abc"]);
-        assert_eq!(block_selection_text(&s, &sel((5, 0), (6, 2))), "");
+        assert_eq!(block_selection_text("", &s, &sel((5, 0), (6, 2))), "");
+    }
+
+    // ---- command-label region (Phase 4F polish) ---------------------
+
+    #[test]
+    fn selection_text_inside_single_line_command() {
+        // Block: command = "echo hello", snapshot = ["hello"]. Row 0
+        // is the command line; row 1 is the output.
+        let s = snap(&["hello"]);
+        let text = block_selection_text("echo hello", &s, &sel((0, 5), (0, 10)));
+        assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn selection_text_inside_multi_line_command() {
+        // Multi-line command (Shift+Enter in the editor):
+        // row 0 = "echo a", row 1 = "echo b", row 2 = "out".
+        let s = snap(&["out"]);
+        let text = block_selection_text("echo a\necho b", &s, &sel((0, 5), (1, 6)));
+        assert_eq!(text, "a\necho b");
+    }
+
+    #[test]
+    fn selection_text_spans_command_and_snapshot() {
+        // Selection starts in the command, ends in the output.
+        let s = snap(&["hello"]);
+        let text = block_selection_text("echo hello", &s, &sel((0, 5), (1, 5)));
+        assert_eq!(text, "hello\nhello");
+    }
+
+    #[test]
+    fn selection_text_empty_command_falls_back_to_snapshot_indexing() {
+        // When the command is empty, row 0 is the first snapshot row.
+        let s = snap(&["abc", "def"]);
+        let text = block_selection_text("", &s, &sel((0, 0), (1, 3)));
+        assert_eq!(text, "abc\ndef");
     }
 }

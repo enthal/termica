@@ -704,6 +704,21 @@ pub fn paint_block_header(
 /// separately by [`paint_block_header`]; this helper handles the
 /// command line itself.
 pub fn paint_command_label(ui: &mut egui::Ui, command: &str) -> Response {
+    paint_command_label_with_selection(ui, command, None)
+}
+
+/// Same as [`paint_command_label`] but with optional selection
+/// overlay (rows in `selection.0.row..=selection.1.row` are
+/// indexed against the command's own `split('\n')` lines, **not**
+/// the unified block-row space — the caller is expected to have
+/// already clipped any unified selection to the command's row
+/// range and shifted it to 0-based). Endpoints must be in reading
+/// order. Highlight rectangles are painted **under** the glyphs.
+pub fn paint_command_label_with_selection(
+    ui: &mut egui::Ui,
+    command: &str,
+    selection: Option<(BlockCursor, BlockCursor)>,
+) -> Response {
     let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
     let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
     let row_h = ui.fonts_mut(|f| f.row_height(&font_id));
@@ -711,8 +726,43 @@ pub fn paint_command_label(ui: &mut egui::Ui, command: &str) -> Response {
     let cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0).max(1);
     let rows = lines.len();
     let size = Vec2::new(cols as f32 * cell_w, rows as f32 * row_h);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
     let painter = ui.painter_at(rect);
+
+    // Selection overlay first (under the glyphs).
+    if let Some((start, end)) = selection
+        && start != end
+    {
+        for (i, line) in lines.iter().enumerate() {
+            if i < start.row || i > end.row {
+                continue;
+            }
+            let line_chars = line.chars().count();
+            let (col_lo, col_hi) = if start.row == end.row {
+                (start.col, end.col)
+            } else if i == start.row {
+                (start.col, line_chars)
+            } else if i == end.row {
+                (0, end.col)
+            } else {
+                (0, line_chars)
+            };
+            let col_hi = col_hi.min(line_chars.max(col_lo));
+            if col_hi <= col_lo {
+                continue;
+            }
+            let x0 = rect.min.x + col_lo as f32 * cell_w;
+            let x1 = rect.min.x + col_hi as f32 * cell_w;
+            let y0 = rect.min.y + i as f32 * row_h;
+            let y1 = y0 + row_h;
+            painter.rect_filled(
+                Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)),
+                0.0,
+                SELECTION_COLOR,
+            );
+        }
+    }
+
     for (i, line) in lines.iter().enumerate() {
         if line.is_empty() {
             continue;
@@ -747,6 +797,23 @@ pub fn paint_command_label(ui: &mut egui::Ui, command: &str) -> Response {
 /// hit-testable rect for sealed-block selection. The command label
 /// region is excluded so that clicks on the label don't begin a
 /// selection that would visually start above the highlight.
+/// Result of painting a sealed block: the union [`Rect`] over the
+/// command label + snapshot regions (excluding the header chip),
+/// plus the row count of the command label. Used by
+/// [`crate::render_pane`] to translate pointer-pixel positions
+/// into a [`BlockCursor`] in the block's unified row space
+/// (`0..command_lines` = command rows, the rest = snapshot rows).
+#[derive(Debug, Clone, Copy)]
+pub struct SealedBlockRender {
+    /// Hit-test rect covering both command-label and snapshot
+    /// regions. The header chip is NOT included so clicks on the
+    /// chip don't start a selection.
+    pub rect: Rect,
+    /// Number of rows the command label occupies. Snapshot rows
+    /// start at this index in the unified row space.
+    pub command_lines: usize,
+}
+
 pub fn paint_sealed_block(
     ui: &mut egui::Ui,
     command: &str,
@@ -755,12 +822,57 @@ pub fn paint_sealed_block(
     cwd: Option<&std::path::Path>,
     home: Option<&std::path::Path>,
     exit: Option<i32>,
-) -> Response {
+) -> SealedBlockRender {
     let _ = paint_block_header(ui, cwd, home, exit);
-    if !command.is_empty() {
-        let _ = paint_command_label(ui, command);
+
+    let cmd_lines = if command.is_empty() { 0 } else { command.split('\n').count() };
+    // Split the unified selection into command and snapshot pieces.
+    let (cmd_sel, snap_sel) = split_selection_at_row(selection, cmd_lines);
+
+    let cmd_rect = if !command.is_empty() {
+        Some(paint_command_label_with_selection(ui, command, cmd_sel).rect)
+    } else {
+        None
+    };
+
+    let snap_rect = paint_styled_lines(ui, snapshot, snap_sel).rect;
+    let rect = match cmd_rect {
+        Some(c) => c.union(snap_rect),
+        None => snap_rect,
+    };
+
+    SealedBlockRender { rect, command_lines: cmd_lines }
+}
+
+/// Clip a unified-row [`BlockSelection`] range to the command
+/// region (rows `0..cmd_lines`) and the snapshot region (rows
+/// `cmd_lines..`), returning each piece in its own 0-based row
+/// space. Either piece is `None` when no part of the selection
+/// lands in that region.
+type SelectionRange = (BlockCursor, BlockCursor);
+fn split_selection_at_row(
+    selection: Option<SelectionRange>,
+    cmd_lines: usize,
+) -> (Option<SelectionRange>, Option<SelectionRange>) {
+    let Some((start, end)) = selection else { return (None, None) };
+    if start == end {
+        return (None, None);
     }
-    paint_styled_lines(ui, snapshot, selection)
+    // Both endpoints in command region.
+    if end.row < cmd_lines {
+        return (Some((start, end)), None);
+    }
+    // Both endpoints in snapshot region.
+    if start.row >= cmd_lines {
+        let s = BlockCursor::new(start.row - cmd_lines, start.col);
+        let e = BlockCursor::new(end.row - cmd_lines, end.col);
+        return (None, Some((s, e)));
+    }
+    // Spans both regions.
+    let cmd_end = BlockCursor::new(cmd_lines - 1, usize::MAX);
+    let snap_start = BlockCursor::new(0, 0);
+    let snap_end = BlockCursor::new(end.row - cmd_lines, end.col);
+    (Some((start, cmd_end)), Some((snap_start, snap_end)))
 }
 
 /// Paint the semi-transparent selection rectangles.
