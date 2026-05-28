@@ -126,8 +126,8 @@ pub fn compute_footer_height(
         return 0.0;
     }
     let editor_rows = editor_lines.max(1);
-    let chrome_rows = if has_cwd { 1 } else { 0 };
-    (chrome_rows + editor_rows) as f32 * row_h + FOOTER_DESCENDER_PAD
+    let chrome_h = if has_cwd { row_h + 2.0 * render::CHIP_PAD_Y } else { 0.0 };
+    chrome_h + editor_rows as f32 * row_h + FOOTER_DESCENDER_PAD
 }
 
 /// Translate a `(Key, Modifiers)` pair into an [`EditorMotion`] +
@@ -519,21 +519,25 @@ pub fn render_pane(
     // visual reads as "stuck to bottom" rather than "floating."
     let tail_is_running_for_height =
         matches!(slot.session.blocks().last(), Some(crate::block::Block::Running { .. }));
+    // Per-block chrome row (the cwd / exit chip) is taller than a
+    // plain text row because the chip has vertical padding.
+    let chip_h = row_h + 2.0 * render::CHIP_PAD_Y;
     let mut content_h: f32 = 0.0;
     if !in_alt_screen {
         for block in slot.session.blocks().iter() {
             match block {
-                crate::block::Block::Sealed { command, snapshot, header, .. } => {
-                    let header_rows = if header.cwd.is_some() { 1 } else { 0 };
+                crate::block::Block::Sealed { command, snapshot, header, exit, .. } => {
+                    let has_header = header.cwd.is_some() || matches!(exit, Some(n) if *n != 0);
+                    let header_h = if has_header { chip_h } else { 0.0 };
                     let command_rows = command.split('\n').count();
                     let snap_rows = snapshot.len();
-                    content_h += (header_rows + command_rows + snap_rows) as f32 * row_h + 4.0;
+                    content_h += header_h + (command_rows + snap_rows) as f32 * row_h + 4.0;
                 }
                 crate::block::Block::Running { command, header, .. } => {
-                    let header_rows = if header.cwd.is_some() { 1 } else { 0 };
+                    let header_h = if header.cwd.is_some() { chip_h } else { 0.0 };
                     let command_rows =
                         if !command.is_empty() { command.split('\n').count() } else { 0 };
-                    content_h += (header_rows + command_rows) as f32 * row_h;
+                    content_h += header_h + command_rows as f32 * row_h;
                 }
                 crate::block::Block::Prompt { .. } => {}
             }
@@ -593,6 +597,7 @@ pub fn render_pane(
                                 snapshot,
                                 sel_for_this,
                                 header.cwd.as_deref(),
+                                home,
                                 *exit,
                             );
                             sealed_rects.push((*id, resp.rect));
@@ -602,7 +607,8 @@ pub fn render_pane(
                             ui.add_space(4.0);
                         }
                         crate::block::Block::Running { command, header, .. } => {
-                            let _ = render::paint_block_header(ui, header.cwd.as_deref(), None);
+                            let _ =
+                                render::paint_block_header(ui, header.cwd.as_deref(), home, None);
                             if !command.is_empty() {
                                 let _ = render::paint_command_label(ui, command);
                             }
@@ -716,14 +722,14 @@ pub fn render_pane(
     // exact rect the editor occupies — used by the click / drag
     // handlers below to translate pointer pixels to byte offsets.
     let footer_rect: Option<egui::Rect> = if footer_h > 0.0 {
-        let chip_h = if has_prompt_cwd { row_h } else { 0.0 };
+        let chip_h = if has_prompt_cwd { row_h + 2.0 * render::CHIP_PAD_Y } else { 0.0 };
         let editor_h = footer_h - chip_h;
         let footer_origin = ui.next_widget_position();
 
         if has_prompt_cwd
             && let Some(crate::block::Block::Prompt { header, .. }) = slot.session.blocks().last()
         {
-            let _ = render::paint_block_header(ui, header.cwd.as_deref(), None);
+            let _ = render::paint_block_header(ui, header.cwd.as_deref(), home, None);
         }
 
         // Allocate the editor strip and paint into it. We use an
@@ -1265,26 +1271,39 @@ mod tests {
     }
 
     #[test]
-    fn single_line_editor_with_cwd_yields_two_rows_plus_descender_pad() {
-        // 1 chrome row (cwd chip) + 1 editor row + descender pad.
-        assert_eq!(compute_footer_height(true, true, 1, true, 20.0), 40.0 + FOOTER_DESCENDER_PAD);
+    fn single_line_editor_with_cwd_includes_chip_padding_and_descender_pad() {
+        // chrome (row_h + 2 * CHIP_PAD_Y) + 1 editor row of row_h
+        // + descender pad.
+        let chip_pad = 2.0 * render::CHIP_PAD_Y;
+        assert_eq!(
+            compute_footer_height(true, true, 1, true, 20.0),
+            40.0 + chip_pad + FOOTER_DESCENDER_PAD
+        );
     }
 
     #[test]
     fn single_line_editor_without_cwd_yields_one_row_plus_descender_pad() {
-        // No chrome row when cwd is unknown.
+        // No chrome row when cwd is unknown — no chip padding either.
         assert_eq!(compute_footer_height(true, true, 1, false, 20.0), 20.0 + FOOTER_DESCENDER_PAD);
     }
 
     #[test]
-    fn three_line_editor_with_cwd_yields_four_rows_plus_descender_pad() {
-        assert_eq!(compute_footer_height(true, true, 3, true, 20.0), 80.0 + FOOTER_DESCENDER_PAD);
+    fn three_line_editor_with_cwd_includes_chip_padding_and_descender_pad() {
+        let chip_pad = 2.0 * render::CHIP_PAD_Y;
+        assert_eq!(
+            compute_footer_height(true, true, 3, true, 20.0),
+            80.0 + chip_pad + FOOTER_DESCENDER_PAD
+        );
     }
 
     #[test]
     fn zero_editor_lines_treated_as_one() {
         // An empty editor still needs a caret row.
-        assert_eq!(compute_footer_height(true, true, 0, true, 20.0), 40.0 + FOOTER_DESCENDER_PAD);
+        let chip_pad = 2.0 * render::CHIP_PAD_Y;
+        assert_eq!(
+            compute_footer_height(true, true, 0, true, 20.0),
+            40.0 + chip_pad + FOOTER_DESCENDER_PAD
+        );
     }
 
     // ---- classify_editor_motion (per-OS keybindings) -----------------

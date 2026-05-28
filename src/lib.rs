@@ -68,7 +68,7 @@ pub use render_pane::{
     render_pane,
 };
 pub use shortcuts::match_pane_shortcut;
-pub use tab_title::{active_pane_in_tabs, tab_title_for};
+pub use tab_title::{active_pane_in_tabs, home_relative_cwd, tab_title_for};
 
 use eframe::egui;
 

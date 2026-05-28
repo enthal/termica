@@ -574,36 +574,47 @@ pub fn paint_prompt_editor_at(
     }
 }
 
-/// Paint the dim header line above a block: cwd on the left, an
-/// optional "exit N" annotation on the right.
+/// Background fill for the cwd / exit chip painted above each block.
+/// A near-black grey that sits clearly above `DEFAULT_BG` without
+/// shouting — it reads as "label affordance" rather than as content.
+pub const BLOCK_HEADER_CHIP_BG: Color32 = Color32::from_rgb(0x22, 0x22, 0x22);
+
+/// Padding inside each chip, in logical pixels. Affects both the
+/// horizontal padding around the text and the chip's `corner_radius`
+/// proportionally. Empirically tuned against the monospace font.
+pub const CHIP_PAD_X: f32 = 6.0;
+pub const CHIP_PAD_Y: f32 = 2.0;
+pub const CHIP_CORNER_RADIUS: f32 = 4.0;
+pub const CHIP_GAP: f32 = 4.0;
+
+/// Paint the dim header line above a block as one or two rounded
+/// chips: the cwd on the left, an optional `exit N` annotation
+/// (red text) on the right. The cwd is shown with `$HOME` substituted
+/// for `~` per [`crate::home_relative_cwd`], matching the tab-title
+/// convention.
 ///
 /// The first piece of [4G](../spec/10-roadmap.md#phase-4--editor-at-prompt-block-model-pivot)
-/// block chrome. Renders **only** the cwd today; the git branch and
-/// dirty-summary chips that spec/04 §"Visual structure" calls for
+/// block chrome. Renders only the cwd today; the git branch and
+/// dirty-summary chips called for in spec/04 §"Visual structure"
 /// live in Phase 5's async-probe surface (`termica-context`). Live
 /// duration timers for `Running` blocks also defer to that phase —
 /// the wall-clock plumbing isn't in place yet.
 ///
-/// Format:
-///
-/// ```text
-/// <cwd>                 exit <n>   ← red, only when exit != 0
-/// ```
-///
 /// When `cwd` is `None` *and* there's nothing to show on the right
 /// (no non-zero `exit`), nothing is painted at all — the header
-/// line is skipped entirely so the block looks identical to the
+/// row is skipped entirely so the block looks identical to the
 /// pre-4G layout.
 pub fn paint_block_header(
     ui: &mut egui::Ui,
     cwd: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
     exit: Option<i32>,
 ) -> Option<Response> {
     let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
     let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
     let row_h = ui.fonts_mut(|f| f.row_height(&font_id));
 
-    let cwd_text = cwd.map(|p| p.display().to_string()).unwrap_or_default();
+    let cwd_text = cwd.map(|p| crate::home_relative_cwd(p, home)).unwrap_or_default();
     let show_exit = matches!(exit, Some(n) if n != 0);
     let exit_text = match exit {
         Some(n) if n != 0 => format!("exit {n}"),
@@ -619,15 +630,30 @@ pub fn paint_block_header(
         return None;
     }
 
-    let total_chars =
-        cwd_text.chars().count() + if show_exit { exit_text.chars().count() + 2 } else { 0 };
-    let size = Vec2::new((total_chars as f32 * cell_w).max(cell_w), row_h);
+    // Layout the row first so we know the total width to allocate.
+    // Each chip is `text_width + 2 * CHIP_PAD_X` wide and
+    // `row_h + 2 * CHIP_PAD_Y` tall; chips are spaced `CHIP_GAP`
+    // apart horizontally.
+    let cwd_chip_w = if cwd_text.is_empty() {
+        0.0
+    } else {
+        cwd_text.chars().count() as f32 * cell_w + 2.0 * CHIP_PAD_X
+    };
+    let exit_chip_w =
+        if show_exit { exit_text.chars().count() as f32 * cell_w + 2.0 * CHIP_PAD_X } else { 0.0 };
+    let between_gap = if !cwd_text.is_empty() && show_exit { CHIP_GAP } else { 0.0 };
+    let total_w = cwd_chip_w + between_gap + exit_chip_w;
+    let chip_h = row_h + 2.0 * CHIP_PAD_Y;
+    let size = Vec2::new(total_w.max(cell_w), chip_h);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
 
+    let radius = CHIP_CORNER_RADIUS as u8;
     if !cwd_text.is_empty() {
+        let chip_rect = Rect::from_min_size(rect.min, Vec2::new(cwd_chip_w, chip_h));
+        painter.rect_filled(chip_rect, radius, BLOCK_HEADER_CHIP_BG);
         painter.text(
-            Pos2::new(rect.min.x, rect.min.y),
+            Pos2::new(chip_rect.min.x + CHIP_PAD_X, chip_rect.min.y + CHIP_PAD_Y),
             egui::Align2::LEFT_TOP,
             &cwd_text,
             font_id.clone(),
@@ -635,12 +661,12 @@ pub fn paint_block_header(
         );
     }
     if show_exit {
-        // Two-cell gap between cwd and exit text — keeps them
-        // visually distinct without leaning on a separator glyph
-        // (which would be Unicode and forbidden per CLAUDE.md).
-        let exit_x = rect.min.x + (cwd_text.chars().count() + 2) as f32 * cell_w;
+        let chip_x = rect.min.x + cwd_chip_w + between_gap;
+        let chip_rect =
+            Rect::from_min_size(Pos2::new(chip_x, rect.min.y), Vec2::new(exit_chip_w, chip_h));
+        painter.rect_filled(chip_rect, radius, BLOCK_HEADER_CHIP_BG);
         painter.text(
-            Pos2::new(exit_x, rect.min.y),
+            Pos2::new(chip_rect.min.x + CHIP_PAD_X, chip_rect.min.y + CHIP_PAD_Y),
             egui::Align2::LEFT_TOP,
             &exit_text,
             font_id,
@@ -716,9 +742,10 @@ pub fn paint_sealed_block(
     snapshot: &[StyledLine],
     selection: Option<(BlockCursor, BlockCursor)>,
     cwd: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
     exit: Option<i32>,
 ) -> Response {
-    let _ = paint_block_header(ui, cwd, exit);
+    let _ = paint_block_header(ui, cwd, home, exit);
     if !command.is_empty() {
         let _ = paint_command_label(ui, command);
     }
