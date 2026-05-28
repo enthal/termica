@@ -138,8 +138,16 @@ impl PromptEditor {
     /// Cursor lands at the start of where the selection was.
     /// Used internally by insert/delete ops when a selection
     /// exists, and externally by Cmd+X cut.
+    ///
+    /// A *degenerate* anchor (anchor == cursor — produced by the
+    /// drag handler's first `set_cursor_extending` before the
+    /// pointer has actually moved) is treated as "no selection"
+    /// and cleared. Without this, later text mutations leave the
+    /// stale anchor pointing into shrunken text and a follow-up
+    /// `replace_range` slices past the end.
     pub fn delete_selection(&mut self) -> bool {
         let Some((start, end)) = self.selection_range() else {
+            self.selection_anchor = None;
             return false;
         };
         self.text.replace_range(start..end, "");
@@ -1101,6 +1109,50 @@ mod tests {
         e.insert_str("bye");
         assert_eq!(e.text(), "bye");
         assert_eq!(e.cursor(), 3);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn backspace_after_degenerate_extending_does_not_panic() {
+        // Repro for the panic the user hit while backspacing:
+        // `set_cursor_extending(cursor)` (issued by the editor's
+        // mouse-drag handler on the press frame, before any actual
+        // pointer movement) anchors the selection at the current
+        // cursor, leaving a *degenerate* selection (anchor == cursor)
+        // that `selection_range()` reports as `None`. The text-
+        // mutating ops then trust `delete_selection()` to have
+        // cleared the anchor when there was no real selection —
+        // it didn't, so subsequent backspaces eventually find an
+        // anchor past `text.len()` and `String::replace_range`
+        // slices past the end.
+        let mut e = PromptEditor::new();
+        e.insert_str("abc");
+        e.set_cursor_extending(3); // degenerate: anchor=Some(3), cursor=3
+        assert!(!e.has_selection(), "degenerate anchor should not look like a selection");
+        e.backspace(); // text="ab", cursor=2, anchor=Some(3) leaks past text.len()
+        // Without the fix, this second backspace panics inside
+        // `String::replace_range(2..3, "")` because anchor=3 > text.len()=2.
+        e.backspace();
+        assert_eq!(e.text(), "a");
+        assert_eq!(e.cursor(), 1);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn typing_after_degenerate_extending_inserts_each_char_independently() {
+        // Same root cause as the panic above, surfaced as the
+        // "second letter replaces the first" bug: a degenerate
+        // anchor from the drag handler turns into a real (and
+        // hidden) selection as soon as the cursor advances past
+        // it via insert. The next insert deletes the captured
+        // range, eating the user's first character.
+        let mut e = PromptEditor::new();
+        e.set_cursor_extending(0); // degenerate at 0
+        e.insert_char('a');
+        e.insert_char('b');
+        assert_eq!(e.text(), "ab", "second char must not delete the first");
+        assert_eq!(e.cursor(), 2);
+        assert!(!e.has_selection());
         assert_invariant(&e);
     }
 
