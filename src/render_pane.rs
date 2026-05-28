@@ -1,8 +1,8 @@
-//! Per-pane rendering: status header, PTY resize, link / path scan,
+//! Per-pane rendering: PTY resize, link / path scan, block stack,
 //! terminal grid paint, mouse selection, scroll wheel, keyboard
-//! input, and app-shortcut detection. Same code path runs for every
-//! visible pane regardless of layout (Phase 2A's "one pane in one
-//! tab" or Phase 2B's "multiple panes across splits").
+//! input, app-shortcut detection, and fixed-footer editor. Same
+//! code path runs for every visible pane regardless of layout
+//! (single tab or split into multiple panes).
 
 use std::path::Path;
 
@@ -10,7 +10,6 @@ use alacritty_terminal::grid::Dimensions;
 use eframe::egui;
 
 use crate::links::{self, LinkSpan};
-use crate::pane::PaneView;
 use crate::pane_slot::PaneSlot;
 use crate::paths;
 use crate::render;
@@ -321,25 +320,6 @@ fn open_url(url: &str) {
     }
 }
 
-/// Render the workspace's status header into `ui`.
-///
-/// Pure UI: takes a plain [`PaneView`] snapshot, never touches OS
-/// resources, safe to drive from `egui_kittest` snapshot tests.
-/// The cell grid is painted separately by [`render::paint_terminal`]
-/// directly below this header.
-pub fn central_panel(ui: &mut egui::Ui, view: &PaneView) {
-    ui.heading("Termica");
-    ui.label(format!(
-        "Phase 2A — tabs live. \
-         Bytes: {}   ·   alt-screen: {}   ·   grid: {}×{}",
-        view.bytes_received, view.alt_screen, view.rows, view.cols
-    ));
-    if let Some(cwd) = &view.cwd {
-        ui.label(format!("cwd: {}", cwd.display()));
-    }
-    ui.separator();
-}
-
 /// Compute how many `(rows, cols)` fit into `avail` at the given
 /// cell metrics, clamped to [`MIN_ROWS`] × [`MIN_COLS`]. Pure
 /// function so the rounding / clamp policy is unit-testable.
@@ -385,9 +365,7 @@ pub fn render_pane(
     // rely on it to consume events that `ctx.input` reads here; we
     // have to gate explicitly.
 
-    // ---- status header ------------------------------------------
     let view = slot.session.view();
-    central_panel(ui, &view);
 
     // ---- bootstrap suppression ----------------------------------
     //
@@ -496,12 +474,54 @@ pub fn render_pane(
     );
     let scroll_max_h = (ui.available_height() - footer_h).max(0.0);
 
+    // Estimate the natural height of the block stack + (conditionally
+    // painted) live `Term`, so the loop can prepend a top spacer that
+    // bottom-aligns the content when it's shorter than the scroll
+    // area. Without this, a fresh pane with one or two sealed blocks
+    // shows those blocks at the *top* of the viewport with a tall
+    // empty gap above the editor footer. Approximate: doesn't account
+    // for every egui item-spacing pixel, but close enough that the
+    // visual reads as "stuck to bottom" rather than "floating."
+    let tail_is_running_for_height =
+        matches!(slot.session.blocks().last(), Some(crate::block::Block::Running { .. }));
+    let mut content_h: f32 = 0.0;
+    if !in_alt_screen {
+        for block in slot.session.blocks().iter() {
+            match block {
+                crate::block::Block::Sealed { command, snapshot, header, .. } => {
+                    let header_rows = if header.cwd.is_some() { 1 } else { 0 };
+                    let command_rows = command.split('\n').count();
+                    let snap_rows = snapshot.len();
+                    content_h += (header_rows + command_rows + snap_rows) as f32 * row_h + 4.0;
+                }
+                crate::block::Block::Running { command, header, .. } => {
+                    let header_rows = if header.cwd.is_some() { 1 } else { 0 };
+                    let command_rows =
+                        if !command.is_empty() { command.split('\n').count() } else { 0 };
+                    content_h += (header_rows + command_rows) as f32 * row_h;
+                }
+                crate::block::Block::Prompt { .. } => {}
+            }
+        }
+        if tail_is_running_for_height {
+            content_h += slot.session.terminal().grid().screen_lines() as f32 * row_h;
+        }
+    }
+    let top_spacer = (scroll_max_h - content_h).max(0.0);
+
     let scroll_inner = egui::ScrollArea::vertical()
         .id_salt(("pane-blocks", slot.session.pane_id()))
         .stick_to_bottom(true)
         .auto_shrink([false, false])
         .max_height(scroll_max_h)
         .show(ui, |ui| {
+            // Top spacer bottom-aligns short content (computed
+            // above). In alt-screen mode `content_h` is 0 and the
+            // alt-screen paint_terminal below claims the whole pane,
+            // so the spacer is harmless there too.
+            if top_spacer > 0.0 {
+                ui.add_space(top_spacer);
+            }
             if in_alt_screen {
                 // Don't paint blocks or the editor — let
                 // paint_terminal below claim the full pane.
@@ -605,19 +625,45 @@ pub fn render_pane(
             // shell's one and the editor's overlay). The editor's
             // cursor is the real input caret in this mode.
             let hide_term_cursor = slot.session.editor_is_active();
-            let rendered = render::paint_terminal(
-                ui,
-                slot.session.terminal(),
-                selection.as_ref(),
-                highlighted_link,
-                hide_term_cursor,
-            );
-
-            // (Phase 4D) The editor + cwd chip have moved out of
-            // this scroll area; they paint in the fixed footer below
-            // it. The live `Term`'s cursor is still hidden by
-            // `hide_term_cursor` above so the empty `PS1=''` cursor
-            // row doesn't show a stray block.
+            // Only paint the live `Term` when there's something to
+            // show: alt-screen programs (vim / less / htop) own the
+            // whole grid, and a `Running` block streams output into
+            // it. When the tail is `Prompt`, the grid is empty
+            // (`reset_for_new_block` cleared it) and painting it
+            // anyway leaves a tall blank region between the last
+            // sealed block and the editor footer — the scroll area's
+            // `stick_to_bottom` then pins that blank to the bottom
+            // and the user has to scroll up to see history. Skip the
+            // paint instead and synthesise an empty `TerminalRender`
+            // so the hit-test path downstream still has something to
+            // chew on.
+            let rendered = if in_alt_screen
+                || matches!(slot.session.blocks().last(), Some(crate::block::Block::Running { .. }))
+            {
+                render::paint_terminal(
+                    ui,
+                    slot.session.terminal(),
+                    selection.as_ref(),
+                    highlighted_link,
+                    hide_term_cursor,
+                )
+            } else {
+                let origin = ui.next_widget_position();
+                let (_rect, response) =
+                    ui.allocate_exact_size(egui::Vec2::ZERO, egui::Sense::hover());
+                render::TerminalRender {
+                    response,
+                    geometry: selection::GridGeometry {
+                        origin_x: origin.x,
+                        origin_y: origin.y,
+                        cell_w,
+                        row_h,
+                        display_offset: 0,
+                        screen_lines: 0,
+                        cols: 0,
+                    },
+                }
+            };
 
             (rendered, links_in_view, highlighted_link.cloned())
         });

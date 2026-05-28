@@ -64,8 +64,8 @@ pub use app::TermicaApp;
 pub use behavior::paint_focused_tab_underline;
 pub use pane_slot::{PaneAction, PaneId, PaneSlot, PaneUiState};
 pub use render_pane::{
-    ALT_SCREEN_BORDER_COLOR, ALT_SCREEN_BORDER_WIDTH, cells_from_pixels, central_panel,
-    paint_alt_screen_border, render_pane,
+    ALT_SCREEN_BORDER_COLOR, ALT_SCREEN_BORDER_WIDTH, cells_from_pixels, paint_alt_screen_border,
+    render_pane,
 };
 pub use shortcuts::match_pane_shortcut;
 pub use tab_title::{active_pane_in_tabs, tab_title_for};

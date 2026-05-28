@@ -1,12 +1,10 @@
 //! UI snapshot tests via `egui_kittest`.
 //!
-//! Two groups:
-//! 1. Status-header tests (`snapshot_central_panel_*`) drive
-//!    `central_panel(ui, &PaneView)` with fixed [`PaneView`]
-//!    fixtures. No grid, no PTY, no OS handles.
-//! 2. Cell-renderer tests (`snapshot_terminal_*`) construct a real
-//!    [`TerminalState`], feed it synthetic bytes, and snapshot the
-//!    rendered grid through `render::paint_terminal`.
+//! Cell-renderer tests (`snapshot_terminal_*`) construct a real
+//! [`TerminalState`], feed it synthetic bytes, and snapshot the
+//! rendered grid through `render::paint_terminal`. Block / editor /
+//! sealed-snapshot tests (`snapshot_paint_*`) drive the helper
+//! functions in `render` directly with fixed inputs.
 //!
 //! Update baselines with:
 //!
@@ -22,7 +20,6 @@
 
 use eframe::egui;
 use egui_kittest::Harness;
-use termica::pane::PaneView;
 use termica::render;
 use termica::terminal::TerminalState;
 
@@ -35,52 +32,6 @@ fn sealed_snapshot(rows: u16, cols: u16, bytes: &[u8]) -> Vec<termica::terminal:
     let mut t = TerminalState::new(rows, cols);
     t.feed(bytes);
     t.snapshot_lines_all()
-}
-
-// ---- status header fixtures ----------------------------------------------
-
-fn empty_view() -> PaneView {
-    PaneView::default()
-}
-
-fn typical_view() -> PaneView {
-    PaneView { bytes_received: 84, alt_screen: false, ..PaneView::default() }
-}
-
-#[test]
-fn snapshot_central_panel_empty() {
-    let view = empty_view();
-    let mut harness = Harness::builder()
-        .with_size(egui::Vec2::new(800.0, 120.0))
-        .build_ui(move |ui| termica::central_panel(ui, &view));
-    harness.snapshot("central_panel_empty");
-}
-
-#[test]
-fn snapshot_central_panel_with_typical_output() {
-    let view = typical_view();
-    let mut harness = Harness::builder()
-        .with_size(egui::Vec2::new(800.0, 120.0))
-        .build_ui(move |ui| termica::central_panel(ui, &view));
-    harness.snapshot("central_panel_typical");
-}
-
-#[test]
-fn snapshot_central_panel_with_cwd() {
-    // OSC 7 has reported a cwd; the header should show the 📂 line.
-    let view = PaneView {
-        bytes_received: 256,
-        alt_screen: false,
-        rows: 24,
-        cols: 80,
-        cwd: Some(std::path::PathBuf::from("/Users/tim/git/enthal/termica")),
-        screen_text: String::new(),
-        ..PaneView::default()
-    };
-    let mut harness = Harness::builder()
-        .with_size(egui::Vec2::new(800.0, 150.0))
-        .build_ui(move |ui| termica::central_panel(ui, &view));
-    harness.snapshot("central_panel_with_cwd");
 }
 
 // ---- cell-renderer fixtures ----------------------------------------------
