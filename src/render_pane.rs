@@ -1236,23 +1236,33 @@ pub fn render_pane(
             _ => false,
         });
 
-        // Editor-mode clipboard ops: copy / cut act on the editor's
-        // selection when the editor is active. Outside editor mode
-        // the existing alacritty selection path stays in charge.
-        // Sealed-block selection (Phase 4F) wins over the live-grid
-        // selection when both somehow exist (the setters keep them
-        // mutually exclusive, but the ordering here makes the
-        // priority explicit).
-        if slot.session.editor_is_active() {
-            if (copy_pressed || cut_pressed)
-                && let Some(text) =
-                    slot.session.blocks().editor_on_tail().and_then(|e| e.selected_text())
-            {
-                let owned = text.to_string();
-                ctx.copy_text(owned);
-                if cut_pressed && let Some(editor) = slot.session.editor_mut() {
-                    editor.delete_selection();
-                }
+        // Clipboard priority, highest to lowest:
+        //   1. The editor's own selection (only relevant in editor
+        //      mode; supports cut).
+        //   2. A sealed-block selection (Phase 4F).
+        //   3. The live-grid (alacritty) selection.
+        //
+        // The editor being active does NOT mask the block / grid
+        // selections — the user can have focus in the editor while
+        // a sealed-block selection is visible, and Cmd+C should
+        // copy that block selection. Only the editor's *own*
+        // selection takes priority, and only when it actually
+        // exists.
+        let editor_selection: Option<String> = if slot.session.editor_is_active() {
+            slot.session
+                .blocks()
+                .editor_on_tail()
+                .and_then(|e| e.selected_text())
+                .map(str::to_string)
+        } else {
+            None
+        };
+        if (copy_pressed || cut_pressed)
+            && let Some(text) = editor_selection
+        {
+            ctx.copy_text(text);
+            if cut_pressed && let Some(editor) = slot.session.editor_mut() {
+                editor.delete_selection();
             }
         } else if copy_pressed {
             if let Some(text) = slot.session.block_selection_text() {
