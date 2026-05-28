@@ -705,17 +705,16 @@ pub fn render_pane(
                 )
             } else {
                 // Synthetic empty `TerminalRender` for the editor-
-                // active case. We allocate a 1×1 `click_and_drag`
-                // widget so its `Response` is **focusable** — without
-                // this, `request_focus()` / `has_focus()` on
-                // `rendered.response` would silently no-op and the
-                // keyboard handler downstream would never see input.
-                // The 1px footprint is invisible and the widget is
-                // sandwiched between the block stack and the editor
-                // footer so a stray click on it is harmless.
+                // active case. `Sense::hover()` — NOT click/drag — so
+                // the placeholder cannot accidentally claim focus.
+                // Focus belongs to the editor footer (built below)
+                // and `focus_response` selects it explicitly; if this
+                // widget were focusable, egui's auto-id machinery
+                // could route focus here instead and the caret would
+                // never appear in the footer.
                 let origin = ui.next_widget_position();
-                let (_rect, response) = ui
-                    .allocate_exact_size(egui::Vec2::new(1.0, 1.0), egui::Sense::click_and_drag());
+                let (_rect, response) =
+                    ui.allocate_exact_size(egui::Vec2::new(1.0, 1.0), egui::Sense::hover());
                 render::TerminalRender {
                     response,
                     geometry: selection::GridGeometry {
@@ -764,17 +763,24 @@ pub fn render_pane(
             let _ = render::paint_block_header(ui, header.cwd.as_deref(), home, None);
         }
 
-        // Allocate the editor strip and paint into it. We use an
-        // explicit rect rather than `paint_prompt_editor` (which
-        // allocates its own size) so the click / drag hit-test rect
-        // matches exactly what we painted. `Sense::click_and_drag`
-        // is required: without it, presses inside the editor footer
-        // are not registered by the mouse handler below.
+        // Allocate the editor strip and paint into it. The widget
+        // ID is pane-scoped and content-independent so it stays
+        // stable across frames AND across the Prompt→Running→Prompt
+        // transition (each command run creates a new editor; the
+        // ID must not depend on its identity). Without this stability
+        // egui's auto-id can shift between frames when adjacent
+        // layout changes, focus is silently dropped, and the caret
+        // never appears. `Sense::click_and_drag` is required so
+        // mouse presses register here at all.
         let editor_rect = egui::Rect::from_min_size(
             egui::Pos2::new(footer_origin.x, footer_origin.y + chip_h),
             egui::Vec2::new(ui.available_width(), editor_h),
         );
-        let editor_response = ui.allocate_rect(editor_rect, egui::Sense::click_and_drag());
+        let editor_response = ui.interact(
+            editor_rect,
+            ui.id().with(("editor-footer", slot.session.pane_id())),
+            egui::Sense::click_and_drag(),
+        );
 
         if let Some(editor) = slot.session.blocks().editor_on_tail() {
             let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
