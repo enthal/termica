@@ -681,12 +681,17 @@ pub fn render_pane(
             let rendered = if in_alt_screen
                 || matches!(slot.session.blocks().last(), Some(crate::block::Block::Running { .. }))
             {
+                // `slot.ui.focused` reflects the previous frame's
+                // focus state — close enough for cursor-tint, which
+                // would otherwise force two paint passes per frame.
+                // A one-frame lag on the focus tint is invisible.
                 render::paint_terminal(
                     ui,
                     slot.session.terminal(),
                     selection.as_ref(),
                     highlighted_link,
                     hide_term_cursor,
+                    slot.ui.focused,
                 )
             } else {
                 let origin = ui.next_widget_position();
@@ -746,11 +751,17 @@ pub fn render_pane(
 
         if let Some(editor) = slot.session.blocks().editor_on_tail() {
             let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
-            // Caret blink: ~1.6 Hz square wave; request a repaint at
-            // the next half-cycle so it keeps toggling on idle.
+            // Caret blink: ~1.6 Hz square wave when the pane has
+            // keyboard focus; suppressed entirely otherwise so
+            // other panes don't show a competing caret. The repaint
+            // request only fires while focused — no point burning
+            // wakeups on idle panes. `slot.ui.focused` reflects the
+            // previous frame's state; one-frame caret lag is invisible.
             let time = ctx.input(|i| i.time);
-            let caret_visible = (time * 1.6) as i64 % 2 == 0;
-            ctx.request_repaint_after(std::time::Duration::from_millis(312));
+            let caret_visible = slot.ui.focused && (time * 1.6) as i64 % 2 == 0;
+            if slot.ui.focused {
+                ctx.request_repaint_after(std::time::Duration::from_millis(312));
+            }
             // Use `ui.painter()` (unclipped to the current ui) rather
             // than `painter_at(editor_rect)` so descender pixels
             // (`p`, `g`, `y`, `q`) clear the rect's bottom edge

@@ -51,7 +51,7 @@ fn snapshot_terminal_plain_text() {
     );
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 200.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None, None, false);
+            render::paint_terminal(ui, &term, None, None, false, true);
         });
     harness.snapshot("terminal_plain_text");
 }
@@ -75,7 +75,7 @@ fn snapshot_terminal_ansi_colors() {
     let term = term_from_bytes(5, 50, &bytes);
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 180.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None, None, false);
+            render::paint_terminal(ui, &term, None, None, false, true);
         });
     harness.snapshot("terminal_ansi_colors");
 }
@@ -88,9 +88,23 @@ fn snapshot_terminal_cursor_visible_at_end_of_text() {
     let term = term_from_bytes(4, 30, b"hi");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 160.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None, None, false);
+            render::paint_terminal(ui, &term, None, None, false, true);
         });
     harness.snapshot("terminal_cursor_visible");
+}
+
+#[test]
+fn snapshot_terminal_cursor_dim_when_unfocused() {
+    // Same setup as `cursor_visible` but with `focused = false`.
+    // The cursor block should still render but in the muted
+    // `CURSOR_UNFOCUSED_COLOR` so the user can see at a glance
+    // that the pane isn't receiving input.
+    let term = term_from_bytes(4, 30, b"hi");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 160.0)).build_ui(move |ui| {
+            render::paint_terminal(ui, &term, None, None, false, false);
+        });
+    harness.snapshot("terminal_cursor_unfocused");
 }
 
 #[test]
@@ -102,7 +116,7 @@ fn snapshot_terminal_cursor_hidden_via_dectcem() {
     let term = term_from_bytes(4, 30, b"hi\x1b[?25l");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 160.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None, None, false);
+            render::paint_terminal(ui, &term, None, None, false, true);
         });
     harness.snapshot("terminal_cursor_hidden");
 }
@@ -135,7 +149,7 @@ fn snapshot_terminal_cell_attributes() {
     let term = term_from_bytes(5, 50, &bytes);
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 180.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None, None, false);
+            render::paint_terminal(ui, &term, None, None, false, true);
         });
     harness.snapshot("terminal_cell_attributes");
 }
@@ -154,7 +168,7 @@ fn snapshot_terminal_scrolled_into_scrollback() {
     term.scroll_display(5);
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 180.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None, None, false);
+            render::paint_terminal(ui, &term, None, None, false, true);
         });
     harness.snapshot("terminal_scrolled_into_scrollback");
 }
@@ -173,7 +187,7 @@ fn snapshot_terminal_alt_screen() {
     let term = term_from_bytes(5, 40, &bytes);
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 180.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None, None, false);
+            render::paint_terminal(ui, &term, None, None, false, true);
         });
     harness.snapshot("terminal_alt_screen");
 }
@@ -194,7 +208,7 @@ fn snapshot_terminal_alt_screen_with_border() {
     let term = term_from_bytes(5, 40, &bytes);
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 180.0)).build_ui(move |ui| {
-            let rendered = render::paint_terminal(ui, &term, None, None, false);
+            let rendered = render::paint_terminal(ui, &term, None, None, false, true);
             termica::paint_alt_screen_border(ui.painter(), rendered.response.rect);
         });
     harness.snapshot("terminal_alt_screen_with_border");
@@ -219,7 +233,7 @@ fn snapshot_terminal_link_underline() {
 
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 120.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None, Some(&link), false);
+            render::paint_terminal(ui, &term, None, Some(&link), false, true);
         });
     harness.snapshot("terminal_link_underline");
 }

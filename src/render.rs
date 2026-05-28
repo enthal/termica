@@ -48,10 +48,19 @@ pub const DEFAULT_BG: Color32 = Color32::from_rgb(0x12, 0x12, 0x12);
 /// foreground convention for dark themes.
 pub const DEFAULT_FG: Color32 = Color32::from_rgb(0xd8, 0xd8, 0xd8);
 
-/// Cursor overlay color. Semi-transparent white so the character
-/// underneath stays legible (block cursor over text reads as
-/// inverted-ish, not as a hole). Phase 10 will make this themable.
+/// Cursor overlay color when the pane has keyboard focus. Semi-
+/// transparent white so the character underneath stays legible
+/// (block cursor over text reads as inverted-ish, not as a hole).
+/// Phase 10 will make this themable.
 pub const CURSOR_COLOR: Color32 = Color32::from_rgba_premultiplied(0x70, 0x70, 0x70, 0x70);
+
+/// Cursor overlay color when the pane is **not** focused. Lower
+/// alpha + greyer hue so the cursor reads as "this pane is
+/// dormant" without disappearing entirely — matches the
+/// "focused tab + ghost cursor in other tabs" idiom of
+/// conventional terminal emulators.
+pub const CURSOR_UNFOCUSED_COLOR: Color32 =
+    Color32::from_rgba_premultiplied(0x55, 0x55, 0x55, 0x40);
 
 /// Selection overlay color. Semi-transparent blue, painted *over* the
 /// cell backgrounds and *under* the glyphs, so selected text remains
@@ -166,6 +175,7 @@ pub fn paint_terminal(
     selection: Option<&Selection>,
     hover_link: Option<&LinkSpan>,
     hide_cursor: bool,
+    focused: bool,
 ) -> TerminalRender {
     let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
     // `glyph_width` / `row_height` mutate the font cache as they go,
@@ -294,7 +304,8 @@ pub fn paint_terminal(
         let x = rect.min.x + col as f32 * cell_w;
         let y = rect.min.y + row as f32 * row_h;
         let cursor_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w, row_h));
-        painter.rect_filled(cursor_rect, 0.0, CURSOR_COLOR);
+        let cursor_color = if focused { CURSOR_COLOR } else { CURSOR_UNFOCUSED_COLOR };
+        painter.rect_filled(cursor_rect, 0.0, cursor_color);
     }
 
     TerminalRender { response, geometry }
