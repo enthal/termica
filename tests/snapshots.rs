@@ -604,7 +604,10 @@ fn snapshot_paint_sealed_block_with_header_and_failed_exit() {
 }
 
 #[test]
-fn snapshot_paint_sealed_block_with_selection_inside_output() {
+fn snapshot_paint_sealed_block_with_selection_spans_command_and_output() {
+    // Selection starts at (row 0, col 0) — the command "ls" — and
+    // ends at (row 1, col 9). Row 0 is the command label; rows 1+
+    // are snapshot output. Highlight should cover both regions.
     use termica::block_selection::BlockCursor;
     let snapshot = sealed_snapshot(4, 40, b"Cargo.toml\r\nREADME.md\r\nsrc\r\n");
     let sel = Some((BlockCursor::new(0, 0), BlockCursor::new(1, 9)));
@@ -613,4 +616,18 @@ fn snapshot_paint_sealed_block_with_selection_inside_output() {
             let _ = render::paint_sealed_block(ui, "ls", &snapshot, sel, None, None, Some(0));
         });
     harness.snapshot("paint_sealed_block_with_selection");
+}
+
+#[test]
+fn snapshot_paint_sealed_block_with_selection_in_command_only() {
+    // Selection entirely within the command label (row 0).
+    use termica::block_selection::BlockCursor;
+    let snapshot = sealed_snapshot(3, 40, b"hello\r\n");
+    let sel = Some((BlockCursor::new(0, 5), BlockCursor::new(0, 10)));
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(500.0, 100.0)).build_ui(move |ui| {
+            let _ =
+                render::paint_sealed_block(ui, "echo hello", &snapshot, sel, None, None, Some(0));
+        });
+    harness.snapshot("paint_sealed_block_with_selection_in_command_only");
 }
