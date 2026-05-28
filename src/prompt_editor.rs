@@ -228,6 +228,77 @@ impl PromptEditor {
         self.text.replace_range(self.cursor..next, "");
     }
 
+    /// Delete from the cursor backward to the start of the previous
+    /// word — OR, if a selection exists, delete the selection. Same
+    /// boundary rule as [`Self::move_word_left`] so Option+Delete
+    /// (macOS) / Ctrl+Backspace (Linux) deletes the same range that
+    /// Option+Left / Ctrl+Left would have *moved over*. No-op at
+    /// byte 0 with no selection.
+    pub fn delete_word_left(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        if self.cursor == 0 {
+            return;
+        }
+        // Compute the word-left target without mutating the cursor /
+        // selection state, then drop the range between target and
+        // current cursor.
+        let start = {
+            let mut i = self.cursor;
+            while i > 0 {
+                let prev = prev_char_boundary(&self.text, i);
+                let c = self.text[prev..i].chars().next().unwrap();
+                if is_word_char(c) {
+                    break;
+                }
+                i = prev;
+            }
+            while i > 0 {
+                let prev = prev_char_boundary(&self.text, i);
+                let c = self.text[prev..i].chars().next().unwrap();
+                if !is_word_char(c) {
+                    break;
+                }
+                i = prev;
+            }
+            i
+        };
+        self.text.replace_range(start..self.cursor, "");
+        self.cursor = start;
+    }
+
+    /// Delete from the cursor forward to the end of the next word.
+    /// Mirror of [`Self::delete_word_left`] for Option+Fn+Delete
+    /// (macOS) / Ctrl+Delete (Linux). No-op at end of buffer.
+    pub fn delete_word_right(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        if self.cursor == self.text.len() {
+            return;
+        }
+        let end = {
+            let mut i = self.cursor;
+            while i < self.text.len() {
+                let c = self.text[i..].chars().next().unwrap();
+                if is_word_char(c) {
+                    break;
+                }
+                i += c.len_utf8();
+            }
+            while i < self.text.len() {
+                let c = self.text[i..].chars().next().unwrap();
+                if !is_word_char(c) {
+                    break;
+                }
+                i += c.len_utf8();
+            }
+            i
+        };
+        self.text.replace_range(self.cursor..end, "");
+    }
+
     /// Move the cursor one character left. No-op at byte 0. Clears
     /// any selection.
     pub fn move_left(&mut self) {
@@ -723,6 +794,88 @@ mod tests {
         assert_eq!(e.cursor(), 4);
         e.backspace();
         assert_eq!(e.text(), "");
+        assert_eq!(e.cursor(), 0);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn delete_word_left_at_byte_zero_is_noop() {
+        let mut e = PromptEditor::new();
+        e.insert_str("abc");
+        e.move_home();
+        e.delete_word_left();
+        assert_eq!(e.text(), "abc");
+        assert_eq!(e.cursor(), 0);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn delete_word_left_removes_word_from_end() {
+        let mut e = PromptEditor::new();
+        e.insert_str("foo bar baz");
+        e.delete_word_left();
+        // Removes "baz", leaving the trailing space because the
+        // word boundary stops at non-word chars.
+        assert_eq!(e.text(), "foo bar ");
+        assert_eq!(e.cursor(), 8);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn delete_word_left_in_middle_removes_partial_word() {
+        let mut e = PromptEditor::new();
+        e.insert_str("foo bar");
+        // Cursor at byte 5 — between 'b' (at idx 4) and 'a' (at
+        // idx 5). delete_word_left walks back to the previous word
+        // start, which is idx 4 (just the 'b' is consumed).
+        e.set_cursor(5);
+        e.delete_word_left();
+        assert_eq!(e.text(), "foo ar");
+        assert_eq!(e.cursor(), 4);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn delete_word_left_consumes_trailing_whitespace_then_prior_word() {
+        // Matches Option+Left's "skip non-word then skip word" rule.
+        let mut e = PromptEditor::new();
+        e.insert_str("foo bar   ");
+        e.delete_word_left();
+        assert_eq!(e.text(), "foo ");
+        assert_eq!(e.cursor(), 4);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn delete_word_left_with_selection_deletes_selection_not_word() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hello world");
+        e.set_selection(0, 5); // "hello"
+        e.delete_word_left();
+        assert_eq!(e.text(), " world");
+        assert_eq!(e.cursor(), 0);
+        assert!(!e.has_selection());
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn delete_word_right_at_end_is_noop() {
+        let mut e = PromptEditor::new();
+        e.insert_str("abc");
+        e.delete_word_right();
+        assert_eq!(e.text(), "abc");
+        assert_eq!(e.cursor(), 3);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn delete_word_right_removes_word_from_start() {
+        let mut e = PromptEditor::new();
+        e.insert_str("foo bar baz");
+        e.move_home();
+        e.delete_word_right();
+        // Removes "foo", leaving the leading space-and-rest.
+        assert_eq!(e.text(), " bar baz");
         assert_eq!(e.cursor(), 0);
         assert_invariant(&e);
     }
