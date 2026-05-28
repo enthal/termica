@@ -293,7 +293,8 @@ fn snapshot_paint_sealed_block_echo() {
     let snapshot = sealed_snapshot(3, 40, b"hello\r\n");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(500.0, 100.0)).build_ui(move |ui| {
-            let _ = render::paint_sealed_block(ui, "echo hello", &snapshot, None, None, Some(0));
+            let _ =
+                render::paint_sealed_block(ui, "echo hello", &snapshot, None, None, None, Some(0));
         });
     harness.snapshot("paint_sealed_block_echo");
 }
@@ -305,7 +306,7 @@ fn snapshot_paint_sealed_block_ls_output() {
     let snapshot = sealed_snapshot(6, 40, b"Cargo.toml\r\nREADME.md\r\nsrc\r\ntests\r\n");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(500.0, 160.0)).build_ui(move |ui| {
-            let _ = render::paint_sealed_block(ui, "ls", &snapshot, None, None, Some(0));
+            let _ = render::paint_sealed_block(ui, "ls", &snapshot, None, None, None, Some(0));
         });
     harness.snapshot("paint_sealed_block_ls_output");
 }
@@ -321,6 +322,7 @@ fn snapshot_paint_sealed_block_multiline_command() {
                 ui,
                 "for i in 1 2; do\n  echo $i\ndone",
                 &snapshot,
+                None,
                 None,
                 None,
                 Some(0),
@@ -518,9 +520,10 @@ fn snapshot_paint_styled_lines_with_multi_row_selection() {
 #[test]
 fn snapshot_paint_block_header_cwd_only() {
     let cwd = std::path::PathBuf::from("/Users/tim/git/enthal/termica");
+    let home = std::path::PathBuf::from("/Users/tim");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 40.0)).build_ui(move |ui| {
-            let _ = render::paint_block_header(ui, Some(cwd.as_path()), None);
+            let _ = render::paint_block_header(ui, Some(cwd.as_path()), Some(home.as_path()), None);
         });
     harness.snapshot("paint_block_header_cwd_only");
 }
@@ -528,19 +531,40 @@ fn snapshot_paint_block_header_cwd_only() {
 #[test]
 fn snapshot_paint_block_header_zero_exit_hides_exit_chip() {
     let cwd = std::path::PathBuf::from("/Users/tim/git/enthal/termica");
+    let home = std::path::PathBuf::from("/Users/tim");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 40.0)).build_ui(move |ui| {
-            let _ = render::paint_block_header(ui, Some(cwd.as_path()), Some(0));
+            let _ =
+                render::paint_block_header(ui, Some(cwd.as_path()), Some(home.as_path()), Some(0));
         });
     harness.snapshot("paint_block_header_zero_exit");
 }
 
 #[test]
-fn snapshot_paint_block_header_nonzero_exit_shows_red_annotation() {
+fn snapshot_paint_block_header_substitutes_home_with_tilde() {
+    // When the cwd is under $HOME, the chip should show `~/…` not
+    // the absolute path — matches the tab-title convention.
     let cwd = std::path::PathBuf::from("/Users/tim/git/enthal/termica");
+    let home = std::path::PathBuf::from("/Users/tim");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 40.0)).build_ui(move |ui| {
-            let _ = render::paint_block_header(ui, Some(cwd.as_path()), Some(127));
+            let _ = render::paint_block_header(ui, Some(cwd.as_path()), Some(home.as_path()), None);
+        });
+    harness.snapshot("paint_block_header_tilde_substitution");
+}
+
+#[test]
+fn snapshot_paint_block_header_nonzero_exit_shows_red_annotation() {
+    let cwd = std::path::PathBuf::from("/Users/tim/git/enthal/termica");
+    let home = std::path::PathBuf::from("/Users/tim");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 40.0)).build_ui(move |ui| {
+            let _ = render::paint_block_header(
+                ui,
+                Some(cwd.as_path()),
+                Some(home.as_path()),
+                Some(127),
+            );
         });
     harness.snapshot("paint_block_header_nonzero_exit");
 }
@@ -548,6 +572,7 @@ fn snapshot_paint_block_header_nonzero_exit_shows_red_annotation() {
 #[test]
 fn snapshot_paint_sealed_block_with_header_and_failed_exit() {
     let cwd = std::path::PathBuf::from("/Users/tim/git/enthal/termica");
+    let home = std::path::PathBuf::from("/Users/tim");
     let snapshot = sealed_snapshot(3, 40, b"command not found: blarg\r\n");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 140.0)).build_ui(move |ui| {
@@ -557,6 +582,7 @@ fn snapshot_paint_sealed_block_with_header_and_failed_exit() {
                 &snapshot,
                 None,
                 Some(cwd.as_path()),
+                Some(home.as_path()),
                 Some(127),
             );
         });
@@ -570,7 +596,7 @@ fn snapshot_paint_sealed_block_with_selection_inside_output() {
     let sel = Some((BlockCursor::new(0, 0), BlockCursor::new(1, 9)));
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(500.0, 140.0)).build_ui(move |ui| {
-            let _ = render::paint_sealed_block(ui, "ls", &snapshot, sel, None, Some(0));
+            let _ = render::paint_sealed_block(ui, "ls", &snapshot, sel, None, None, Some(0));
         });
     harness.snapshot("paint_sealed_block_with_selection");
 }

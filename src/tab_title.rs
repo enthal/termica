@@ -43,31 +43,43 @@ pub fn tab_title_for(pane_id: PaneId, cwd: Option<&Path>, home: Option<&Path>) -
     let Some(c) = cwd else {
         return format!("pane {}", pane_id.0);
     };
-    let cwd_s = c.to_string_lossy();
-    // Normalize trailing slash on the cwd (but keep `/` itself).
+    let raw = home_relative_cwd(c, home);
+    truncate_tab_title(&raw)
+}
+
+/// Render `cwd` with the user's `$HOME` substituted for `~`, in the
+/// same way [`tab_title_for`] does it, but **without** the tab-title
+/// truncation. Used by block-header chrome which has more horizontal
+/// room than a tab strip and wants to show the full path.
+///
+/// Rules (same as [`tab_title_for`]):
+/// - `cwd == $HOME` → `~`.
+/// - `cwd` strictly inside `$HOME` → `~/relative/path`.
+/// - Trailing slashes normalized on both ends so `/Users/tim/`
+///   resolves to `~`, not `~/`.
+/// - `$HOME` unknown, empty, or `cwd` outside `$HOME` → the cwd is
+///   returned as-is (sans trailing slash, except for `/` itself).
+/// - No tilde-prefix abbreviation for *other* users' home dirs
+///   (`~jones`) — only the current `$HOME`.
+pub fn home_relative_cwd(cwd: &Path, home: Option<&Path>) -> String {
+    let cwd_s = cwd.to_string_lossy();
     let cwd_norm: &str = if cwd_s.as_ref() == "/" { "/" } else { cwd_s.trim_end_matches('/') };
 
-    let raw = if let Some(h) = home {
+    if let Some(h) = home {
         let home_s = h.to_string_lossy();
         let home_norm = home_s.trim_end_matches('/');
         if !home_norm.is_empty() {
             if cwd_norm == home_norm {
-                "~".to_string()
-            } else if let Some(rest) = cwd_norm.strip_prefix(home_norm)
+                return "~".to_string();
+            }
+            if let Some(rest) = cwd_norm.strip_prefix(home_norm)
                 && rest.starts_with('/')
             {
-                format!("~{rest}")
-            } else {
-                cwd_norm.to_string()
+                return format!("~{rest}");
             }
-        } else {
-            cwd_norm.to_string()
         }
-    } else {
-        cwd_norm.to_string()
-    };
-
-    truncate_tab_title(&raw)
+    }
+    cwd_norm.to_string()
 }
 
 /// Truncate a tab title to [`MAX_TAB_TITLE_CHARS`], preserving the
