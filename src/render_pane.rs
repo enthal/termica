@@ -521,8 +521,14 @@ pub fn render_pane(
     // empty gap above the editor footer. Approximate: doesn't account
     // for every egui item-spacing pixel, but close enough that the
     // visual reads as "stuck to bottom" rather than "floating."
-    let tail_is_running_for_height =
-        matches!(slot.session.blocks().last(), Some(crate::block::Block::Running { .. }));
+    // Whether the live `Term` will be painted in this frame. Mirrors
+    // the `skip_live_term` decision inside the scroll closure: the
+    // grid contributes its full row count to `content_h` whenever
+    // it's actually painted, so the bottom-align spacer matches.
+    let tail_is_prompt =
+        matches!(slot.session.blocks().last(), Some(crate::block::Block::Prompt { .. }));
+    let will_paint_live_term =
+        in_alt_screen || !(tail_is_prompt && slot.session.editor_is_active());
     // Per-block chrome row (the cwd / exit chip) is taller than a
     // plain text row because the chip has vertical padding.
     let chip_h = row_h + 2.0 * render::CHIP_PAD_Y;
@@ -546,9 +552,14 @@ pub fn render_pane(
                 crate::block::Block::Prompt { .. } => {}
             }
         }
-        if tail_is_running_for_height {
-            content_h += slot.session.terminal().grid().screen_lines() as f32 * row_h;
-        }
+    }
+    // Live `Term` contributes its grid height whenever it's
+    // actually painted — including alt-screen mode. The block loop
+    // is gated on `!in_alt_screen` because no blocks paint in alt-
+    // screen, but the live grid does and the spacer must account
+    // for it so vim / less / htop don't get pushed offscreen.
+    if will_paint_live_term {
+        content_h += slot.session.terminal().grid().screen_lines() as f32 * row_h;
     }
     let top_spacer = (scroll_max_h - content_h).max(0.0);
 
@@ -674,21 +685,12 @@ pub fn render_pane(
             // shell's one and the editor's overlay). The editor's
             // cursor is the real input caret in this mode.
             let hide_term_cursor = slot.session.editor_is_active();
-            // Only paint the live `Term` when there's something to
-            // show: alt-screen programs (vim / less / htop) own the
-            // whole grid, and a `Running` block streams output into
-            // it. When the tail is `Prompt`, the grid is empty
-            // (`reset_for_new_block` cleared it) and painting it
-            // anyway leaves a tall blank region between the last
-            // sealed block and the editor footer — the scroll area's
-            // `stick_to_bottom` then pins that blank to the bottom
-            // and the user has to scroll up to see history. Skip the
-            // paint instead and synthesise an empty `TerminalRender`
-            // so the hit-test path downstream still has something to
-            // chew on.
-            let rendered = if in_alt_screen
-                || matches!(slot.session.blocks().last(), Some(crate::block::Block::Running { .. }))
-            {
+            // Use the `will_paint_live_term` decision computed
+            // before the closure (see comment up there for the
+            // full reasoning). The two paths must agree: the
+            // bottom-align spacer's `content_h` only includes the
+            // grid height when we actually paint it.
+            let rendered = if will_paint_live_term {
                 // `slot.ui.focused` reflects the previous frame's
                 // focus state — close enough for cursor-tint, which
                 // would otherwise force two paint passes per frame.
@@ -702,9 +704,18 @@ pub fn render_pane(
                     slot.ui.focused,
                 )
             } else {
+                // Synthetic empty `TerminalRender` for the editor-
+                // active case. We allocate a 1×1 `click_and_drag`
+                // widget so its `Response` is **focusable** — without
+                // this, `request_focus()` / `has_focus()` on
+                // `rendered.response` would silently no-op and the
+                // keyboard handler downstream would never see input.
+                // The 1px footprint is invisible and the widget is
+                // sandwiched between the block stack and the editor
+                // footer so a stray click on it is harmless.
                 let origin = ui.next_widget_position();
-                let (_rect, response) =
-                    ui.allocate_exact_size(egui::Vec2::ZERO, egui::Sense::hover());
+                let (_rect, response) = ui
+                    .allocate_exact_size(egui::Vec2::new(1.0, 1.0), egui::Sense::click_and_drag());
                 render::TerminalRender {
                     response,
                     geometry: selection::GridGeometry {
@@ -734,7 +745,15 @@ pub fn render_pane(
     // (when known) and then the editor here. `footer_rect` is the
     // exact rect the editor occupies — used by the click / drag
     // handlers below to translate pointer pixels to byte offsets.
-    let footer_rect: Option<egui::Rect> = if footer_h > 0.0 {
+    // (footer_rect, footer_response) — `footer_response` is the
+    // focusable widget for the editor strip. Used downstream when
+    // the editor is active so `request_focus()` / `has_focus()`
+    // land on a real widget that egui can actually focus on,
+    // rather than the synthetic 1×1 `rendered.response` that has
+    // no input semantics. `None` when the footer isn't drawn.
+    let (footer_rect, footer_response): (Option<egui::Rect>, Option<egui::Response>) = if footer_h
+        > 0.0
+    {
         let chip_h = if has_prompt_cwd { row_h + 2.0 * render::CHIP_PAD_Y } else { 0.0 };
         let editor_h = footer_h - chip_h;
         let footer_origin = ui.next_widget_position();
@@ -755,7 +774,7 @@ pub fn render_pane(
             egui::Pos2::new(footer_origin.x, footer_origin.y + chip_h),
             egui::Vec2::new(ui.available_width(), editor_h),
         );
-        let _ = ui.allocate_rect(editor_rect, egui::Sense::click_and_drag());
+        let editor_response = ui.allocate_rect(editor_rect, egui::Sense::click_and_drag());
 
         if let Some(editor) = slot.session.blocks().editor_on_tail() {
             let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
@@ -786,10 +805,18 @@ pub fn render_pane(
                 caret_visible,
             );
         }
-        Some(editor_rect)
+        (Some(editor_rect), Some(editor_response))
     } else {
-        None
+        (None, None)
     };
+
+    // The actual focusable widget for this pane: the editor footer
+    // when it's painted, otherwise the live `Term` (or the synthetic
+    // placeholder). All focus interactions — `request_focus`,
+    // focus-lock filter, `has_focus` checks, the keyboard handler —
+    // go through this single response so a stale reference can't
+    // quietly route around the active widget.
+    let focus_response = footer_response.as_ref().unwrap_or(&rendered.response);
 
     // ---- alt-screen border --------------------------------------
     //
@@ -884,7 +911,7 @@ pub fn render_pane(
             || press_in_sealed_block.is_some()
             || editor_rect.is_some_and(|r| r.contains(pos)))
     {
-        rendered.response.request_focus();
+        focus_response.request_focus();
 
         if let Some((block_id, block_rect, _cmd_lines)) = press_in_sealed_block {
             // Sealed-block press. Single → place an empty selection
@@ -1120,7 +1147,7 @@ pub fn render_pane(
     let needs_focus = std::mem::take(&mut slot.ui.needs_focus);
     let nothing_focused = ctx.memory(|m| m.focused().is_none());
     if !modal_open && (needs_focus || nothing_focused) {
-        rendered.response.request_focus();
+        focus_response.request_focus();
     }
 
     // While this pane has keyboard focus, claim Tab and the arrow
@@ -1137,7 +1164,7 @@ pub fn render_pane(
     // first frame of a new pane is invisible in practice.
     ctx.memory_mut(|m| {
         m.set_focus_lock_filter(
-            rendered.response.id,
+            focus_response.id,
             egui::EventFilter {
                 tab: true,
                 horizontal_arrows: true,
@@ -1147,14 +1174,14 @@ pub fn render_pane(
         );
     });
 
-    // Record focus state for the next frame's tab styling.
-    // `has_focus` is read by `TermicaApp::update` after
-    // `tree.ui()` returns; the focused pane's tab title is then
-    // rendered bold via the Behavior.
-    slot.ui.focused = rendered.response.has_focus();
+    // Record focus state for the next frame's tab styling and
+    // caret blink. `has_focus` is read by `TermicaApp::update` after
+    // `tree.ui()` returns; the focused pane's tab title is rendered
+    // bold via the Behavior.
+    slot.ui.focused = focus_response.has_focus();
 
     // ---- keyboard input, focus-gated ----------------------------
-    if !modal_open && rendered.response.has_focus() {
+    if !modal_open && focus_response.has_focus() {
         let is_macos = cfg!(target_os = "macos");
         let events: Vec<egui::Event> = ctx.input(|i| i.events.clone());
 
