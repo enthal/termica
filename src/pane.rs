@@ -741,8 +741,11 @@ impl PaneSession {
 
     /// Length of `row` in the sealed block's unified row space. The
     /// row is checked against the command label first, then the
-    /// snapshot. `None` if no sealed block has that id or the row
-    /// is past the end.
+    /// snapshot. For snapshot rows the length stops at the last
+    /// typed cell (trailing-space padding is excluded) so drag-
+    /// clamping does not let the selection extend into the grid's
+    /// imaginary right-margin spaces. `None` if no sealed block has
+    /// that id or the row is past the end.
     pub fn sealed_row_len(&self, block_id: crate::block::BlockId, row: usize) -> Option<usize> {
         for block in self.blocks.iter() {
             if let Block::Sealed { id, command, snapshot, .. } = block
@@ -754,7 +757,9 @@ impl PaneSession {
                     return Some(cmd_lines[row].chars().count());
                 }
                 let snap_row = row - cmd_lines.len();
-                return snapshot.get(snap_row).map(|l| l.cells.len());
+                return snapshot
+                    .get(snap_row)
+                    .map(|l| crate::block_selection::effective_row_len(&l.cells));
             }
         }
         None
