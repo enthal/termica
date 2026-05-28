@@ -851,6 +851,23 @@ pub fn render_pane(
         (i.pointer.primary_pressed(), i.pointer.press_origin(), i.pointer.primary_down(), i.time)
     });
 
+    // Focus claim: a press *anywhere* in the pane — including the
+    // empty area above the bottom-aligned block stack, the gap
+    // between blocks, or the strip between the block stack and
+    // the editor footer — grabs keyboard focus. The selection
+    // branches below only fire when the press lands on a real
+    // hit-target (live grid / sealed block / editor footer); the
+    // "gray background" cases would otherwise leave the pane
+    // unfocused even though the user clicked into it.
+    let pane_rect = ui.max_rect();
+    if !modal_open
+        && primary_pressed
+        && let Some(pos) = press_origin
+        && pane_rect.contains(pos)
+    {
+        focus_response.request_focus();
+    }
+
     // Editor hit-area: the fixed footer below the scroll area.
     // Phase 4D anchors the editor to the viewport bottom, so the
     // hit-test rect is exactly the footer rect we painted above.
