@@ -87,13 +87,23 @@ pub fn cell_word_range(line: &[StyledCell], col: usize) -> (usize, usize) {
     (start, end)
 }
 
-/// Full-width range of the row, used by triple-click and
-/// triple-click-drag. Trailing whitespace is included; the renderer
-/// pads each row to the original cell width with space cells and we
-/// preserve that on overlay, then [`block_selection_text`] trims
-/// trailing spaces per row for the copy-to-clipboard payload.
+/// Index past the last non-`' '` cell in `line`. The terminal grid
+/// pads every row to the column width with space cells; this
+/// function returns the position the user would think of as
+/// "end of typed content" so selections, line-select, and clamping
+/// don't extend across the imaginary trailing space cells. Returns
+/// `0` for an all-space (or empty) row.
+pub fn effective_row_len(line: &[StyledCell]) -> usize {
+    line.iter().rposition(|c| c.c != ' ').map(|i| i + 1).unwrap_or(0)
+}
+
+/// Inclusive-start, exclusive-end column range of a row's typed
+/// content, used by triple-click and triple-click-drag. Stops at
+/// the last non-space cell so the selection doesn't span the
+/// grid's trailing space padding (the same padding that
+/// [`block_selection_text`] already trims for the clipboard).
 pub fn cell_line_range(line: &[StyledCell]) -> (usize, usize) {
-    (0, line.len())
+    (0, effective_row_len(line))
 }
 
 /// Extract text covered by `sel` from a sealed block's unified
@@ -279,6 +289,50 @@ mod tests {
     fn cell_line_range_empty_row() {
         let l = line("").cells;
         assert_eq!(cell_line_range(&l), (0, 0));
+    }
+
+    #[test]
+    fn cell_line_range_stops_at_last_non_space_cell() {
+        // Snapshot rows are padded to grid width with `' '` cells.
+        // Triple-click line-select must stop at the last typed char
+        // so the user does not "select imaginary characters" that
+        // exist only as grid padding.
+        let l = line("hi      ").cells;
+        assert_eq!(cell_line_range(&l), (0, 2));
+    }
+
+    #[test]
+    fn cell_line_range_blank_row_is_degenerate() {
+        // An all-space row has no typed content; the range collapses
+        // to (0, 0) rather than (0, width).
+        let l = line("        ").cells;
+        assert_eq!(cell_line_range(&l), (0, 0));
+    }
+
+    // ---- effective_row_len ------------------------------------------
+
+    #[test]
+    fn effective_row_len_strips_trailing_spaces() {
+        let l = line("abc   ").cells;
+        assert_eq!(effective_row_len(&l), 3);
+    }
+
+    #[test]
+    fn effective_row_len_keeps_inner_spaces() {
+        let l = line("a   b   ").cells;
+        assert_eq!(effective_row_len(&l), 5);
+    }
+
+    #[test]
+    fn effective_row_len_zero_for_all_space_row() {
+        let l = line("     ").cells;
+        assert_eq!(effective_row_len(&l), 0);
+    }
+
+    #[test]
+    fn effective_row_len_full_when_no_trailing_space() {
+        let l = line("abc").cells;
+        assert_eq!(effective_row_len(&l), 3);
     }
 
     // ---- block_selection_text ---------------------------------------
