@@ -737,6 +737,29 @@ pub fn render_pane(
         ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 
+    // Sealed-block link hover: when Cmd is held and the pointer is
+    // over a URL / file-path inside a sealed block, switch to the
+    // pointing-hand icon so the affordance matches what Cmd-click
+    // would do. `sealed_rects` was populated during the paint pass
+    // above; we re-use it to map pointer → block → (row, col).
+    if modifier_held
+        && let Some(pos) = pointer_pos
+        && let Some((block_id, block_rect, _cmd_lines)) =
+            sealed_rects.iter().find(|(_, r, _)| r.contains(pos)).copied()
+    {
+        let (cl, sl) = slot.session.sealed_block_rows(block_id).unwrap_or((0, 0));
+        let total_rows = cl + sl;
+        let mut cursor_pt = sealed_cursor_for_pos(block_rect, pos, cell_w, row_h, total_rows);
+        if let Some(row_len) = slot.session.sealed_row_len(block_id, cursor_pt.row) {
+            cursor_pt.col = cursor_pt.col.min(row_len);
+        }
+        if let Some(links) = slot.session.sealed_block_links(block_id, home)
+            && links.iter().any(|l| l.contains(cursor_pt.row, cursor_pt.col))
+        {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+    }
+
     // ---- Phase 4D fixed-footer: cwd chip + editor ----------------
     //
     // The ScrollArea above was constrained to leave `footer_h` of
@@ -942,20 +965,6 @@ pub fn render_pane(
         focus_response.request_focus();
 
         if let Some((block_id, block_rect, _cmd_lines)) = press_in_sealed_block {
-            // Sealed-block press. Single → place an empty selection
-            // at the clicked cell (drag extends it); double → select
-            // the word; triple → select the line. Same multi-click
-            // counter that drives editor + live grid.
-            let dt = now - slot.ui.last_press_time;
-            let dist = (pos - slot.ui.last_press_pos).length();
-            if dt < MULTI_CLICK_WINDOW_SECS && dist < MULTI_CLICK_DISTANCE_PX {
-                slot.ui.click_count = (slot.ui.click_count + 1).min(3);
-            } else {
-                slot.ui.click_count = 1;
-            }
-            slot.ui.last_press_time = now;
-            slot.ui.last_press_pos = pos;
-
             let (cmd_lines, snap_lines) =
                 slot.session.sealed_block_rows(block_id).unwrap_or((0, 0));
             let total_rows = cmd_lines + snap_lines;
@@ -966,28 +975,75 @@ pub fn render_pane(
                 cursor.col = cursor.col.min(row_len);
             }
 
-            match slot.ui.click_count {
-                2 => {
-                    if let Some((a, b)) = slot.session.sealed_word_range(block_id, cursor) {
-                        slot.ui.sealed_drag_anchor = Some((block_id, a, b));
+            // Cmd-click on a URL / file-path inside the sealed block:
+            // open the link and skip selection entirely (the live-grid
+            // path has the same shortcut). Computed before the multi-
+            // click counter so a Cmd-click doesn't burn a click into
+            // a follow-up double-click word selection.
+            let sealed_link = slot.session.sealed_block_links(block_id, home).and_then(|links| {
+                links.iter().find(|l| l.contains(cursor.row, cursor.col)).cloned()
+            });
+            if modifier_held && let Some(link) = &sealed_link {
+                open_url(&link.url);
+                focus_response.request_focus();
+                // No selection / no drag-anchor; let the user keep
+                // typing into the editor footer.
+            } else {
+                // Sealed-block press. Single → place an empty selection
+                // at the clicked cell (drag extends it); double → select
+                // the word OR the whole URL/path span if one is under
+                // the pointer; triple → select the line. Same multi-
+                // click counter that drives editor + live grid.
+                let dt = now - slot.ui.last_press_time;
+                let dist = (pos - slot.ui.last_press_pos).length();
+                if dt < MULTI_CLICK_WINDOW_SECS && dist < MULTI_CLICK_DISTANCE_PX {
+                    slot.ui.click_count = (slot.ui.click_count + 1).min(3);
+                } else {
+                    slot.ui.click_count = 1;
+                }
+                slot.ui.last_press_time = now;
+                slot.ui.last_press_pos = pos;
+
+                match slot.ui.click_count {
+                    2 => {
+                        // Double-click on a URL or path span: select
+                        // the whole span as one unit (so `https://...`
+                        // doesn't fragment at `:` / `/` / `.` the way
+                        // the bare word-char predicate does).
+                        if let Some(link) = &sealed_link {
+                            let a =
+                                crate::block_selection::BlockCursor::new(link.row, link.col_start);
+                            let b = crate::block_selection::BlockCursor::new(
+                                link.row,
+                                link.col_end + 1,
+                            );
+                            slot.ui.sealed_drag_anchor = Some((block_id, a, b));
+                            slot.session.set_block_selection(
+                                crate::block_selection::BlockSelection::new(block_id, a, b),
+                            );
+                        } else if let Some((a, b)) =
+                            slot.session.sealed_word_range(block_id, cursor)
+                        {
+                            slot.ui.sealed_drag_anchor = Some((block_id, a, b));
+                            slot.session.set_block_selection(
+                                crate::block_selection::BlockSelection::new(block_id, a, b),
+                            );
+                        }
+                    }
+                    3 => {
+                        if let Some((a, b)) = slot.session.sealed_line_range(block_id, cursor) {
+                            slot.ui.sealed_drag_anchor = Some((block_id, a, b));
+                            slot.session.set_block_selection(
+                                crate::block_selection::BlockSelection::new(block_id, a, b),
+                            );
+                        }
+                    }
+                    _ => {
+                        slot.ui.sealed_drag_anchor = None;
                         slot.session.set_block_selection(
-                            crate::block_selection::BlockSelection::new(block_id, a, b),
+                            crate::block_selection::BlockSelection::new(block_id, cursor, cursor),
                         );
                     }
-                }
-                3 => {
-                    if let Some((a, b)) = slot.session.sealed_line_range(block_id, cursor) {
-                        slot.ui.sealed_drag_anchor = Some((block_id, a, b));
-                        slot.session.set_block_selection(
-                            crate::block_selection::BlockSelection::new(block_id, a, b),
-                        );
-                    }
-                }
-                _ => {
-                    slot.ui.sealed_drag_anchor = None;
-                    slot.session.set_block_selection(crate::block_selection::BlockSelection::new(
-                        block_id, cursor, cursor,
-                    ));
                 }
             }
         } else if click_in_editor && let Some(rect) = editor_rect {
