@@ -23,6 +23,7 @@ use alacritty_terminal::index::Point;
 use crate::block::{Block, BlockStack};
 use crate::block_selection::BlockSelection;
 use crate::events::EventRecorder;
+use crate::history::{CaptureState, HistoryContext, capture_on_event};
 use crate::integration::{ManagedSpawn, ShellSpec, managed_spawn_for, new_session_id};
 use crate::pty::{PtyConfig, PtyError, PtySession};
 use crate::selection::{self, Selection, SelectionMode};
@@ -135,6 +136,16 @@ pub struct PaneSession {
     /// populated at any moment — the setters clear the other so the
     /// user sees a single "current selection" across the pane.
     block_selection: Option<BlockSelection>,
+    /// Phase 4J: handle on the per-process `runs` store + the
+    /// `app_run_id` UUID. `None` for panes spawned without history
+    /// (the low-level `spawn` path, used in tests). The capture
+    /// path no-ops on `None`.
+    history: Option<HistoryContext>,
+    /// Per-pane mutable state for history capture: the row id of
+    /// the currently-running command so the matching
+    /// `CommandFinished` can stamp the exit code. Reset on every
+    /// `Preexec` and every `CommandFinished`.
+    capture_state: CaptureState,
 }
 
 impl PaneSession {
@@ -199,6 +210,8 @@ impl PaneSession {
             recorder,
             last_submitted: None,
             block_selection: None,
+            history: None,
+            capture_state: CaptureState::default(),
         })
     }
 
@@ -222,6 +235,7 @@ impl PaneSession {
         cwd: Option<std::path::PathBuf>,
         pane_id: u64,
         recorder: Option<Arc<EventRecorder>>,
+        history: Option<HistoryContext>,
     ) -> Result<Self, PtyError> {
         let session_id = new_session_id();
         let ManagedSpawn { argv, pty_bootstrap, env, wrapper_dir } =
@@ -234,6 +248,7 @@ impl PaneSession {
         let args: Vec<String> = argv[1..].to_vec();
         let config = PtyConfig { program, args, env, cwd, rows, cols };
         let mut session = Self::spawn(rows, cols, &config, session_id, pane_id, recorder)?;
+        session.history = history;
         // Tie the wrapper TempDir's lifetime to the pane session.
         // When the pane closes, the directory under $TMPDIR is
         // recursively removed.
@@ -343,6 +358,21 @@ impl PaneSession {
             if matches!(event, crate::markers::LifecycleEvent::Preexec { .. }) {
                 self.last_submitted = None;
             }
+            // Phase 4J: persist Preexec → record_submit and
+            // CommandFinished → record_finish. No-op if history is
+            // disabled (the low-level `spawn` path or a missing
+            // `<data-dir>/history.sqlite`). The cwd comes from
+            // OSC 7 / DCS-JSON Precmd, whichever fired most recently.
+            let now_ms = wall_clock_ms();
+            let cwd_str = self.terminal.cwd().map(|p| p.display().to_string());
+            capture_on_event(
+                self.history.as_ref(),
+                &mut self.capture_state,
+                &event,
+                self.pane_id,
+                cwd_str.as_deref(),
+                now_ms,
+            );
             self.blocks.observe_lifecycle_event(&event, &mut self.terminal, self.frame);
             self.controller.observe_event(event, self.frame);
             self.record_pending_transitions();
@@ -862,6 +892,15 @@ impl PaneSession {
         }
         None
     }
+}
+
+/// Wall-clock unix-epoch milliseconds. Used by the history
+/// capture path. Determinism rule from [spec/09](../spec/09-testing.md):
+/// tests inject the value into `capture_on_event` directly, so
+/// this only runs in production drain() calls.
+fn wall_clock_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 /// Word range for `col` (a char index) in `chars`, using the

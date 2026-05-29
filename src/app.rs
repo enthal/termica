@@ -171,10 +171,20 @@ impl TermicaApp {
         app
     }
 
+    /// Build the per-pane `HistoryContext` from the app's
+    /// `history` + `app_run_id`. Returns `None` if history couldn't
+    /// be opened (degraded mode) — panes spawn without capture and
+    /// the app stays usable.
+    fn history_ctx(&self) -> Option<crate::history::HistoryContext> {
+        let store = self.history.clone()?;
+        Some(crate::history::HistoryContext { store, app_run_id: self.app_run_id.clone() })
+    }
+
     fn bootstrap(&mut self) {
         let pane_id = self.mint_pane_id();
         let shell = resolve_shell_from_env();
         let recorder = self.event_recorder.clone();
+        let history = self.history_ctx();
         let session = PaneSession::spawn_managed(
             MIN_ROWS.max(24),
             MIN_COLS.max(80),
@@ -182,6 +192,7 @@ impl TermicaApp {
             None,
             pane_id.0,
             recorder,
+            history,
         )
         .expect("spawn initial pane");
         self.panes.insert(pane_id, PaneSlot { session, ui: PaneUiState::default() });
@@ -331,13 +342,15 @@ impl TermicaApp {
         let pane_id = self.mint_pane_id();
         let shell = resolve_shell_from_env();
         let recorder = self.event_recorder.clone();
-        let session = match PaneSession::spawn_managed(24, 80, shell, cwd, pane_id.0, recorder) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("termica: failed to spawn new pane: {e}");
-                return;
-            }
-        };
+        let history = self.history_ctx();
+        let session =
+            match PaneSession::spawn_managed(24, 80, shell, cwd, pane_id.0, recorder, history) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("termica: failed to spawn new pane: {e}");
+                    return;
+                }
+            };
         self.panes.insert(pane_id, PaneSlot { session, ui: PaneUiState::default() });
 
         let pane_tile = self.tree.tiles.insert_pane(pane_id);
