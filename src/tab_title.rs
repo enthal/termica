@@ -40,6 +40,24 @@ const MAX_TAB_TITLE_CHARS: usize = 25;
 /// Pure function so the rule is unit-testable without any egui
 /// plumbing.
 pub fn tab_title_for(pane_id: PaneId, cwd: Option<&Path>, home: Option<&Path>) -> String {
+    tab_title_for_with_osc(pane_id, None, cwd, home)
+}
+
+/// Variant of [`tab_title_for`] that prefers a shell-set OSC 0 / 2
+/// title when present (`osc_title`); falls back to the cwd-derived
+/// title otherwise, and to `pane <n>` when neither is available.
+/// The same truncation rule applies to whichever title wins.
+pub fn tab_title_for_with_osc(
+    pane_id: PaneId,
+    osc_title: Option<&str>,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> String {
+    if let Some(t) = osc_title
+        && !t.trim().is_empty()
+    {
+        return truncate_tab_title(t);
+    }
     let Some(c) = cwd else {
         return format!("pane {}", pane_id.0);
     };
@@ -124,6 +142,41 @@ mod tests {
     #[test]
     fn tab_title_falls_back_to_pane_n_when_cwd_unknown() {
         assert_eq!(tab_title_for(PaneId(3), None, None), "pane 3");
+    }
+
+    #[test]
+    fn tab_title_with_osc_uses_shell_title_when_present() {
+        let cwd = PathBuf::from("/Users/tim/git");
+        let home = PathBuf::from("/Users/tim");
+        assert_eq!(
+            tab_title_for_with_osc(PaneId(0), Some("vim foo.txt"), Some(&cwd), Some(&home)),
+            "vim foo.txt"
+        );
+    }
+
+    #[test]
+    fn tab_title_with_osc_ignores_blank_shell_title() {
+        // Empty / whitespace-only titles fall through to the cwd path
+        // — a shell that did `\e]2;\a` to reset shouldn't strand the
+        // user on a blank tab.
+        let cwd = PathBuf::from("/Users/tim");
+        let home = PathBuf::from("/Users/tim");
+        assert_eq!(tab_title_for_with_osc(PaneId(0), Some(""), Some(&cwd), Some(&home)), "~");
+        assert_eq!(tab_title_for_with_osc(PaneId(0), Some("   "), Some(&cwd), Some(&home)), "~");
+    }
+
+    #[test]
+    fn tab_title_with_osc_falls_back_to_pane_n_when_no_cwd_and_no_title() {
+        assert_eq!(tab_title_for_with_osc(PaneId(7), None, None, None), "pane 7");
+    }
+
+    #[test]
+    fn tab_title_with_osc_truncates_long_shell_titles() {
+        // 100-char OSC title — the same truncation rule that applies
+        // to cwd-derived titles should apply here.
+        let long: String = "x".repeat(100);
+        let out = tab_title_for_with_osc(PaneId(0), Some(&long), None, None);
+        assert!(out.len() < long.len(), "long titles should be truncated; got {out}");
     }
 
     #[test]
