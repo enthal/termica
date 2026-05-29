@@ -99,6 +99,13 @@ pub struct PaneUiState {
     /// the drag handler can union them with the word / line under
     /// the current pointer.
     pub(crate) sealed_drag_anchor: Option<(BlockId, BlockCursor, BlockCursor)>,
+    /// "Force the scroll area to the bottom on next render." Set by
+    /// `render_pane` when the editor's `Enter` submit fires; the
+    /// ScrollArea normally only sticks to the bottom when the user
+    /// is already there, which means a submit while scrolled up
+    /// would leave the new output off-screen. Cleared after one
+    /// frame's render consumes it.
+    pub(crate) scroll_to_bottom_pending: bool,
 }
 
 /// One pane's full state: the OS-resource [`PaneSession`] (PTY +
