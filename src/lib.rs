@@ -34,6 +34,7 @@ pub mod block_selection;
 pub mod echo_suppress;
 pub mod events;
 pub mod history;
+pub mod history_overlay;
 pub mod input;
 pub mod integration;
 pub mod links;

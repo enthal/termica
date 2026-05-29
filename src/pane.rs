@@ -555,6 +555,24 @@ impl PaneSession {
         self.recall.abandon();
     }
 
+    /// Borrow the per-process history context for surfaces that
+    /// need to open queries directly (the `^R` overlay). Returns
+    /// `None` if persistence was disabled or unreachable at
+    /// startup.
+    pub fn history_ctx(&self) -> Option<&HistoryContext> {
+        self.history.as_ref()
+    }
+
+    /// Insert `text` into the editor as the buffer (replacing any
+    /// existing content) and place the caret at the end. Used by
+    /// the `^R` overlay after the user picks an entry.
+    pub fn replace_editor_buffer(&mut self, text: &str) {
+        if let Some(editor) = self.blocks.editor_on_tail_mut() {
+            editor.clear();
+            editor.insert_str(text);
+        }
+    }
+
     /// Submit the editor's current text to the PTY (spec/04
     /// §"Submission semantics"). The order is load-bearing:
     ///

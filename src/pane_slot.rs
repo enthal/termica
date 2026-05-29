@@ -114,6 +114,11 @@ pub struct PaneUiState {
     /// recent bell-driven flash started. `None` when no flash is
     /// active; the flash fades out over `BELL_FLASH_SECS`.
     pub(crate) bell_flash_started_at: Option<f64>,
+    /// `Some` while the Ctrl+R history overlay is open. Holds the
+    /// query string the user is typing, the active scope, the
+    /// current selection index, and the cached result snapshot.
+    /// Cleared on Esc / Enter / pane refocus.
+    pub history_overlay: Option<crate::history_overlay::HistoryOverlay>,
 }
 
 /// One pane's full state: the OS-resource [`PaneSession`] (PTY +
