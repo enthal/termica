@@ -175,6 +175,25 @@ where
             continue;
         }
 
+        // KEY=VALUE shape: if the token contains `=` (common for
+        // shell-export tokens like `TERMICA_DUMP_EVENTS=/path/...`
+        // and `PATH=$HOME/...`), try the part AFTER the first `=`
+        // as a path candidate. The emitted span starts at the
+        // character after `=` so only the path itself is highlighted
+        // / navigable — the `KEY=` prefix is not.
+        if let Some(rel_eq) = token[..end].iter().position(|c| *c == '=') {
+            let rhs_off = rel_eq + 1;
+            if rhs_off < end {
+                let rhs = &token[rhs_off..end];
+                if is_path_shaped(rhs)
+                    && let Some(resolved) = resolve_and_check(rhs, cwd, home, is_existing)
+                {
+                    out.push((start + rhs_off, start + end - 1, resolved));
+                    continue;
+                }
+            }
+        }
+
         // Fallback: peel one more trailing `.` if the token ended
         // in one. This catches `see foo.rs.` (sentence-final dot)
         // without breaking `foo.rs` (extension dot).
@@ -429,6 +448,48 @@ mod tests {
         let exists = exists_predicate(&["/Users/tim/code/|", "/Users/tim/code/-->"]);
         let r = find_paths_in_chars(&chars("a | b --> c"), Some(&cwd()), Some(&home()), &exists);
         assert!(r.is_empty(), "pure-punctuation tokens should be skipped; got {r:?}");
+    }
+
+    #[test]
+    fn path_after_equals_in_kv_token_is_detected() {
+        // `KEY=/abs/path` is the common shell-export shape. The whole
+        // token doesn't exist (it isn't a real filename), but the part
+        // after `=` does — emit the path span starting at the `/`,
+        // not at the `K`, so that only the path is highlighted /
+        // navigable.
+        let exists = exists_predicate(&["/tmp/termica-vscode-events.json"]);
+        let line = "TERMICA_DUMP_EVENTS=/tmp/termica-vscode-events.json";
+        let r = find_paths_in_chars(&chars(line), Some(&cwd()), Some(&home()), &exists);
+        assert_eq!(r.len(), 1);
+        let (start, end, path) = &r[0];
+        assert_eq!(path, &PathBuf::from("/tmp/termica-vscode-events.json"));
+        // Span should start at the `/`, i.e. one past the `=`.
+        let eq_pos = line.find('=').expect("test setup includes an `=`");
+        assert_eq!(*start, eq_pos + 1, "span should start at the `/`, not the `T`");
+        assert_eq!(*end, line.len() - 1, "span should extend to the last char");
+    }
+
+    #[test]
+    fn path_after_equals_with_tilde_is_detected() {
+        // `HOME-based KV: env var pointing into the home dir.
+        let exists = exists_predicate(&["/Users/tim/.config/foo.toml"]);
+        let line = "FOO=~/.config/foo.toml";
+        let r = find_paths_in_chars(&chars(line), Some(&cwd()), Some(&home()), &exists);
+        assert_eq!(r.len(), 1);
+        let (start, _end, path) = &r[0];
+        assert_eq!(path, &PathBuf::from("/Users/tim/.config/foo.toml"));
+        let eq_pos = line.find('=').expect("test setup includes an `=`");
+        assert_eq!(*start, eq_pos + 1);
+    }
+
+    #[test]
+    fn kv_token_with_nonexistent_rhs_yields_nothing() {
+        // No fallback to whole-token: if neither the whole token nor
+        // the RHS is real, emit nothing.
+        let exists = exists_predicate(&[]);
+        let r =
+            find_paths_in_chars(&chars("FOO=/nope/nope.txt"), Some(&cwd()), Some(&home()), &exists);
+        assert!(r.is_empty(), "neither whole token nor RHS exist; got {r:?}");
     }
 
     #[test]
