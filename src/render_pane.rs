@@ -772,9 +772,32 @@ pub fn render_pane(
             cursor_pt.col = cursor_pt.col.min(row_len);
         }
         if let Some(links) = slot.session.sealed_block_links(block_id, home)
-            && links.iter().any(|l| l.contains(cursor_pt.row, cursor_pt.col))
+            && let Some(link) = links.iter().find(|l| l.contains(cursor_pt.row, cursor_pt.col))
         {
             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            // Paint the Cmd-hover affordance over the link's cells
+            // inside the sealed block — same translucent-blue
+            // overlay + underline that `paint_terminal` uses on the
+            // live grid, so the visual reads consistently across
+            // the live and frozen paths.
+            let x0 = block_rect.min.x + link.col_start as f32 * cell_w;
+            let x1 = block_rect.min.x + (link.col_end as f32 + 1.0) * cell_w;
+            let row_top = block_rect.min.y + link.row as f32 * row_h;
+            let row_bottom = row_top + row_h;
+            let underline_y = row_bottom - 1.5;
+            let painter = ui.painter();
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::Pos2::new(x0, row_top),
+                    egui::Pos2::new(x1, row_bottom),
+                ),
+                0.0,
+                render::LINK_HOVER_OVERLAY_COLOR,
+            );
+            painter.line_segment(
+                [egui::Pos2::new(x0, underline_y), egui::Pos2::new(x1, underline_y)],
+                egui::Stroke::new(1.5, render::LINK_UNDERLINE_COLOR),
+            );
         }
     }
 
