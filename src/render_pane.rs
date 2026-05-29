@@ -788,11 +788,17 @@ pub fn render_pane(
             // keyboard focus; suppressed entirely otherwise so
             // other panes don't show a competing caret. The repaint
             // request only fires while focused — no point burning
-            // wakeups on idle panes. `slot.ui.focused` reflects the
-            // previous frame's state; one-frame caret lag is invisible.
+            // wakeups on idle panes. Read the focus state from
+            // `editor_response.has_focus()` rather than the mirrored
+            // `slot.ui.focused`: the latter is reset to `false` at
+            // the top of every frame in `TermicaApp::update` so
+            // background-pane tab styling can't latch stale focus,
+            // which means by the time the caret is painted it always
+            // reads `false`.
+            let editor_focused = editor_response.has_focus();
             let time = ctx.input(|i| i.time);
-            let caret_visible = slot.ui.focused && (time * 1.6) as i64 % 2 == 0;
-            if slot.ui.focused {
+            let caret_visible = editor_focused && (time * 1.6) as i64 % 2 == 0;
+            if editor_focused {
                 ctx.request_repaint_after(std::time::Duration::from_millis(312));
             }
             // Use `ui.painter()` (unclipped to the current ui) rather
