@@ -558,8 +558,18 @@ pub fn render_pane(
     // is gated on `!in_alt_screen` because no blocks paint in alt-
     // screen, but the live grid does and the spacer must account
     // for it so vim / less / htop don't get pushed offscreen.
+    // Outside alt-screen mode the grid is rendered with its full
+    // history inline so a running command's earlier output stays
+    // visible; the spacer must include those rows too.
     if will_paint_live_term {
-        content_h += slot.session.terminal().grid().screen_lines() as f32 * row_h;
+        let grid = slot.session.terminal().grid();
+        let history = if in_alt_screen {
+            0
+        } else {
+            use alacritty_terminal::grid::Dimensions;
+            grid.history_size()
+        };
+        content_h += (history + grid.screen_lines()) as f32 * row_h;
     }
     let top_spacer = (scroll_max_h - content_h).max(0.0);
 
@@ -695,6 +705,13 @@ pub fn render_pane(
                 // focus state — close enough for cursor-tint, which
                 // would otherwise force two paint passes per frame.
                 // A one-frame lag on the focus tint is invisible.
+                //
+                // `include_history = !in_alt_screen`: outside alt-screen
+                // mode, render the entire grid (history + viewport) so
+                // a running command's output stays end-to-end visible
+                // — the outer ScrollArea handles navigation. In alt-
+                // screen mode there's no scrollback to include and the
+                // running program owns the screen at fixed size.
                 render::paint_terminal(
                     ui,
                     slot.session.terminal(),
@@ -702,6 +719,7 @@ pub fn render_pane(
                     highlighted_link,
                     hide_term_cursor,
                     slot.ui.focused,
+                    !in_alt_screen,
                 )
             } else {
                 // Synthetic empty `TerminalRender` for the editor-
