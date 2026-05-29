@@ -767,15 +767,10 @@ pub fn render_pane(
     // (when known) and then the editor here. `footer_rect` is the
     // exact rect the editor occupies — used by the click / drag
     // handlers below to translate pointer pixels to byte offsets.
-    // (footer_rect, footer_response) — `footer_response` is the
-    // focusable widget for the editor strip. Used downstream when
-    // the editor is active so `request_focus()` / `has_focus()`
-    // land on a real widget that egui can actually focus on,
-    // rather than the synthetic 1×1 `rendered.response` that has
-    // no input semantics. `None` when the footer isn't drawn.
-    let (footer_rect, footer_response): (Option<egui::Rect>, Option<egui::Response>) = if footer_h
-        > 0.0
-    {
+    // Focus lives on the per-pane focus anchor allocated AFTER this
+    // block; the editor footer's own `Response` is only used for
+    // hit-testing.
+    let footer_rect: Option<egui::Rect> = if footer_h > 0.0 {
         let chip_h = if has_prompt_cwd { row_h + 2.0 * render::CHIP_PAD_Y } else { 0.0 };
         let editor_h = footer_h - chip_h;
         let footer_origin = ui.next_widget_position();
@@ -799,7 +794,11 @@ pub fn render_pane(
             egui::Pos2::new(footer_origin.x, footer_origin.y + chip_h),
             egui::Vec2::new(ui.available_width(), editor_h),
         );
-        let editor_response = ui.interact(
+        // Register the editor footer as a widget so egui knows there's
+        // a click-and-drag target here (cursor icon etc.). Focus is
+        // held by the per-pane focus anchor allocated below; the
+        // Response itself isn't used.
+        let _editor_response = ui.interact(
             editor_rect,
             ui.id().with(("editor-footer", slot.session.pane_id())),
             egui::Sense::click_and_drag(),
@@ -807,22 +806,23 @@ pub fn render_pane(
 
         if let Some(editor) = slot.session.blocks().editor_on_tail() {
             let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
-            // Show the caret whenever the editor footer holds focus.
-            // Read from `ctx.memory` directly rather than
-            // `editor_response.has_focus()` — the latter ANDs in
-            // `egui::InputState::focused` (the OS window-focus
-            // flag), which is unreliable on macOS due to a known
-            // winit / egui-winit ordering bug
-            // (https://github.com/emilk/egui/issues/7588). When
-            // that flag is spuriously `false`, the caret silently
-            // disappears even though the editor is the keyboard
-            // target and typing still routes here.
+            // Caret visibility tracks the pane focus anchor (defined
+            // below the footer block but with a stable id). Read
+            // from `ctx.memory` directly so the OS window-focus flag
+            // (`egui::InputState::focused`) — known to be unreliable
+            // on macOS, see egui#7588 — can't suppress the caret
+            // while the editor is the actual keyboard target.
             //
-            // No blink for now: a steady caret is the priority; the
-            // blink can come back once we're certain we never lose
-            // it again.
-            let editor_focused = ctx.memory(|m| m.has_focus(editor_response.id));
-            let caret_visible = editor_focused;
+            // Blink: ~1.6 Hz square wave. The repaint request fires
+            // only while focused so idle panes don't burn wakeups.
+            let pane_focused = ctx.memory(|m| {
+                m.has_focus(egui::Id::new(("termica-pane-focus", slot.session.pane_id())))
+            });
+            let time = ctx.input(|i| i.time);
+            let caret_visible = pane_focused && (time * 1.6) as i64 % 2 == 0;
+            if pane_focused {
+                ctx.request_repaint_after(std::time::Duration::from_millis(312));
+            }
             // Use `ui.painter()` (unclipped to the current ui) rather
             // than `painter_at(editor_rect)` so descender pixels
             // (`p`, `g`, `y`, `q`) clear the rect's bottom edge
@@ -839,18 +839,40 @@ pub fn render_pane(
                 caret_visible,
             );
         }
-        (Some(editor_rect), Some(editor_response))
+        Some(editor_rect)
     } else {
-        (None, None)
+        None
     };
 
-    // The actual focusable widget for this pane: the editor footer
-    // when it's painted, otherwise the live `Term` (or the synthetic
-    // placeholder). All focus interactions — `request_focus`,
-    // focus-lock filter, `has_focus` checks, the keyboard handler —
-    // go through this single response so a stale reference can't
-    // quietly route around the active widget.
-    let focus_response = footer_response.as_ref().unwrap_or(&rendered.response);
+    // Stable per-pane focus anchor.
+    //
+    // Previously `focus_response` was either the editor footer (when
+    // editor mode) or the live `Term` (otherwise). Submitting a
+    // command would switch modes mid-frame: the editor footer would
+    // stop being allocated, its widget id would drop out of egui's
+    // `used_ids`, and egui's end-of-frame dead-mans-switch would
+    // release focus. On the next frame every visible pane would
+    // observe `nothing_focused = true` and race to call
+    // `request_focus()` — whichever pane rendered last in egui_tiles'
+    // iteration order kept focus, which is why the user saw focus
+    // hop to "the last tab on the left collection" after pressing
+    // Enter in a right-collection pane.
+    //
+    // The fix: allocate a 0×0 focusable widget with a pane-stable
+    // id every frame, regardless of mode. All focus interactions
+    // (`request_focus` / `has_focus` / `set_focus_lock_filter` / the
+    // keyboard-gate read) go through this single anchor, so the id
+    // never changes mid-session and the dead-mans-switch never fires
+    // on it. The editor footer and live `Term` keep their own
+    // responses for hit-testing (rect + drag detection); they no
+    // longer hold focus themselves.
+    let pane_focus_id = egui::Id::new(("termica-pane-focus", slot.session.pane_id()));
+    let focus_anchor = ui.interact(
+        egui::Rect::from_min_size(ui.max_rect().min, egui::Vec2::ZERO),
+        pane_focus_id,
+        egui::Sense::focusable_noninteractive(),
+    );
+    let focus_response = &focus_anchor;
 
     // ---- alt-screen border --------------------------------------
     //
