@@ -70,10 +70,9 @@ impl StyledLine {
     }
 }
 
-/// Captures the alacritty `Event`s we care about — currently the
-/// monotonically growing bell count. Title-change events will hook
-/// in here too once OSC 0/2 support lands; the listener is the only
-/// channel alacritty offers and we'd rather not add a second one.
+/// Captures the alacritty `Event`s we care about: the monotonically
+/// growing bell count and the most recent shell-set window title
+/// (OSC 0 / OSC 2).
 ///
 /// All fields use interior mutability (the trait gives us `&self`)
 /// and are wrapped in `Arc` so the listener can be cheaply cloned —
@@ -82,6 +81,12 @@ impl StyledLine {
 #[derive(Debug, Clone, Default)]
 pub struct TerminalEventTracker {
     bell_count: Arc<AtomicU64>,
+    /// Most recent title set by the shell via OSC 0 / OSC 2.
+    /// `None` until a title is set and after an
+    /// `Event::ResetTitle`. Read by the tab strip; cloning the
+    /// `String` is cheap because tab rendering runs at most a few
+    /// times per second.
+    title: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl TerminalEventTracker {
@@ -89,23 +94,40 @@ impl TerminalEventTracker {
         Self::default()
     }
 
-    /// Monotonically-increasing count of `Event::Bell`s seen. Each
-    /// `\a` (BEL) byte emitted by the shell increments this once.
-    /// The UI thread polls it to detect "a new bell since last
-    /// frame" — exact equality with the previously-read value means
-    /// no new bell.
+    /// Monotonically-increasing count of `Event::Bell`s seen.
     pub fn bell_count(&self) -> u64 {
         self.bell_count.load(Ordering::Acquire)
+    }
+
+    /// Most recent shell-set title from OSC 0 / OSC 2. The shell
+    /// typically sets this on every prompt (`\e]2;...\a` in
+    /// `PROMPT_COMMAND` / zsh `precmd`). `None` before any title
+    /// has been set or after an explicit reset.
+    pub fn title(&self) -> Option<String> {
+        self.title.lock().expect("title mutex poisoned").clone()
     }
 }
 
 impl EventListener for TerminalEventTracker {
     fn send_event(&self, event: Event) {
-        if matches!(event, Event::Bell) {
-            self.bell_count.fetch_add(1, Ordering::Release);
+        match event {
+            Event::Bell => {
+                self.bell_count.fetch_add(1, Ordering::Release);
+            }
+            Event::Title(s) => {
+                // Treat an empty payload (`\e]2;\a`) as "clear the
+                // title" since that's the convention shells use to
+                // reset the window title to default.
+                let normalized = if s.is_empty() { None } else { Some(s) };
+                *self.title.lock().expect("title mutex poisoned") = normalized;
+            }
+            Event::ResetTitle => {
+                *self.title.lock().expect("title mutex poisoned") = None;
+            }
+            // Other events (cwd via OSC 7, etc.) are still
+            // discarded; they'll hook in as new fields land.
+            _ => {}
         }
-        // Other events (title, cwd, etc.) are still discarded for
-        // now; they'll hook in as new fields land.
     }
 }
 
@@ -149,6 +171,13 @@ impl TerminalState {
     /// a visible-bell flash.
     pub fn bell_count(&self) -> u64 {
         self.events.bell_count()
+    }
+
+    /// Most recent shell-set window title from OSC 0 / OSC 2.
+    /// Surfaced in the tab strip when present; falls back to
+    /// cwd-derived title otherwise.
+    pub fn osc_title(&self) -> Option<String> {
+        self.events.title()
     }
 
     /// Feed bytes into the VT parser. The grid mutates accordingly,
@@ -871,6 +900,52 @@ mod tests {
         let mut state = TerminalState::new(5, 20);
         state.feed(b"hello world\r\n");
         assert_eq!(state.bell_count(), 0);
+    }
+
+    // ---- OSC 0 / OSC 2 title capture ------------------------------
+
+    #[test]
+    fn osc_title_starts_unset() {
+        let state = TerminalState::new(5, 20);
+        assert_eq!(state.osc_title(), None);
+    }
+
+    #[test]
+    fn osc_2_sets_the_window_title() {
+        // OSC 2 (`\e]2;<title>\a`) — modern shells emit this on each
+        // prompt to surface "user@host: cwd" or similar.
+        let mut state = TerminalState::new(5, 40);
+        state.feed(b"\x1b]2;cargo run -- hello\x07");
+        assert_eq!(state.osc_title().as_deref(), Some("cargo run -- hello"));
+    }
+
+    #[test]
+    fn osc_0_sets_both_icon_and_window_title() {
+        // OSC 0 (`\e]0;<title>\a`) sets the icon name AND the
+        // window title in xterm convention; alacritty's
+        // `Event::Title` fires for either.
+        let mut state = TerminalState::new(5, 40);
+        state.feed(b"\x1b]0;~/projects/termica\x07");
+        assert_eq!(state.osc_title().as_deref(), Some("~/projects/termica"));
+    }
+
+    #[test]
+    fn later_osc_title_overrides_earlier() {
+        let mut state = TerminalState::new(5, 40);
+        state.feed(b"\x1b]2;first\x07");
+        state.feed(b"\x1b]2;second\x07");
+        assert_eq!(state.osc_title().as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn empty_osc_title_clears_via_reset_title_event() {
+        // alacritty fires `Event::ResetTitle` for OSC 2 with an
+        // empty payload; our listener clears the cached title.
+        let mut state = TerminalState::new(5, 40);
+        state.feed(b"\x1b]2;something\x07");
+        assert!(state.osc_title().is_some());
+        state.feed(b"\x1b]2;\x07");
+        assert_eq!(state.osc_title(), None);
     }
 
     #[test]

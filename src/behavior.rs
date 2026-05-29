@@ -14,7 +14,7 @@ use egui_tiles::{Behavior, Tile, TileId, Tiles, UiResponse};
 
 use crate::pane_slot::{PaneId, PaneSlot};
 use crate::render_pane::render_pane;
-use crate::tab_title::tab_title_for;
+use crate::tab_title::tab_title_for_with_osc;
 
 /// Per-frame Behavior shim. Holds borrows into [`crate::app::TermicaApp`]
 /// so the Behavior callbacks can read pane state, draw pane UI, and
@@ -50,8 +50,10 @@ pub(crate) struct TabBehavior<'a> {
 
 impl<'a> Behavior<PaneId> for TabBehavior<'a> {
     fn tab_title_for_pane(&mut self, pane_id: &PaneId) -> egui::WidgetText {
-        let cwd = self.panes.get(pane_id).and_then(|s| s.session.terminal().cwd());
-        tab_title_for(*pane_id, cwd, self.home).into()
+        let term = self.panes.get(pane_id).map(|s| s.session.terminal());
+        let osc = term.and_then(|t| t.osc_title());
+        let cwd = term.and_then(|t| t.cwd());
+        tab_title_for_with_osc(*pane_id, osc.as_deref(), cwd, self.home).into()
     }
 
     fn pane_ui(&mut self, ui: &mut egui::Ui, _tile_id: TileId, pane_id: &mut PaneId) -> UiResponse {
@@ -146,13 +148,15 @@ impl<'a> Behavior<PaneId> for TabBehavior<'a> {
         let Some(Tile::Pane(pane_id)) = tiles.get(tile_id) else {
             return "?".into();
         };
-        let cwd = self.panes.get(pane_id).and_then(|s| s.session.terminal().cwd());
+        let term = self.panes.get(pane_id).map(|s| s.session.terminal());
+        let osc = term.and_then(|t| t.osc_title());
+        let cwd = term.and_then(|t| t.cwd());
         // No styling on the text itself any more. Active-in-container
         // is already differentiated by egui_tiles' default `tab_ui`
         // (brighter bg + connecting hline). The focused-for-the-whole-
         // app indicator is the blue bottom border painted in
         // [`on_tab_button`] below.
-        egui::RichText::new(tab_title_for(*pane_id, cwd, self.home)).into()
+        egui::RichText::new(tab_title_for_with_osc(*pane_id, osc.as_deref(), cwd, self.home)).into()
     }
 
     fn on_tab_button(
