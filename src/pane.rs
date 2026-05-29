@@ -722,6 +722,36 @@ impl PaneSession {
         None
     }
 
+    /// Scan a sealed block (command + snapshot) for URLs and
+    /// existing file-path tokens. Returns `(row, col_start,
+    /// col_end_inclusive, url)` spans in the block's unified row
+    /// space — same indexing as the selection / cursor helpers.
+    /// `None` if no sealed block has that id.
+    ///
+    /// Walks the block on every call; sealed blocks don't mutate
+    /// after seal, so caching is a viable future optimisation, but
+    /// at typical visible-block counts the scan is cheap and the
+    /// data path stays simple.
+    pub fn sealed_block_links(
+        &self,
+        block_id: crate::block::BlockId,
+        home: Option<&std::path::Path>,
+    ) -> Option<Vec<crate::block_links::BlockLinkSpan>> {
+        for block in self.blocks.iter() {
+            if let Block::Sealed { id, command, snapshot, header, .. } = block
+                && *id == block_id
+            {
+                return Some(crate::block_links::scan_block_links(
+                    command,
+                    snapshot,
+                    header.cwd.as_deref(),
+                    home,
+                ));
+            }
+        }
+        None
+    }
+
     /// Number of rows in a sealed block: `(command_lines, snapshot_lines)`.
     /// The unified row space is `0..command_lines` for the command
     /// label and `command_lines..(command_lines + snapshot_lines)`
