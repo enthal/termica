@@ -75,6 +75,15 @@ pub const SELECTION_COLOR: Color32 = Color32::from_rgba_premultiplied(0x3a, 0x60
 /// readable. Phase 10 will make this themable.
 pub const LINK_UNDERLINE_COLOR: Color32 = Color32::from_rgb(0x7c, 0xa9, 0xff);
 
+/// Translucent blue overlay painted on the cells of a Cmd-hovered
+/// URL or path so the hover affordance reads at a glance, not just
+/// as a thin underline. Premultiplied so the on-screen colour is
+/// the literal RGB — on the dark terminal background that produces
+/// a clear blue tint without obscuring the glyphs. Same hue family
+/// as [`LINK_UNDERLINE_COLOR`] so the two reinforce each other.
+pub const LINK_HOVER_OVERLAY_COLOR: Color32 =
+    Color32::from_rgba_premultiplied(0x3a, 0x55, 0x8a, 0x60);
+
 /// Foreground for user-entered text inside the [`PromptEditor`].
 /// Visually distinct from `DEFAULT_FG` (which paints shell output)
 /// so a screenshot makes immediately clear which characters the user
@@ -946,13 +955,15 @@ fn paint_selection_overlay(painter: &egui::Painter, start: Point, end: Point, g:
     }
 }
 
-/// Underline the cells covered by `link` in the link-hover colour.
+/// Paint the Cmd-hover affordance for `link`: a translucent blue
+/// rectangle over the link's cells and a 1.5 px underline 1.5 px
+/// above the cell bottom (matches the regular underline decoration
+/// in [`paint_terminal`]).
 ///
-/// Drawn 1.5 px above the cell bottom (matches the regular underline
-/// decoration in [`paint_terminal`]), at 1.5 px thickness so it
-/// reads as "affordance" rather than as a textual underline that
-/// the program itself emitted. Single-row only — multi-row URL
-/// stitching is deferred (see [`crate::links`]).
+/// The overlay alpha is low enough (≈ 28 %) that the glyphs remain
+/// fully legible; the underline reinforces the link affordance at a
+/// glance. Single-row only — multi-row URL stitching is deferred
+/// (see [`crate::links`]).
 fn paint_link_underline(painter: &egui::Painter, link: &LinkSpan, g: GridGeometry) {
     let viewport_row = link.start.line.0 + g.display_offset;
     if viewport_row < 0 || viewport_row >= g.screen_lines as i32 {
@@ -964,10 +975,19 @@ fn paint_link_underline(painter: &egui::Painter, link: &LinkSpan, g: GridGeometr
 
     let x0 = g.origin_x + col_lo as f32 * g.cell_w;
     let x1 = g.origin_x + (col_hi as f32 + 1.0) * g.cell_w;
-    let y = g.origin_y + (viewport_row as f32 + 1.0) * g.row_h - 1.5;
+    let row_top = g.origin_y + viewport_row as f32 * g.row_h;
+    let row_bottom = row_top + g.row_h;
+    let underline_y = row_bottom - 1.5;
 
-    painter
-        .line_segment([Pos2::new(x0, y), Pos2::new(x1, y)], Stroke::new(1.5, LINK_UNDERLINE_COLOR));
+    painter.rect_filled(
+        Rect::from_min_max(Pos2::new(x0, row_top), Pos2::new(x1, row_bottom)),
+        0.0,
+        LINK_HOVER_OVERLAY_COLOR,
+    );
+    painter.line_segment(
+        [Pos2::new(x0, underline_y), Pos2::new(x1, underline_y)],
+        Stroke::new(1.5, LINK_UNDERLINE_COLOR),
+    );
 }
 
 /// Resolve a cell to its `(fg, bg, paint_glyph)` triple for this
