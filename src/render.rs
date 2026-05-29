@@ -126,6 +126,11 @@ pub const TOKEN_PIPE_FG: Color32 = Color32::from_rgb(0xd6, 0x8f, 0xd8);
 pub const TOKEN_REDIRECT_FG: Color32 = Color32::from_rgb(0xd6, 0x8f, 0xd8);
 pub const TOKEN_FLAG_FG: Color32 = Color32::from_rgb(0xe8, 0xb5, 0x6e);
 pub const TOKEN_COMMENT_FG: Color32 = Color32::from_rgb(0x70, 0x70, 0x70);
+/// Bright yellow for the `=` inside a shell `KEY=value` var def.
+/// Sits between the `Variable`-coloured name on its left and the
+/// `String`-coloured value on its right, so the assignment reads
+/// as a three-toned phrase at a glance.
+pub const TOKEN_EQUALS_FG: Color32 = Color32::from_rgb(0xf5, 0xd0, 0x3a);
 
 /// Map a [`TokenKind`](crate::shell_syntax::TokenKind) to the
 /// foreground colour the editor should paint with. `Word` falls
@@ -140,6 +145,7 @@ pub fn color_for_token_kind(kind: crate::shell_syntax::TokenKind) -> Color32 {
         TokenKind::Redirect => TOKEN_REDIRECT_FG,
         TokenKind::Flag => TOKEN_FLAG_FG,
         TokenKind::Comment => TOKEN_COMMENT_FG,
+        TokenKind::Equals => TOKEN_EQUALS_FG,
         TokenKind::Word => EDITOR_FG,
     }
 }
