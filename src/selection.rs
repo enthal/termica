@@ -335,6 +335,35 @@ pub fn selection_text(grid: &Grid<Cell>, selection: &Selection) -> String {
         };
         let line_start = line_start.min(cols.saturating_sub(1));
 
+        // Skip the row's trailing space cells — the grid pads every
+        // row to `cols` with `' '` even when only a few cells are
+        // actually typed, and the copy payload shouldn't carry that
+        // padding. Find the last non-space column on this row and
+        // clamp `line_end` to it; if the whole row is blank the
+        // inner loop runs zero times and this row contributes
+        // nothing.
+        let last_typed = last_typed_col(grid, Line(line_idx), cols);
+        let line_end = match last_typed {
+            Some(last) => line_end.min(last),
+            None => {
+                // Blank row: contribute no chars; still emit a
+                // newline separator below for multi-row selections.
+                if line_idx < end_line {
+                    out.push('\n');
+                }
+                continue;
+            }
+        };
+
+        if line_start > line_end {
+            // Selection on this row starts past the last typed
+            // cell — nothing to copy from it.
+            if line_idx < end_line {
+                out.push('\n');
+            }
+            continue;
+        }
+
         for col_idx in line_start..=line_end {
             let pt = Point::new(Line(line_idx), Column(col_idx));
             let cell = &grid[pt];
@@ -353,6 +382,15 @@ pub fn selection_text(grid: &Grid<Cell>, selection: &Selection) -> String {
     }
 
     out
+}
+
+/// Index of the last non-`' '` cell on `line`, or `None` for an
+/// all-space row. Mirrors `block_selection::effective_row_len` but
+/// for the alacritty `Grid<Cell>` (and returns the inclusive last
+/// col rather than the exclusive end, matching the `..=` slicing
+/// convention this module uses).
+pub fn last_typed_col(grid: &Grid<Cell>, line: Line, cols: usize) -> Option<usize> {
+    (0..cols).rev().find(|&c| grid[Point::new(line, Column(c))].c != ' ')
 }
 
 #[cfg(test)]
@@ -500,21 +538,16 @@ mod tests {
     }
 
     #[test]
-    fn selection_text_multi_row_joins_with_newline() {
-        // "one\r\ntwo\r\nthree" puts three labels on three rows.
-        // Selecting the full content of rows 0..2 yields "one  …\ntwo  …\nthree".
-        // The full-row width is 20 cols (spaces fill the rest).
+    fn selection_text_multi_row_trims_trailing_whitespace() {
+        // "one\r\ntwo\r\nthree" puts three labels on three rows. The
+        // grid pads each row to its column width with `' '` cells; the
+        // copy payload should NOT include that imaginary right-margin
+        // padding — selecting "all of rows 0..2" yields just the
+        // typed content per row, joined with `\n`.
         let term = term_with(b"one\r\ntwo\r\nthree", 5, 20);
         let sel = char_sel(Point::new(Line(0), Column(0)), Point::new(Line(2), Column(4)));
         let t = selection_text(term.grid(), &sel);
-        // First row: "one" + 17 trailing spaces (to col 19 — full row).
-        // Middle row: full 20 cells of "two…".
-        // Last row: "three" (cols 0..=4).
-        let lines: Vec<&str> = t.split('\n').collect();
-        assert_eq!(lines.len(), 3);
-        assert!(lines[0].starts_with("one"));
-        assert!(lines[1].starts_with("two"));
-        assert_eq!(lines[2], "three");
+        assert_eq!(t, "one\ntwo\nthree");
     }
 
     #[test]
@@ -526,15 +559,34 @@ mod tests {
     }
 
     #[test]
-    fn selection_text_clamps_overshoot_to_grid_bounds() {
-        // Asking for a column far past the grid's right edge should
-        // just stop at the last cell, not panic with OOB.
+    fn selection_text_clamps_overshoot_at_last_typed_cell() {
+        // Selecting past the typed content does not include the grid's
+        // imaginary right-margin space cells. "abc" on a 20-col row,
+        // selection to col 999 → just "abc". (Also exercises the
+        // overshoot-clamp safety — must not panic.)
         let term = term_with(b"abc", 5, 20);
         let sel = char_sel(Point::new(Line(0), Column(0)), Point::new(Line(0), Column(999)));
         let t = selection_text(term.grid(), &sel);
-        assert!(t.starts_with("abc"));
-        // ...followed by the row's trailing spaces, up to the last col.
-        assert_eq!(t.chars().count(), 20);
+        assert_eq!(t, "abc");
+    }
+
+    #[test]
+    fn selection_text_empty_row_yields_empty_string() {
+        // A blank row contributes no characters to the copy payload.
+        let term = term_with(b"", 5, 20);
+        let sel = char_sel(Point::new(Line(0), Column(0)), Point::new(Line(0), Column(19)));
+        let t = selection_text(term.grid(), &sel);
+        assert_eq!(t, "");
+    }
+
+    #[test]
+    fn selection_text_preserves_internal_spaces() {
+        // The trim is "trailing whitespace per row", NOT "all
+        // whitespace": spaces between typed characters stay.
+        let term = term_with(b"a  b   c   ", 5, 20);
+        let sel = char_sel(Point::new(Line(0), Column(0)), Point::new(Line(0), Column(19)));
+        let t = selection_text(term.grid(), &sel);
+        assert_eq!(t, "a  b   c");
     }
 
     #[test]

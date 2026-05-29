@@ -24,9 +24,9 @@
 
 #![forbid(unsafe_code)]
 
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Grid};
 use alacritty_terminal::index::{Column, Line, Point};
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Response, Stroke, Vec2};
 
@@ -301,7 +301,7 @@ pub fn paint_terminal(
         && !sel.is_empty()
     {
         let (start, end) = sel.effective_range(grid);
-        paint_selection_overlay(&painter, start, end, geometry);
+        paint_selection_overlay(&painter, grid, start, end, geometry);
     }
 
     // Link hover underline. The caller has already gated this on
@@ -911,7 +911,13 @@ fn split_selection_at_row(
 /// row. Single-row selections collapse to one rectangle. Selections
 /// that fall partly outside the current viewport (because the user
 /// has scrolled) are clipped to the visible rows.
-fn paint_selection_overlay(painter: &egui::Painter, start: Point, end: Point, g: GridGeometry) {
+fn paint_selection_overlay(
+    painter: &egui::Painter,
+    grid: &Grid<Cell>,
+    start: Point,
+    end: Point,
+    g: GridGeometry,
+) {
     // Translate absolute Lines to viewport row indices, clamping each
     // endpoint to the visible range. If both endpoints land outside
     // the viewport on the same side, the clamp collapses them and we
@@ -937,6 +943,15 @@ fn paint_selection_overlay(painter: &egui::Painter, start: Point, end: Point, g:
             (0, g.cols.saturating_sub(1))
         };
 
+        // Stop the highlight at the last typed cell on this row so
+        // the user can't visually "select" the grid's imaginary
+        // right-margin space padding. `last_typed_col` returns
+        // `None` for an all-space row → skip the row entirely.
+        let line = Line(vrow - g.display_offset);
+        let Some(last_typed) = crate::selection::last_typed_col(grid, line, g.cols) else {
+            continue;
+        };
+        let col_hi = col_hi.min(last_typed);
         let col_hi = col_hi.min(g.cols.saturating_sub(1));
         let col_lo = col_lo.min(col_hi);
 
