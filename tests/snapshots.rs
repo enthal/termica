@@ -51,7 +51,7 @@ fn snapshot_terminal_plain_text() {
     );
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 200.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None, None, false, true);
+            render::paint_terminal(ui, &term, None, None, false, true, false);
         });
     harness.snapshot("terminal_plain_text");
 }
@@ -75,7 +75,7 @@ fn snapshot_terminal_ansi_colors() {
     let term = term_from_bytes(5, 50, &bytes);
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 180.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None, None, false, true);
+            render::paint_terminal(ui, &term, None, None, false, true, false);
         });
     harness.snapshot("terminal_ansi_colors");
 }
@@ -88,7 +88,7 @@ fn snapshot_terminal_cursor_visible_at_end_of_text() {
     let term = term_from_bytes(4, 30, b"hi");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 160.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None, None, false, true);
+            render::paint_terminal(ui, &term, None, None, false, true, false);
         });
     harness.snapshot("terminal_cursor_visible");
 }
@@ -102,7 +102,7 @@ fn snapshot_terminal_cursor_dim_when_unfocused() {
     let term = term_from_bytes(4, 30, b"hi");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 160.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None, None, false, false);
+            render::paint_terminal(ui, &term, None, None, false, false, false);
         });
     harness.snapshot("terminal_cursor_unfocused");
 }
@@ -116,7 +116,7 @@ fn snapshot_terminal_cursor_hidden_via_dectcem() {
     let term = term_from_bytes(4, 30, b"hi\x1b[?25l");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 160.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None, None, false, true);
+            render::paint_terminal(ui, &term, None, None, false, true, false);
         });
     harness.snapshot("terminal_cursor_hidden");
 }
@@ -149,7 +149,7 @@ fn snapshot_terminal_cell_attributes() {
     let term = term_from_bytes(5, 50, &bytes);
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 180.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None, None, false, true);
+            render::paint_terminal(ui, &term, None, None, false, true, false);
         });
     harness.snapshot("terminal_cell_attributes");
 }
@@ -168,7 +168,7 @@ fn snapshot_terminal_scrolled_into_scrollback() {
     term.scroll_display(5);
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 180.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None, None, false, true);
+            render::paint_terminal(ui, &term, None, None, false, true, false);
         });
     harness.snapshot("terminal_scrolled_into_scrollback");
 }
@@ -187,7 +187,7 @@ fn snapshot_terminal_alt_screen() {
     let term = term_from_bytes(5, 40, &bytes);
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 180.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None, None, false, true);
+            render::paint_terminal(ui, &term, None, None, false, true, false);
         });
     harness.snapshot("terminal_alt_screen");
 }
@@ -208,10 +208,57 @@ fn snapshot_terminal_alt_screen_with_border() {
     let term = term_from_bytes(5, 40, &bytes);
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 180.0)).build_ui(move |ui| {
-            let rendered = render::paint_terminal(ui, &term, None, None, false, true);
+            let rendered = render::paint_terminal(ui, &term, None, None, false, true, false);
             termica::paint_alt_screen_border(ui.painter(), rendered.response.rect);
         });
     harness.snapshot("terminal_alt_screen_with_border");
+}
+
+#[test]
+fn paint_terminal_with_include_history_renders_scrollback_rows() {
+    // A 3-row grid that has had 10 lines printed pushes 7 lines into
+    // history. With `include_history = true` the painter should
+    // allocate (history + screen_lines) row-heights worth of space
+    // so a running command's earlier output stays scrollable in the
+    // outer `ScrollArea` instead of being clipped to the visible
+    // viewport.
+    use alacritty_terminal::grid::Dimensions;
+    let mut bytes = Vec::new();
+    for i in 0..10 {
+        bytes.extend_from_slice(format!("line {i}\r\n").as_bytes());
+    }
+    let history_size = term_from_bytes(3, 12, &bytes).grid().history_size();
+    let screen_lines = term_from_bytes(3, 12, &bytes).grid().screen_lines();
+    assert!(history_size > 0, "fixture should have pushed lines into history");
+
+    fn measure(include_history: bool, bytes: &[u8]) -> f32 {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_closure = captured.clone();
+        let term = term_from_bytes(3, 12, bytes);
+        let _harness =
+            Harness::builder().with_size(egui::Vec2::new(400.0, 600.0)).build_ui(move |ui| {
+                let rendered =
+                    render::paint_terminal(ui, &term, None, None, false, true, include_history);
+                *captured_for_closure.lock().unwrap() = Some(rendered.response.rect.height());
+            });
+        captured.lock().unwrap().expect("paint_terminal ran")
+    }
+
+    let h_full = measure(true, &bytes);
+    let h_viewport = measure(false, &bytes);
+    assert!(
+        h_full > h_viewport,
+        "include_history must grow the painted region (full={h_full}, viewport={h_viewport})",
+    );
+    // row_h drops out of the ratio so the assertion holds across
+    // platforms / DPIs without hard-coding pixel counts.
+    let row_h = h_viewport / (screen_lines as f32);
+    let expected_h = (history_size + screen_lines) as f32 * row_h;
+    assert!(
+        (h_full - expected_h).abs() < 1.0,
+        "painted height {h_full} should match {expected_h} (rows={}, row_h={row_h})",
+        history_size + screen_lines,
+    );
 }
 
 #[test]
@@ -233,7 +280,7 @@ fn snapshot_terminal_link_underline() {
 
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 120.0)).build_ui(move |ui| {
-            render::paint_terminal(ui, &term, None, Some(&link), false, true);
+            render::paint_terminal(ui, &term, None, Some(&link), false, true, false);
         });
     harness.snapshot("terminal_link_underline");
 }

@@ -155,20 +155,26 @@ pub struct TerminalRender {
     pub geometry: GridGeometry,
 }
 
-/// Paint `term`'s visible grid into the current cursor position.
+/// Paint `term`'s grid into the current cursor position.
 ///
-/// Allocates exactly `cols × rows` of monospace metrics from `ui` so
-/// the surrounding layout knows we drew there. Caller decides where
-/// the grid lives (typically directly inside a `CentralPanel` after
-/// the status line).
+/// `include_history`:
+/// - `false` — paint exactly the visible viewport (rows
+///   `display_offset..display_offset + screen_lines`). The legacy
+///   path used by alt-screen mode (which has no scrollback anyway)
+///   and by snapshot tests.
+/// - `true` — paint **all** rows the grid currently holds: the
+///   `history_size` scrollback rows followed by the `screen_lines`
+///   viewport rows. `display_offset` is ignored; the rendered
+///   height grows to `(history_size + screen_lines) × row_h`. This
+///   is what running commands need: every line emitted since
+///   `Preexec` stays on-screen and the outer ScrollArea handles
+///   navigation. The returned `GridGeometry.display_offset` is set
+///   to `history_size` so pixel→grid hit-testing places (row 0,
+///   col 0) at grid line `-history_size`.
 ///
 /// `selection`, if `Some`, is painted as a semi-transparent overlay
 /// over the cells covered by the selection range. The hit-testing /
 /// drag tracking lives in the caller — this function only renders.
-///
-/// Returns a [`TerminalGeometry`] describing what was painted plus
-/// the egui `Response` (sensed `click_and_drag`) so the caller can
-/// turn pointer events into grid coordinates.
 pub fn paint_terminal(
     ui: &mut egui::Ui,
     term: &TerminalState,
@@ -176,6 +182,7 @@ pub fn paint_terminal(
     hover_link: Option<&LinkSpan>,
     hide_cursor: bool,
     focused: bool,
+    include_history: bool,
 ) -> TerminalRender {
     let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
     // `glyph_width` / `row_height` mutate the font cache as they go,
@@ -186,14 +193,19 @@ pub fn paint_terminal(
 
     let grid = term.grid();
     let cols = grid.columns();
-    let rows = grid.screen_lines();
+    let screen_lines = grid.screen_lines();
+    let history_size = if include_history { grid.history_size() } else { 0 };
+    let rows = history_size + screen_lines;
     // Translate viewport rows (`0..rows`) to grid `Line` indices.
-    // When the user scrolls into the scrollback, the visible top
-    // moves UP into negative `Line` territory.
-    //
-    // See `alacritty_terminal::term::viewport_to_point`:
-    //     grid_line = viewport_line - display_offset
-    let display_offset = grid.display_offset() as i32;
+    // In the legacy (no-history) path, viewport row `r` maps to
+    // grid line `r - display_offset`. When `include_history` is on
+    // we ignore `display_offset` and pin the top of the painted
+    // region at grid line `-history_size` so the oldest scrollback
+    // row sits at viewport row 0; `effective_display_offset` is the
+    // value we'd substitute for alacritty's `display_offset` to make
+    // the same formula keep working.
+    let effective_display_offset =
+        if include_history { history_size as i32 } else { grid.display_offset() as i32 };
 
     let size = Vec2::new(cols as f32 * cell_w, rows as f32 * row_h);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
@@ -206,7 +218,7 @@ pub fn paint_terminal(
 
     for row in 0..rows {
         for col in 0..cols {
-            let grid_line = (row as i32) - display_offset;
+            let grid_line = (row as i32) - effective_display_offset;
             let pt = Point::new(Line(grid_line), Column(col));
             let cell = &grid[pt];
 
@@ -262,7 +274,7 @@ pub fn paint_terminal(
         origin_y: rect.min.y,
         cell_w,
         row_h,
-        display_offset,
+        display_offset: effective_display_offset,
         screen_lines: rows,
         cols,
     };
@@ -297,12 +309,18 @@ pub fn paint_terminal(
     // will move ownership of cursor visibility to the prompt-editor
     // when we're at a trusted shell prompt; until then the renderer
     // simply mirrors what the terminal mode flags say.
+    //
+    // `cursor_position()` returns the *viewport* row. With
+    // `include_history` the painted area starts `history_size` rows
+    // earlier, so shift the cursor's painted row by `history_size`
+    // to land it in the right place.
     if !hide_cursor
         && term.is_cursor_visible()
         && let Some((row, col)) = term.cursor_position()
     {
+        let painted_row = row + history_size;
         let x = rect.min.x + col as f32 * cell_w;
-        let y = rect.min.y + row as f32 * row_h;
+        let y = rect.min.y + painted_row as f32 * row_h;
         let cursor_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w, row_h));
         let cursor_color = if focused { CURSOR_COLOR } else { CURSOR_UNFOCUSED_COLOR };
         painter.rect_filled(cursor_rect, 0.0, cursor_color);
