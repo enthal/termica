@@ -8,13 +8,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 use egui_tiles::{Tile, TileId, Tiles, Tree};
 
 use crate::behavior::TabBehavior;
 use crate::events::EventRecorder;
+use crate::history::{HistoryStore, ReplayPaths, replay_into};
 use crate::integration::ShellSpec;
 use crate::pane::PaneSession;
 use crate::pane_slot::{PaneAction, PaneId, PaneSlot, PaneUiState};
@@ -113,6 +114,30 @@ pub struct TermicaApp {
     /// startup; passed to each [`PaneSession`] on spawn. `None`
     /// disables dump-events entirely with zero per-pane cost.
     event_recorder: Option<Arc<EventRecorder>>,
+    /// Per-process command-history store. `Some` once the on-disk
+    /// SQLite at `<data-dir>/history.sqlite` opens successfully;
+    /// `None` if the data dir couldn't be resolved or the DB
+    /// failed to open — in which case the app degrades gracefully
+    /// to "no persisted history" and continues running.
+    ///
+    /// Used for: (a) recording Termica's own captured submits via
+    /// `PaneSession` (PR 4); (b) feeding the ↑/↓ recall (PR 5) and
+    /// ^R overlay (PR 6). PR 3 populates it from `~/.zsh_history`
+    /// & friends at construction time.
+    ///
+    /// `Arc<Mutex<…>>` because `rusqlite::Connection` is `Send` but
+    /// not `Sync` — future code paths (PaneSession capture in PR 4,
+    /// background `gc()` later) will need to hold a clone. The mutex
+    /// cost is negligible: no contention today, and history writes
+    /// are infrequent compared to PTY traffic.
+    #[allow(dead_code)]
+    pub(crate) history: Option<Arc<Mutex<HistoryStore>>>,
+    /// Per-process UUID tagging every captured submit in the
+    /// `runs` table. The `↑`/`↓` recall filters by this so a fresh
+    /// pane never inherits a closed pane's typing — see
+    /// [spec/07 §"Pane-scope recall"](../spec/07-history-and-search.md#pane-scope-recall--).
+    #[allow(dead_code)]
+    pub(crate) app_run_id: String,
 }
 
 impl TermicaApp {
@@ -121,6 +146,8 @@ impl TermicaApp {
     pub fn new() -> Self {
         let home = home::home_dir();
         let event_recorder = init_event_recorder();
+        let history = init_history_store(home.as_deref());
+        let app_run_id = uuid::Uuid::new_v4().to_string();
         let mut app = Self {
             panes: HashMap::new(),
             tree: Tree::empty("termica-tree"),
@@ -137,6 +164,8 @@ impl TermicaApp {
             should_quit: false,
             about_open: false,
             event_recorder,
+            history,
+            app_run_id,
         };
         app.bootstrap();
         app
@@ -749,4 +778,28 @@ fn init_event_recorder() -> Option<Arc<EventRecorder>> {
             None
         }
     }
+}
+
+/// Open the on-disk `HistoryStore` and replay the user's shell-
+/// history files into it. Returns `None` (and logs to stderr) if
+/// the data dir can't be resolved or the DB fails to open —
+/// history is a nice-to-have, never allowed to block startup.
+///
+/// Replay is idempotent (see [`crate::history::replay`]) so the
+/// "run on every startup" model is safe: re-reading the same file
+/// doesn't duplicate rows.
+fn init_history_store(home: Option<&std::path::Path>) -> Option<Arc<Mutex<HistoryStore>>> {
+    let dirs = directories::ProjectDirs::from("", "", "termica")?;
+    let path = dirs.data_dir().join("history.sqlite");
+    let store = match HistoryStore::open(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("termica: failed to open history db {}: {e}", path.display());
+            return None;
+        }
+    };
+    if let Some(h) = home {
+        let _stats = replay_into(&store, &ReplayPaths::from_home(h));
+    }
+    Some(Arc::new(Mutex::new(store)))
 }
