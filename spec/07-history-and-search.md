@@ -4,22 +4,30 @@
 
 Command history and transcript search are core to what Termica claims to be ("as navigable as an IDE"). They are not bolt-ons. They are structural.
 
-## Two stores, one shape
+## One store, two scopes
 
 ```
-┌──────────────────────────┐         ┌──────────────────────────┐
-│  Per-pane recent history │         │  Global command history  │
-│  (in-memory ring + spill)│         │  (SQLite, persisted)     │
-└────────────┬─────────────┘         └────────────┬─────────────┘
-             │                                    │
-             └──────────────┬─────────────────────┘
-                            │
-                   ┌────────▼────────┐
-                   │  History UI:    │
-                   │  Up-arrow walk  │
-                   │  Ctrl-R popup   │
-                   └─────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│   runs (SQLite)                                                  │
+│   - every Termica submit                                         │
+│   - every replayed shell-history-file entry                      │
+│     (~/.zsh_history, ~/.bash_history, fish)                      │
+└────────────────────────────┬─────────────────────────────────────┘
+                             │
+                ┌────────────┴────────────┐
+                │                         │
+       Pane scope                   Global scope
+       WHERE pane_id = ?            (no filter)
+        AND  app_run_id = ?
+                │                         │
+        ↑ / ↓ recall              ^R popup default
 ```
+
+A single `runs` table backs both surfaces. The query scope — pane vs global — is just a `WHERE` clause; the schema, ranking, and UI shape are otherwise identical. See [08](08-persistence.md) for the schema.
+
+### Hybrid: shell-history files feed the same table
+
+Termica replays each shell's own history file (`~/.zsh_history`, `~/.bash_history`, fish) into `runs` on app start with `source = '<shell>'` and no `pane_id` / `app_run_id`. The replay is idempotent (text + started_at + source is the dedup key); the user gets their pre-Termica history immediately and earned entries from every other terminal session.
 
 Both stores live behind the same query trait so the UI is scope-agnostic.
 
@@ -37,9 +45,13 @@ pub struct HistorySearch {
 }
 
 pub enum HistoryScope {
-    ThisPane(PaneId),
-    ThisTab(TabId),
-    ThisProject(PathBuf),   // typically the cwd's git root
+    /// Only this pane in this Termica process.
+    /// Matches `WHERE pane_id = ? AND app_run_id = ?`. Default
+    /// for `↑` / `↓` recall — it's what a "pane history" intuition
+    /// should give the user.
+    Pane { pane_id: PaneId, app_run_id: AppRunId },
+    /// Every row. Default for `^R`. cwd-proximity boosts the
+    /// ranker but does not filter.
     Global,
 }
 ```
@@ -80,27 +92,28 @@ pub enum CommandOrigin {
 
 The pane's `CommandRunBuffer` tracks open runs; only one can be open at a time per pane.
 
-## Pane-local history
+## Pane-scope recall (↑ / ↓)
 
-In-memory, capped at `N` (config; default 5000). The most recent K are also held in memory; older spill to a per-pane history table in SQLite. UI:
+Queries `runs WHERE pane_id = <this> AND app_run_id = <this process>`, ordered by `started_at DESC`. UI:
 
-- **Up arrow** in the editor: walks backwards through pane-local history. Down arrow walks forward.
+- **Up arrow** in the editor: walks backwards through pane-scope history. Down arrow walks forward.
 - The popup is closed; this is the lightest-weight history surface.
 - Multi-line history entries are reinserted exactly, including their newlines.
 
 A walk does not record into history; only `submit()` does.
 
-## Global history
+The `app_run_id` filter is what makes pane scope meaningful across restarts: pane numeric ids are minted by an in-memory counter and reuse freely, so without the UUID a fresh pane would inherit a closed pane's typing. When workspace restore eventually lands, restored panes can drop the `app_run_id` filter to recover their pre-restart history.
 
-SQLite-backed. Schema in [08](08-persistence.md). Every `CommandRun` writes one row at `started_at`; the row is updated at `ended_at`.
+## Global history (^R)
+
+SQLite-backed, identical schema (see [08](08-persistence.md)). Every Termica submit writes one row at `started_at`; the row is updated at `finished_at`. Replayed shell-history-file entries land alongside with their own `source`.
 
 UI:
 
 - **Ctrl+R** opens the history popup.
-- Default scope: `Global`, sorted by recency, optionally cwd-biased.
+- Default scope: `Global`, sorted by recency, with the current pane's cwd as a soft boost in the ranker (not a filter).
 - Fuzzy matcher: `nucleo` (v1 candidate) ranking by combined recency + cwd-proximity + match score.
-- Scope toggles in the popup chrome: `[ this pane | this project | global ]`.
-- Filters: `--this-project` mode shows only entries whose cwd is within the current git root.
+- Scope toggle in the popup chrome: `[ this pane | global ]`. Pane scope here narrows to the same `(pane_id, app_run_id)` slice the arrows walk.
 
 ```text
 ┌────────────────────────────────────────────────────────────────┐
@@ -111,9 +124,9 @@ UI:
 │   cargo test --package termica-terminal                        │
 │   17m ago · ~/git/enthal/termica · exit 0                      │
 │   cargo test -p termica-shell --test markers                   │
-│   yesterday · ~/git/enthal/termica · exit 0                    │
+│   yesterday · ~/git/enthal/termica · exit 0 · zsh              │
 └────────────────────────────────────────────────────────────────┘
-       scope: [ this pane | this project | global* ]
+       scope: [ this pane | global* ]
 ```
 
 Selecting an entry replaces the editor buffer. The popup never sends to the PTY directly.

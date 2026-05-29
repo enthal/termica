@@ -76,23 +76,28 @@ CREATE TABLE session (
     exit_code   INTEGER
 );
 
--- one row per CommandRun. closed when the matching command_end arrives,
--- or marked unknown if it never does ([07]).
-CREATE TABLE command_run (
-    id           INTEGER PRIMARY KEY,
-    session_id   INTEGER NOT NULL REFERENCES session(id),
-    pane_id      INTEGER NOT NULL REFERENCES pane(id),
-    command      TEXT NOT NULL,
-    cwd          TEXT NOT NULL,
-    started_at   INTEGER NOT NULL,
-    ended_at     INTEGER,
-    exit_status  INTEGER,
-    duration_ms  INTEGER,
-    origin       TEXT NOT NULL,             -- 'editor' | 'raw' | 'unknown'
-    output_start INTEGER,                   -- scrollback global line index (start, inclusive)
-    output_end   INTEGER,                   -- scrollback global line index (end, exclusive)
-    git_branch   TEXT,
-    git_dirty    INTEGER
+-- one row per command invocation. Backs BOTH the per-pane recent
+-- history (↑ / ↓) AND the global cross-pane history (^R). Replayed
+-- shell-history-file entries (~/.zsh_history, ~/.bash_history, fish)
+-- also land here with `source` set to the shell name.
+--
+-- Earlier drafts split this into `command_run` (engine record) and
+-- `history_entry` (UI quick-walk tail). The split added churn — the
+-- same row needed two writes and the UI had to UNION across them —
+-- without buying anything: a single `runs` table with the right
+-- indexes serves both surfaces. `(pane_id, app_run_id)` is the
+-- pane-scope key; the `app_run_id` UUID distinguishes a fresh pane
+-- from a closed pane that happens to reuse the same numeric id.
+CREATE TABLE runs (
+    id            INTEGER PRIMARY KEY,
+    text          TEXT NOT NULL,
+    started_at    INTEGER NOT NULL,
+    finished_at   INTEGER,
+    exit_code     INTEGER,
+    cwd           TEXT,
+    app_run_id    TEXT,                      -- UUIDv4, one per Termica process lifetime
+    pane_id       INTEGER,                   -- not yet a FK; becomes one when `pane` lands
+    source        TEXT NOT NULL              -- 'termica' | 'zsh' | 'bash' | 'fish'
 );
 
 -- scrollback chunk index. one row per sealed chunk file.
@@ -109,23 +114,10 @@ CREATE TABLE scrollback_chunk (
     byte_size    INTEGER NOT NULL
 );
 
--- pane-local history rotation tail. global history is queryable via
--- the command_run table directly; the dedicated history_entry table
--- is for pane-local quick walks where we want stable IDs even after
--- a command_run is deleted by retention.
-CREATE TABLE history_entry (
-    id         INTEGER PRIMARY KEY,
-    pane_id    INTEGER NOT NULL REFERENCES pane(id),
-    command    TEXT NOT NULL,
-    cwd        TEXT NOT NULL,
-    at         INTEGER NOT NULL,
-    exit       INTEGER
-);
-
-CREATE INDEX idx_command_run_pane_started  ON command_run(pane_id, started_at);
-CREATE INDEX idx_command_run_started_at    ON command_run(started_at);
-CREATE INDEX idx_scrollback_chunk_pane     ON scrollback_chunk(pane_id, start_line);
-CREATE INDEX idx_history_entry_pane_at     ON history_entry(pane_id, at);
+CREATE INDEX idx_runs_started_at        ON runs(started_at DESC);
+CREATE INDEX idx_runs_pane_started      ON runs(pane_id, app_run_id, started_at DESC);
+CREATE INDEX idx_runs_text              ON runs(text);
+CREATE INDEX idx_scrollback_chunk_pane  ON scrollback_chunk(pane_id, start_line);
 ```
 
 ### What lives in the layout blob

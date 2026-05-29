@@ -90,6 +90,20 @@ tempfile = "3"
 # a stale child can be discriminated.
 uuid = { version = "1", features = ["v4"] }
 
+# Phase 4J: command-history persistence. SQLite, bundled so users
+# don't need a system `libsqlite3`. ~500 KB to the binary; in
+# exchange we get full SQL (range scans, GROUP BY, indexes) for the
+# `runs` table that backs `↑` / `↓` recall + `^R` reverse search.
+# See [spec/08](spec/08-persistence.md) for the schema.
+rusqlite = { version = "0.34", features = ["bundled"] }
+
+# Phase 4J: choose the right OS-conventional data directory for
+# `history.sqlite`. On macOS `~/Library/Application Support/termica`,
+# on Linux `${XDG_DATA_HOME:-~/.local/share}/termica`, on Windows
+# `%APPDATA%/termica/data`. Avoids hard-coding any one platform's
+# convention and matches what spec/08 calls "`<data-dir>/`".
+directories = "5"
+
 # macOS-only: we need `EventLoopBuilderExtMacOS::with_default_menu(false)`
 # to disable winit's default app menubar. Its Quit item invokes
 # `[NSApplication terminate:]` directly, which bypasses our key
