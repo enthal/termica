@@ -42,6 +42,17 @@ pub enum TokenKind {
     /// shell: the `#` must be at the start of a token (preceded by
     /// whitespace, start of line, or a metachar).
     Comment,
+    /// The `=` separator inside a shell `KEY=value` env-var def.
+    /// Emitted only when the surrounding token is actually a var
+    /// def — i.e. at command position (`LANG=C cargo run`) or
+    /// after a var-modifier command (`export PATH=...`,
+    /// `declare/local/readonly/typeset KEY=value`). Painted in a
+    /// distinct bright colour so the `=` reads as the assignment
+    /// operator, with the name on its left painted as a Variable
+    /// and the value on its right as a String. Flag tokens
+    /// (`--long=value`) are detected earlier and never produce
+    /// this kind.
+    Equals,
     /// Anything that didn't match a more specific kind.
     Word,
 }
@@ -69,6 +80,12 @@ pub fn tokenize(text: &str) -> Vec<Token> {
     let mut tokens: Vec<Token> = Vec::new();
     let mut i = 0;
     let mut expecting_command = true;
+    // `true` immediately after a `Command` token whose text is one
+    // of the shell's var-modifier commands. Lets subsequent
+    // `KEY=value` words classify as var defs even though they're
+    // not at command position. Reset on pipe / new line / a non-
+    // `=` arg.
+    let mut var_modifier_active = false;
 
     while i < bytes.len() {
         // Skip horizontal whitespace within a line.
@@ -86,6 +103,7 @@ pub fn tokenize(text: &str) -> Vec<Token> {
             // is starting a fresh shell statement.
             i += 1;
             expecting_command = true;
+            var_modifier_active = false;
             continue;
         }
 
@@ -168,6 +186,7 @@ pub fn tokenize(text: &str) -> Vec<Token> {
             }
             tokens.push(Token::new(TokenKind::Pipe, start..i));
             expecting_command = true;
+            var_modifier_active = false;
             continue;
         }
 
@@ -179,6 +198,7 @@ pub fn tokenize(text: &str) -> Vec<Token> {
             }
             tokens.push(Token::new(TokenKind::Pipe, start..i));
             expecting_command = true;
+            var_modifier_active = false;
             continue;
         }
 
@@ -186,6 +206,7 @@ pub fn tokenize(text: &str) -> Vec<Token> {
             tokens.push(Token::new(TokenKind::Pipe, i..i + 1));
             i += 1;
             expecting_command = true;
+            var_modifier_active = false;
             continue;
         }
 
@@ -221,8 +242,21 @@ pub fn tokenize(text: &str) -> Vec<Token> {
             continue;
         }
 
-        // Default: a plain word. First word after a fresh statement
-        // boundary is the Command; subsequent words are args.
+        // Default: a plain word. The classification depends on
+        // (1) whether the word contains `=`, and (2) where in the
+        // statement we are:
+        //
+        // - At command position (`expecting_command`) OR right after
+        //   a var-modifier command (`export NAME=value`, ditto for
+        //   `declare/local/readonly/typeset`), a word containing
+        //   `=` is a var def — split into three sub-tokens:
+        //   `Variable` (the name), `Equals`, `String` (the value).
+        //   A var def at command position does NOT consume the
+        //   command slot (`a=b cargo run` — `cargo` is still the
+        //   command).
+        // - Anywhere else, `=` inside a word has no special meaning
+        //   (`echo a=b` — `a=b` is just an arg) and the whole word
+        //   classifies as `Command` (if expecting) or `Word`.
         let start = i;
         while i < bytes.len() && !is_word_break(bytes[i]) {
             i += 1;
@@ -234,8 +268,38 @@ pub fn tokenize(text: &str) -> Vec<Token> {
             i += 1;
             continue;
         }
+        let is_var_def =
+            (expecting_command || var_modifier_active) && bytes[start..i].contains(&b'=');
+        if is_var_def {
+            let eq_off = bytes[start..i].iter().position(|&b| b == b'=').unwrap();
+            let eq_pos = start + eq_off;
+            // Name slice may be empty in pathological cases like
+            // `=foo`; emit it only when non-empty.
+            if eq_pos > start {
+                tokens.push(Token::new(TokenKind::Variable, start..eq_pos));
+            }
+            tokens.push(Token::new(TokenKind::Equals, eq_pos..eq_pos + 1));
+            if eq_pos + 1 < i {
+                tokens.push(Token::new(TokenKind::String, eq_pos + 1..i));
+            }
+            // A var def at command position keeps the command slot
+            // open for the next token; in the after-export case
+            // `expecting_command` is already false and we leave it
+            // that way. `var_modifier_active` stays on so a sequence
+            // like `export A=1 B=2 C=3` all classify.
+            continue;
+        }
         let kind = if expecting_command { TokenKind::Command } else { TokenKind::Word };
+        let token_text = &bytes[start..i];
         tokens.push(Token::new(kind, start..i));
+        if kind == TokenKind::Command {
+            var_modifier_active = is_var_modifier_command(token_text);
+        } else {
+            // Any non-Command, non-var-def word ends the var-modifier
+            // scope (e.g. `export FOO bar` — once we see a non-`=`
+            // arg, subsequent `=`-words shouldn't auto-classify).
+            var_modifier_active = false;
+        }
         expecting_command = false;
     }
 
@@ -271,6 +335,13 @@ fn consume_variable(bytes: &[u8], i: usize, tokens: &mut Vec<Token>) -> usize {
 
 fn is_var_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Shell built-ins whose immediate args are `KEY=value` var-defs
+/// rather than ordinary arguments. Used by the tokenizer to keep
+/// the var-def coloring through `export FOO=bar BAZ=qux`.
+fn is_var_modifier_command(name: &[u8]) -> bool {
+    matches!(name, b"export" | b"declare" | b"local" | b"readonly" | b"typeset")
 }
 
 fn is_word_break(b: u8) -> bool {
@@ -331,6 +402,120 @@ mod tests {
     fn long_flag_with_equals() {
         let t = tokenize("git --no-pager log");
         assert_eq!(kinds(&t), vec![TokenKind::Command, TokenKind::Flag, TokenKind::Word]);
+    }
+
+    // ---- env-var defs -------------------------------------------
+    //
+    // Var defs are split into three sub-tokens so the renderer can
+    // colour the name, the `=`, and the value separately: `Variable`,
+    // `Equals`, `String`. An empty value (`KEY=`) emits just
+    // `Variable` + `Equals`; the empty value run is dropped because
+    // there's nothing to colour.
+
+    #[test]
+    fn env_var_def_at_command_position_splits_into_name_eq_value() {
+        let t = tokenize("a=b cargo run");
+        assert_eq!(
+            kinds(&t),
+            vec![
+                TokenKind::Variable,
+                TokenKind::Equals,
+                TokenKind::String,
+                TokenKind::Command,
+                TokenKind::Word,
+            ]
+        );
+        assert_eq!(slices("a=b cargo run", &t), vec!["a", "=", "b", "cargo", "run"]);
+    }
+
+    #[test]
+    fn multiple_env_var_defs_before_command_all_split() {
+        let t = tokenize("a=b c=d e= cargo run");
+        // 3 var defs (one with empty value) + Command + Word.
+        // `e=` has no value run.
+        assert_eq!(
+            kinds(&t),
+            vec![
+                TokenKind::Variable,
+                TokenKind::Equals,
+                TokenKind::String,
+                TokenKind::Variable,
+                TokenKind::Equals,
+                TokenKind::String,
+                TokenKind::Variable,
+                TokenKind::Equals,
+                TokenKind::Command,
+                TokenKind::Word,
+            ]
+        );
+    }
+
+    #[test]
+    fn lone_env_var_def_with_no_command_following() {
+        let t = tokenize("a=b");
+        assert_eq!(kinds(&t), vec![TokenKind::Variable, TokenKind::Equals, TokenKind::String]);
+    }
+
+    #[test]
+    fn empty_value_omits_the_value_run() {
+        let t = tokenize("KEY=");
+        assert_eq!(kinds(&t), vec![TokenKind::Variable, TokenKind::Equals]);
+    }
+
+    #[test]
+    fn export_keeps_var_def_classification_through_its_args() {
+        let t = tokenize("export FOO=bar BAZ=qux");
+        assert_eq!(
+            kinds(&t),
+            vec![
+                TokenKind::Command,
+                TokenKind::Variable,
+                TokenKind::Equals,
+                TokenKind::String,
+                TokenKind::Variable,
+                TokenKind::Equals,
+                TokenKind::String,
+            ]
+        );
+    }
+
+    #[test]
+    fn echo_with_equals_arg_is_not_a_var_def() {
+        // `echo a=b` — `a=b` is just an argument, not an
+        // assignment. The whole word classifies as `Word`.
+        let t = tokenize("echo a=b");
+        assert_eq!(kinds(&t), vec![TokenKind::Command, TokenKind::Word]);
+        assert_eq!(slices("echo a=b", &t), vec!["echo", "a=b"]);
+    }
+
+    #[test]
+    fn long_flag_with_equals_stays_a_flag_not_var_def() {
+        // The `=` inside a `--long=value` flag must not flip the
+        // flag's classification.
+        let t = tokenize("git --foo=bar log");
+        assert_eq!(kinds(&t), vec![TokenKind::Command, TokenKind::Flag, TokenKind::Word]);
+    }
+
+    #[test]
+    fn pipe_resets_var_modifier_scope() {
+        // After a pipe we're at command position again — but
+        // `export` only applies to its own scope, not whatever
+        // comes after a pipe. `foo=bar` after a non-var-modifier
+        // command is still a var def because it's at the new
+        // command position.
+        let t = tokenize("export FOO=bar | echo done");
+        assert_eq!(
+            kinds(&t),
+            vec![
+                TokenKind::Command,
+                TokenKind::Variable,
+                TokenKind::Equals,
+                TokenKind::String,
+                TokenKind::Pipe,
+                TokenKind::Command,
+                TokenKind::Word,
+            ]
+        );
     }
 
     // ---- pipes / redirects --------------------------------------
