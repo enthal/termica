@@ -23,7 +23,9 @@ use alacritty_terminal::index::Point;
 use crate::block::{Block, BlockStack};
 use crate::block_selection::BlockSelection;
 use crate::events::EventRecorder;
-use crate::history::{CaptureState, HistoryContext, capture_on_event};
+use crate::history::{
+    CaptureState, HistoryContext, RecallOutcome, RecallState, Scope, capture_on_event,
+};
 use crate::integration::{ManagedSpawn, ShellSpec, managed_spawn_for, new_session_id};
 use crate::pty::{PtyConfig, PtyError, PtySession};
 use crate::selection::{self, Selection, SelectionMode};
@@ -146,6 +148,10 @@ pub struct PaneSession {
     /// `CommandFinished` can stamp the exit code. Reset on every
     /// `Preexec` and every `CommandFinished`.
     capture_state: CaptureState,
+    /// `↑`/`↓` history-recall state. Persists across the in-flight
+    /// walk (saved buffer + cached entries + cursor) and is reset
+    /// on the first non-recall edit. See [`crate::history::recall`].
+    recall: RecallState,
 }
 
 impl PaneSession {
@@ -212,6 +218,7 @@ impl PaneSession {
             block_selection: None,
             history: None,
             capture_state: CaptureState::default(),
+            recall: RecallState::default(),
         })
     }
 
@@ -498,6 +505,54 @@ impl PaneSession {
     pub fn editor_is_active(&self) -> bool {
         self.controller.mode() == PaneMode::ShellPromptEditor
             && self.blocks.editor_on_tail().is_some()
+    }
+
+    /// `↑`: substitute the previous (older) pane-scope history
+    /// entry into the editor. First call saves the current buffer
+    /// so `↓` can restore it. Returns `true` if the editor changed
+    /// (so the caller's auto-scroll/auto-redraw machinery can
+    /// react). No-op if no editor, no history, or no entries.
+    pub fn editor_history_prev(&mut self) -> bool {
+        let Some(ctx) = self.history.clone() else { return false };
+        if self.blocks.editor_on_tail().is_none() {
+            return false;
+        }
+        let pane_id = self.pane_id;
+        let current_text =
+            self.blocks.editor_on_tail().map(|e| e.text().to_string()).unwrap_or_default();
+        let app_run_id = ctx.app_run_id.clone();
+        let outcome = self.recall.step_back(
+            || {
+                let store = match ctx.store.lock() {
+                    Ok(s) => s,
+                    Err(_) => return Vec::new(),
+                };
+                store
+                    .recent(&Scope::Pane { pane_id: pane_id as i64, app_run_id: &app_run_id }, 500)
+                    .map(|rows| rows.into_iter().map(|r| r.text).collect())
+                    .unwrap_or_default()
+            },
+            &current_text,
+        );
+        apply_recall_outcome(self.blocks.editor_on_tail_mut(), outcome)
+    }
+
+    /// `↓`: walk toward newer entries; returns to the saved buffer
+    /// at the head. Returns `true` if the editor changed.
+    pub fn editor_history_next(&mut self) -> bool {
+        if self.blocks.editor_on_tail().is_none() {
+            return false;
+        }
+        let outcome = self.recall.step_forward();
+        apply_recall_outcome(self.blocks.editor_on_tail_mut(), outcome)
+    }
+
+    /// Abandon any in-progress `↑`/`↓` walk so the next `↑`
+    /// re-queries and re-saves the editor buffer. Idempotent.
+    /// Call from edit paths (text insert, backspace, …) so a
+    /// keystroke other than an arrow exits recall.
+    pub fn clear_history_recall(&mut self) {
+        self.recall.abandon();
     }
 
     /// Submit the editor's current text to the PTY (spec/04
@@ -891,6 +946,25 @@ impl PaneSession {
             }
         }
         None
+    }
+}
+
+/// Replace the editor's contents with `outcome`'s `new_text` and
+/// move the caret to the end. No-op (and `false` return) on
+/// `Unchanged`. Shared between the `↑` / `↓` recall paths in
+/// `PaneSession::editor_history_*`.
+fn apply_recall_outcome(
+    editor: Option<&mut crate::prompt_editor::PromptEditor>,
+    outcome: RecallOutcome,
+) -> bool {
+    let Some(editor) = editor else { return false };
+    match outcome {
+        RecallOutcome::Replace { new_text } => {
+            editor.clear();
+            editor.insert_str(&new_text);
+            true
+        }
+        RecallOutcome::Unchanged => false,
     }
 }
 
