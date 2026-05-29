@@ -784,23 +784,22 @@ pub fn render_pane(
 
         if let Some(editor) = slot.session.blocks().editor_on_tail() {
             let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
-            // Caret blink: ~1.6 Hz square wave when the pane has
-            // keyboard focus; suppressed entirely otherwise so
-            // other panes don't show a competing caret. The repaint
-            // request only fires while focused — no point burning
-            // wakeups on idle panes. Read the focus state from
-            // `editor_response.has_focus()` rather than the mirrored
-            // `slot.ui.focused`: the latter is reset to `false` at
-            // the top of every frame in `TermicaApp::update` so
-            // background-pane tab styling can't latch stale focus,
-            // which means by the time the caret is painted it always
-            // reads `false`.
-            let editor_focused = editor_response.has_focus();
-            let time = ctx.input(|i| i.time);
-            let caret_visible = editor_focused && (time * 1.6) as i64 % 2 == 0;
-            if editor_focused {
-                ctx.request_repaint_after(std::time::Duration::from_millis(312));
-            }
+            // Show the caret whenever the editor footer holds focus.
+            // Read from `ctx.memory` directly rather than
+            // `editor_response.has_focus()` — the latter ANDs in
+            // `egui::InputState::focused` (the OS window-focus
+            // flag), which is unreliable on macOS due to a known
+            // winit / egui-winit ordering bug
+            // (https://github.com/emilk/egui/issues/7588). When
+            // that flag is spuriously `false`, the caret silently
+            // disappears even though the editor is the keyboard
+            // target and typing still routes here.
+            //
+            // No blink for now: a steady caret is the priority; the
+            // blink can come back once we're certain we never lose
+            // it again.
+            let editor_focused = ctx.memory(|m| m.has_focus(editor_response.id));
+            let caret_visible = editor_focused;
             // Use `ui.painter()` (unclipped to the current ui) rather
             // than `painter_at(editor_rect)` so descender pixels
             // (`p`, `g`, `y`, `q`) clear the rect's bottom edge
