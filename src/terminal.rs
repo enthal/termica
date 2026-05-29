@@ -10,6 +10,9 @@
 
 #![forbid(unsafe_code)]
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use alacritty_terminal::Term;
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Grid;
@@ -67,15 +70,43 @@ impl StyledLine {
     }
 }
 
-/// No-op event listener. `alacritty_terminal` calls into this on bell,
-/// title change, mouse cursor change, OSC events, etc. For Phase 1D
-/// we discard everything; Phase 3 will replace this with a listener
-/// that surfaces OSC markers onto our marker stream.
+/// Captures the alacritty `Event`s we care about — currently the
+/// monotonically growing bell count. Title-change events will hook
+/// in here too once OSC 0/2 support lands; the listener is the only
+/// channel alacritty offers and we'd rather not add a second one.
+///
+/// All fields use interior mutability (the trait gives us `&self`)
+/// and are wrapped in `Arc` so the listener can be cheaply cloned —
+/// alacritty's `Term::new` takes the listener by value and we keep
+/// a second handle for read access from the UI thread.
 #[derive(Debug, Clone, Default)]
-struct NopListener;
+pub struct TerminalEventTracker {
+    bell_count: Arc<AtomicU64>,
+}
 
-impl EventListener for NopListener {
-    fn send_event(&self, _event: Event) {}
+impl TerminalEventTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Monotonically-increasing count of `Event::Bell`s seen. Each
+    /// `\a` (BEL) byte emitted by the shell increments this once.
+    /// The UI thread polls it to detect "a new bell since last
+    /// frame" — exact equality with the previously-read value means
+    /// no new bell.
+    pub fn bell_count(&self) -> u64 {
+        self.bell_count.load(Ordering::Acquire)
+    }
+}
+
+impl EventListener for TerminalEventTracker {
+    fn send_event(&self, event: Event) {
+        if matches!(event, Event::Bell) {
+            self.bell_count.fetch_add(1, Ordering::Release);
+        }
+        // Other events (title, cwd, etc.) are still discarded for
+        // now; they'll hook in as new fields land.
+    }
 }
 
 /// One terminal's grid + parser. Feed bytes via [`Self::feed`]; read
@@ -83,7 +114,11 @@ impl EventListener for NopListener {
 /// the lower-level [`Self::grid`] / [`Self::cursor_position`] accessors
 /// that the renderer uses.
 pub struct TerminalState {
-    term: Term<NopListener>,
+    term: Term<TerminalEventTracker>,
+    /// Read handle on the listener's captured events. Cloned from
+    /// the same `Arc` the `Term` holds, so the UI thread can poll
+    /// `bell_count()` etc. without going through `term`.
+    events: TerminalEventTracker,
     parser: Processor,
     /// Lightweight second pass over the same byte stream that watches
     /// for OSC sequences alacritty discards (notably OSC 7 — cwd).
@@ -101,11 +136,19 @@ impl TerminalState {
     pub fn new(rows: u16, cols: u16) -> Self {
         let size = TermSize::new(cols as usize, rows as usize);
         let config = Config::default();
-        let term = Term::new(config, &size, NopListener);
+        let events = TerminalEventTracker::new();
+        let term = Term::new(config, &size, events.clone());
         let parser = Processor::new();
         let osc = crate::osc::OscSniffer::new();
         let echo_suppress = crate::echo_suppress::EchoSuppressor::new();
-        Self { term, parser, osc, echo_suppress }
+        Self { term, events, parser, osc, echo_suppress }
+    }
+
+    /// Monotonically-increasing bell count seen since this terminal
+    /// was created. The UI uses the delta-since-last-frame to fire
+    /// a visible-bell flash.
+    pub fn bell_count(&self) -> u64 {
+        self.events.bell_count()
     }
 
     /// Feed bytes into the VT parser. The grid mutates accordingly,
@@ -804,6 +847,30 @@ mod tests {
         // No scrollback left to scroll into.
         state.scroll_display(10_000);
         assert_eq!(state.display_offset(), 0);
+    }
+
+    // ---- bell event capture --------------------------------------
+
+    #[test]
+    fn bell_count_starts_at_zero() {
+        let state = TerminalState::new(5, 20);
+        assert_eq!(state.bell_count(), 0);
+    }
+
+    #[test]
+    fn bell_count_increments_on_bel_byte() {
+        let mut state = TerminalState::new(5, 20);
+        state.feed(b"\x07");
+        assert_eq!(state.bell_count(), 1);
+        state.feed(b"\x07\x07");
+        assert_eq!(state.bell_count(), 3);
+    }
+
+    #[test]
+    fn bell_count_unaffected_by_non_bel_bytes() {
+        let mut state = TerminalState::new(5, 20);
+        state.feed(b"hello world\r\n");
+        assert_eq!(state.bell_count(), 0);
     }
 
     #[test]

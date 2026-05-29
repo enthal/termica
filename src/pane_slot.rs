@@ -106,6 +106,14 @@ pub struct PaneUiState {
     /// would leave the new output off-screen. Cleared after one
     /// frame's render consumes it.
     pub(crate) scroll_to_bottom_pending: bool,
+    /// Last `bell_count` we observed on this pane's terminal. When
+    /// the live count exceeds this on a render, a new bell happened
+    /// since last frame and the visible flash kicks off.
+    pub(crate) bell_last_seen: u64,
+    /// Wall-clock time (`ctx.input(|i| i.time)`) at which the most
+    /// recent bell-driven flash started. `None` when no flash is
+    /// active; the flash fades out over `BELL_FLASH_SECS`.
+    pub(crate) bell_flash_started_at: Option<f64>,
 }
 
 /// One pane's full state: the OS-resource [`PaneSession`] (PTY +

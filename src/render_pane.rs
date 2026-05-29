@@ -36,6 +36,46 @@ pub const ALT_SCREEN_BORDER_COLOR: egui::Color32 = egui::Color32::from_rgb(0x5b,
 /// Stroke width of the alt-screen border, in egui logical pixels.
 pub const ALT_SCREEN_BORDER_WIDTH: f32 = 1.0;
 
+/// How long the visible-bell flash stays on screen after a `\a`
+/// (BEL) byte reaches the terminal. Long enough that the user
+/// notices it even if the next frame is idle; short enough that a
+/// noisy stream of bells (some programs ring on every typo)
+/// doesn't strobe the pane chrome.
+pub const BELL_FLASH_SECS: f64 = 0.25;
+
+/// Colour of the visible-bell border. Saturated warm orange —
+/// reads as "attention" without the literal-alarm of red. Painted
+/// at the listed alpha at the start of the flash; the alpha fades
+/// linearly to zero across `BELL_FLASH_SECS`.
+pub const BELL_FLASH_COLOR: egui::Color32 = egui::Color32::from_rgb(0xf2, 0xa0, 0x4a);
+
+/// Width of the visible-bell border, in egui logical pixels.
+pub const BELL_FLASH_WIDTH: f32 = 3.0;
+
+/// Paint a visible-bell border around `pane_rect` with the linear-
+/// fade alpha appropriate for the elapsed time since the flash
+/// started. `alpha_factor` is `1.0` at flash start, `0.0` at end.
+/// Public so a snapshot test can drive it directly without
+/// constructing a real `PaneSession`.
+pub fn paint_bell_flash_border(painter: &egui::Painter, pane_rect: egui::Rect, alpha_factor: f32) {
+    if alpha_factor <= 0.0 {
+        return;
+    }
+    let a = (alpha_factor.clamp(0.0, 1.0) * 255.0) as u8;
+    let color = egui::Color32::from_rgba_unmultiplied(
+        BELL_FLASH_COLOR.r(),
+        BELL_FLASH_COLOR.g(),
+        BELL_FLASH_COLOR.b(),
+        a,
+    );
+    painter.rect_stroke(
+        pane_rect,
+        egui::CornerRadius::ZERO,
+        egui::Stroke::new(BELL_FLASH_WIDTH, color),
+        egui::StrokeKind::Inside,
+    );
+}
+
 /// Paint the alt-screen indicator border around `grid_rect`.
 ///
 /// The border is a 1px [`ALT_SCREEN_BORDER_COLOR`] stroke flush
@@ -1467,6 +1507,34 @@ pub fn render_pane(
                     let _ = slot.session.write(&bytes);
                 }
             }
+        }
+    }
+
+    // ---- visible bell ------------------------------------------
+    //
+    // The shell can ring the terminal bell at any time (the BEL
+    // byte, `\a`). The alacritty event listener (`TerminalEventTracker`)
+    // captures it; we compare the live count against the last
+    // value we observed for this pane to detect a new bell. On
+    // detection the flash starts; it then linearly fades over
+    // `BELL_FLASH_SECS` and clears itself. We also schedule a
+    // repaint while the flash is active so the fade animates
+    // even when the user isn't producing input events.
+    let now = ctx.input(|i| i.time);
+    let current_bell = slot.session.terminal().bell_count();
+    if current_bell > slot.ui.bell_last_seen {
+        slot.ui.bell_last_seen = current_bell;
+        slot.ui.bell_flash_started_at = Some(now);
+    }
+    if let Some(started_at) = slot.ui.bell_flash_started_at {
+        let elapsed = (now - started_at).max(0.0);
+        if elapsed >= BELL_FLASH_SECS {
+            slot.ui.bell_flash_started_at = None;
+        } else {
+            let alpha_factor = 1.0 - (elapsed / BELL_FLASH_SECS) as f32;
+            paint_bell_flash_border(ui.painter(), ui.max_rect(), alpha_factor);
+            let remaining_ms = ((BELL_FLASH_SECS - elapsed) * 1000.0).max(0.0) as u64;
+            ctx.request_repaint_after(std::time::Duration::from_millis(remaining_ms.min(16)));
         }
     }
 }
