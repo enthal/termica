@@ -338,9 +338,22 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
                 }
                 return true;
             }
+            // Emacs-style editing chords + history/completion chords
+            // are swallowed by the editor so they don't leak to the
+            // PTY as raw `\x01`, `\x0b`, … bytes. Without this,
+            // typing `Ctrl+A` or `Ctrl+K` while the editor was
+            // active wrote control bytes to the shell, which then
+            // tried to execute commands like `^Kls` and complained
+            // `command not found: ^K…`. `Ctrl+C` (`\x03`, SIGINT)
+            // and `Ctrl+D` (`\x04`, EOF) deliberately stay PTY-bound
+            // per spec/04, so the user can always interrupt a
+            // running program.
             if modifiers.ctrl
                 && !modifiers.shift
-                && matches!(key, Key::P | Key::N | Key::S | Key::G)
+                && matches!(
+                    key,
+                    Key::A | Key::E | Key::K | Key::U | Key::W | Key::P | Key::N | Key::S | Key::G
+                )
             {
                 return true;
             }
@@ -1041,9 +1054,7 @@ pub fn render_pane(
             // the pane — which is exactly why the editor's text
             // content clips correctly at the pane's right edge
             // while a decoration drawn at `available_width`
-            // overshoots into the divider or off-screen. Reading
-            // `ui.clip_rect().right()` gives us the pane's true
-            // right edge regardless of split-pane geometry.
+            // overshoots into the divider or off-screen.
             let pane_clip = ui.clip_rect();
             let body_w = (pane_clip.right() - footer_origin.x).max(0.0);
             let chip_rect = if has_prompt_cwd {
@@ -1053,8 +1064,20 @@ pub fn render_pane(
             };
             let combined =
                 egui::Rect::from_min_size(footer_origin, egui::vec2(body_w, chip_h + editor_h));
-            let unclipped = ctx.layer_painter(ui.layer_id());
-            crate::focused_chrome::paint(&unclipped, chip_rect, combined, chrome_variant);
+            // Chrome painter: layer-painter (so we're not clipped
+            // to the footer's tight vertical clip — variants paint
+            // a few px above + below the body, which `ui.painter()`
+            // would chop), but with a CLIP RECT that's the pane's
+            // horizontal bounds + unbounded vertical. Without the
+            // horizontal clip, the chrome's expand(3–5)+stroke
+            // overshoots into a neighboring pane on splits. The
+            // vertical infinity keeps the bottom/top edges intact.
+            let chrome_clip = egui::Rect::from_min_max(
+                egui::pos2(pane_clip.left(), -f32::INFINITY),
+                egui::pos2(pane_clip.right(), f32::INFINITY),
+            );
+            let painter = ctx.layer_painter(ui.layer_id()).with_clip_rect(chrome_clip);
+            crate::focused_chrome::paint(&painter, chip_rect, combined, chrome_variant);
         }
 
         Some(editor_rect)

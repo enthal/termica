@@ -312,12 +312,15 @@ impl TermicaApp {
                 self.quit_requested = true;
             }
             PaneAction::ClearScrollback => {
-                // Cmd+K: blank the viewport, drop scrollback, home
-                // the cursor. The shell is not signalled — it'll
-                // redraw its prompt on the next prompt cycle (or
-                // when the user presses Enter).
+                // Cmd+K / Ctrl+Shift+K: drop the sealed-block
+                // history AND blank the live terminal grid. The
+                // shell process is untouched — it'll redraw its
+                // prompt on the next prompt cycle (or when the
+                // user presses Enter). Previously this only cleared
+                // the alacritty grid, leaving the block stack
+                // visually intact, so the user saw nothing change.
                 if let Some(slot) = self.panes.get_mut(&pane_id) {
-                    slot.session.terminal_mut().clear_all();
+                    slot.session.clear_scrollback();
                 }
             }
         }

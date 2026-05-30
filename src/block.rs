@@ -164,6 +164,15 @@ impl BlockStack {
         self.blocks.iter()
     }
 
+    /// Drop every `Sealed` block, keeping the live tail (whichever
+    /// of `Prompt` / `Running` it currently is). The new stack
+    /// preserves the in-flight command's id and editor state — the
+    /// user sees the scrollback erased but their current prompt
+    /// untouched. Used by Cmd+K / Ctrl+Shift+K (clear scrollback).
+    pub fn clear_sealed(&mut self) {
+        self.blocks.retain(|b| !matches!(b, Block::Sealed { .. }));
+    }
+
     /// Borrow the live tail block. Always present by invariant; only
     /// returns `Option` so the API stays defensive in case a future
     /// caller manages to clear the stack out from under us (it

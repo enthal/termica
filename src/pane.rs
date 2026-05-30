@@ -480,6 +480,15 @@ impl PaneSession {
         &self.blocks
     }
 
+    /// Cmd+K / Ctrl+Shift+K: drop the sealed block scrollback AND
+    /// blank the live terminal grid. The shell process is
+    /// untouched — it'll redraw its prompt on the next prompt
+    /// cycle, or when the user presses Enter.
+    pub fn clear_scrollback(&mut self) {
+        self.blocks.clear_sealed();
+        self.terminal.clear_all();
+    }
+
     /// Stable per-pane id. Used to salt egui widget IDs that may
     /// otherwise collide when multiple panes are visible at once
     /// (e.g. each pane's `ScrollArea` needs its own state — see the

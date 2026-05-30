@@ -16,7 +16,6 @@ use eframe::egui;
 /// a saved choice in `/tmp` or settings keeps working.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChromeVariant {
-    #[default]
     A,
     B,
     C,
@@ -25,6 +24,10 @@ pub enum ChromeVariant {
     F,
     G,
     H,
+    /// Default: soft outer glow. Picked via the in-app
+    /// `--pick-chrome` viewport — reads as "this area is the focus"
+    /// without a hard frame that competes with content.
+    #[default]
     I,
     J,
     K,
