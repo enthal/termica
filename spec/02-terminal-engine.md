@@ -86,6 +86,8 @@ pub struct TerminalState {
 
 `Term` owns the grid, the cursor, the alternate screen buffer, and the selection model. We do **not** subclass or fork it — we wrap it.
 
+The cell cursor obeys the same visibility rule as the prompt-editor caret in [04](04-prompt-editor.md#when-is-the-caret-shown): drawn as a blinking solid block only when the pane is focused AND the Termica window is the OS foreground app; rendered dim / hollow otherwise. The principle is identical — "your next keypress lands here" must be true for the affordance to appear.
+
 ### Marker interception (preview, full detail in [03](03-shell-integration.md))
 
 `alacritty_terminal` lets us inspect OSC sequences before they affect the grid. Our flow:
