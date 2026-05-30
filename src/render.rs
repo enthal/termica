@@ -660,13 +660,18 @@ pub const BLOCK_HEADER_CHIP_BG: Color32 = Color32::from_rgb(0x22, 0x22, 0x22);
 pub const BLOCK_HEADER_CHIP_STROKE: Color32 = Color32::from_rgb(0x44, 0x44, 0x44);
 
 /// Background wash painted behind a sealed block whose command
-/// finished with a non-zero exit code. Translucent so the styled
-/// snapshot text on top is still legible. RGBA-unmultiplied (warm
-/// dark red, 25% alpha) blends cleanly with the panel bg.
-// Pre-multiplied form of unmultiplied rgba(0x80, 0x20, 0x20, 0x40):
-// each channel × (alpha / 255), so (128 * 0x40/255, 32 * 0x40/255, ...).
-// Rounded: ≈ (0x20, 0x08, 0x08, 0x40).
-pub const FAILED_BLOCK_BG: Color32 = Color32::from_rgba_premultiplied(0x20, 0x08, 0x08, 0x40);
+/// finished with a non-zero exit code. Translucent — picked via
+/// `cargo run --example pick_failed_block_bg` (variant `a18` =
+/// alpha 0x18 ≈ 9%). Reads as a warm shadow, not a red fill, so
+/// the styled snapshot text on top stays fully legible.
+//
+// Stored premultiplied: each channel × (alpha / 255). Source is
+// unmultiplied rgba(0x80, 0x20, 0x20, 0x18):
+//   r = 128 * 0x18/255 ≈ 0x0c
+//   g =  32 * 0x18/255 ≈ 0x03
+//   b =  32 * 0x18/255 ≈ 0x03
+// → premul (0x0c, 0x03, 0x03, 0x18).
+pub const FAILED_BLOCK_BG: Color32 = Color32::from_rgba_premultiplied(0x0c, 0x03, 0x03, 0x18);
 
 /// Vertical space (top AND bottom of the hairline) inserted
 /// between sealed blocks. Picked via `pick_block_separator`,
