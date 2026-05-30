@@ -391,9 +391,34 @@ impl Default for TermicaApp {
 
 impl eframe::App for TermicaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Ask for a redraw soon so PTY output keeps flowing even
-        // when the user is idle.
-        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        // Drain every pane up front so this frame decides the next
+        // repaint cadence from actual activity. Drained panes also
+        // reset their `slot.ui.focused` mirror.
+        //
+        // Idle (no PTY bytes arrived this frame): 300 ms = ~3 fps —
+        // enough to keep the channel from backing up but cheap on
+        // CPU. egui is reactive: any input event (mouse, key,
+        // viewport command) repaints immediately regardless. The
+        // caret-blink and bell-flash paths schedule their own
+        // shorter timers when those features are active.
+        //
+        // Active (any pane consumed bytes): 50 ms = 20 fps so a
+        // streaming command still feels live.
+        //
+        // Previous behaviour was an unconditional 50 ms repaint
+        // request — 20 fps forever, regardless of activity. With
+        // the chrome-picker viewport open as a second window, that
+        // doubled per-frame work and pushed CPU to ~100% even when
+        // the shell was idle.
+        let mut had_activity = false;
+        for slot in self.panes.values_mut() {
+            if slot.session.drain() > 0 {
+                had_activity = true;
+            }
+            slot.ui.focused = false;
+        }
+        let next = if had_activity { 50 } else { 300 };
+        ctx.request_repaint_after(std::time::Duration::from_millis(next));
 
         // Chrome picker viewport (second OS window). Stays open
         // as long as `picker_viewport_open` is true; the picker
@@ -450,10 +475,10 @@ impl eframe::App for TermicaApp {
         // sticks to a pane that no longer has keyboard focus.
         // (Real egui focus is unaffected — that's stored in egui's
         // memory; only our mirror needs the reset.)
-        for slot in self.panes.values_mut() {
-            slot.session.drain();
-            slot.ui.focused = false;
-        }
+        // (The per-pane `drain()` + `slot.ui.focused = false` loop
+        // moved to the top of `update()` so the result of the drain
+        // can drive the per-frame repaint cadence. See the comment
+        // above `had_activity`.)
 
         // Auto-close panes whose shell process has exited. The
         // shell `exit`ing (user typed exit, Ctrl+D, or `exit N`)
