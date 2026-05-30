@@ -274,18 +274,10 @@ impl TermicaApp {
                 }
             }
             PaneAction::NextTab => {
-                if let Some(parent_tabs) =
-                    self.tile_for_pane(pane_id).and_then(|t| self.parent_tabs_of(t))
-                {
-                    self.cycle_active_tab(parent_tabs, 1);
-                }
+                self.cycle_pane_global(pane_id, 1);
             }
             PaneAction::PrevTab => {
-                if let Some(parent_tabs) =
-                    self.tile_for_pane(pane_id).and_then(|t| self.parent_tabs_of(t))
-                {
-                    self.cycle_active_tab(parent_tabs, -1);
-                }
+                self.cycle_pane_global(pane_id, -1);
             }
             PaneAction::CloseTab => {
                 // Closing the *last* tab is equivalent to quitting:
@@ -333,24 +325,43 @@ impl TermicaApp {
         }
     }
 
-    /// Move the active tab of `tabs_tile` by `delta` positions
-    /// (wraps around). Used for Cmd+Shift+] / [.
-    fn cycle_active_tab(&mut self, tabs_tile: TileId, delta: i32) {
-        let Some(Tile::Container(egui_tiles::Container::Tabs(tabs))) =
-            self.tree.tiles.get_mut(tabs_tile)
-        else {
-            return;
-        };
-        if tabs.children.is_empty() {
+    /// Cycle keyboard focus to the next/prev pane GLOBALLY across
+    /// every `Container` in the workspace, in DFS tree order
+    /// (left→right, top→bottom). Used for Cmd+Shift+] / [.
+    ///
+    /// The previous behaviour confined cycling to the focused
+    /// pane's parent `Container::Tabs` — a Cmd+Shift+] from the
+    /// rightmost tab in the left container of a horizontal split
+    /// wrapped back to the leftmost tab of the SAME container,
+    /// never reaching the right container. The user wants the
+    /// shortcut to walk every tab everywhere, so this version
+    /// flattens the tree and steps through that list.
+    ///
+    /// For the destination pane, we set its parent `Tabs`'s
+    /// active child (so the tab becomes visible) and flag
+    /// `slot.ui.needs_focus` so `render_pane` claims keyboard
+    /// focus on its next render. Panes whose parent isn't a Tabs
+    /// container (e.g., the only child of a SplitH) still get the
+    /// focus flag — they're already visible.
+    fn cycle_pane_global(&mut self, from: PaneId, delta: i32) {
+        let panes = collect_panes_in_tree_order(&self.tree);
+        if panes.len() <= 1 {
             return;
         }
-        let len = tabs.children.len() as i32;
-        let current =
-            tabs.active.and_then(|a| tabs.children.iter().position(|c| *c == a)).unwrap_or(0)
-                as i32;
-        let next = ((current + delta).rem_euclid(len)) as usize;
-        let new_active = tabs.children[next];
-        tabs.set_active(new_active);
+        let Some(current_idx) = panes.iter().position(|(p, _)| *p == from) else {
+            return;
+        };
+        let next_idx = ((current_idx as i32 + delta).rem_euclid(panes.len() as i32)) as usize;
+        let (new_pane, new_tile) = panes[next_idx];
+        if let Some(parent) = self.tree.tiles.parent_of(new_tile)
+            && let Some(Tile::Container(egui_tiles::Container::Tabs(tabs))) =
+                self.tree.tiles.get_mut(parent)
+        {
+            tabs.set_active(new_tile);
+        }
+        if let Some(slot) = self.panes.get_mut(&new_pane) {
+            slot.ui.needs_focus = true;
+        }
     }
 
     /// Spawn a new pane and add it as a tab inside the given Tabs
@@ -923,6 +934,32 @@ fn init_history_store(home: Option<&std::path::Path>) -> Option<Arc<Mutex<Histor
     Some(Arc::new(Mutex::new(store)))
 }
 
+/// Walk the tile tree DFS, collecting `(PaneId, TileId)` for every
+/// leaf pane in tree order (left→right, top→bottom). Pure helper
+/// used by [`TermicaApp::cycle_pane_global`] to give a deterministic
+/// "next pane" relative to the current focus, across all
+/// `Container`s in the workspace.
+///
+/// Returns an empty `Vec` when the tree has no root.
+fn collect_panes_in_tree_order(tree: &egui_tiles::Tree<PaneId>) -> Vec<(PaneId, TileId)> {
+    fn walk(tiles: &egui_tiles::Tiles<PaneId>, tile_id: TileId, out: &mut Vec<(PaneId, TileId)>) {
+        match tiles.get(tile_id) {
+            Some(Tile::Pane(p)) => out.push((*p, tile_id)),
+            Some(Tile::Container(c)) => {
+                for child in c.children_vec() {
+                    walk(tiles, child, out);
+                }
+            }
+            None => {}
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(root) = tree.root {
+        walk(&tree.tiles, root, &mut out);
+    }
+    out
+}
+
 /// Optional knobs for `TermicaApp::new_with_options`. Defaults
 /// match what `TermicaApp::new` produced before — no behaviour
 /// change unless the caller asks for it.
@@ -985,4 +1022,69 @@ pub(crate) fn show_chrome_picker_viewport(
             }
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui_tiles::{Tiles, Tree};
+
+    /// Build a tree with two side-by-side Tabs containers:
+    ///   SplitH(
+    ///     Tabs(p1, p2),       <- left container
+    ///     Tabs(p3, p4, p5),   <- right container
+    ///   )
+    /// Returns the tree and the inserted (PaneId → TileId) mapping
+    /// in insertion order.
+    fn split_with_two_tab_containers() -> (Tree<PaneId>, Vec<(PaneId, TileId)>) {
+        let mut tiles: Tiles<PaneId> = Tiles::default();
+        let p1 = tiles.insert_pane(PaneId(1));
+        let p2 = tiles.insert_pane(PaneId(2));
+        let p3 = tiles.insert_pane(PaneId(3));
+        let p4 = tiles.insert_pane(PaneId(4));
+        let p5 = tiles.insert_pane(PaneId(5));
+        let left = tiles.insert_tab_tile(vec![p1, p2]);
+        let right = tiles.insert_tab_tile(vec![p3, p4, p5]);
+        let root = tiles.insert_horizontal_tile(vec![left, right]);
+        let tree = Tree::new("test", root, tiles);
+        let pairs = vec![
+            (PaneId(1), p1),
+            (PaneId(2), p2),
+            (PaneId(3), p3),
+            (PaneId(4), p4),
+            (PaneId(5), p5),
+        ];
+        (tree, pairs)
+    }
+
+    #[test]
+    fn collect_panes_walks_horizontal_split_left_to_right() {
+        let (tree, _) = split_with_two_tab_containers();
+        let got: Vec<PaneId> =
+            collect_panes_in_tree_order(&tree).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(got, vec![PaneId(1), PaneId(2), PaneId(3), PaneId(4), PaneId(5)]);
+    }
+
+    #[test]
+    fn collect_panes_returns_empty_on_empty_tree() {
+        let tiles: Tiles<PaneId> = Tiles::default();
+        // egui_tiles::Tree::empty creates a rootless tree.
+        let tree: Tree<PaneId> = Tree::empty("empty");
+        assert!(tree.root.is_none(), "scaffolding: empty tree should have no root");
+        assert!(collect_panes_in_tree_order(&tree).is_empty());
+        // Touch `tiles` so the unused-binding lint doesn't complain
+        // in CI; the empty-tree assertion above is the meat.
+        let _ = tiles;
+    }
+
+    #[test]
+    fn collect_panes_pane_id_to_tile_id_mapping_is_correct() {
+        let (tree, pairs) = split_with_two_tab_containers();
+        let got = collect_panes_in_tree_order(&tree);
+        // Same length, same ordering.
+        assert_eq!(got.len(), pairs.len());
+        for (got_pair, expected_pair) in got.iter().zip(pairs.iter()) {
+            assert_eq!(got_pair, expected_pair);
+        }
+    }
 }
