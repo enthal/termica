@@ -365,6 +365,25 @@ impl PaneSession {
             if matches!(event, crate::markers::LifecycleEvent::Preexec { .. }) {
                 self.last_submitted = None;
             }
+            // Zombie alt-screen recovery. `less`, `vim`, etc. enter
+            // the alternate screen via `\e[?1049h` and SHOULD restore
+            // via `\e[?1049l` on exit. In practice (less `q` on
+            // macOS, vim crash, ssh-disconnect-mid-program) the exit
+            // sequence can be skipped — alacritty's alt-screen flag
+            // stays true, the editor footer paints OVER a stale alt-
+            // grid, and an Esc / focus change unmasks the zombie.
+            // A fresh `Precmd` from the shell means: shell has
+            // resumed control, there is no longer a foreground
+            // program owning the screen, so any latent alt-screen
+            // must be cleared. Feed the exit sequence into the
+            // alacritty parser so it processes the transition the
+            // normal way (clears flag, restores grid). No-op when
+            // alt-screen is already off.
+            if matches!(event, crate::markers::LifecycleEvent::Precmd { .. })
+                && self.terminal.is_alternate_screen()
+            {
+                self.terminal.feed(b"\x1b[?1049l");
+            }
             // Phase 4J: persist Preexec → record_submit and
             // CommandFinished → record_finish. No-op if history is
             // disabled (the low-level `spawn` path or a missing
