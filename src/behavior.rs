@@ -127,17 +127,25 @@ impl<'a> Behavior<PaneId> for TabBehavior<'a> {
     fn resize_stroke(&self, style: &egui::Style, resize_state: ResizeState) -> egui::Stroke {
         // egui_tiles' splitter stroke is painted AFTER each pane's
         // contents (and the focused-editor chrome that extends a
-        // few px into the gap via `CHROME_OUTER_OVERHANG`). A
-        // non-transparent idle stroke overpaints that overhang,
-        // visibly occluding the chrome where it crosses the gap.
-        // `panel_fill` matches the panel bg color, but the OPAQUE
-        // stroke still wins — colored or not, it sits over the
-        // chrome. Transparent stroke when idle: nothing is painted,
-        // chrome stays visible. Bright hover / drag strokes still
-        // appear because those wins are what makes the splitter
-        // affordance discoverable.
+        // few px into the gap via `CHROME_OUTER_OVERHANG`). A wide
+        // opaque idle stroke (egui_tiles' default = `gap_width`
+        // wide in `tab_bar_color`) overpaints that overhang and
+        // visibly occludes the chrome where it crosses the gap.
+        //
+        // Idle: a 1 px hairline at low alpha. The hairline sits
+        // centered in the 16 px gap (~8 px from each pane edge);
+        // the chrome's overhang ends well inside that, so the
+        // hairline lives in the unoccupied middle and doesn't
+        // touch the chrome. Just enough to read as "there's a
+        // splitter here" without competing with content.
+        //
+        // Hover / Drag: egui's defaults — bright, full width — so
+        // the splitter is unmistakably interactive on touch.
         match resize_state {
-            ResizeState::Idle => egui::Stroke::new(0.0, egui::Color32::TRANSPARENT),
+            ResizeState::Idle => egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(0xa0, 0xa0, 0xa0, 0x30),
+            ),
             ResizeState::Hovering => style.visuals.widgets.hovered.fg_stroke,
             ResizeState::Dragging => style.visuals.widgets.active.fg_stroke,
         }
