@@ -668,6 +668,21 @@ pub const BLOCK_HEADER_CHIP_STROKE: Color32 = Color32::from_rgb(0x44, 0x44, 0x44
 // Rounded: ≈ (0x20, 0x08, 0x08, 0x40).
 pub const FAILED_BLOCK_BG: Color32 = Color32::from_rgba_premultiplied(0x20, 0x08, 0x08, 0x40);
 
+/// Vertical space (top AND bottom of the hairline) inserted
+/// between sealed blocks. Picked via `pick_block_separator`,
+/// adjusted to 10 px per the user's preference between the 8px
+/// and 12px variants. Total inter-block "breath" is
+/// `2 * BLOCK_SEPARATOR_GAP + 1` px with the hairline centered.
+pub const BLOCK_SEPARATOR_GAP: f32 = 10.0;
+
+/// 1px hairline between sealed blocks. Picked variant `h8-18` =
+/// alpha 0x18 (~9%, "barely" visible). Stored in premultiplied
+/// form: each RGB channel must be ≤ alpha. unmultiplied
+/// `rgba(0xa0, 0xa0, 0xa0, 0x18)` premultiplies to roughly
+/// `(0x10, 0x10, 0x10, 0x18)` — a barely-perceptible warm dim grey.
+pub const BLOCK_SEPARATOR_HAIRLINE: Color32 =
+    Color32::from_rgba_premultiplied(0x10, 0x10, 0x10, 0x18);
+
 /// Padding inside each chip, in logical pixels. Affects both the
 /// horizontal padding around the text and the chip's `corner_radius`
 /// proportionally. Empirically tuned against the monospace font.

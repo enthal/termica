@@ -98,57 +98,58 @@ fn paint_blocks_with_separator(
             if let Some(alpha) = hairline
                 && alpha > 0
             {
-                {
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(BLOCK_W, 1.0), egui::Sense::hover());
-                    ui.painter().line_segment(
-                        [rect.left_center(), rect.right_center()],
-                        egui::Stroke::new(
-                            1.0,
-                            egui::Color32::from_rgba_premultiplied(0xa0, 0xa0, 0xa0, alpha),
-                        ),
-                    );
-                    ui.add_space(extra_gap);
-                }
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(BLOCK_W, 1.0), egui::Sense::hover());
+                // Unmultiplied so the alpha actually attenuates the
+                // grey. The premultiplied form silently invalidates
+                // colors where RGB > alpha and renders too bright.
+                ui.painter().line_segment(
+                    [rect.left_center(), rect.right_center()],
+                    egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(0xa0, 0xa0, 0xa0, alpha),
+                    ),
+                );
+                ui.add_space(extra_gap);
             }
         }
     }
 }
 
-fn paint_natural(ui: &mut egui::Ui) {
-    paint_blocks_with_separator(ui, 0.0, None);
+fn paint_h8_08(ui: &mut egui::Ui) {
+    paint_blocks_with_separator(ui, 8.0, Some(0x08));
 }
-fn paint_gap_only_small(ui: &mut egui::Ui) {
-    paint_blocks_with_separator(ui, 8.0, None);
+fn paint_h8_10(ui: &mut egui::Ui) {
+    paint_blocks_with_separator(ui, 8.0, Some(0x10));
 }
-fn paint_gap_only_large(ui: &mut egui::Ui) {
-    paint_blocks_with_separator(ui, 16.0, None);
+fn paint_h8_18(ui: &mut egui::Ui) {
+    paint_blocks_with_separator(ui, 8.0, Some(0x18));
 }
-fn paint_dim_hairline(ui: &mut egui::Ui) {
-    paint_blocks_with_separator(ui, 4.0, Some(0x40));
+fn paint_h12_10(ui: &mut egui::Ui) {
+    paint_blocks_with_separator(ui, 12.0, Some(0x10));
 }
-fn paint_dimmer_hairline_more_gap(ui: &mut egui::Ui) {
-    paint_blocks_with_separator(ui, 8.0, Some(0x30));
+fn paint_h12_18(ui: &mut egui::Ui) {
+    paint_blocks_with_separator(ui, 12.0, Some(0x18));
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = std::path::PathBuf::from("/tmp/termica-picker-choice.txt");
     let _ = std::fs::remove_file(&output);
     let choice = run(
-        "Sealed-block separator (gap and/or hairline)",
+        "Sealed-block separator — barely-there hairline",
         vec![
-            Variant::new("natural", "A · No extra gap (today)", paint_natural),
-            Variant::new("gap-8", "B · 8px gap, no rule", paint_gap_only_small),
-            Variant::new("gap-16", "C · 16px gap, no rule", paint_gap_only_large),
+            Variant::new("h8-08", "A · 8px gap · alpha 0x08 (≈3%) — ghost", paint_h8_08),
+            Variant::new("h8-10", "B · 8px gap · alpha 0x10 (≈6%) — barely", paint_h8_10),
+            Variant::new("h8-18", "C · 8px gap · alpha 0x18 (≈9%) — faint", paint_h8_18),
             Variant::new(
-                "hairline-4-40",
-                "D · 4px + dim hairline (alpha 0x40)",
-                paint_dim_hairline,
+                "h12-10",
+                "D · 12px gap · alpha 0x10 — wider gap, ghost line",
+                paint_h12_10,
             ),
             Variant::new(
-                "hairline-8-30",
-                "E · 8px + dimmer hairline (alpha 0x30)",
-                paint_dimmer_hairline_more_gap,
+                "h12-18",
+                "E · 12px gap · alpha 0x18 — wider gap, faint line",
+                paint_h12_18,
             ),
         ],
         &output,

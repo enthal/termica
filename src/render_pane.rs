@@ -735,10 +735,21 @@ pub fn render_pane(
                             *exit,
                         );
                         sealed_rects.push((*id, sealed_render.rect, sealed_render.command_lines));
-                        // Thin separator gap — spec/04 §"Visual
-                        // structure" calls for "non-text (thin
-                        // separator + space)".
-                        ui.add_space(4.0);
+                        // Block separator — picked via
+                        // `cargo run --example pick_block_separator`
+                        // (variant `h10-18`). 10px gap + a barely-
+                        // there 1px hairline at alpha 0x18 + another
+                        // 10px gap. Total ~21px of "breath" between
+                        // blocks with the hairline centered.
+                        ui.add_space(render::BLOCK_SEPARATOR_GAP);
+                        let avail_w = ui.available_width();
+                        let (sep_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(avail_w, 1.0), egui::Sense::hover());
+                        ui.painter().line_segment(
+                            [sep_rect.left_center(), sep_rect.right_center()],
+                            egui::Stroke::new(1.0, render::BLOCK_SEPARATOR_HAIRLINE),
+                        );
+                        ui.add_space(render::BLOCK_SEPARATOR_GAP);
                     }
                     crate::block::Block::Running { command, header, .. } => {
                         let _ = render::paint_block_header(ui, header.cwd.as_deref(), home, None);
