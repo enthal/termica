@@ -21,3 +21,9 @@
 /data/
 
 /.claude/settings*.json
+
+# Claude Code per-project agent state — task locks etc.
+/.claude/scheduled_tasks.lock
+
+# Profile dumps from --profile / Instruments captures.
+/profile.json.gz

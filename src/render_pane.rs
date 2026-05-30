@@ -1005,11 +1005,20 @@ pub fn render_pane(
 
         if let Some(editor) = slot.session.blocks().editor_on_tail() {
             let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
-            // Blink: ~1.6 Hz square wave, only while we'd paint a
-            // caret at all so idle / background panes don't burn
-            // repaint wakeups.
+            // Detect caret motion across frames and reset the blink
+            // anchor so the "visible" half-cycle starts AT the
+            // moment of the move. Without this, a caret motion
+            // landing in the middle of an "off" half-cycle is
+            // invisible until the next blink — the user briefly
+            // can't see where the caret is. Standard editor UX.
             let time = ctx.input(|i| i.time);
-            let caret_visible = caret_active && (time * 1.6) as i64 % 2 == 0;
+            let current_cursor = editor.cursor();
+            if slot.ui.last_cursor_byte != Some(current_cursor) {
+                slot.ui.caret_blink_anchor = time;
+                slot.ui.last_cursor_byte = Some(current_cursor);
+            }
+            let elapsed = (time - slot.ui.caret_blink_anchor).max(0.0);
+            let caret_visible = caret_active && (elapsed * 1.6) as i64 % 2 == 0;
             if caret_active {
                 ctx.request_repaint_after(std::time::Duration::from_millis(312));
             }
@@ -1028,6 +1037,11 @@ pub fn render_pane(
                 &font_id,
                 caret_visible,
             );
+        } else {
+            // Editor not on tail this frame — forget the cursor
+            // tracker so re-opening the editor in a new prompt
+            // starts a fresh blink cycle.
+            slot.ui.last_cursor_byte = None;
         }
 
         // Focused-editor chrome. Dispatched via the
@@ -1046,7 +1060,27 @@ pub fn render_pane(
         // the pane's tight clip and three sides of the stroke got
         // cut. Same trick the focused-tab underline uses
         // (`behavior::paint_focused_tab_underline`).
-        if caret_active {
+        // Animate the focused-editor chrome's opacity toward the
+        // caret-active target. Half-second fade either direction so
+        // the chrome breathes in/out instead of popping. While the
+        // value is in transit we request a fast repaint so the
+        // animation runs smoothly even if the PTY is idle.
+        const CHROME_FADE_SECS: f32 = 0.5;
+        let target_opacity: f32 = if caret_active { 1.0 } else { 0.0 };
+        let dt = ctx.input(|i| i.stable_dt);
+        let step = (dt / CHROME_FADE_SECS).clamp(0.0, 1.0);
+        slot.ui.chrome_opacity = if (slot.ui.chrome_opacity - target_opacity).abs() <= step {
+            target_opacity
+        } else if slot.ui.chrome_opacity < target_opacity {
+            slot.ui.chrome_opacity + step
+        } else {
+            slot.ui.chrome_opacity - step
+        };
+        if slot.ui.chrome_opacity != target_opacity {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+
+        if slot.ui.chrome_opacity > 0.0 {
             // Body width comes from the ui's CLIP rect, not its
             // available-width / layout rect. egui_tiles can give
             // the pane_ui a layout rect that's wider than the
@@ -1077,7 +1111,13 @@ pub fn render_pane(
                 egui::pos2(pane_clip.right(), f32::INFINITY),
             );
             let painter = ctx.layer_painter(ui.layer_id()).with_clip_rect(chrome_clip);
-            crate::focused_chrome::paint(&painter, chip_rect, combined, chrome_variant);
+            crate::focused_chrome::paint(
+                &painter,
+                chip_rect,
+                combined,
+                chrome_variant,
+                slot.ui.chrome_opacity,
+            );
         }
 
         Some(editor_rect)

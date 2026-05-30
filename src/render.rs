@@ -651,7 +651,14 @@ pub fn paint_prompt_editor_at(
 /// Background fill for the cwd / exit chip painted above each block.
 /// A near-black grey that sits clearly above `DEFAULT_BG` without
 /// shouting — it reads as "label affordance" rather than as content.
-pub const BLOCK_HEADER_CHIP_BG: Color32 = Color32::from_rgb(0x22, 0x22, 0x22);
+// Translucent chip fill so the failed-block wash (or any future
+// per-block bg) shows through DARKER inside each chip. Source =
+// unmultiplied rgba(0x22, 0x22, 0x22, 0xc0) — 75% opaque dark grey.
+// Premultiplied form: each channel × (alpha / 255) =
+// (0x22 * 0xc0 / 255, …) ≈ (0x19, 0x19, 0x19). Over the regular
+// panel bg this still reads as the previous opaque dark grey;
+// over the failed-block wash it darkens the red inside the chip.
+pub const BLOCK_HEADER_CHIP_BG: Color32 = Color32::from_rgba_premultiplied(0x19, 0x19, 0x19, 0xc0);
 
 /// 1px stroke around each chip in the block header. "Quite dim"
 /// per user direction — visible enough to outline the chip against
@@ -925,12 +932,16 @@ pub fn paint_sealed_block(
     exit: Option<i32>,
 ) -> SealedBlockRender {
     // Reserve a backing shape index BEFORE any paint so the
-    // failed-block bg wash can be slotted underneath the chip +
-    // command + snapshot. We don't know the full block rect until
-    // after layout, so we paint chip + content first and then set
-    // the shape via `painter.set()` once `rect` is known.
+    // failed-block bg wash sits underneath the chip + command +
+    // snapshot. Translucent chips ([`BLOCK_HEADER_CHIP_BG`]) then
+    // blend with the wash so the red shows through DARKER inside
+    // each chip — the user-specified visual.
     let failed = matches!(exit, Some(n) if n != 0);
     let bg_idx = if failed { Some(ui.painter().add(egui::Shape::Noop)) } else { None };
+
+    // Capture the chip's top-Y BEFORE the header paints so the
+    // wash can extend up to the inter-block hairline above.
+    let block_top_y = ui.next_widget_position().y;
 
     let _ = paint_block_header(ui, cwd, home, exit);
 
@@ -951,10 +962,20 @@ pub fn paint_sealed_block(
     };
 
     if let Some(idx) = bg_idx {
-        // Extend the wash slightly outside the content's tight rect
-        // so it reads as a "block background" rather than text-hugging.
-        let wash = rect.expand2(egui::vec2(4.0, 2.0));
-        ui.painter().set(idx, egui::Shape::rect_filled(wash, 4.0, FAILED_BLOCK_BG));
+        // Full-bleed wash: from the inter-block hairline above to
+        // the inter-block hairline below this block (= block_top -
+        // GAP to block_bottom + GAP). Horizontally flush to the
+        // pane edges (`ui.clip_rect`). Reads as "the failed slot
+        // is THIS strip of the transcript," not "the failed text
+        // has a red wrapper."
+        let pane_clip = ui.clip_rect();
+        let bottom_y = snap_rect.bottom();
+        let wash = Rect::from_min_max(
+            Pos2::new(pane_clip.left(), block_top_y - BLOCK_SEPARATOR_GAP),
+            Pos2::new(pane_clip.right(), bottom_y + BLOCK_SEPARATOR_GAP),
+        );
+        // Corner radius 0 so the wash truly is flush left/right.
+        ui.painter().set(idx, egui::Shape::rect_filled(wash, 0.0, FAILED_BLOCK_BG));
     }
 
     SealedBlockRender { rect, command_lines: cmd_lines }

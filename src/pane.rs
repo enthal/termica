@@ -617,6 +617,13 @@ impl PaneSession {
             None => return Ok(()),
         };
 
+        // Reset history-recall state: the next `↑` should start a
+        // fresh walk from the most-recent entry, not from wherever
+        // the previous walk left the cursor. Without this, after
+        // submitting a recalled command, `↑` would resume from the
+        // old cursor position and skip the just-submitted entry.
+        self.recall.abandon();
+
         // 2. Eager demote BEFORE the PTY write.
         self.controller.submit_command(self.frame);
         // Record the transition into the dump-events file so the

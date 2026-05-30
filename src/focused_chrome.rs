@@ -69,47 +69,63 @@ impl ChromeVariant {
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x4a, 0xa8, 0xc0);
 
-fn unmul(r: u8, g: u8, b: u8, a: u8) -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(r, g, b, a)
+/// Unmultiplied-alpha color helper. The `opacity` factor multiplies
+/// the alpha so the caller can fade the whole variant in / out.
+fn unmul(r: u8, g: u8, b: u8, a: u8, opacity: f32) -> egui::Color32 {
+    let scaled = ((a as f32) * opacity.clamp(0.0, 1.0)).round() as u8;
+    egui::Color32::from_rgba_unmultiplied(r, g, b, scaled)
+}
+
+/// Opaque color with overall opacity multiplier (for variants like
+/// the accent bar / accent outline that don't carry their own alpha).
+fn opaque_with_opacity(c: egui::Color32, opacity: f32) -> egui::Color32 {
+    let alpha = ((c.a() as f32) * opacity.clamp(0.0, 1.0)).round() as u8;
+    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
 }
 
 /// Paint the chosen chrome around the editor area. `body_rect` is
 /// the combined chip-bar + editor footprint. `chip_rect` is `Some`
 /// when the chip bar is showing — used by variant L (chip-bar tint)
-/// which decorates only the chip portion.
+/// which decorates only the chip portion. `opacity` (0.0 .. 1.0)
+/// scales every color's alpha; the caller animates it for the
+/// fade-in / fade-out behaviour.
 pub fn paint(
     painter: &egui::Painter,
     chip_rect: Option<egui::Rect>,
     body_rect: egui::Rect,
     variant: ChromeVariant,
+    opacity: f32,
 ) {
+    if opacity <= 0.0 {
+        return;
+    }
     use ChromeVariant::*;
     match variant {
-        A => stroke_round(painter, body_rect, 1.0, unmul(0xc0, 0xc0, 0xc0, 0xb0)),
-        B => stroke_round(painter, body_rect, 1.0, unmul(0xc0, 0xc0, 0xc0, 0x60)),
-        C => fill_round(painter, body_rect, unmul(0xff, 0xff, 0xff, 0x10)),
-        D => paint_lane(painter, body_rect),
-        E => paint_left_bar(painter, body_rect),
+        A => stroke_round(painter, body_rect, 1.0, unmul(0xc0, 0xc0, 0xc0, 0xb0, opacity)),
+        B => stroke_round(painter, body_rect, 1.0, unmul(0xc0, 0xc0, 0xc0, 0x60, opacity)),
+        C => fill_round(painter, body_rect, unmul(0xff, 0xff, 0xff, 0x10, opacity)),
+        D => paint_lane(painter, body_rect, opacity),
+        E => paint_left_bar(painter, body_rect, opacity),
         F => {
-            paint_left_bar(painter, body_rect);
+            paint_left_bar(painter, body_rect, opacity);
             paint_bottom_rule(
                 painter,
                 body_rect,
                 1.0,
-                unmul(ACCENT.r(), ACCENT.g(), ACCENT.b(), 0x80),
+                unmul(ACCENT.r(), ACCENT.g(), ACCENT.b(), 0x80, opacity),
             );
         }
         G => paint_bottom_rule(
             painter,
             body_rect,
             2.0,
-            unmul(ACCENT.r(), ACCENT.g(), ACCENT.b(), 0xc0),
+            unmul(ACCENT.r(), ACCENT.g(), ACCENT.b(), 0xc0, opacity),
         ),
-        H => paint_corner_brackets(painter, body_rect),
-        I => paint_glow(painter, body_rect),
-        J => stroke_round(painter, body_rect, 1.5, ACCENT),
-        K => paint_doubled_hairline(painter, body_rect),
-        L => paint_chip_tint(painter, chip_rect),
+        H => paint_corner_brackets(painter, body_rect, opacity),
+        I => paint_glow(painter, body_rect, opacity),
+        J => stroke_round(painter, body_rect, 1.5, opaque_with_opacity(ACCENT, opacity)),
+        K => paint_doubled_hairline(painter, body_rect, opacity),
+        L => paint_chip_tint(painter, chip_rect, opacity),
     }
 }
 
@@ -126,20 +142,20 @@ fn fill_round(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     painter.rect_filled(rect.expand(3.0), 6.0, color);
 }
 
-fn paint_lane(painter: &egui::Painter, rect: egui::Rect) {
+fn paint_lane(painter: &egui::Painter, rect: egui::Rect, opacity: f32) {
     let exp = rect.expand2(egui::vec2(0.0, 3.0));
-    painter.rect_filled(exp, 0.0, unmul(0xff, 0xff, 0xff, 0x08));
-    let stroke = egui::Stroke::new(1.0, unmul(0xc0, 0xc0, 0xc0, 0x40));
+    painter.rect_filled(exp, 0.0, unmul(0xff, 0xff, 0xff, 0x08, opacity));
+    let stroke = egui::Stroke::new(1.0, unmul(0xc0, 0xc0, 0xc0, 0x40, opacity));
     painter.line_segment([exp.left_top(), exp.right_top()], stroke);
     painter.line_segment([exp.left_bottom(), exp.right_bottom()], stroke);
 }
 
-fn paint_left_bar(painter: &egui::Painter, rect: egui::Rect) {
+fn paint_left_bar(painter: &egui::Painter, rect: egui::Rect, opacity: f32) {
     let bar = egui::Rect::from_min_max(
         egui::pos2(rect.left() - 6.0, rect.top() - 2.0),
         egui::pos2(rect.left() - 3.0, rect.bottom() + 2.0),
     );
-    painter.rect_filled(bar, 1.5, ACCENT);
+    painter.rect_filled(bar, 1.5, opaque_with_opacity(ACCENT, opacity));
 }
 
 fn paint_bottom_rule(painter: &egui::Painter, rect: egui::Rect, width: f32, color: egui::Color32) {
@@ -150,35 +166,35 @@ fn paint_bottom_rule(painter: &egui::Painter, rect: egui::Rect, width: f32, colo
     );
 }
 
-fn paint_corner_brackets(painter: &egui::Painter, rect: egui::Rect) {
+fn paint_corner_brackets(painter: &egui::Painter, rect: egui::Rect, opacity: f32) {
     let r = rect.expand(3.0);
     let len = 12.0;
-    let stroke = egui::Stroke::new(1.5, unmul(0xff, 0xff, 0xff, 0xa0));
+    let stroke = egui::Stroke::new(1.5, unmul(0xff, 0xff, 0xff, 0xa0, opacity));
     painter.line_segment([r.left_top(), r.left_top() + egui::vec2(len, 0.0)], stroke);
     painter.line_segment([r.left_top(), r.left_top() + egui::vec2(0.0, len)], stroke);
     painter.line_segment([r.right_bottom(), r.right_bottom() - egui::vec2(len, 0.0)], stroke);
     painter.line_segment([r.right_bottom(), r.right_bottom() - egui::vec2(0.0, len)], stroke);
 }
 
-fn paint_glow(painter: &egui::Painter, rect: egui::Rect) {
+fn paint_glow(painter: &egui::Painter, rect: egui::Rect, opacity: f32) {
     for (offset, alpha) in [(5.0f32, 0x18u8), (3.5, 0x30), (2.0, 0x60)] {
         painter.rect_stroke(
             rect.expand(offset),
             6.0 + offset,
-            egui::Stroke::new(1.0, unmul(0xff, 0xff, 0xff, alpha)),
+            egui::Stroke::new(1.0, unmul(0xff, 0xff, 0xff, alpha, opacity)),
             egui::StrokeKind::Outside,
         );
     }
 }
 
-fn paint_doubled_hairline(painter: &egui::Painter, rect: egui::Rect) {
-    let stroke = egui::Stroke::new(1.0, unmul(0xc0, 0xc0, 0xc0, 0x80));
+fn paint_doubled_hairline(painter: &egui::Painter, rect: egui::Rect, opacity: f32) {
+    let stroke = egui::Stroke::new(1.0, unmul(0xc0, 0xc0, 0xc0, 0x80, opacity));
     painter.rect_stroke(rect.expand(2.0), 5.0, stroke, egui::StrokeKind::Outside);
     painter.rect_stroke(rect.expand(5.0), 7.0, stroke, egui::StrokeKind::Outside);
 }
 
-fn paint_chip_tint(painter: &egui::Painter, chip_rect: Option<egui::Rect>) {
+fn paint_chip_tint(painter: &egui::Painter, chip_rect: Option<egui::Rect>, opacity: f32) {
     let Some(rect) = chip_rect else { return };
     let area = rect.expand2(egui::vec2(2.0, 2.0));
-    painter.rect_filled(area, 4.0, unmul(ACCENT.r(), ACCENT.g(), ACCENT.b(), 0x18));
+    painter.rect_filled(area, 4.0, unmul(ACCENT.r(), ACCENT.g(), ACCENT.b(), 0x18, opacity));
 }
