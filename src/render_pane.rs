@@ -1034,18 +1034,25 @@ pub fn render_pane(
         // cut. Same trick the focused-tab underline uses
         // (`behavior::paint_focused_tab_underline`).
         if caret_active {
+            // Body width comes from the ui's CLIP rect, not its
+            // available-width / layout rect. egui_tiles can give
+            // the pane_ui a layout rect that's wider than the
+            // pane and rely on the clip_rect to keep paint inside
+            // the pane — which is exactly why the editor's text
+            // content clips correctly at the pane's right edge
+            // while a decoration drawn at `available_width`
+            // overshoots into the divider or off-screen. Reading
+            // `ui.clip_rect().right()` gives us the pane's true
+            // right edge regardless of split-pane geometry.
+            let pane_clip = ui.clip_rect();
+            let body_w = (pane_clip.right() - footer_origin.x).max(0.0);
             let chip_rect = if has_prompt_cwd {
-                Some(egui::Rect::from_min_size(
-                    footer_origin,
-                    egui::vec2(ui.available_width(), chip_h),
-                ))
+                Some(egui::Rect::from_min_size(footer_origin, egui::vec2(body_w, chip_h)))
             } else {
                 None
             };
-            let combined = egui::Rect::from_min_size(
-                footer_origin,
-                egui::vec2(ui.available_width(), chip_h + editor_h),
-            );
+            let combined =
+                egui::Rect::from_min_size(footer_origin, egui::vec2(body_w, chip_h + editor_h));
             let unclipped = ctx.layer_painter(ui.layer_id());
             crate::focused_chrome::paint(&unclipped, chip_rect, combined, chrome_variant);
         }
