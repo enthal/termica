@@ -55,11 +55,13 @@ pub(crate) struct TabBehavior<'a> {
 
 impl<'a> Behavior<PaneId> for TabBehavior<'a> {
     fn tab_title_for_pane(&mut self, pane_id: &PaneId) -> egui::WidgetText {
-        let term = self.panes.get(pane_id).map(|s| s.session.terminal());
+        let slot = self.panes.get(pane_id);
+        let term = slot.map(|s| s.session.terminal());
         let osc = term.and_then(|t| t.osc_title());
         let cwd = term.and_then(|t| t.cwd());
+        let running = running_command_for(slot);
         pad_to_min_chars(
-            &tab_title_for_with_osc(*pane_id, osc.as_deref(), cwd, self.home),
+            &tab_title_for_with_osc(*pane_id, osc.as_deref(), cwd, self.home, running.as_deref()),
             MIN_TAB_TITLE_CHARS,
         )
         .into()
@@ -111,6 +113,17 @@ impl<'a> Behavior<PaneId> for TabBehavior<'a> {
         false
     }
 
+    fn gap_width(&self, _style: &egui::Style) -> f32 {
+        // egui_tiles' default is 1.0 px — too tight for the
+        // focused-editor chrome to render its outer expand without
+        // bleeding into a neighboring pane on splits. 16 px gives
+        // the glow's 5–6 px outer radius room to land in the gap
+        // (the chrome's horizontal clip in `render_pane` extends
+        // halfway into this gap). Also reads as a clean tile
+        // separation visually.
+        16.0
+    }
+
     fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
         // By default egui_tiles prunes Tabs containers with only one
         // child, which silently removes our tab strip whenever there's
@@ -158,16 +171,18 @@ impl<'a> Behavior<PaneId> for TabBehavior<'a> {
         let Some(Tile::Pane(pane_id)) = tiles.get(tile_id) else {
             return "?".into();
         };
-        let term = self.panes.get(pane_id).map(|s| s.session.terminal());
+        let slot = self.panes.get(pane_id);
+        let term = slot.map(|s| s.session.terminal());
         let osc = term.and_then(|t| t.osc_title());
         let cwd = term.and_then(|t| t.cwd());
+        let running = running_command_for(slot);
         // No styling on the text itself any more. Active-in-container
         // is already differentiated by egui_tiles' default `tab_ui`
         // (brighter bg + connecting hline). The focused-for-the-whole-
         // app indicator is the blue bottom border painted in
         // [`on_tab_button`] below.
         egui::RichText::new(pad_to_min_chars(
-            &tab_title_for_with_osc(*pane_id, osc.as_deref(), cwd, self.home),
+            &tab_title_for_with_osc(*pane_id, osc.as_deref(), cwd, self.home, running.as_deref()),
             MIN_TAB_TITLE_CHARS,
         ))
         .into()
@@ -251,6 +266,20 @@ fn pad_to_min_chars(text: &str, min_chars: usize) -> String {
     let left_pad: String = std::iter::repeat_n(' ', left).collect();
     let right_pad: String = std::iter::repeat_n(' ', right).collect();
     format!("{left_pad}{text}{right_pad}")
+}
+
+/// Extract the currently-running command string for a pane (if
+/// any). When the pane's tail block is `Running`, this surfaces
+/// the recorded command line so [`tab_title_for_with_osc`] can use
+/// its first word as the tab title (`less`, `vim`, `htop`, …).
+/// Returns `None` for `Prompt` / `Sealed` tails — the cwd or OSC
+/// title wins in those states.
+pub(crate) fn running_command_for(slot: Option<&PaneSlot>) -> Option<String> {
+    let slot = slot?;
+    match slot.session.blocks().last()? {
+        crate::block::Block::Running { command, .. } => Some(command.clone()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

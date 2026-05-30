@@ -1101,14 +1101,21 @@ pub fn render_pane(
             // Chrome painter: layer-painter (so we're not clipped
             // to the footer's tight vertical clip — variants paint
             // a few px above + below the body, which `ui.painter()`
-            // would chop), but with a CLIP RECT that's the pane's
-            // horizontal bounds + unbounded vertical. Without the
-            // horizontal clip, the chrome's expand(3–5)+stroke
-            // overshoots into a neighboring pane on splits. The
-            // vertical infinity keeps the bottom/top edges intact.
+            // would chop), but with a CLIP RECT that includes a few
+            // pixels OUTSIDE the pane's horizontal bounds so the
+            // chrome's outer L/R strokes (glow expands by 5+ px)
+            // actually render. Without this overhang, the side
+            // strokes are clipped exactly at the pane edge and only
+            // the top + bottom edges show. egui_tiles' gap_width is
+            // bumped to 16 px in `behavior.rs` so this 8 px overhang
+            // sits inside the splitter gap and never bleeds into a
+            // neighbor pane. The vertical infinity keeps the
+            // bottom/top edges intact (footer's natural clip would
+            // chop them).
+            const CHROME_OUTER_OVERHANG: f32 = 8.0;
             let chrome_clip = egui::Rect::from_min_max(
-                egui::pos2(pane_clip.left(), -f32::INFINITY),
-                egui::pos2(pane_clip.right(), f32::INFINITY),
+                egui::pos2(pane_clip.left() - CHROME_OUTER_OVERHANG, -f32::INFINITY),
+                egui::pos2(pane_clip.right() + CHROME_OUTER_OVERHANG, f32::INFINITY),
             );
             let painter = ctx.layer_painter(ui.layer_id()).with_clip_rect(chrome_clip);
             crate::focused_chrome::paint(

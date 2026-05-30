@@ -150,6 +150,12 @@ pub struct TermicaApp {
     /// picker window. The picker keeps its own ViewportId so egui
     /// can route close events back to us.
     pub(crate) picker_viewport_open: Arc<AtomicBool>,
+    /// Most-recently-sent OS window title. We compute the desired
+    /// title each frame (`<active-tab-title> | Termica`) and only
+    /// dispatch a `ViewportCommand::Title` when it changes — the
+    /// command crosses an OS boundary and a no-op call per frame
+    /// would be wasteful.
+    last_window_title: String,
 }
 
 impl TermicaApp {
@@ -186,6 +192,7 @@ impl TermicaApp {
             app_run_id,
             chrome_variant: Arc::new(Mutex::new(opts.initial_chrome_variant)),
             picker_viewport_open: Arc::new(AtomicBool::new(opts.open_chrome_picker)),
+            last_window_title: String::new(),
         };
         app.bootstrap();
         app
@@ -811,6 +818,44 @@ impl eframe::App for TermicaApp {
         {
             self.focus_history.retain(|p| *p != focused);
             self.focus_history.insert(0, focused);
+        }
+
+        // OS window title: `<active-pane-title> | Termica` where
+        // the active-pane title is the same string the tab strip
+        // shows (running program ⇒ that program's name; else OSC
+        // shell-set ⇒ that; else cwd-derived). Only dispatched when
+        // it changes — `ViewportCommand::Title` crosses an OS
+        // boundary and a no-op call per frame would be wasteful.
+        let pane_for_title =
+            self.focused_pane.or_else(|| self.focus_history.first().copied()).or_else(|| {
+                self.tree
+                    .tiles
+                    .iter()
+                    .find_map(|(_, t)| if let Tile::Pane(id) = t { Some(*id) } else { None })
+            });
+        let desired_title = pane_for_title
+            .and_then(|id| {
+                let slot = self.panes.get(&id)?;
+                let osc = slot.session.terminal().osc_title();
+                let cwd = slot.session.terminal().cwd();
+                let running = crate::behavior::running_command_for(Some(slot));
+                Some(crate::tab_title::tab_title_for_with_osc(
+                    id,
+                    osc.as_deref(),
+                    cwd,
+                    self.home.as_deref(),
+                    running.as_deref(),
+                ))
+            })
+            .unwrap_or_default();
+        let new_window_title = if desired_title.is_empty() {
+            "Termica".to_string()
+        } else {
+            format!("{desired_title} | Termica")
+        };
+        if new_window_title != self.last_window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(new_window_title.clone()));
+            self.last_window_title = new_window_title;
         }
 
         // Garbage-collect panes whose tiles are no longer in the
