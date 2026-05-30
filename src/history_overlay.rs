@@ -34,20 +34,19 @@ impl OverlayScope {
     }
 }
 
-/// What `key()` decided to do with the keystroke. The caller
-/// applies it: substitute, close, or just consume the event.
+/// One-shot intent returned by [`paint`]. The caller applies it:
+/// replace the editor buffer, close the overlay, toggle scope
+/// (which also re-fetches the candidate set).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverlayAction {
     /// Replace the editor buffer with `text` and close the overlay.
     Submit(String),
     /// Close the overlay without changing the editor.
     Cancel,
-    /// The overlay handled the key; nothing else to do.
-    Handled,
-    /// The overlay did not consume the key — the caller should
-    /// route it elsewhere (in practice: ignore it; the overlay is
-    /// modal and swallows everything except its own keys).
-    Pass,
+    /// Flip `OverlayScope` and refresh entries. The caller owns
+    /// both because refresh needs the `HistoryContext` and `pane_id`
+    /// which the overlay state doesn't carry.
+    ToggleScope,
 }
 
 /// Live state of the overlay.
@@ -98,7 +97,7 @@ impl HistoryOverlay {
                 )
                 .ok()?,
         };
-        self.cached_entries = entries;
+        self.cached_entries = dedupe_by_text(entries);
         Some(())
     }
 
@@ -120,42 +119,18 @@ impl HistoryOverlay {
         self.selected_entry_idx().and_then(|i| self.cached_entries.get(i)).map(|e| e.text.as_str())
     }
 
-    /// One key in, one [`OverlayAction`] out. Pure: doesn't query
-    /// the store or refresh anything — the caller does any follow-
-    /// up work (scope toggle → `refresh_entries` + `rerank`).
-    pub fn on_key(&mut self, key: egui::Key, current_cwd: Option<&str>) -> OverlayAction {
-        match key {
-            egui::Key::Enter => match self.selected_text() {
-                Some(t) => OverlayAction::Submit(t.to_string()),
-                None => OverlayAction::Cancel,
-            },
-            egui::Key::Escape => OverlayAction::Cancel,
-            egui::Key::ArrowDown => {
-                if !self.ranked.is_empty() {
-                    self.selected = (self.selected + 1).min(self.ranked.len() - 1);
-                }
-                OverlayAction::Handled
-            }
-            egui::Key::ArrowUp => {
-                self.selected = self.selected.saturating_sub(1);
-                OverlayAction::Handled
-            }
-            egui::Key::Backspace => {
-                self.query.pop();
-                self.rerank(current_cwd);
-                OverlayAction::Handled
-            }
-            _ => OverlayAction::Pass,
+    /// Advance the selection down (toward older results), clamped
+    /// at the last row. Exposed for testing the bound; also used
+    /// by `paint` via [`egui::Key::ArrowDown`].
+    pub fn move_down(&mut self) {
+        if !self.ranked.is_empty() {
+            self.selected = (self.selected + 1).min(self.ranked.len() - 1);
         }
     }
 
-    /// Apply a printable text event (chars the user typed).
-    /// Appends to query and reranks. Bound separately from
-    /// `on_key` because egui delivers them as `Event::Text`.
-    pub fn on_text(&mut self, s: &str, current_cwd: Option<&str>) -> OverlayAction {
-        self.query.push_str(s);
-        self.rerank(current_cwd);
-        OverlayAction::Handled
+    /// Walk the selection up (toward newer results), clamped at 0.
+    pub fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
     }
 
     /// Toggle the scope. Caller must follow with `refresh_entries`
@@ -165,18 +140,38 @@ impl HistoryOverlay {
     }
 }
 
-/// Paint the overlay as a centered floating panel over the pane.
-/// No-op if the slot doesn't have an open overlay.
+/// Dedupe by command text, keeping the FIRST occurrence (which is
+/// the most recent because `recent()` returns newest-first). Without
+/// this, replayed shell history files turn a user's "ran `ls` 200
+/// times" into 200 list rows.
+fn dedupe_by_text(entries: Vec<Entry>) -> Vec<Entry> {
+    let mut seen = std::collections::HashSet::new();
+    entries.into_iter().filter(|e| seen.insert(e.text.clone())).collect()
+}
+
+/// Paint the overlay as a centered floating panel over the pane
+/// and return an [`OverlayAction`] when the user submitted /
+/// cancelled / asked to toggle scope this frame. Returns `None`
+/// when the overlay is closed or stayed open without an event.
 ///
-/// This is the only place that touches `egui::Area` / `egui::Frame`
-/// / fonts; the rest of the module is engine-pure. Pragmatic-layer
-/// per spec/09 — the logic above is what the strict-layer tests
-/// cover.
-pub fn paint(ui: &mut egui::Ui, slot: &mut PaneSlot) {
-    let Some(overlay) = slot.ui.history_overlay.as_ref() else { return };
-    let area_id = ui.id().with(("history-overlay", slot.session.pane_id()));
+/// Owns its own input via:
+///   - A real interactive `TextEdit::singleline` bound directly to
+///     `overlay.query`. egui handles caret + typing + selection.
+///   - `ctx.input` checks for navigation keys (`Enter` / `Esc` /
+///     `Tab` / `ArrowUp` / `ArrowDown`) — `lock_focus(true)` on the
+///     TextEdit keeps `Tab` from triggering focus navigation so we
+///     can repurpose it for scope toggle.
+///   - Clickable rows in the results list (mouse → Submit).
+pub fn paint(ui: &mut egui::Ui, slot: &mut PaneSlot) -> Option<OverlayAction> {
+    let pane_id = slot.session.pane_id();
+    let current_cwd = slot.session.terminal().cwd().map(|p| p.display().to_string());
+    let overlay = slot.ui.history_overlay.as_mut()?;
+
+    let area_id = ui.id().with(("history-overlay", pane_id));
     let screen_rect = ui.ctx().content_rect();
     let panel_w = (screen_rect.width() * 0.6).clamp(360.0, 720.0);
+    let scope_text = scope_label(overlay.scope).to_string();
+    let mut action: Option<OverlayAction> = None;
 
     egui::Area::new(area_id)
         .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, screen_rect.height() * 0.12))
@@ -186,21 +181,60 @@ pub fn paint(ui: &mut egui::Ui, slot: &mut PaneSlot) {
                 ui.set_width(panel_w);
                 ui.horizontal(|ui| {
                     ui.strong("Ctrl-R");
-                    ui.label(format!("scope: {}", scope_label(overlay.scope)));
-                    ui.label("(Tab to toggle)");
+                    ui.label(format!("scope: {scope_text}"));
+                    ui.weak("(Tab toggles scope · Enter submits · Esc cancels)");
                 });
-                ui.horizontal(|ui| {
-                    ui.label("search:");
-                    let mut q = overlay.query.clone();
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut q)
-                            .desired_width(panel_w - 80.0)
-                            .interactive(false),
-                    );
+                let prev_query = overlay.query.clone();
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut overlay.query)
+                        .desired_width(panel_w - 16.0)
+                        .id_salt(("history-overlay-query", pane_id))
+                        .hint_text("search…")
+                        .lock_focus(true),
+                );
+                if !resp.has_focus() {
                     resp.request_focus();
+                }
+                if overlay.query != prev_query {
+                    overlay.rerank(current_cwd.as_deref());
+                }
+
+                // Navigation keys. `ctx.input` is the source of
+                // truth for "was this key pressed this frame";
+                // checking through the TextEdit response would
+                // miss Esc / Tab because the TextEdit doesn't
+                // consume those.
+                let (enter, escape, tab, arrow_down, arrow_up) = ui.ctx().input(|i| {
+                    (
+                        i.key_pressed(egui::Key::Enter),
+                        i.key_pressed(egui::Key::Escape),
+                        i.key_pressed(egui::Key::Tab),
+                        i.key_pressed(egui::Key::ArrowDown),
+                        i.key_pressed(egui::Key::ArrowUp),
+                    )
                 });
+                if enter {
+                    action = Some(match overlay.selected_text() {
+                        Some(t) => OverlayAction::Submit(t.to_string()),
+                        None => OverlayAction::Cancel,
+                    });
+                } else if escape {
+                    action = Some(OverlayAction::Cancel);
+                } else if tab {
+                    action = Some(OverlayAction::ToggleScope);
+                } else {
+                    if arrow_down {
+                        overlay.move_down();
+                    }
+                    if arrow_up {
+                        overlay.move_up();
+                    }
+                }
+
                 ui.separator();
+
                 egui::ScrollArea::vertical()
+                    .id_salt(("history-overlay-results", pane_id))
                     .max_height(screen_rect.height() * 0.5)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
@@ -208,16 +242,56 @@ pub fn paint(ui: &mut egui::Ui, slot: &mut PaneSlot) {
                             ui.weak("(no matches)");
                             return;
                         }
-                        for (row, &cand) in overlay.ranked.iter().enumerate() {
-                            let Some(entry) = overlay.cached_entries.get(cand) else {
-                                continue;
-                            };
-                            let is_selected = row == overlay.selected;
-                            paint_row(ui, entry, is_selected, panel_w);
+                        // Snapshot the row data so the result loop
+                        // doesn't borrow `overlay` immutably while
+                        // we also assign into `action` (mutable).
+                        let rows: Vec<RowView> = overlay
+                            .ranked
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(row, &cand)| {
+                                let e = overlay.cached_entries.get(cand)?;
+                                Some(RowView {
+                                    row,
+                                    text: e.text.clone(),
+                                    cwd: e.cwd.clone(),
+                                    exit_code: e.exit_code,
+                                    source: e.source.clone(),
+                                })
+                            })
+                            .collect();
+                        for r in rows {
+                            let is_selected = r.row == overlay.selected;
+                            let clicked = paint_clickable_row(
+                                ui,
+                                &r.text,
+                                r.cwd.as_deref(),
+                                r.exit_code,
+                                &r.source,
+                                is_selected,
+                                panel_w,
+                            );
+                            if clicked {
+                                action = Some(OverlayAction::Submit(r.text));
+                                break;
+                            }
                         }
                     });
             });
         });
+
+    action
+}
+
+/// Snapshot of one row pulled out of `cached_entries` so the
+/// click loop doesn't borrow `overlay` immutably while it also
+/// writes the click result back into `action`.
+struct RowView {
+    row: usize,
+    text: String,
+    cwd: Option<String>,
+    exit_code: Option<i32>,
+    source: String,
 }
 
 fn scope_label(s: OverlayScope) -> &'static str {
@@ -227,33 +301,46 @@ fn scope_label(s: OverlayScope) -> &'static str {
     }
 }
 
-fn paint_row(ui: &mut egui::Ui, entry: &Entry, is_selected: bool, panel_w: f32) {
-    let bg =
-        if is_selected { Some(ui.visuals().selection.bg_fill.linear_multiply(0.4)) } else { None };
-    let frame = if let Some(c) = bg { egui::Frame::NONE.fill(c) } else { egui::Frame::NONE };
-    frame.show(ui, |ui| {
+/// Render one result row as a clickable area. Returns `true`
+/// when the user clicked it.
+fn paint_clickable_row(
+    ui: &mut egui::Ui,
+    text: &str,
+    cwd: Option<&str>,
+    exit_code: Option<i32>,
+    source: &str,
+    is_selected: bool,
+    panel_w: f32,
+) -> bool {
+    let frame = if is_selected {
+        egui::Frame::NONE.fill(ui.visuals().selection.bg_fill.linear_multiply(0.35))
+    } else {
+        egui::Frame::NONE
+    };
+    let inner = frame.show(ui, |ui| {
         ui.set_width(panel_w);
         ui.vertical(|ui| {
-            let text = egui::RichText::new(&entry.text).monospace().strong();
-            ui.label(text);
-            let meta = format_meta(entry);
+            ui.label(egui::RichText::new(text).monospace().strong());
+            let meta = format_meta(cwd, exit_code, source);
             if !meta.is_empty() {
                 ui.weak(meta);
             }
         });
     });
+    let row_id = ui.id().with(("hist-row", text));
+    ui.interact(inner.response.rect, row_id, egui::Sense::click()).clicked()
 }
 
-fn format_meta(entry: &Entry) -> String {
+fn format_meta(cwd: Option<&str>, exit_code: Option<i32>, source: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if let Some(cwd) = entry.cwd.as_deref() {
-        parts.push(cwd.to_string());
+    if let Some(c) = cwd {
+        parts.push(c.to_string());
     }
-    if let Some(code) = entry.exit_code {
+    if let Some(code) = exit_code {
         parts.push(format!("exit {code}"));
     }
-    if entry.source != "termica" {
-        parts.push(format!("· {}", entry.source));
+    if source != "termica" {
+        parts.push(source.to_string());
     }
     parts.join(" · ")
 }
@@ -290,8 +377,6 @@ mod tests {
 
     #[test]
     fn empty_query_lists_all_entries_newest_first() {
-        // Cached entries are already newest-first (DB returns them
-        // that way) so rerank with "" preserves that order.
         let entries =
             vec![make_entry("third", 300), make_entry("second", 200), make_entry("first", 100)];
         let o = overlay_with(entries);
@@ -300,88 +385,60 @@ mod tests {
     }
 
     #[test]
-    fn typing_filters_via_substring() {
+    fn rerank_filters_via_substring() {
         let entries = vec![
             make_entry("cargo run", 300),
             make_entry("ls", 200),
             make_entry("cargo test", 100),
         ];
         let mut o = overlay_with(entries);
-        o.on_text("cargo", None);
+        o.query = "cargo".to_string();
+        o.rerank(None);
         let texts: Vec<&str> =
             o.ranked.iter().map(|i| o.cached_entries[*i].text.as_str()).collect();
         assert_eq!(texts, vec!["cargo run", "cargo test"]);
     }
 
     #[test]
-    fn backspace_widens_filter() {
-        let entries = vec![make_entry("alpha", 200), make_entry("beta", 100)];
-        let mut o = overlay_with(entries);
-        o.on_text("alph", None);
-        assert_eq!(o.ranked.len(), 1);
-        o.on_key(egui::Key::Backspace, None);
-        assert_eq!(o.query, "alp");
-        assert_eq!(o.ranked.len(), 1);
-        for _ in 0..3 {
-            o.on_key(egui::Key::Backspace, None);
-        }
-        assert_eq!(o.query, "");
-        assert_eq!(o.ranked.len(), 2);
-    }
-
-    #[test]
-    fn arrow_down_advances_selection_clamped_to_last_row() {
+    fn move_down_clamps_to_last_row() {
         let entries = vec![make_entry("a", 200), make_entry("b", 100)];
         let mut o = overlay_with(entries);
-        assert_eq!(o.selected, 0);
-        o.on_key(egui::Key::ArrowDown, None);
+        o.move_down();
         assert_eq!(o.selected, 1);
-        o.on_key(egui::Key::ArrowDown, None);
+        o.move_down();
         assert_eq!(o.selected, 1, "clamped to last index");
     }
 
     #[test]
-    fn arrow_up_decreases_selection_clamped_to_zero() {
+    fn move_up_clamps_to_zero() {
         let entries = vec![make_entry("a", 200), make_entry("b", 100)];
         let mut o = overlay_with(entries);
-        o.on_key(egui::Key::ArrowDown, None);
-        o.on_key(egui::Key::ArrowUp, None);
+        o.move_down();
+        o.move_up();
         assert_eq!(o.selected, 0);
-        o.on_key(egui::Key::ArrowUp, None);
+        o.move_up();
+        assert_eq!(o.selected, 0, "clamped at 0");
+    }
+
+    #[test]
+    fn move_down_on_empty_results_is_noop() {
+        let mut o = overlay_with(vec![make_entry("ls", 100)]);
+        o.query = "no-match".to_string();
+        o.rerank(None);
+        assert!(o.ranked.is_empty());
+        o.move_down();
         assert_eq!(o.selected, 0);
-    }
-
-    #[test]
-    fn enter_submits_selected_entry() {
-        let entries = vec![make_entry("only", 100)];
-        let mut o = overlay_with(entries);
-        let action = o.on_key(egui::Key::Enter, None);
-        assert_eq!(action, OverlayAction::Submit("only".to_string()));
-    }
-
-    #[test]
-    fn enter_on_empty_results_cancels() {
-        let mut o = overlay_with(vec![make_entry("ls", 100)]);
-        o.on_text("xyz", None);
-        let action = o.on_key(egui::Key::Enter, None);
-        assert_eq!(action, OverlayAction::Cancel);
-    }
-
-    #[test]
-    fn escape_cancels() {
-        let mut o = overlay_with(vec![make_entry("ls", 100)]);
-        assert_eq!(o.on_key(egui::Key::Escape, None), OverlayAction::Cancel);
     }
 
     #[test]
     fn rerank_resets_selection_to_top() {
         let entries = vec![make_entry("a", 300), make_entry("b", 200), make_entry("c", 100)];
         let mut o = overlay_with(entries);
-        o.on_key(egui::Key::ArrowDown, None);
-        o.on_key(egui::Key::ArrowDown, None);
+        o.move_down();
+        o.move_down();
         assert_eq!(o.selected, 2);
-        o.on_text("a", None);
-        // After rerank, selection is back to 0 (the top result).
+        o.query = "a".to_string();
+        o.rerank(None);
         assert_eq!(o.selected, 0);
     }
 
@@ -396,9 +453,21 @@ mod tests {
     }
 
     #[test]
-    fn unknown_key_returns_pass() {
-        let mut o = overlay_with(vec![make_entry("ls", 100)]);
-        let action = o.on_key(egui::Key::Tab, None);
-        assert_eq!(action, OverlayAction::Pass);
+    fn dedupe_keeps_first_occurrence_of_each_text() {
+        // `recent()` returns newest-first, so the first occurrence
+        // IS the most recent — keep it. Replayed shell-history
+        // files with `ls` ten times must collapse to one row.
+        let entries = vec![
+            make_entry("ls", 500),
+            make_entry("cd", 400),
+            make_entry("ls", 300),
+            make_entry("ls", 200),
+            make_entry("cd", 100),
+        ];
+        let deduped = dedupe_by_text(entries);
+        let texts: Vec<&str> = deduped.iter().map(|e| e.text.as_str()).collect();
+        let ts: Vec<i64> = deduped.iter().map(|e| e.started_at_ms).collect();
+        assert_eq!(texts, vec!["ls", "cd"]);
+        assert_eq!(ts, vec![500, 400], "kept the newest occurrence of each");
     }
 }

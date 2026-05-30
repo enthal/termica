@@ -429,50 +429,6 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
     }
 }
 
-/// Route one egui event to the Ctrl+R history overlay (assumed
-/// open by the caller). Handles scope toggle (Tab — needs a
-/// refresh + rerank), text input, key events, and the Submit /
-/// Cancel outcomes that close the overlay.
-fn route_event_to_history_overlay(event: &egui::Event, slot: &mut PaneSlot) {
-    use crate::history_overlay::OverlayAction;
-    let current_cwd = slot.session.terminal().cwd().map(|p| p.display().to_string());
-    match event {
-        egui::Event::Text(s) => {
-            if let Some(overlay) = slot.ui.history_overlay.as_mut() {
-                let _ = overlay.on_text(s, current_cwd.as_deref());
-            }
-        }
-        egui::Event::Key { key, pressed: true, modifiers, .. } => {
-            // Tab toggles scope — needs a fresh fetch + rerank.
-            if matches!(key, egui::Key::Tab) && !modifiers.shift {
-                if let Some(overlay) = slot.ui.history_overlay.as_mut()
-                    && let Some(history) = slot.session.history_ctx().cloned()
-                {
-                    overlay.toggle_scope();
-                    overlay.refresh_entries(&history, slot.session.pane_id());
-                    overlay.rerank(current_cwd.as_deref());
-                }
-                return;
-            }
-            let action = match slot.ui.history_overlay.as_mut() {
-                Some(o) => o.on_key(*key, current_cwd.as_deref()),
-                None => return,
-            };
-            match action {
-                OverlayAction::Submit(text) => {
-                    slot.session.replace_editor_buffer(&text);
-                    slot.ui.history_overlay = None;
-                }
-                OverlayAction::Cancel => {
-                    slot.ui.history_overlay = None;
-                }
-                OverlayAction::Handled | OverlayAction::Pass => {}
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Spawn the OS's "open this URL or path" handler.
 ///
 /// macOS: `open <arg>`. Linux/BSD: `xdg-open <arg>`. The argument
@@ -1579,11 +1535,11 @@ pub fn render_pane(
             // events — typing into the editor must NOT also echo to
             // the shell. `apply_event_to_editor` returns `true` when
             // it owned the event.
-            // While the Ctrl+R overlay is open it is modal: every
-            // event is routed to it (or silently dropped) so the
-            // editor, the PTY, and the scrollback all stay frozen.
+            // While the Ctrl+R overlay is open it is modal: events
+            // are owned by the overlay's `TextEdit` + the `ctx.input`
+            // navigation checks in `crate::history_overlay::paint`.
+            // We just skip the editor / PTY paths so nothing leaks.
             if slot.ui.history_overlay.is_some() {
-                route_event_to_history_overlay(event, slot);
                 continue;
             }
             if editor_active && apply_event_to_editor(event, slot) {
@@ -1648,11 +1604,32 @@ pub fn render_pane(
     }
 
     // Phase 4J PR 6: paint the Ctrl+R history overlay on top of
-    // everything else if it's open. Inputs were already routed
-    // to it above (modal); rendering is a separate layer so
-    // the popup sits over the pane regardless of where the
-    // selection or scroll position landed.
-    crate::history_overlay::paint(ui, slot);
+    // everything else if it's open, and apply its returned action
+    // (Submit / Cancel / ToggleScope). The overlay's `TextEdit` +
+    // `ctx.input` navigation checks own the input; the event loop
+    // above just blocked the editor / PTY paths while it's open.
+    if let Some(action) = crate::history_overlay::paint(ui, slot) {
+        use crate::history_overlay::OverlayAction;
+        match action {
+            OverlayAction::Submit(text) => {
+                slot.session.replace_editor_buffer(&text);
+                slot.ui.history_overlay = None;
+            }
+            OverlayAction::Cancel => {
+                slot.ui.history_overlay = None;
+            }
+            OverlayAction::ToggleScope => {
+                if let Some(history) = slot.session.history_ctx().cloned()
+                    && let Some(overlay) = slot.ui.history_overlay.as_mut()
+                {
+                    overlay.toggle_scope();
+                    overlay.refresh_entries(&history, slot.session.pane_id());
+                    let cwd = slot.session.terminal().cwd().map(|p| p.display().to_string());
+                    overlay.rerank(cwd.as_deref());
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
