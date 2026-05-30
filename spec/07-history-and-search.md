@@ -108,28 +108,71 @@ The `app_run_id` filter is what makes pane scope meaningful across restarts: pan
 
 SQLite-backed, identical schema (see [08](08-persistence.md)). Every Termica submit writes one row at `started_at`; the row is updated at `finished_at`. Replayed shell-history-file entries land alongside with their own `source`.
 
-UI:
+### Open + close
 
-- **Ctrl+R** opens the history popup.
-- Default scope: `Global`, sorted by recency, with the current pane's cwd as a soft boost in the ranker (not a filter).
-- Fuzzy matcher: `nucleo` (v1 candidate) ranking by combined recency + cwd-proximity + match score.
-- Scope toggle in the popup chrome: `[ this pane | global ]`. Pane scope here narrows to the same `(pane_id, app_run_id)` slice the arrows walk.
+- **Ctrl+R** opens the popup. If the editor has text, that text **prefills the search field** so a partially-typed command pre-narrows results (same UX as zsh's `history-search-backward`).
+- The popup is modal: while open, every key + click event routes to the popup; the editor and PTY stay frozen.
+- **Enter** substitutes the selected entry into the editor buffer (caret at end) and closes the popup. **Esc** closes without changing the editor. **Clicking** a row submits it.
+- On Submit OR Cancel the focus is explicitly re-claimed by the pane that owned the popup. Without this, in split-screen layouts focus migrates to the first tile's active tab.
+
+### Scope
+
+- Default scope: `Global`. Toggle via **Tab** to `Pane` (the same `(pane_id, app_run_id)` slice the arrow keys walk). The popup's `lock_focus(true)` on its `TextEdit` lets Tab reach the popup instead of triggering egui focus navigation.
+- Cwd proximity is a soft *boost* in the ranker, not a filter, so `^R` from a different directory still surfaces matches.
+
+### Query semantics
+
+The query is **whitespace-split** before matching. Each whitespace-separated word is its own substring matcher; results must contain **every** word (AND semantics), in any order. Ranking, in priority order:
+
+1. **cwd_match** (the row's recorded cwd equals the pane's current cwd).
+2. **whole_word_count** — query words that land at a word boundary (ASCII alphanumeric + `_`-aware) score above ones that only matched as a substring. More hits beats fewer.
+3. **in_order** — when the query words appear in the text in the same order as in the query, that's a small additional boost.
+4. **recency** — `started_at_ms` descending; final tiebreak.
+
+So `echo that` matches `echo this that the other` (both words at word boundaries, in order) above `that thing echo more` (same words, different order) above `echo gotthat now` (`that` is part of `gotthat`).
+
+### Match highlighting
+
+Each row highlights **every occurrence of every query word** in the displayed command text. Highlight color is a saturated warm gold (`Color32(255, 215, 90)`) with a 1.5px underline at the same color — chosen because the egui-selection cool teal got washed out against the bright monospace command text. Case-insensitive byte-substring on the lowercase form; non-ASCII text that changes byte length on lowercase falls back to plain rendering instead of risking a non-char-boundary slice.
+
+### Result rows
+
+Each row is two lines: the command text (with matched runs highlighted), then a meta line that begins with a compact relative age:
+
+- `now` (<60s), `4m`, `3h`, `1d` (= yesterday), `3d`, `2w`, `3mo`, `1y`. Hovering the age shows the long form (`just now`, `4 minutes ago`, `yesterday`, …) via `on_hover_text`.
+- Replayed shell-history-file entries that had no per-entry timestamp (`started_at_ms ≤ 0`) **skip the age slot entirely** — rendering "56y ago" against epoch 0 was just noise.
+- Age is followed by `cwd · exit code · source` (each segment present only when known). `source = 'termica'` is the captured-here default and is not displayed; `zsh` / `bash` / `fish` tags are shown so the user knows a row came from the file replay.
+
+Multi-line commands (here-docs, multi-line for-loops, anything with embedded `\n`) collapse to **one visual line** with the `↲` glyph (U+21B2) in place of newlines. The query matches and highlight ranges run on the collapsed display text so the visible matches always line up.
+
+The row list is deduped by command text (keeping the most-recent occurrence) so a `ls` run 200 times doesn't produce 200 rows.
+
+### Visual chrome
+
+- Panel width: 70% of the viewport, clamped to `[560, 1100]`. Result list has a `min_scrolled_height` floor of 45% of the viewport (clamped to `[280, 520]`) so the panel always has visual mass even with two matches.
+- Rows separated by an explicit 6px gap (picked via `pick_history_row_separator` → `more-spacing`).
+- Header layout: `Ctrl-R · scope: <scope*>` left-justified, `(Tab toggles scope · Enter submits · Esc cancels)` right-justified.
 
 ```text
-┌────────────────────────────────────────────────────────────────┐
-│ Ctrl+R  search: cargo te█                                      │
-├────────────────────────────────────────────────────────────────┤
-│ ▸ cargo test --workspace                                       │
-│   2m ago · ~/git/enthal/termica · exit 0                       │
-│   cargo test --package termica-terminal                        │
-│   17m ago · ~/git/enthal/termica · exit 0                      │
-│   cargo test -p termica-shell --test markers                   │
-│   yesterday · ~/git/enthal/termica · exit 0 · zsh              │
-└────────────────────────────────────────────────────────────────┘
-       scope: [ this pane | global* ]
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ Ctrl-R  scope: global*           (Tab toggles scope · Enter submits · Esc)   │
+│ ┌────────────────────────────────────────────────────────────────────────┐   │
+│ │ cargo te█                                                              │   │
+│ └────────────────────────────────────────────────────────────────────────┘   │
+│ ▸ cargo test --workspace                                                     │
+│   2m · ~/git/enthal/termica · exit 0                                         │
+│                                                                              │
+│   cargo run --release                                                        │
+│   45m · ~/git/enthal/termica · exit 0                                        │
+│                                                                              │
+│   ls                                                                         │
+│         · zsh                                                                │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Selecting an entry replaces the editor buffer. The popup never sends to the PTY directly.
+(The `ls` row's meta line begins with the cwd-bullet because the replayed `zsh` entry has no age slot.)
+
+Selecting an entry replaces the editor buffer; the popup never sends to the PTY directly.
 
 ## Command blocks (transcript view)
 

@@ -58,6 +58,12 @@ A "duplicate shell" sets `cwd` but does **not** copy scrollback or transcript. E
 - Reorder tabs via drag.
 - Persisted as part of layout ([08](08-persistence.md)).
 
+### Tab title and minimum width
+
+Tab titles default to the home-relative cwd (`~/git/enthal/termica`, `~/projects/foo`, …) and are tracked in [`src/tab_title.rs`](../src/tab_title.rs). When the cwd collapses to bare `~` (the default startup cwd, so the worst case is also the first thing the user sees), the natural-width tab is ~16 px — barely clickable.
+
+Rule: titles are space-padded to **`MIN_TAB_TITLE_CHARS = 7` characters** before being handed to `egui_tiles`. egui_tiles has no min-tab-width knob; widening via the title string is the cleanest cross-Behavior approach. Padding is split symmetrically with the extra character going to the right when the shortfall is odd (matches egui_tiles' `LEFT_CENTER` paint origin so the text stays visually centered). The constant was picked via `cargo run --example pick_tab_min_width` (variant `3x` ≈ 48 px, 3× the natural `~` width). Implemented as a pure `pad_to_min_chars` helper in [`src/behavior.rs`](../src/behavior.rs) with strict-layer tests.
+
 ## Active pane / focus
 
 Exactly one pane is "active" per workspace. Focus follows mouse click or keyboard navigation; egui's focus system drives it. The active pane:

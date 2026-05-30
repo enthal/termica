@@ -120,6 +120,36 @@ CREATE INDEX idx_runs_text              ON runs(text);
 CREATE INDEX idx_scrollback_chunk_pane  ON scrollback_chunk(pane_id, start_line);
 ```
 
+### Schema v2: idempotent shell-history replay
+
+Termica replays the user's shell-history files (`~/.zsh_history`, `~/.bash_history`, fish) into `runs` on every app start (see [§"Shell-history-file replay"](#shell-history-file-replay)). Idempotency is structural — a `UNIQUE` index excludes captured rows so re-running the replay inserts each shell-file line at most once, but `source = 'termica'` rows stay distinct (running `ls` ten times produces ten rows):
+
+```sql
+CREATE UNIQUE INDEX idx_runs_replay_unique
+    ON runs(source, text, started_at)
+    WHERE source != 'termica';
+```
+
+The replay loop uses `INSERT OR IGNORE` against this index. Returns `Ok(Option<i64>)` from `record_replayed`: `Some(id)` for the inserted row, `None` for an existing-row no-op. The schema migration ladder lives in [`src/history/db.rs`](../src/history/db.rs); `PRAGMA user_version` tracks current version.
+
+### Shell-history-file replay
+
+On `TermicaApp::new`, before the first pane spawns, the app:
+
+1. Resolves the data dir via `directories::ProjectDirs::from("", "", "termica")`.
+2. Opens (or creates) `<data-dir>/history.sqlite` and migrates to the current schema.
+3. For each known shell-history-file location, reads bytes and runs the matching parser, then writes every entry via `record_replayed`.
+
+Locations + formats (in [`src/history/shell_files.rs`](../src/history/shell_files.rs)):
+
+- **zsh**: `$HISTFILE` or `~/.zsh_history`. Extended (`: ts:elapsed;cmd`) or plain; backslash-at-EOL continuation folds multi-line commands.
+- **bash**: `$HISTFILE` or `~/.bash_history`. Plain or `#<ts>` + command (`HISTTIMEFORMAT` mode). Orphan timestamps drop silently.
+- **fish**: `${XDG_DATA_HOME:-~/.local/share}/fish/fish_history`. YAML-ish `- cmd:` / `  when:`; `\n` and `\\` decoded.
+
+When the file format carries no per-entry timestamp (bash without `HISTTIMEFORMAT`), the replay loop synthesizes `started_at_ms = -(position + 1)`. Negative values sort below real positive unix-ms timestamps, are stable across replays of an append-only file, and are detected by the UI ([07](07-history-and-search.md#result-rows)) to suppress the age slot.
+
+Replay is **never allowed to block startup**. If the data dir can't be resolved or the DB can't be opened, `TermicaApp.history` stays `None`, the app continues normally, and the prompt-editor UIs that consume it just degrade to "no history" (arrow keys are no-ops, `^R` doesn't open).
+
 ### What lives in the layout blob
 
 `window.layout_blob` is a bincode-serialized `egui_tiles::Tree<PaneId>` plus minimal egui state (active leaf, split fractions). The format is owned by Termica; we ship a migration when the layout serialization changes.

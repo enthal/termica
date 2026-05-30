@@ -309,6 +309,20 @@ The chrome between blocks is non-text (thin separator + space). Selection (below
 
 The `❯` and the chips are decorative — painted by Termica, not the shell's `PS1`. The integration script intentionally minimises `PS1` so the shell's own prompt drawing doesn't visually conflict with Termica's chrome ([03](03-shell-integration.md)).
 
+### Block visual chrome (shipped)
+
+Concrete visual rules that landed via `examples/pick_*` visual-picker decisions (see [09](09-testing.md)). Each is documented here as a constant in [`src/render.rs`](../src/render.rs); the comment on each constant names the picker variant that won.
+
+**Chips (block header).** Each chip (cwd, exit code) is a dark-grey rounded rectangle with a **1 px dim stroke** (`BLOCK_HEADER_CHIP_STROKE = #444`). The stroke is just enough to read the chip's edge against the very-similar panel background without competing with the chip text. `exit N` for non-zero `N` renders the text in red.
+
+**Failed-block background wash.** Sealed blocks whose command exited non-zero are painted on a warm-dark red wash (`FAILED_BLOCK_BG`, unmultiplied rgba≈`#80, #20, #20, alpha 0x18` ≈ 9%). The wash is implemented via the `painter.add(Shape::Noop) + painter.set()` pattern: a shape index is reserved BEFORE the chip + label + snapshot paint, and the rect is filled in after layout settles, so the wash sits underneath the content. Translucent enough that the styled snapshot text on top is fully legible.
+
+**Block separator.** Between sealed blocks: `BLOCK_SEPARATOR_GAP = 10 px` of vertical space, then a 1 px hairline (`BLOCK_SEPARATOR_HAIRLINE`, unmultiplied rgba `#a0, #a0, #a0, alpha 0x18` ≈ 9%) running the full pane width, then another 10 px. Total inter-block breath is ~21 px with the hairline centered.
+
+**Focused-editor chrome.** When the prompt-editor caret would be drawn ([§"When is the caret shown?"](#when-is-the-caret-shown)), a 1 px rounded outline (`FOCUSED_EDITOR_CHROME_COLOR`, premul rgba `#a0, #a0, #a0, alpha 0xb0`) is drawn around BOTH the chip bar AND the editor body together, 2 px outside the combined rect, 6 px corner radius. The outline says "this whole prompt surface is wired for input"; same predicate as the caret. (Visual tuning is open: see this branch's `pick_*` follow-ups.)
+
+**Color helper.** The const Color32 constructors require premultiplied values, so source colors written here as "unmultiplied" are pre-computed: each channel × (alpha / 255), rounded. The picker examples use `from_rgba_unmultiplied` at the call site for natural authoring; production code uses the precomputed `Color32::from_rgba_premultiplied` constants and the comment names the unmultiplied source.
+
 ## Layout: fixed-footer prompt, sticky-top header
 
 Three rules govern the per-frame layout pass:
