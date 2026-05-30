@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
@@ -138,12 +139,29 @@ pub struct TermicaApp {
     /// [spec/07 §"Pane-scope recall"](../spec/07-history-and-search.md#pane-scope-recall--).
     #[allow(dead_code)]
     pub(crate) app_run_id: String,
+    /// Live-tunable focused-editor chrome variant. The main pane
+    /// renderer consults this every frame; the picker viewport
+    /// (a second OS window opened via `--pick-chrome`) writes into
+    /// the same `Arc<Mutex<…>>` so a click in the picker shows the
+    /// new chrome in the main window immediately.
+    pub(crate) chrome_variant: Arc<Mutex<crate::focused_chrome::ChromeVariant>>,
+    /// True while the picker viewport is meant to be alive. Set by
+    /// `--pick-chrome` and cleared when the user closes the
+    /// picker window. The picker keeps its own ViewportId so egui
+    /// can route close events back to us.
+    pub(crate) picker_viewport_open: Arc<AtomicBool>,
 }
 
 impl TermicaApp {
     /// Construct an app with one initial pane in a single Tabs
     /// container at the root of the tree.
     pub fn new() -> Self {
+        Self::new_with_options(TermicaAppOptions::default())
+    }
+
+    /// Construct with options — used by `--pick-chrome` to open the
+    /// chrome picker viewport on startup.
+    pub fn new_with_options(opts: TermicaAppOptions) -> Self {
         let home = home::home_dir();
         let event_recorder = init_event_recorder();
         let history = init_history_store(home.as_deref());
@@ -166,6 +184,8 @@ impl TermicaApp {
             event_recorder,
             history,
             app_run_id,
+            chrome_variant: Arc::new(Mutex::new(opts.initial_chrome_variant)),
+            picker_viewport_open: Arc::new(AtomicBool::new(opts.open_chrome_picker)),
         };
         app.bootstrap();
         app
@@ -375,6 +395,18 @@ impl eframe::App for TermicaApp {
         // when the user is idle.
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
 
+        // Chrome picker viewport (second OS window). Stays open
+        // as long as `picker_viewport_open` is true; the picker
+        // clears the flag on its own close-request so subsequent
+        // frames don't keep scheduling it.
+        if self.picker_viewport_open.load(Ordering::Relaxed) {
+            show_chrome_picker_viewport(
+                ctx,
+                self.chrome_variant.clone(),
+                self.picker_viewport_open.clone(),
+            );
+        }
+
         // macOS' Cmd+Q (and the red traffic-light close button on any
         // OS) is delivered by winit as a *viewport close request*,
         // not a `Key::Q` event. Our shortcut matcher never sees it,
@@ -464,6 +496,7 @@ impl eframe::App for TermicaApp {
                 pending_closes: &mut self.pending_closes,
                 pending_close_confirm: &mut self.pending_close_confirm,
                 modal_open,
+                chrome_variant: *self.chrome_variant.lock().expect("chrome variant mutex"),
             };
             self.tree.ui(&mut behavior, ui);
             self.new_tab_requested_in = behavior.new_tab_requested_in;
@@ -815,4 +848,58 @@ fn init_history_store(home: Option<&std::path::Path>) -> Option<Arc<Mutex<Histor
         let _stats = replay_into(&store, &ReplayPaths::from_home(h));
     }
     Some(Arc::new(Mutex::new(store)))
+}
+
+/// Optional knobs for `TermicaApp::new_with_options`. Defaults
+/// match what `TermicaApp::new` produced before — no behaviour
+/// change unless the caller asks for it.
+#[derive(Debug, Clone, Default)]
+pub struct TermicaAppOptions {
+    /// Open the chrome-picker viewport (second OS window) on
+    /// startup. The picker shares an `Arc<Mutex<ChromeVariant>>`
+    /// with the main window so clicks live-update the chrome.
+    pub open_chrome_picker: bool,
+    /// Initial value of [`TermicaApp::chrome_variant`].
+    pub initial_chrome_variant: crate::focused_chrome::ChromeVariant,
+}
+
+/// Paint the focused-editor chrome picker into a deferred
+/// Viewport (second OS window). Reads + writes the shared
+/// `Arc<Mutex<ChromeVariant>>` so a click in this window
+/// updates the main window's chrome on the next frame.
+///
+/// Closing the window via the OS close button clears
+/// `picker_viewport_open` so subsequent frames stop scheduling
+/// the viewport.
+pub(crate) fn show_chrome_picker_viewport(
+    ctx: &egui::Context,
+    variant: Arc<Mutex<crate::focused_chrome::ChromeVariant>>,
+    open: Arc<AtomicBool>,
+) {
+    let viewport_id = egui::ViewportId::from_hash_of("termica-chrome-picker");
+    let builder = egui::ViewportBuilder::default()
+        .with_title("Termica · pick focused-editor chrome")
+        .with_inner_size([460.0, 720.0])
+        .with_min_inner_size([320.0, 360.0]);
+    ctx.show_viewport_deferred(viewport_id, builder, move |ctx, _class| {
+        if ctx.input(|i| i.viewport().close_requested()) {
+            open.store(false, Ordering::Relaxed);
+        }
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Focused-editor chrome");
+            ui.weak("Click a variant — the main window updates immediately.");
+            ui.weak("Close this window when you're done.");
+            ui.separator();
+            let current = *variant.lock().expect("chrome variant mutex");
+            for (v, _id, label) in crate::focused_chrome::ChromeVariant::ALL {
+                let is_selected = *v == current;
+                let resp = ui.selectable_label(is_selected, *label);
+                if resp.clicked() {
+                    *variant.lock().expect("chrome variant mutex") = *v;
+                }
+            }
+            ui.add_space(8.0);
+            ui.weak(format!("current: {} ({})", current.label(), current.id()));
+        });
+    });
 }

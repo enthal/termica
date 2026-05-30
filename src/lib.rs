@@ -33,6 +33,7 @@ pub mod block_links;
 pub mod block_selection;
 pub mod echo_suppress;
 pub mod events;
+pub mod focused_chrome;
 pub mod history;
 pub mod history_overlay;
 pub mod input;
@@ -86,6 +87,13 @@ pub(crate) const MIN_COLS: u16 = 20;
 /// Run the native window. Used by `main` and any future end-to-end
 /// harness.
 pub fn run() -> eframe::Result<()> {
+    // Cheap arg sniff — no full clap dep needed for one boolean
+    // flag. `--pick-chrome` opens the focused-editor chrome picker
+    // viewport (a second OS window) on startup. Clicks in that
+    // window live-update the chrome of the main window.
+    let pick_chrome = std::env::args().any(|a| a == "--pick-chrome");
+    let app_opts =
+        crate::app::TermicaAppOptions { open_chrome_picker: pick_chrome, ..Default::default() };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
@@ -124,7 +132,7 @@ pub fn run() -> eframe::Result<()> {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
             #[cfg(target_os = "macos")]
             menu_macos::install_macos_menu();
-            Ok(Box::new(TermicaApp::new()))
+            Ok(Box::new(TermicaApp::new_with_options(app_opts.clone())))
         }),
     )
 }

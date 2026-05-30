@@ -46,6 +46,11 @@ pub(crate) struct TabBehavior<'a> {
     /// reach the PTY because pane input is read before the modal
     /// renders later in the frame.
     pub(crate) modal_open: bool,
+    /// Live-tunable focused-editor chrome variant. Read each frame
+    /// from `TermicaApp.chrome_variant`; the second-window picker
+    /// viewport writes into the same `Arc<Mutex<…>>` so a click
+    /// in the picker updates the chrome on the next paint.
+    pub(crate) chrome_variant: crate::focused_chrome::ChromeVariant,
 }
 
 impl<'a> Behavior<PaneId> for TabBehavior<'a> {
@@ -73,8 +78,9 @@ impl<'a> Behavior<PaneId> for TabBehavior<'a> {
         // out the rule: assume any UI element can render twice in
         // a frame and salt accordingly.
         let modal_open = self.modal_open;
+        let chrome_variant = self.chrome_variant;
         ui.push_id(("pane", pane_id.0), |ui| {
-            render_pane(ui, self.ctx, slot, self.home, modal_open);
+            render_pane(ui, self.ctx, slot, self.home, modal_open, chrome_variant);
         });
         UiResponse::None
     }

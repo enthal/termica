@@ -472,6 +472,7 @@ pub fn render_pane(
     slot: &mut PaneSlot,
     home: Option<&Path>,
     modal_open: bool,
+    chrome_variant: crate::focused_chrome::ChromeVariant,
 ) {
     // Input routing in a multi-pane world:
     //
@@ -1016,22 +1017,34 @@ pub fn render_pane(
             );
         }
 
-        // Focused-editor chrome (picker variant `dim-white-round-rect`):
-        // a dim grey-white rounded outline that wraps the chip bar +
-        // editor body together, drawn ONLY when the same caret-active
-        // predicate fires. The visual says "this editor will receive
-        // your next keypress" — same situation that grows the caret.
+        // Focused-editor chrome. Dispatched via the
+        // [`crate::focused_chrome::paint`] table so the second
+        // OS window (chrome picker) can swap the variant live.
+        // The chip bar + editor are wrapped as a single visual
+        // unit — the user asked for "include the chip bar."
+        //
+        // Wraparound fix: paint into a painter whose clip rect is
+        // the full screen rather than `ui`'s clip. The footer
+        // block's natural clip stops at the pane's bottom edge,
+        // which is exactly where the chrome's bottom stroke
+        // landed before — getting clipped off. Re-clipping to the
+        // viewport (the chrome only ever expands a few px outside
+        // the body) ensures all four sides render.
         if caret_active {
+            let chip_rect = if has_prompt_cwd {
+                Some(egui::Rect::from_min_size(
+                    footer_origin,
+                    egui::vec2(ui.available_width(), chip_h),
+                ))
+            } else {
+                None
+            };
             let combined = egui::Rect::from_min_size(
                 footer_origin,
                 egui::vec2(ui.available_width(), chip_h + editor_h),
             );
-            ui.painter().rect_stroke(
-                combined.expand(2.0),
-                6.0,
-                egui::Stroke::new(1.0, render::FOCUSED_EDITOR_CHROME_COLOR),
-                egui::StrokeKind::Outside,
-            );
+            let unclipped = ui.painter().clone().with_clip_rect(ui.ctx().viewport_rect());
+            crate::focused_chrome::paint(&unclipped, chip_rect, combined, chrome_variant);
         }
 
         Some(editor_rect)
