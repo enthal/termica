@@ -887,19 +887,29 @@ pub(crate) fn show_chrome_picker_viewport(
         }
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Focused-editor chrome");
-            ui.weak("Click a variant — the main window updates immediately.");
+            ui.weak("Click a variant — the main window updates immediately and reclaims keyboard focus so you can keep typing.");
             ui.weak("Close this window when you're done.");
             ui.separator();
             let current = *variant.lock().expect("chrome variant mutex");
+            let mut picked = false;
             for (v, _id, label) in crate::focused_chrome::ChromeVariant::ALL {
                 let is_selected = *v == current;
                 let resp = ui.selectable_label(is_selected, *label);
                 if resp.clicked() {
                     *variant.lock().expect("chrome variant mutex") = *v;
+                    picked = true;
                 }
             }
             ui.add_space(8.0);
             ui.weak(format!("current: {} ({})", current.label(), current.id()));
+            // Return OS focus to the main Termica window after every
+            // pick so the user's typing lands in the prompt editor
+            // instead of getting stuck in the picker. Without this,
+            // clicking a variant grabs window focus per OS convention
+            // and the user has to manually re-click the main window.
+            if picked {
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+            }
         });
     });
 }
