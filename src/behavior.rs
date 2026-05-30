@@ -125,15 +125,19 @@ impl<'a> Behavior<PaneId> for TabBehavior<'a> {
     }
 
     fn resize_stroke(&self, style: &egui::Style, resize_state: ResizeState) -> egui::Stroke {
-        // egui_tiles' default `Idle` stroke uses `tab_bar_color`,
-        // which in dark mode is `extreme_bg_color` — near-black.
-        // With our widened 16 px gap, that paints a wide black
-        // stripe between panes that reads as a bug. Blend the
-        // idle gap with `panel_fill` so it becomes invisible;
-        // keep the bright hover / drag strokes egui's defaults so
-        // the splitter still affords interaction on hover.
+        // egui_tiles' splitter stroke is painted AFTER each pane's
+        // contents (and the focused-editor chrome that extends a
+        // few px into the gap via `CHROME_OUTER_OVERHANG`). A
+        // non-transparent idle stroke overpaints that overhang,
+        // visibly occluding the chrome where it crosses the gap.
+        // `panel_fill` matches the panel bg color, but the OPAQUE
+        // stroke still wins — colored or not, it sits over the
+        // chrome. Transparent stroke when idle: nothing is painted,
+        // chrome stays visible. Bright hover / drag strokes still
+        // appear because those wins are what makes the splitter
+        // affordance discoverable.
         match resize_state {
-            ResizeState::Idle => egui::Stroke::new(self.gap_width(style), style.visuals.panel_fill),
+            ResizeState::Idle => egui::Stroke::new(0.0, egui::Color32::TRANSPARENT),
             ResizeState::Hovering => style.visuals.widgets.hovered.fg_stroke,
             ResizeState::Dragging => style.visuals.widgets.active.fg_stroke,
         }

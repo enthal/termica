@@ -287,6 +287,17 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
             } else {
                 modifiers.ctrl && !modifiers.alt && matches!(key, Key::Delete)
             };
+            // Delete-to-line-start: macOS Cmd+Backspace (= the
+            // platform's `cmd+delete` per Apple's nomenclature),
+            // Linux/Windows Ctrl+U (readline / emacs convention).
+            // Joins onto the previous line when the caret is at the
+            // start of a non-first line; no-op at byte 0 of the
+            // buffer.
+            let delete_to_line_start = if is_macos {
+                modifiers.command && !modifiers.alt && matches!(key, Key::Backspace)
+            } else {
+                modifiers.ctrl && !modifiers.alt && !modifiers.shift && matches!(key, Key::U)
+            };
             if word_delete_left {
                 slot.session.clear_history_recall();
                 if let Some(editor) = slot.session.editor_mut() {
@@ -298,6 +309,13 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
                 slot.session.clear_history_recall();
                 if let Some(editor) = slot.session.editor_mut() {
                     editor.delete_word_right();
+                }
+                return true;
+            }
+            if delete_to_line_start {
+                slot.session.clear_history_recall();
+                if let Some(editor) = slot.session.editor_mut() {
+                    editor.delete_to_line_start();
                 }
                 return true;
             }

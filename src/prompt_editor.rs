@@ -276,6 +276,37 @@ impl PromptEditor {
         self.cursor = start;
     }
 
+    /// Delete from the caret to the **start of the current line**.
+    /// If the caret already sits at the start of a non-first line,
+    /// delete the preceding newline (= join the current line with
+    /// the previous one). No-op at byte 0 of the buffer. Bound to
+    /// `Cmd+Delete` (macOS) and `Ctrl+Delete` is reserved for the
+    /// existing `delete_word_right`, so this lands as Cmd-only.
+    /// Standard macOS text-field behavior.
+    pub fn delete_to_line_start(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        if self.cursor == 0 {
+            return;
+        }
+        let line_start = self.text[..self.cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        if line_start == self.cursor {
+            // Caret is at the start of a non-first line — eat the
+            // preceding `\n` so the current line joins the previous
+            // one. `prev_char_boundary` would do the same for a
+            // single ASCII byte; we use it for safety in case the
+            // newline ever became a multi-byte unicode line break.
+            let prev = prev_char_boundary(&self.text, self.cursor);
+            self.text.replace_range(prev..self.cursor, "");
+            self.cursor = prev;
+        } else {
+            self.text.replace_range(line_start..self.cursor, "");
+            self.cursor = line_start;
+        }
+        self.selection_anchor = None;
+    }
+
     /// Delete from the cursor forward to the end of the next word.
     /// Mirror of [`Self::delete_word_left`] for Option+Fn+Delete
     /// (macOS) / Ctrl+Delete (Linux). No-op at end of buffer.
@@ -773,6 +804,73 @@ mod tests {
     }
 
     // ---- delete ------------------------------------------------------
+
+    #[test]
+    fn delete_to_line_start_drops_text_left_of_caret_on_single_line() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hello world");
+        e.move_home();
+        e.move_right(); // cursor at byte 1 ("h|ello world")
+        e.move_right(); // byte 2
+        e.move_right(); // byte 3 ("hel|lo world")
+        e.delete_to_line_start();
+        assert_eq!(e.text(), "lo world");
+        assert_eq!(e.cursor(), 0);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn delete_to_line_start_at_byte_zero_is_noop() {
+        // Don't crash at the very start of the buffer.
+        let mut e = PromptEditor::new();
+        e.insert_str("hello");
+        e.move_home();
+        e.delete_to_line_start();
+        assert_eq!(e.text(), "hello");
+        assert_eq!(e.cursor(), 0);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn delete_to_line_start_at_start_of_non_first_line_joins_lines() {
+        // Caret at the very start of the SECOND line — should
+        // delete the preceding newline so the second line joins
+        // the first.
+        let mut e = PromptEditor::new();
+        e.insert_str("one\ntwo");
+        e.move_home(); // cursor at start of "two" (byte 4)
+        assert_eq!(e.cursor(), 4);
+        e.delete_to_line_start();
+        assert_eq!(e.text(), "onetwo");
+        // Caret should now sit at the join point (where the
+        // newline was).
+        assert_eq!(e.cursor(), 3);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn delete_to_line_start_deletes_only_within_current_line_on_multiline() {
+        // Caret mid-second-line; the FIRST line stays untouched.
+        let mut e = PromptEditor::new();
+        e.insert_str("one\ntwo");
+        // Move to mid of second line ("tw|o"): byte index 6.
+        e.move_left(); // 6
+        e.delete_to_line_start();
+        assert_eq!(e.text(), "one\no");
+        assert_eq!(e.cursor(), 4);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn delete_to_line_start_drops_active_selection() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hello world");
+        e.select_all();
+        e.delete_to_line_start();
+        assert_eq!(e.text(), "");
+        assert_eq!(e.cursor(), 0);
+        assert_invariant(&e);
+    }
 
     #[test]
     fn backspace_at_byte_zero_is_noop() {

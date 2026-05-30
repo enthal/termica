@@ -673,12 +673,11 @@ impl PaneSession {
 
     /// Demote the pane out of `ShellPromptEditor` back to
     /// `RawTerminal` (the canonical "Esc on the editor" gesture per
-    /// spec/05). Clears the editor buffer so the next promotion
-    /// starts fresh. No-op when not in `ShellPromptEditor`.
+    /// spec/05). Preserves the editor buffer so a stray Esc doesn't
+    /// nuke what the user just typed — they can promote back into
+    /// the editor (the next `Precmd`) and pick up where they left
+    /// off. No-op when not in `ShellPromptEditor`.
     pub fn leave_editor_esc(&mut self) {
-        if let Some(editor) = self.blocks.editor_on_tail_mut() {
-            editor.clear();
-        }
         self.controller.leave_editor_esc(self.frame);
         // Record the transition into the dump-events file so the
         // user-initiated demote shows up in diagnostics.
