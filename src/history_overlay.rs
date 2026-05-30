@@ -204,7 +204,11 @@ pub fn paint_overlay(
                 ui.horizontal(|ui| {
                     ui.strong("Ctrl-R");
                     ui.label(format!("scope: {scope_text}"));
-                    ui.weak("(Tab toggles scope · Enter submits · Esc cancels)");
+                    // Push the keybinding hint to the right edge so
+                    // the leading title isn't crowded against it.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.weak("(Tab toggles scope · Enter submits · Esc cancels)");
+                    });
                 });
                 let prev_query = overlay.query.clone();
                 let resp = ui.add(
@@ -356,30 +360,48 @@ fn paint_clickable_row(
     let inner = frame.show(ui, |ui| {
         ui.set_width(panel_w);
         ui.vertical(|ui| {
-            // Command text — highlight the matched substring.
+            // Command text — replace newlines with ↲ so the row stays
+            // single-line; highlight matched substring on the display
+            // string (the same string the user can see, so match
+            // ranges line up visually).
+            let display = display_text_for_command(text);
             let job = highlight_layout_job(
-                text,
+                &display,
                 query,
                 command_base_format(ui),
                 command_match_format(ui),
             );
             ui.label(job);
 
-            // Meta line: age (with hover for full) · cwd · exit · source.
-            let (age_short, age_full) = format_age(now_ms, started_at_ms);
+            // Meta line. Age FIRST (with hover for the full form),
+            // but only when the row carries a real timestamp.
+            // Replayed shell-history entries that had no per-entry
+            // timestamp are synthesized as `started_at_ms <= 0` —
+            // showing them as "56y ago" is just noise.
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                ui.weak(age_short).on_hover_text(age_full);
+                let mut wrote_meta = false;
+                if started_at_ms > 0 {
+                    let (age_short, age_full) = format_age(now_ms, started_at_ms);
+                    ui.weak(age_short).on_hover_text(age_full);
+                    wrote_meta = true;
+                }
+                let mut bullet = |ui: &mut egui::Ui| {
+                    if wrote_meta {
+                        ui.weak("·");
+                    }
+                    wrote_meta = true;
+                };
                 if let Some(c) = cwd {
-                    ui.weak("·");
+                    bullet(ui);
                     ui.weak(c);
                 }
                 if let Some(code) = exit_code {
-                    ui.weak("·");
+                    bullet(ui);
                     ui.weak(format!("exit {code}"));
                 }
                 if source != "termica" {
-                    ui.weak("·");
+                    bullet(ui);
                     ui.weak(source);
                 }
             });
@@ -397,23 +419,42 @@ fn command_base_format(ui: &egui::Ui) -> egui::TextFormat {
     }
 }
 
-fn command_match_format(ui: &egui::Ui) -> egui::TextFormat {
+/// Bright warm gold for matched runs — meant to stand out clearly
+/// against the white command text. Empirically the egui selection
+/// fill (cool navy) gets washed out next to monospace white;
+/// switching to a saturated warm color reads as a real highlight
+/// rather than a hover state.
+const MATCH_HIGHLIGHT: egui::Color32 = egui::Color32::from_rgb(255, 215, 90);
+
+fn command_match_format(_ui: &egui::Ui) -> egui::TextFormat {
     egui::TextFormat {
         font_id: egui::FontId::monospace(13.0),
-        color: ui.visuals().selection.bg_fill,
-        underline: egui::Stroke::new(1.0, ui.visuals().selection.bg_fill),
+        color: MATCH_HIGHLIGHT,
+        underline: egui::Stroke::new(1.5, MATCH_HIGHLIGHT),
         ..Default::default()
     }
 }
 
+/// "Newline-collapsed" display form of a command. The `runs` table
+/// stores commands with their literal newlines (a here-doc, a
+/// for-loop, …); rendering them as N visual lines in a list of
+/// rows would explode row height. Replace each `\n` with a
+/// "downward arrow with tip leftwards" glyph (U+21B2) with one
+/// space on each side so it reads as a separator without crowding.
+pub fn display_text_for_command(text: &str) -> String {
+    text.replace('\n', " ↲ ")
+}
+
 /// Build a [`LayoutJob`] for `text` where every case-insensitive
-/// occurrence of `query` is rendered with `match_format` and the
-/// rest with `base_format`. Empty query → the whole string in
-/// `base_format`. Public-in-module for testability; the matching
-/// is byte-substring on the lowercase form, with a char-boundary
-/// guard so non-ASCII text that happens to change byte length on
-/// lowercase falls back to the plain base format instead of
-/// panicking.
+/// occurrence of any word in `query` is rendered with `hit` and
+/// the rest with `base`. The query is whitespace-split before
+/// matching — `"echo that"` highlights every `echo` AND every
+/// `that` in the text. Empty query → the whole string in `base`.
+///
+/// Matching is byte-substring on the lowercase form with a
+/// char-boundary guard, so non-ASCII text that happens to change
+/// byte length on lowercase falls back to plain rendering instead
+/// of panicking.
 fn highlight_layout_job(
     text: &str,
     query: &str,
@@ -421,43 +462,72 @@ fn highlight_layout_job(
     hit: egui::TextFormat,
 ) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
-    if query.is_empty() {
+    let words = split_query_words(query);
+    if words.is_empty() {
         job.append(text, 0.0, base);
         return job;
     }
-    let needle = query.to_lowercase();
     let hay = text.to_lowercase();
     if hay.len() != text.len() {
-        // Lowercase changed byte length somewhere — slicing the
-        // original by lowercase byte offsets is no longer safe.
-        // Render plain.
+        // Lowercase changed byte length — slicing the original by
+        // lowercase byte offsets is no longer safe. Render plain.
         job.append(text, 0.0, base);
         return job;
     }
-    let n_len = needle.len();
-    let mut cursor = 0;
-    while cursor < text.len() {
-        match hay[cursor..].find(&needle) {
-            Some(rel) => {
-                let abs = cursor + rel;
-                let end = abs + n_len;
-                if !text.is_char_boundary(abs) || !text.is_char_boundary(end) {
-                    job.append(&text[cursor..], 0.0, base);
-                    return job;
+    // Collect every match range across every word.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for w in &words {
+        let mut cursor = 0;
+        while cursor < hay.len() {
+            match hay[cursor..].find(w.as_str()) {
+                Some(rel) => {
+                    let abs = cursor + rel;
+                    let end = abs + w.len();
+                    if text.is_char_boundary(abs) && text.is_char_boundary(end) {
+                        ranges.push((abs, end));
+                    }
+                    cursor = end;
                 }
-                if abs > cursor {
-                    job.append(&text[cursor..abs], 0.0, base.clone());
-                }
-                job.append(&text[abs..end], 0.0, hit.clone());
-                cursor = end;
-            }
-            None => {
-                job.append(&text[cursor..], 0.0, base);
-                break;
+                None => break,
             }
         }
     }
+    if ranges.is_empty() {
+        job.append(text, 0.0, base);
+        return job;
+    }
+    ranges.sort();
+    // Merge overlapping / touching ranges so a word that overlaps
+    // another (e.g. "ab" and "bc" against "abc") renders as one
+    // contiguous highlight span instead of two adjacent ones.
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (s, e) in ranges {
+        match merged.last_mut() {
+            Some(last) if last.1 >= s => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    let mut cursor = 0;
+    for (s, e) in merged {
+        if s > cursor {
+            job.append(&text[cursor..s], 0.0, base.clone());
+        }
+        job.append(&text[s..e], 0.0, hit.clone());
+        cursor = e;
+    }
+    if cursor < text.len() {
+        job.append(&text[cursor..], 0.0, base);
+    }
     job
+}
+
+/// Lowercase whitespace-split of `query` — the canonical word
+/// list both `highlight_layout_job` (display) and
+/// [`crate::history::search::rank`] (filter + score) iterate.
+/// Public for tests + so the ranker uses the exact same tokens
+/// that get highlighted.
+pub fn split_query_words(query: &str) -> Vec<String> {
+    query.split_whitespace().map(|w| w.to_lowercase()).collect()
 }
 
 /// Render a unix-ms timestamp relative to `now_ms` as `(short, full)`.
@@ -728,6 +798,39 @@ mod tests {
     fn highlight_no_match_is_one_base_section() {
         let job = highlight_layout_job("ls -la", "xyz", base_fmt(), hit_fmt());
         assert_eq!(job_sections(&job), vec![("ls -la".into(), false)]);
+    }
+
+    #[test]
+    fn highlight_multiple_words_each_run_highlighted() {
+        // Query "echo that" — every `echo` AND every `that` should
+        // light up, with the un-matched runs between them in base.
+        let job =
+            highlight_layout_job("echo this that the other", "echo that", base_fmt(), hit_fmt());
+        assert_eq!(
+            job_sections(&job),
+            vec![
+                ("echo".into(), true),
+                (" this ".into(), false),
+                ("that".into(), true),
+                (" the other".into(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn highlight_word_split_skips_whitespace_only_tokens() {
+        // Extra spaces in the query produce no extra "words".
+        let job = highlight_layout_job("echo bar", "  echo   ", base_fmt(), hit_fmt());
+        assert_eq!(job_sections(&job), vec![("echo".into(), true), (" bar".into(), false)]);
+    }
+
+    #[test]
+    fn highlight_overlapping_matches_merge_into_one_run() {
+        // Query words "ab" and "bc" — the two overlapping ranges
+        // (0..2 and 1..3) inside "abc" should merge into one
+        // highlighted run "abc" rather than emit two adjacent.
+        let job = highlight_layout_job("abc def", "ab bc", base_fmt(), hit_fmt());
+        assert_eq!(job_sections(&job), vec![("abc".into(), true), (" def".into(), false)]);
     }
 
     #[test]

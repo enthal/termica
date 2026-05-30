@@ -49,6 +49,7 @@ pub mod selection;
 pub mod shell;
 pub mod shell_syntax;
 pub mod terminal;
+pub mod visual_picker;
 
 mod app;
 mod behavior;

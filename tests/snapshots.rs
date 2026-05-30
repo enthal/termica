@@ -804,6 +804,38 @@ fn snapshot_history_overlay_with_filter_typed() {
 }
 
 #[test]
+fn snapshot_history_overlay_word_split_and_replayed_and_multiline() {
+    // One snapshot covers three behaviors at once so a future
+    // reader sees them composed:
+    //   - Word-split query "echo that" highlights BOTH words.
+    //   - The replayed `zsh` row has `started_at_ms < 0` so no age
+    //     column renders — just `zsh`.
+    //   - A multi-line command is folded to a single line with
+    //     "↲" glyphs replacing the embedded newlines.
+    let mut overlay = overlay_with_entries(
+        "echo that",
+        0,
+        termica::history_overlay::OverlayScope::Global,
+        vec![
+            entry(
+                "echo this that the other",
+                SNAP_NOW_MS - 3 * MIN,
+                Some("~/git/enthal/termica"),
+                Some(0),
+                "termica",
+            ),
+            entry("echo that\necho more", SNAP_NOW_MS - 12 * MIN, None, Some(0), "termica"),
+            entry("echo something else that exists", -2, None, None, "zsh"),
+        ],
+    );
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(1100.0, 720.0)).build_ui(move |ui| {
+            let _ = termica::history_overlay::paint_overlay(ui, &mut overlay, 1, None, SNAP_NOW_MS);
+        });
+    harness.snapshot("history_overlay_word_split_replayed_multiline");
+}
+
+#[test]
 fn snapshot_history_overlay_match_highlight_inside_command() {
     // Pwd-in-PWD case from spec: query "pwd" matches "echo $PWD"
     // case-insensitively. The "PWD" run renders in selection
