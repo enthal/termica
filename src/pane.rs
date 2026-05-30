@@ -377,12 +377,23 @@ impl PaneSession {
             // program owning the screen, so any latent alt-screen
             // must be cleared. Feed the exit sequence into the
             // alacritty parser so it processes the transition the
-            // normal way (clears flag, restores grid). No-op when
-            // alt-screen is already off.
+            // normal way (clears flag, restores grid), THEN notify
+            // the controller of the alt-screen drop synchronously —
+            // this is the load-bearing detail: the controller is
+            // still in `AlternateScreen` mode at this point, and the
+            // `try_promote_to_editor` call inside `observe_event`
+            // below requires `RawTerminal`. Without the synchronous
+            // edge notification, the post-loop edge-detect would
+            // drop alt-screen mode AFTER the Precmd was already
+            // consumed, leaving the pane stranded in `RawTerminal`
+            // with no editor. No-op when alt-screen is already off.
             if matches!(event, crate::markers::LifecycleEvent::Precmd { .. })
                 && self.terminal.is_alternate_screen()
             {
                 self.terminal.feed(b"\x1b[?1049l");
+                self.controller.observe_alt_screen(false, self.frame);
+                self.last_alt_screen = false;
+                self.record_pending_transitions();
             }
             // Phase 4J: persist Preexec → record_submit and
             // CommandFinished → record_finish. No-op if history is
@@ -1530,6 +1541,122 @@ mod tests {
             session.drain();
             assert!(session.is_exited());
         }
+    }
+
+    #[test]
+    fn precmd_after_unrecovered_alt_screen_clears_alt_screen_flag() {
+        // Strict-layer regression: when a foreground program enters
+        // the alt-screen (`\e[?1049h`) and exits WITHOUT emitting the
+        // matching `\e[?1049l` (real-world: `less q` on macOS, vim
+        // crash, ssh disconnect), the shell's next `precmd` marker
+        // MUST be enough to drop the zombie alt-screen flag AND
+        // promote back to the editor. Otherwise the editor footer
+        // paints over a stale alt-grid and `Esc` unmasks it.
+        //
+        // The order of bytes from the shell, with a deliberate sleep
+        // between the alt-screen entry and the second precmd so the
+        // pane-mode machine has time to observe the alt-screen edge
+        // (this is the realistic ordering: a frame tick happens
+        // while less is running):
+        //   1. integration_ready  →  RawTerminal
+        //   2. precmd             →  ShellPromptEditor (first prompt)
+        //   3. \e[?1049h          →  alt-screen flag goes ON; the
+        //                            edge-detect in drain() then
+        //                            transitions controller →
+        //                            AlternateScreen (THIS is what
+        //                            breaks naive Precmd-time
+        //                            recovery: try_promote_to_editor
+        //                            won't fire from AlternateScreen)
+        //   4. sleep 0.2          →  give the polling loop multiple
+        //                            drain cycles in alt-screen mode
+        //   5. precmd AGAIN       →  must (a) clear the alt-screen
+        //                            flag, (b) drop controller back
+        //                            to RawTerminal, (c) re-promote
+        //                            to ShellPromptEditor
+        // Three printf bursts separated by short sleeps mirror the
+        // real shell flow:
+        //   burst 1: integration_ready + first precmd  (→ editor)
+        //   burst 2: preexec + 1049h                   (→ alt-screen)
+        //   burst 3: second precmd, NO matching 1049l  (→ zombie)
+        // Without sleeps the bursts collapse into a single drain
+        // and the alt-screen excursion is hidden by the recovery,
+        // which doesn't reproduce the bug at all.
+        // Three printf bursts separated by short sleeps mirror the
+        // real shell flow:
+        //   burst 1: integration_ready + first precmd  (→ editor)
+        //   burst 2: preexec + 1049h                   (→ alt-screen)
+        //   burst 3: command_finished + second precmd, NO 1049l
+        //                                              (→ zombie)
+        // Without sleeps the bursts collapse into a single drain
+        // and the alt-screen excursion is hidden by the recovery,
+        // which doesn't reproduce the bug at all.
+        let cmd = "printf '\\033PTermica;{\"type\":\"integration_ready\",\
+                   \"session\":\"t\",\"value\":{\"shell\":\"zsh\",\"version\":1}}\\033\\\\\
+                   \\033PTermica;{\"type\":\"precmd\",\
+                   \"session\":\"t\",\"value\":\"/tmp\"}\\033\\\\'; \
+                   sleep 0.2; \
+                   printf '\\033PTermica;{\"type\":\"preexec\",\
+                   \"session\":\"t\",\"value\":\"less foo\"}\\033\\\\\
+                   \\033[?1049h'; \
+                   sleep 0.2; \
+                   printf '\\033PTermica;{\"type\":\"command_finished\",\
+                   \"session\":\"t\",\"value\":0}\\033\\\\\
+                   \\033PTermica;{\"type\":\"precmd\",\
+                   \"session\":\"t\",\"value\":\"/tmp\"}\\033\\\\'; \
+                   sleep 5";
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c(cmd), "t".into(), 0, None).expect("spawn");
+
+        // Confirm the realistic intermediate state: the controller
+        // entered AlternateScreen mode after 1049h. If we ever skip
+        // this state in the test (because the second precmd arrived
+        // in the same drain as 1049h), the test isn't exercising the
+        // bug.
+        let intermediate_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            session.drain();
+            if session.controller.mode() == PaneMode::AlternateScreen {
+                break;
+            }
+            if Instant::now() >= intermediate_deadline {
+                panic!(
+                    "test scaffolding: never reached AlternateScreen mode after 1049h; \
+                     got mode={:?}",
+                    session.controller.mode(),
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // Now spin drain() until the second precmd has been observed
+        // AND we are back to the editor with the alt-screen flag
+        // cleared.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            session.drain();
+            if session.editor_is_active() && !session.terminal.is_alternate_screen() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "after two precmds with a hung 1049h in between, expected \
+                     editor_is_active=true and alt_screen=false; got \
+                     editor_is_active={}, alt_screen={}, mode={:?}",
+                    session.editor_is_active(),
+                    session.terminal.is_alternate_screen(),
+                    session.controller.mode(),
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Belt + braces — the view snapshot the renderer consumes
+        // must also report alt_screen=false (it reads
+        // is_alternate_screen() inline, so this is a sanity check on
+        // the snapshot path).
+        assert!(
+            !session.view().alt_screen,
+            "view.alt_screen should be false after Precmd recovery"
+        );
     }
 
     #[test]
