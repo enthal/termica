@@ -328,6 +328,22 @@ impl PaneSession {
         self.controller.tick_bootstrap_timeout(self.frame);
         self.record_pending_transitions();
 
+        // Sync the controller's alt-screen view BEFORE any
+        // lifecycle event runs. The bytes above may have toggled
+        // alacritty's alt-screen flag (`1049h` / `1049l`) — without
+        // catching that here, a `Precmd` event later in this drain
+        // would call `try_promote_to_editor` while the controller
+        // is still in stale `AlternateScreen` mode and refuse to
+        // promote (it requires `RawTerminal`). The post-loop
+        // edge-detect below still runs to catch any `1049h` that
+        // arrived without a matching event in this batch.
+        let alt = self.terminal.is_alternate_screen();
+        if alt != self.last_alt_screen {
+            self.controller.observe_alt_screen(alt, self.frame);
+            self.last_alt_screen = alt;
+            self.record_pending_transitions();
+        }
+
         // Feed lifecycle events extracted from the byte stream into
         // the controller AND the block stack. Order is preserved
         // per spec/03. The block stack reads the terminal snapshot
@@ -1657,6 +1673,84 @@ mod tests {
             !session.view().alt_screen,
             "view.alt_screen should be false after Precmd recovery"
         );
+    }
+
+    #[test]
+    fn precmd_in_same_burst_as_1049l_still_promotes_to_editor() {
+        // Companion to the no-1049l zombie test, gating the
+        // intermittent variant the user reported: even when the
+        // foreground program DID emit `\e[?1049l` cleanly, if those
+        // bytes arrive in the same PTY chunk as `command_finished
+        // + precmd + PS1`, alacritty's alt-screen flag goes off
+        // mid-feed BUT the controller is still in
+        // `AlternateScreen` mode when the Precmd event runs
+        // `try_promote_to_editor` (the post-loop edge-detect
+        // hasn't run yet). Promotion was refused; editor never
+        // came back. The fix is to sync the controller's alt-
+        // screen view BEFORE the event loop so Precmd promotion
+        // sees the up-to-date mode.
+        //
+        // Burst sequence:
+        //   burst 1: integration_ready + first precmd  (→ editor)
+        //   burst 2: preexec + 1049h                   (→ alt-screen)
+        //   burst 3: 1049l + command_finished + precmd (→ should
+        //                                               restore
+        //                                               editor)
+        let cmd = "printf '\\033PTermica;{\"type\":\"integration_ready\",\
+                   \"session\":\"t\",\"value\":{\"shell\":\"zsh\",\"version\":1}}\\033\\\\\
+                   \\033PTermica;{\"type\":\"precmd\",\
+                   \"session\":\"t\",\"value\":\"/tmp\"}\\033\\\\'; \
+                   sleep 0.2; \
+                   printf '\\033PTermica;{\"type\":\"preexec\",\
+                   \"session\":\"t\",\"value\":\"less foo\"}\\033\\\\\
+                   \\033[?1049h'; \
+                   sleep 0.2; \
+                   printf '\\033[?1049l\
+                   \\033PTermica;{\"type\":\"command_finished\",\
+                   \"session\":\"t\",\"value\":0}\\033\\\\\
+                   \\033PTermica;{\"type\":\"precmd\",\
+                   \"session\":\"t\",\"value\":\"/tmp\"}\\033\\\\'; \
+                   sleep 5";
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c(cmd), "t".into(), 0, None).expect("spawn");
+
+        // Confirm we entered AlternateScreen mode (mirror the
+        // other zombie test's scaffolding so a chunking surprise
+        // can't silently degrade coverage).
+        let intermediate_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            session.drain();
+            if session.controller.mode() == PaneMode::AlternateScreen {
+                break;
+            }
+            if Instant::now() >= intermediate_deadline {
+                panic!(
+                    "test scaffolding: never reached AlternateScreen mode after 1049h; \
+                     got mode={:?}",
+                    session.controller.mode(),
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            session.drain();
+            if session.editor_is_active() && !session.terminal.is_alternate_screen() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "after a clean 1049l burst with command_finished+precmd in the \
+                     same chunk, expected editor_is_active=true and alt_screen=false; \
+                     got editor_is_active={}, alt_screen={}, mode={:?}",
+                    session.editor_is_active(),
+                    session.terminal.is_alternate_screen(),
+                    session.controller.mode(),
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
