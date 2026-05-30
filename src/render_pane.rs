@@ -316,16 +316,24 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
             // the live `Term` — visible noise. `Ctrl+C` (`\x03`,
             // SIGINT) and `Ctrl+D` (`\x04`, EOF) deliberately stay
             // PTY-bound per spec/04.
-            // `Ctrl+R` opens the history overlay; the rest still
-            // get swallowed (see comment above) until 4I / 4J PRs
-            // wire completion + Ctrl+P/N walk variants.
+            // `Ctrl+R` opens the history overlay. If the editor
+            // already has text, prefill the search box with it so
+            // a partial command pre-narrows the results — same UX
+            // as zsh's incremental history-search-backward.
             if modifiers.ctrl && !modifiers.shift && matches!(key, Key::R) {
                 if let Some(history) = slot.session.history_ctx().cloned()
-                    && let Some(overlay) = crate::history_overlay::HistoryOverlay::open(
+                    && let Some(mut overlay) = crate::history_overlay::HistoryOverlay::open(
                         &history,
                         slot.session.pane_id(),
                     )
                 {
+                    let prefill =
+                        slot.session.editor_mut().map(|e| e.text().to_string()).unwrap_or_default();
+                    if !prefill.is_empty() {
+                        overlay.query = prefill;
+                        let cwd = slot.session.terminal().cwd().map(|p| p.display().to_string());
+                        overlay.rerank(cwd.as_deref());
+                    }
                     slot.ui.history_overlay = Some(overlay);
                 }
                 return true;
@@ -1614,9 +1622,18 @@ pub fn render_pane(
             OverlayAction::Submit(text) => {
                 slot.session.replace_editor_buffer(&text);
                 slot.ui.history_overlay = None;
+                // Submit closes the overlay; the keyboard belongs
+                // to THIS pane's editor (we just dropped a command
+                // into it). Without this, egui's focus migrates
+                // to whichever widget gets activated next — in a
+                // split-screen layout that's typically the first
+                // tile's active tab, NOT the pane the user just
+                // submitted into.
+                slot.ui.needs_focus = true;
             }
             OverlayAction::Cancel => {
                 slot.ui.history_overlay = None;
+                slot.ui.needs_focus = true;
             }
             OverlayAction::ToggleScope => {
                 if let Some(history) = slot.session.history_ctx().cloned()

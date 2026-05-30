@@ -681,6 +681,17 @@ fn snapshot_paint_sealed_block_with_selection_in_command_only() {
 
 // ---- Ctrl+R history overlay (Phase 4J PR 6) -----------------------------
 
+/// Fixed `now` used by every overlay snapshot — every entry's
+/// `started_at_ms` is expressed as an offset from this so the age
+/// formatter renders deterministically. Concrete value chosen to
+/// keep readers from squinting at a 13-digit epoch.
+const SNAP_NOW_MS: i64 = 1_700_000_000_000;
+
+const SEC: i64 = 1_000;
+const MIN: i64 = 60 * SEC;
+const HOUR: i64 = 60 * MIN;
+const DAY: i64 = 24 * HOUR;
+
 /// Build a synthetic [`HistoryOverlay`] with deterministic entries
 /// + initial state. Pure POD construction; no DB, no filesystem.
 fn overlay_with_entries(
@@ -723,64 +734,124 @@ fn entry(
 
 #[test]
 fn snapshot_history_overlay_empty_query_shows_all_entries() {
+    // Timestamps chosen to exercise every age-formatter branch:
+    // now / minutes / hours / yesterday / days / months / years.
     let mut overlay = overlay_with_entries(
         "",
         0,
         termica::history_overlay::OverlayScope::Global,
         vec![
-            entry("cargo test --workspace", 500, Some("~/git/enthal/termica"), Some(0), "termica"),
-            entry("git status", 400, Some("~/git/enthal/termica"), Some(0), "termica"),
-            entry("ls -la", 300, None, None, "zsh"),
-            entry("cd src", 200, None, None, "zsh"),
-            entry("vim CLAUDE.md", 100, None, None, "bash"),
+            entry(
+                "cargo test --workspace",
+                SNAP_NOW_MS - 30 * SEC,
+                Some("~/git/enthal/termica"),
+                Some(0),
+                "termica",
+            ),
+            entry(
+                "git status",
+                SNAP_NOW_MS - 4 * MIN,
+                Some("~/git/enthal/termica"),
+                Some(0),
+                "termica",
+            ),
+            entry("ls -la", SNAP_NOW_MS - 3 * HOUR, None, None, "zsh"),
+            entry("cd src", SNAP_NOW_MS - DAY, None, None, "zsh"),
+            entry("vim CLAUDE.md", SNAP_NOW_MS - 3 * DAY, None, None, "bash"),
+            entry("rustup update", SNAP_NOW_MS - 60 * DAY, None, None, "bash"),
+            entry("brew install fish", SNAP_NOW_MS - 400 * DAY, None, None, "bash"),
         ],
     );
     let mut harness =
-        Harness::builder().with_size(egui::Vec2::new(900.0, 600.0)).build_ui(move |ui| {
-            let _ = termica::history_overlay::paint_overlay(ui, &mut overlay, 1, None);
+        Harness::builder().with_size(egui::Vec2::new(1100.0, 720.0)).build_ui(move |ui| {
+            let _ = termica::history_overlay::paint_overlay(ui, &mut overlay, 1, None, SNAP_NOW_MS);
         });
     harness.snapshot("history_overlay_empty_query");
 }
 
 #[test]
 fn snapshot_history_overlay_with_filter_typed() {
-    // Query "cargo" narrows the list to two entries; selection
-    // sits at the top.
+    // Query "cargo" narrows the list to two entries; the matched
+    // substring renders in selection color + underline in each row.
     let mut overlay = overlay_with_entries(
         "cargo",
         0,
         termica::history_overlay::OverlayScope::Global,
         vec![
-            entry("cargo test --workspace", 500, Some("~/git/enthal/termica"), Some(0), "termica"),
-            entry("git status", 400, None, None, "termica"),
-            entry("cargo run --release", 300, Some("~/git/enthal/termica"), Some(0), "termica"),
-            entry("ls", 200, None, None, "zsh"),
+            entry(
+                "cargo test --workspace",
+                SNAP_NOW_MS - 2 * MIN,
+                Some("~/git/enthal/termica"),
+                Some(0),
+                "termica",
+            ),
+            entry("git status", SNAP_NOW_MS - 8 * MIN, None, None, "termica"),
+            entry(
+                "cargo run --release",
+                SNAP_NOW_MS - 45 * MIN,
+                Some("~/git/enthal/termica"),
+                Some(0),
+                "termica",
+            ),
+            entry("ls", SNAP_NOW_MS - 2 * HOUR, None, None, "zsh"),
         ],
     );
     let mut harness =
-        Harness::builder().with_size(egui::Vec2::new(900.0, 600.0)).build_ui(move |ui| {
-            let _ = termica::history_overlay::paint_overlay(ui, &mut overlay, 1, None);
+        Harness::builder().with_size(egui::Vec2::new(1100.0, 720.0)).build_ui(move |ui| {
+            let _ = termica::history_overlay::paint_overlay(ui, &mut overlay, 1, None, SNAP_NOW_MS);
         });
     harness.snapshot("history_overlay_with_filter");
 }
 
 #[test]
+fn snapshot_history_overlay_match_highlight_inside_command() {
+    // Pwd-in-PWD case from spec: query "pwd" matches "echo $PWD"
+    // case-insensitively. The "PWD" run renders in selection
+    // color + underline; the surrounding text stays plain.
+    let mut overlay = overlay_with_entries(
+        "pwd",
+        0,
+        termica::history_overlay::OverlayScope::Global,
+        vec![
+            entry("echo $PWD", SNAP_NOW_MS - 30 * SEC, None, None, "termica"),
+            entry("pwd", SNAP_NOW_MS - 5 * MIN, None, None, "termica"),
+            entry("echo \"pwd is $PWD\"", SNAP_NOW_MS - 12 * MIN, None, None, "termica"),
+        ],
+    );
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(1100.0, 720.0)).build_ui(move |ui| {
+            let _ = termica::history_overlay::paint_overlay(ui, &mut overlay, 1, None, SNAP_NOW_MS);
+        });
+    harness.snapshot("history_overlay_match_highlight");
+}
+
+#[test]
 fn snapshot_history_overlay_selected_second_row() {
-    // Same content as the empty-query case, but the selection has
-    // moved down one — the highlight should follow.
     let mut overlay = overlay_with_entries(
         "",
         1,
         termica::history_overlay::OverlayScope::Global,
         vec![
-            entry("cargo test --workspace", 500, Some("~/git/enthal/termica"), Some(0), "termica"),
-            entry("git status", 400, Some("~/git/enthal/termica"), Some(0), "termica"),
-            entry("ls -la", 300, None, None, "zsh"),
+            entry(
+                "cargo test --workspace",
+                SNAP_NOW_MS - 30 * SEC,
+                Some("~/git/enthal/termica"),
+                Some(0),
+                "termica",
+            ),
+            entry(
+                "git status",
+                SNAP_NOW_MS - 4 * MIN,
+                Some("~/git/enthal/termica"),
+                Some(0),
+                "termica",
+            ),
+            entry("ls -la", SNAP_NOW_MS - 2 * HOUR, None, None, "zsh"),
         ],
     );
     let mut harness =
-        Harness::builder().with_size(egui::Vec2::new(900.0, 600.0)).build_ui(move |ui| {
-            let _ = termica::history_overlay::paint_overlay(ui, &mut overlay, 1, None);
+        Harness::builder().with_size(egui::Vec2::new(1100.0, 720.0)).build_ui(move |ui| {
+            let _ = termica::history_overlay::paint_overlay(ui, &mut overlay, 1, None, SNAP_NOW_MS);
         });
     harness.snapshot("history_overlay_selected_second_row");
 }
@@ -795,13 +866,13 @@ fn snapshot_history_overlay_pane_scope_no_matches() {
         0,
         termica::history_overlay::OverlayScope::Pane,
         vec![
-            entry("cargo test", 200, None, None, "termica"),
-            entry("ls", 100, None, None, "termica"),
+            entry("cargo test", SNAP_NOW_MS - 3 * MIN, None, None, "termica"),
+            entry("ls", SNAP_NOW_MS - 10 * MIN, None, None, "termica"),
         ],
     );
     let mut harness =
-        Harness::builder().with_size(egui::Vec2::new(900.0, 400.0)).build_ui(move |ui| {
-            let _ = termica::history_overlay::paint_overlay(ui, &mut overlay, 1, None);
+        Harness::builder().with_size(egui::Vec2::new(1100.0, 600.0)).build_ui(move |ui| {
+            let _ = termica::history_overlay::paint_overlay(ui, &mut overlay, 1, None, SNAP_NOW_MS);
         });
     harness.snapshot("history_overlay_pane_scope_no_matches");
 }

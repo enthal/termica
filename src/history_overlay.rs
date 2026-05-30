@@ -165,8 +165,16 @@ fn dedupe_by_text(entries: Vec<Entry>) -> Vec<Entry> {
 pub fn paint(ui: &mut egui::Ui, slot: &mut PaneSlot) -> Option<OverlayAction> {
     let pane_id = slot.session.pane_id();
     let current_cwd = slot.session.terminal().cwd().map(|p| p.display().to_string());
+    let now_ms = wall_clock_ms();
     let overlay = slot.ui.history_overlay.as_mut()?;
-    paint_overlay(ui, overlay, pane_id, current_cwd.as_deref())
+    paint_overlay(ui, overlay, pane_id, current_cwd.as_deref(), now_ms)
+}
+
+/// Wall-clock unix-ms for the production paint path. Tests use
+/// `paint_overlay` directly and supply a deterministic `now_ms`.
+fn wall_clock_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 /// The renderable inner of [`paint`], split out so snapshot tests
@@ -178,10 +186,12 @@ pub fn paint_overlay(
     overlay: &mut HistoryOverlay,
     pane_id: u64,
     current_cwd: Option<&str>,
+    now_ms: i64,
 ) -> Option<OverlayAction> {
     let area_id = ui.id().with(("history-overlay", pane_id));
     let screen_rect = ui.ctx().content_rect();
-    let panel_w = (screen_rect.width() * 0.6).clamp(360.0, 720.0);
+    let panel_w = (screen_rect.width() * 0.7).clamp(560.0, 1100.0);
+    let panel_min_h = (screen_rect.height() * 0.45).clamp(280.0, 520.0);
     let scope_text = scope_label(overlay.scope).to_string();
     let mut action: Option<OverlayAction> = None;
 
@@ -247,8 +257,9 @@ pub fn paint_overlay(
 
                 egui::ScrollArea::vertical()
                     .id_salt(("history-overlay-results", pane_id))
-                    .max_height(screen_rect.height() * 0.5)
-                    .auto_shrink([false, true])
+                    .min_scrolled_height(panel_min_h)
+                    .max_height(screen_rect.height() * 0.6)
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
                         if overlay.ranked.is_empty() {
                             ui.weak("(no matches)");
@@ -257,6 +268,7 @@ pub fn paint_overlay(
                         // Snapshot the row data so the result loop
                         // doesn't borrow `overlay` immutably while
                         // we also assign into `action` (mutable).
+                        let query = overlay.query.clone();
                         let rows: Vec<RowView> = overlay
                             .ranked
                             .iter()
@@ -269,6 +281,7 @@ pub fn paint_overlay(
                                     cwd: e.cwd.clone(),
                                     exit_code: e.exit_code,
                                     source: e.source.clone(),
+                                    started_at_ms: e.started_at_ms,
                                 })
                             })
                             .collect();
@@ -277,9 +290,12 @@ pub fn paint_overlay(
                             let clicked = paint_clickable_row(
                                 ui,
                                 &r.text,
+                                &query,
                                 r.cwd.as_deref(),
                                 r.exit_code,
                                 &r.source,
+                                r.started_at_ms,
+                                now_ms,
                                 is_selected,
                                 panel_w,
                             );
@@ -304,6 +320,7 @@ struct RowView {
     cwd: Option<String>,
     exit_code: Option<i32>,
     source: String,
+    started_at_ms: i64,
 }
 
 fn scope_label(s: OverlayScope) -> &'static str {
@@ -313,14 +330,21 @@ fn scope_label(s: OverlayScope) -> &'static str {
     }
 }
 
-/// Render one result row as a clickable area. Returns `true`
-/// when the user clicked it.
+/// Render one result row as a clickable area. The row body shows
+/// the command (with matching substring highlighted) followed by a
+/// meta line: compact age (with the full age string as a hover
+/// tooltip), then cwd, exit code, and source tag (`zsh`/`bash`/`fish`)
+/// when present. Returns `true` when the user clicked the row.
+#[allow(clippy::too_many_arguments)]
 fn paint_clickable_row(
     ui: &mut egui::Ui,
     text: &str,
+    query: &str,
     cwd: Option<&str>,
     exit_code: Option<i32>,
     source: &str,
+    started_at_ms: i64,
+    now_ms: i64,
     is_selected: bool,
     panel_w: f32,
 ) -> bool {
@@ -332,29 +356,149 @@ fn paint_clickable_row(
     let inner = frame.show(ui, |ui| {
         ui.set_width(panel_w);
         ui.vertical(|ui| {
-            ui.label(egui::RichText::new(text).monospace().strong());
-            let meta = format_meta(cwd, exit_code, source);
-            if !meta.is_empty() {
-                ui.weak(meta);
-            }
+            // Command text — highlight the matched substring.
+            let job = highlight_layout_job(
+                text,
+                query,
+                command_base_format(ui),
+                command_match_format(ui),
+            );
+            ui.label(job);
+
+            // Meta line: age (with hover for full) · cwd · exit · source.
+            let (age_short, age_full) = format_age(now_ms, started_at_ms);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.weak(age_short).on_hover_text(age_full);
+                if let Some(c) = cwd {
+                    ui.weak("·");
+                    ui.weak(c);
+                }
+                if let Some(code) = exit_code {
+                    ui.weak("·");
+                    ui.weak(format!("exit {code}"));
+                }
+                if source != "termica" {
+                    ui.weak("·");
+                    ui.weak(source);
+                }
+            });
         });
     });
-    let row_id = ui.id().with(("hist-row", text));
+    let row_id = ui.id().with(("hist-row", text, started_at_ms));
     ui.interact(inner.response.rect, row_id, egui::Sense::click()).clicked()
 }
 
-fn format_meta(cwd: Option<&str>, exit_code: Option<i32>, source: &str) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(c) = cwd {
-        parts.push(c.to_string());
+fn command_base_format(ui: &egui::Ui) -> egui::TextFormat {
+    egui::TextFormat {
+        font_id: egui::FontId::monospace(13.0),
+        color: ui.visuals().strong_text_color(),
+        ..Default::default()
     }
-    if let Some(code) = exit_code {
-        parts.push(format!("exit {code}"));
+}
+
+fn command_match_format(ui: &egui::Ui) -> egui::TextFormat {
+    egui::TextFormat {
+        font_id: egui::FontId::monospace(13.0),
+        color: ui.visuals().selection.bg_fill,
+        underline: egui::Stroke::new(1.0, ui.visuals().selection.bg_fill),
+        ..Default::default()
     }
-    if source != "termica" {
-        parts.push(source.to_string());
+}
+
+/// Build a [`LayoutJob`] for `text` where every case-insensitive
+/// occurrence of `query` is rendered with `match_format` and the
+/// rest with `base_format`. Empty query → the whole string in
+/// `base_format`. Public-in-module for testability; the matching
+/// is byte-substring on the lowercase form, with a char-boundary
+/// guard so non-ASCII text that happens to change byte length on
+/// lowercase falls back to the plain base format instead of
+/// panicking.
+fn highlight_layout_job(
+    text: &str,
+    query: &str,
+    base: egui::TextFormat,
+    hit: egui::TextFormat,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    if query.is_empty() {
+        job.append(text, 0.0, base);
+        return job;
     }
-    parts.join(" · ")
+    let needle = query.to_lowercase();
+    let hay = text.to_lowercase();
+    if hay.len() != text.len() {
+        // Lowercase changed byte length somewhere — slicing the
+        // original by lowercase byte offsets is no longer safe.
+        // Render plain.
+        job.append(text, 0.0, base);
+        return job;
+    }
+    let n_len = needle.len();
+    let mut cursor = 0;
+    while cursor < text.len() {
+        match hay[cursor..].find(&needle) {
+            Some(rel) => {
+                let abs = cursor + rel;
+                let end = abs + n_len;
+                if !text.is_char_boundary(abs) || !text.is_char_boundary(end) {
+                    job.append(&text[cursor..], 0.0, base);
+                    return job;
+                }
+                if abs > cursor {
+                    job.append(&text[cursor..abs], 0.0, base.clone());
+                }
+                job.append(&text[abs..end], 0.0, hit.clone());
+                cursor = end;
+            }
+            None => {
+                job.append(&text[cursor..], 0.0, base);
+                break;
+            }
+        }
+    }
+    job
+}
+
+/// Render a unix-ms timestamp relative to `now_ms` as `(short, full)`.
+/// `short` is the compact label that goes in the row meta line
+/// (e.g. "4m"); `full` is the long-form tooltip the user gets on
+/// hover (e.g. "4 minutes ago"). Determinism rule from spec/09:
+/// `now_ms` is injected, not read from the system clock.
+pub fn format_age(now_ms: i64, then_ms: i64) -> (String, String) {
+    let secs = (now_ms - then_ms).max(0) / 1000;
+    if secs < 60 {
+        return ("now".to_string(), "just now".to_string());
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return (format!("{mins}m"), pluralize(mins, "minute"));
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return (format!("{hours}h"), pluralize(hours, "hour"));
+    }
+    let days = hours / 24;
+    if days == 1 {
+        return ("1d".to_string(), "yesterday".to_string());
+    }
+    if days < 7 {
+        return (format!("{days}d"), pluralize(days, "day"));
+    }
+    if days < 30 {
+        let weeks = days / 7;
+        return (format!("{weeks}w"), pluralize(weeks, "week"));
+    }
+    if days < 365 {
+        let months = days / 30;
+        return (format!("{months}mo"), pluralize(months, "month"));
+    }
+    let years = days / 365;
+    (format!("{years}y"), pluralize(years, "year"))
+}
+
+fn pluralize(n: i64, unit: &str) -> String {
+    if n == 1 { format!("1 {unit} ago") } else { format!("{n} {unit}s ago") }
 }
 
 #[cfg(test)]
@@ -462,6 +606,128 @@ mod tests {
         assert_eq!(o.scope, OverlayScope::Pane);
         o.toggle_scope();
         assert_eq!(o.scope, OverlayScope::Global);
+    }
+
+    // ---- format_age ---------------------------------------------------
+
+    fn ms(secs: i64) -> i64 {
+        secs * 1000
+    }
+
+    #[test]
+    fn age_under_a_minute_renders_now() {
+        assert_eq!(format_age(ms(100), ms(70)), ("now".into(), "just now".into()));
+        assert_eq!(format_age(ms(100), ms(41)), ("now".into(), "just now".into()));
+    }
+
+    #[test]
+    fn age_minutes_singular_and_plural() {
+        assert_eq!(format_age(ms(120), ms(60)), ("1m".into(), "1 minute ago".into()));
+        assert_eq!(format_age(ms(60 * 4), ms(0)), ("4m".into(), "4 minutes ago".into()));
+        assert_eq!(format_age(ms(60 * 59), ms(0)), ("59m".into(), "59 minutes ago".into()));
+    }
+
+    #[test]
+    fn age_hours_singular_and_plural() {
+        assert_eq!(format_age(ms(60 * 60), ms(0)), ("1h".into(), "1 hour ago".into()));
+        assert_eq!(format_age(ms(60 * 60 * 3), ms(0)), ("3h".into(), "3 hours ago".into()));
+    }
+
+    #[test]
+    fn age_one_day_renders_yesterday() {
+        let one_day = 60 * 60 * 24;
+        assert_eq!(format_age(ms(one_day), ms(0)), ("1d".into(), "yesterday".into()));
+    }
+
+    #[test]
+    fn age_two_to_six_days_render_as_days() {
+        let day = 60 * 60 * 24;
+        assert_eq!(format_age(ms(day * 3), ms(0)), ("3d".into(), "3 days ago".into()));
+        assert_eq!(format_age(ms(day * 6), ms(0)), ("6d".into(), "6 days ago".into()));
+    }
+
+    #[test]
+    fn age_weeks_singular_and_plural() {
+        let day = 60 * 60 * 24;
+        assert_eq!(format_age(ms(day * 7), ms(0)), ("1w".into(), "1 week ago".into()));
+        assert_eq!(format_age(ms(day * 14), ms(0)), ("2w".into(), "2 weeks ago".into()));
+    }
+
+    #[test]
+    fn age_months_and_years() {
+        let day = 60 * 60 * 24;
+        assert_eq!(format_age(ms(day * 30), ms(0)), ("1mo".into(), "1 month ago".into()));
+        assert_eq!(format_age(ms(day * 90), ms(0)), ("3mo".into(), "3 months ago".into()));
+        assert_eq!(format_age(ms(day * 365), ms(0)), ("1y".into(), "1 year ago".into()));
+        assert_eq!(format_age(ms(day * 365 * 2), ms(0)), ("2y".into(), "2 years ago".into()));
+    }
+
+    #[test]
+    fn age_future_timestamps_clamp_to_now() {
+        // Defensive: if `then_ms > now_ms` (clock skew), render
+        // "now" rather than a negative duration.
+        assert_eq!(format_age(ms(100), ms(500)), ("now".into(), "just now".into()));
+    }
+
+    // ---- highlight_layout_job -----------------------------------------
+
+    fn base_fmt() -> egui::TextFormat {
+        egui::TextFormat::default()
+    }
+
+    fn hit_fmt() -> egui::TextFormat {
+        egui::TextFormat {
+            color: egui::Color32::RED,
+            underline: egui::Stroke::new(1.0, egui::Color32::RED),
+            ..Default::default()
+        }
+    }
+
+    /// Extract the (text, color) of each section so the test can
+    /// assert which runs got the match treatment without touching
+    /// egui font metrics.
+    fn job_sections(job: &egui::text::LayoutJob) -> Vec<(String, bool)> {
+        job.sections
+            .iter()
+            .map(|s| {
+                let text = job.text[s.byte_range.clone()].to_string();
+                let highlighted = s.format.color == egui::Color32::RED;
+                (text, highlighted)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn highlight_empty_query_is_one_base_section() {
+        let job = highlight_layout_job("echo hello", "", base_fmt(), hit_fmt());
+        assert_eq!(job_sections(&job), vec![("echo hello".into(), false)]);
+    }
+
+    #[test]
+    fn highlight_matches_case_insensitively() {
+        let job = highlight_layout_job("echo $PWD", "pwd", base_fmt(), hit_fmt());
+        assert_eq!(job_sections(&job), vec![("echo $".into(), false), ("PWD".into(), true)]);
+    }
+
+    #[test]
+    fn highlight_matches_multiple_occurrences() {
+        let job = highlight_layout_job("foo bar foo baz foo", "foo", base_fmt(), hit_fmt());
+        assert_eq!(
+            job_sections(&job),
+            vec![
+                ("foo".into(), true),
+                (" bar ".into(), false),
+                ("foo".into(), true),
+                (" baz ".into(), false),
+                ("foo".into(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn highlight_no_match_is_one_base_section() {
+        let job = highlight_layout_job("ls -la", "xyz", base_fmt(), hit_fmt());
+        assert_eq!(job_sections(&job), vec![("ls -la".into(), false)]);
     }
 
     #[test]
