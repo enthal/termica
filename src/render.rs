@@ -653,6 +653,21 @@ pub fn paint_prompt_editor_at(
 /// shouting — it reads as "label affordance" rather than as content.
 pub const BLOCK_HEADER_CHIP_BG: Color32 = Color32::from_rgb(0x22, 0x22, 0x22);
 
+/// 1px stroke around each chip in the block header. "Quite dim"
+/// per user direction — visible enough to outline the chip against
+/// the (very similar) block background, not so loud that it
+/// competes with the chip text inside.
+pub const BLOCK_HEADER_CHIP_STROKE: Color32 = Color32::from_rgb(0x44, 0x44, 0x44);
+
+/// Background wash painted behind a sealed block whose command
+/// finished with a non-zero exit code. Translucent so the styled
+/// snapshot text on top is still legible. RGBA-unmultiplied (warm
+/// dark red, 25% alpha) blends cleanly with the panel bg.
+// Pre-multiplied form of unmultiplied rgba(0x80, 0x20, 0x20, 0x40):
+// each channel × (alpha / 255), so (128 * 0x40/255, 32 * 0x40/255, ...).
+// Rounded: ≈ (0x20, 0x08, 0x08, 0x40).
+pub const FAILED_BLOCK_BG: Color32 = Color32::from_rgba_premultiplied(0x20, 0x08, 0x08, 0x40);
+
 /// Padding inside each chip, in logical pixels. Affects both the
 /// horizontal padding around the text and the chip's `corner_radius`
 /// proportionally. Empirically tuned against the monospace font.
@@ -723,9 +738,11 @@ pub fn paint_block_header(
     let painter = ui.painter_at(rect);
 
     let radius = CHIP_CORNER_RADIUS as u8;
+    let chip_stroke = egui::Stroke::new(1.0, BLOCK_HEADER_CHIP_STROKE);
     if !cwd_text.is_empty() {
         let chip_rect = Rect::from_min_size(rect.min, Vec2::new(cwd_chip_w, chip_h));
         painter.rect_filled(chip_rect, radius, BLOCK_HEADER_CHIP_BG);
+        painter.rect_stroke(chip_rect, radius, chip_stroke, egui::StrokeKind::Inside);
         painter.text(
             Pos2::new(chip_rect.min.x + CHIP_PAD_X, chip_rect.min.y + CHIP_PAD_Y),
             egui::Align2::LEFT_TOP,
@@ -739,6 +756,7 @@ pub fn paint_block_header(
         let chip_rect =
             Rect::from_min_size(Pos2::new(chip_x, rect.min.y), Vec2::new(exit_chip_w, chip_h));
         painter.rect_filled(chip_rect, radius, BLOCK_HEADER_CHIP_BG);
+        painter.rect_stroke(chip_rect, radius, chip_stroke, egui::StrokeKind::Inside);
         painter.text(
             Pos2::new(chip_rect.min.x + CHIP_PAD_X, chip_rect.min.y + CHIP_PAD_Y),
             egui::Align2::LEFT_TOP,
@@ -886,6 +904,14 @@ pub fn paint_sealed_block(
     home: Option<&std::path::Path>,
     exit: Option<i32>,
 ) -> SealedBlockRender {
+    // Reserve a backing shape index BEFORE any paint so the
+    // failed-block bg wash can be slotted underneath the chip +
+    // command + snapshot. We don't know the full block rect until
+    // after layout, so we paint chip + content first and then set
+    // the shape via `painter.set()` once `rect` is known.
+    let failed = matches!(exit, Some(n) if n != 0);
+    let bg_idx = if failed { Some(ui.painter().add(egui::Shape::Noop)) } else { None };
+
     let _ = paint_block_header(ui, cwd, home, exit);
 
     let cmd_lines = if command.is_empty() { 0 } else { command.split('\n').count() };
@@ -903,6 +929,13 @@ pub fn paint_sealed_block(
         Some(c) => c.union(snap_rect),
         None => snap_rect,
     };
+
+    if let Some(idx) = bg_idx {
+        // Extend the wash slightly outside the content's tight rect
+        // so it reads as a "block background" rather than text-hugging.
+        let wash = rect.expand2(egui::vec2(4.0, 2.0));
+        ui.painter().set(idx, egui::Shape::rect_filled(wash, 4.0, FAILED_BLOCK_BG));
+    }
 
     SealedBlockRender { rect, command_lines: cmd_lines }
 }
