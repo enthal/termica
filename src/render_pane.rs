@@ -1023,13 +1023,16 @@ pub fn render_pane(
         // The chip bar + editor are wrapped as a single visual
         // unit — the user asked for "include the chip bar."
         //
-        // Wraparound fix: paint into a painter whose clip rect is
-        // the full screen rather than `ui`'s clip. The footer
-        // block's natural clip stops at the pane's bottom edge,
-        // which is exactly where the chrome's bottom stroke
-        // landed before — getting clipped off. Re-clipping to the
-        // viewport (the chrome only ever expands a few px outside
-        // the body) ensures all four sides render.
+        // Wraparound fix: use `ctx.layer_painter(layer_id)` to
+        // get a painter on the SAME layer (so the chrome paints
+        // on top of the chip + editor that landed there earlier)
+        // with `Rect::EVERYTHING` for the clip rect.
+        // `Painter::with_clip_rect` *intersects* with the existing
+        // clip rather than replacing it, so the previous
+        // `clone().with_clip_rect(viewport_rect)` didn't widen
+        // the pane's tight clip and three sides of the stroke got
+        // cut. Same trick the focused-tab underline uses
+        // (`behavior::paint_focused_tab_underline`).
         if caret_active {
             let chip_rect = if has_prompt_cwd {
                 Some(egui::Rect::from_min_size(
@@ -1043,7 +1046,7 @@ pub fn render_pane(
                 footer_origin,
                 egui::vec2(ui.available_width(), chip_h + editor_h),
             );
-            let unclipped = ui.painter().clone().with_clip_rect(ui.ctx().viewport_rect());
+            let unclipped = ctx.layer_painter(ui.layer_id());
             crate::focused_chrome::paint(&unclipped, chip_rect, combined, chrome_variant);
         }
 
