@@ -345,6 +345,58 @@ fn snapshot_paint_prompt_editor_with_text_and_cursor_at_end() {
     harness.snapshot("paint_prompt_editor_typed");
 }
 
+// Spec/04 "When is the caret shown?" — paired snapshots verifying
+// the caret is drawn IFF the window is foreground. Same editor
+// content; the only pixel delta is the caret column.
+
+#[test]
+fn snapshot_prompt_editor_caret_when_foreground() {
+    let mut editor = termica::prompt_editor::PromptEditor::new();
+    editor.insert_str("git status");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(400.0, 80.0)).build_ui(move |ui| {
+            let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
+            let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
+            let row_h = ui.fonts_mut(|f| f.row_height(&font_id));
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(400.0, row_h), egui::Sense::hover());
+            render::paint_prompt_editor_at(
+                ui.painter(),
+                &editor,
+                rect.min,
+                cell_w,
+                row_h,
+                &font_id,
+                render::should_show_caret(true, true, true),
+            );
+        });
+    harness.snapshot("prompt_editor_caret_foreground");
+}
+
+#[test]
+fn snapshot_prompt_editor_caret_when_window_not_foreground() {
+    let mut editor = termica::prompt_editor::PromptEditor::new();
+    editor.insert_str("git status");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(400.0, 80.0)).build_ui(move |ui| {
+            let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
+            let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
+            let row_h = ui.fonts_mut(|f| f.row_height(&font_id));
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(400.0, row_h), egui::Sense::hover());
+            // Same pane focus, but the app's window is NOT the OS
+            // foreground — the caret must be hidden.
+            render::paint_prompt_editor_at(
+                ui.painter(),
+                &editor,
+                rect.min,
+                cell_w,
+                row_h,
+                &font_id,
+                render::should_show_caret(true, true, false),
+            );
+        });
+    harness.snapshot("prompt_editor_caret_not_foreground");
+}
+
 // ---- whole-block snapshots (command + output together) -------------------
 
 #[test]

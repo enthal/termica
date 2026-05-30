@@ -104,6 +104,27 @@ pub const EDITOR_FG: Color32 = Color32::from_rgb(0x6e, 0xd0, 0xe8);
 /// can never be two cursors painted at once.
 pub const EDITOR_CURSOR_COLOR: Color32 = Color32::from_rgba_premultiplied(0x4a, 0xa8, 0xc0, 0xa0);
 
+/// Single source of truth for "should we draw a caret in this pane
+/// right now?" per [spec/04](../spec/04-prompt-editor.md#when-is-the-caret-shown).
+/// Returns `true` iff ALL three conditions hold:
+///
+///   - `mode_is_editor`: the pane is in `ShellPromptEditor` (only state
+///     with a real editor caret).
+///   - `pane_has_focus`: this pane currently holds in-app keyboard focus.
+///   - `viewport_focused`: the Termica window is the OS foreground app
+///     (i.e. the OS will route the next keystroke to us).
+///
+/// Used by the prompt-editor caret AND by the raw-terminal cell
+/// cursor's "blinking solid" vs "dim hollow" choice — same principle,
+/// different surface ([spec/02](../spec/02-terminal-engine.md)).
+pub fn should_show_caret(
+    mode_is_editor: bool,
+    pane_has_focus: bool,
+    viewport_focused: bool,
+) -> bool {
+    mode_is_editor && pane_has_focus && viewport_focused
+}
+
 /// Foreground for the dim header line above each block. Roughly
 /// "muted grey" against `DEFAULT_BG` — readable but unmistakably
 /// secondary to the command + output text below. 4G renders cwd
@@ -1182,6 +1203,22 @@ mod tests {
     //! by snapshot tests in `tests/snapshots.rs`.
 
     use super::*;
+
+    /// 2×2×2 truth table for the caret-visibility rule. Spec/04
+    /// says the caret is shown iff `mode_is_editor && pane_has_focus
+    /// && viewport_focused`; everything else hides it.
+    #[test]
+    fn should_show_caret_is_three_way_and() {
+        for &mode in &[false, true] {
+            for &pane in &[false, true] {
+                for &vp in &[false, true] {
+                    let got = should_show_caret(mode, pane, vp);
+                    let want = mode && pane && vp;
+                    assert_eq!(got, want, "mode={mode}, pane_focus={pane}, viewport_focused={vp}",);
+                }
+            }
+        }
+    }
 
     #[test]
     fn named_default_returns_none() {

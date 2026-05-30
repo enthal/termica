@@ -816,13 +816,19 @@ pub fn render_pane(
             // — the outer ScrollArea handles navigation. In alt-
             // screen mode there's no scrollback to include and the
             // running program owns the screen at fixed size.
+            // Cell-cursor focus state per spec/02 (cross-ref to
+            // spec/04's caret-visibility rule): the bright `CURSOR_COLOR`
+            // is reserved for "this is where your next keypress
+            // lands." Both pane focus AND OS window foreground must
+            // be true; otherwise we render the dim/hollow color.
+            let cell_cursor_focused = slot.ui.focused && ctx.input(|i| i.focused);
             render::paint_terminal(
                 ui,
                 slot.session.terminal(),
                 selection.as_ref(),
                 highlighted_link,
                 hide_term_cursor,
-                slot.ui.focused,
+                cell_cursor_focused,
                 !in_alt_screen,
             )
         } else {
@@ -961,21 +967,25 @@ pub fn render_pane(
 
         if let Some(editor) = slot.session.blocks().editor_on_tail() {
             let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
-            // Caret visibility tracks the pane focus anchor (defined
-            // below the footer block but with a stable id). Read
-            // from `ctx.memory` directly so the OS window-focus flag
-            // (`egui::InputState::focused`) — known to be unreliable
-            // on macOS, see egui#7588 — can't suppress the caret
-            // while the editor is the actual keyboard target.
+            // Caret visibility per spec/04 "When is the caret shown?":
+            // require mode-is-editor (true here — `editor_on_tail()`
+            // returned `Some`), pane keyboard focus, AND OS window
+            // foreground. The viewport-focused flag is read via
+            // `ctx.input(|i| i.focused)`; egui defaults it to `true`
+            // when the backend hasn't reported one, so a backend
+            // that omits the signal never silently hides the caret.
             //
-            // Blink: ~1.6 Hz square wave. The repaint request fires
-            // only while focused so idle panes don't burn wakeups.
+            // Blink: ~1.6 Hz square wave, only while we'd paint a
+            // caret at all so idle / background panes don't burn
+            // repaint wakeups.
             let pane_focused = ctx.memory(|m| {
                 m.has_focus(egui::Id::new(("termica-pane-focus", slot.session.pane_id())))
             });
+            let viewport_focused = ctx.input(|i| i.focused);
+            let caret_active = render::should_show_caret(true, pane_focused, viewport_focused);
             let time = ctx.input(|i| i.time);
-            let caret_visible = pane_focused && (time * 1.6) as i64 % 2 == 0;
-            if pane_focused {
+            let caret_visible = caret_active && (time * 1.6) as i64 % 2 == 0;
+            if caret_active {
                 ctx.request_repaint_after(std::time::Duration::from_millis(312));
             }
             // Use `ui.painter()` (unclipped to the current ui) rather
