@@ -53,7 +53,11 @@ impl<'a> Behavior<PaneId> for TabBehavior<'a> {
         let term = self.panes.get(pane_id).map(|s| s.session.terminal());
         let osc = term.and_then(|t| t.osc_title());
         let cwd = term.and_then(|t| t.cwd());
-        tab_title_for_with_osc(*pane_id, osc.as_deref(), cwd, self.home).into()
+        pad_to_min_chars(
+            &tab_title_for_with_osc(*pane_id, osc.as_deref(), cwd, self.home),
+            MIN_TAB_TITLE_CHARS,
+        )
+        .into()
     }
 
     fn pane_ui(&mut self, ui: &mut egui::Ui, _tile_id: TileId, pane_id: &mut PaneId) -> UiResponse {
@@ -156,7 +160,11 @@ impl<'a> Behavior<PaneId> for TabBehavior<'a> {
         // (brighter bg + connecting hline). The focused-for-the-whole-
         // app indicator is the blue bottom border painted in
         // [`on_tab_button`] below.
-        egui::RichText::new(tab_title_for_with_osc(*pane_id, osc.as_deref(), cwd, self.home)).into()
+        egui::RichText::new(pad_to_min_chars(
+            &tab_title_for_with_osc(*pane_id, osc.as_deref(), cwd, self.home),
+            MIN_TAB_TITLE_CHARS,
+        ))
+        .into()
     }
 
     fn on_tab_button(
@@ -209,4 +217,69 @@ pub fn paint_focused_tab_underline(response: &egui::Response) {
     let stroke = egui::Stroke::new(2.5, color);
     let y = rect.bottom() - 1.25;
     painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], stroke);
+}
+
+/// Minimum tab title length in characters. Chosen via the
+/// `pick_tab_min_width` visual picker — variant `3x` (≈48 px,
+/// 3× the natural width of the worst-case `~` title that the
+/// default home-directory pane shows on startup). egui_tiles has
+/// no min-tab-width knob, so we get the width via the title text:
+/// shorter titles are padded with spaces on each side. Symmetric
+/// padding keeps the text centered (`tab_ui` paints it left-aligned
+/// within the tab rect; the extra leading space shifts it
+/// rightward so the visual center matches the tab center).
+const MIN_TAB_TITLE_CHARS: usize = 7;
+
+/// Pad `text` with leading + trailing spaces until it reaches
+/// `min_chars`. Strings already `>= min_chars` are returned
+/// unchanged. Odd-shortfalls split the extra space toward the
+/// right so the result is consistently positioned across renders.
+fn pad_to_min_chars(text: &str, min_chars: usize) -> String {
+    let len = text.chars().count();
+    if len >= min_chars {
+        return text.to_string();
+    }
+    let shortfall = min_chars - len;
+    let left = shortfall / 2;
+    let right = shortfall - left;
+    let left_pad: String = std::iter::repeat_n(' ', left).collect();
+    let right_pad: String = std::iter::repeat_n(' ', right).collect();
+    format!("{left_pad}{text}{right_pad}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pad_to_min_chars_leaves_long_titles_alone() {
+        assert_eq!(pad_to_min_chars("very-long-title", 7), "very-long-title");
+    }
+
+    #[test]
+    fn pad_to_min_chars_centers_short_title() {
+        // "~" → "   ~   " (3 spaces each side; 1 + 6 = 7).
+        assert_eq!(pad_to_min_chars("~", 7), "   ~   ");
+    }
+
+    #[test]
+    fn pad_to_min_chars_handles_odd_shortfall_with_extra_on_right() {
+        // "ab" + 5 short → split 2/3 (extra on right so the
+        // visual center sits to the right of the geometric one,
+        // matching egui_tiles' LEFT_CENTER paint origin).
+        assert_eq!(pad_to_min_chars("ab", 7), "  ab   ");
+    }
+
+    #[test]
+    fn pad_to_min_chars_is_noop_when_already_at_min() {
+        assert_eq!(pad_to_min_chars("abcdefg", 7), "abcdefg");
+    }
+
+    #[test]
+    fn pad_to_min_chars_handles_empty_string() {
+        // Defensive: a Behavior callback that returned an empty
+        // title shouldn't panic; the helper should pad it to a
+        // 7-space placeholder so the tab still has a clickable area.
+        assert_eq!(pad_to_min_chars("", 7), "       ");
+    }
 }

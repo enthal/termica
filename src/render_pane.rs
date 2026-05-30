@@ -936,6 +936,19 @@ pub fn render_pane(
         let editor_h = footer_h - chip_h;
         let footer_origin = ui.next_widget_position();
 
+        // Caret visibility per spec/04 "When is the caret shown?":
+        // mode-is-editor + pane keyboard focus + OS window foreground.
+        // Lifted to here (above the chip + editor paint) so the
+        // focused-editor chrome (the rounded outline that wraps BOTH
+        // the chip and the editor) can use the same predicate without
+        // recomputing it.
+        let editor_in_mode = slot.session.blocks().editor_on_tail().is_some();
+        let pane_focused = ctx
+            .memory(|m| m.has_focus(egui::Id::new(("termica-pane-focus", slot.session.pane_id()))));
+        let viewport_focused = ctx.input(|i| i.focused);
+        let caret_active =
+            render::should_show_caret(editor_in_mode, pane_focused, viewport_focused);
+
         if has_prompt_cwd
             && let Some(crate::block::Block::Prompt { header, .. }) = slot.session.blocks().last()
         {
@@ -967,22 +980,9 @@ pub fn render_pane(
 
         if let Some(editor) = slot.session.blocks().editor_on_tail() {
             let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
-            // Caret visibility per spec/04 "When is the caret shown?":
-            // require mode-is-editor (true here — `editor_on_tail()`
-            // returned `Some`), pane keyboard focus, AND OS window
-            // foreground. The viewport-focused flag is read via
-            // `ctx.input(|i| i.focused)`; egui defaults it to `true`
-            // when the backend hasn't reported one, so a backend
-            // that omits the signal never silently hides the caret.
-            //
             // Blink: ~1.6 Hz square wave, only while we'd paint a
             // caret at all so idle / background panes don't burn
             // repaint wakeups.
-            let pane_focused = ctx.memory(|m| {
-                m.has_focus(egui::Id::new(("termica-pane-focus", slot.session.pane_id())))
-            });
-            let viewport_focused = ctx.input(|i| i.focused);
-            let caret_active = render::should_show_caret(true, pane_focused, viewport_focused);
             let time = ctx.input(|i| i.time);
             let caret_visible = caret_active && (time * 1.6) as i64 % 2 == 0;
             if caret_active {
@@ -1004,6 +1004,25 @@ pub fn render_pane(
                 caret_visible,
             );
         }
+
+        // Focused-editor chrome (picker variant `dim-white-round-rect`):
+        // a dim grey-white rounded outline that wraps the chip bar +
+        // editor body together, drawn ONLY when the same caret-active
+        // predicate fires. The visual says "this editor will receive
+        // your next keypress" — same situation that grows the caret.
+        if caret_active {
+            let combined = egui::Rect::from_min_size(
+                footer_origin,
+                egui::vec2(ui.available_width(), chip_h + editor_h),
+            );
+            ui.painter().rect_stroke(
+                combined.expand(2.0),
+                6.0,
+                egui::Stroke::new(1.0, render::FOCUSED_EDITOR_CHROME_COLOR),
+                egui::StrokeKind::Outside,
+            );
+        }
+
         Some(editor_rect)
     } else {
         None

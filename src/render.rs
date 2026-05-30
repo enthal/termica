@@ -104,6 +104,15 @@ pub const EDITOR_FG: Color32 = Color32::from_rgb(0x6e, 0xd0, 0xe8);
 /// can never be two cursors painted at once.
 pub const EDITOR_CURSOR_COLOR: Color32 = Color32::from_rgba_premultiplied(0x4a, 0xa8, 0xc0, 0xa0);
 
+/// Stroke color for the focused-editor chrome — the rounded outline
+/// that wraps the chip bar + editor body when the pane is focused
+/// AND the window is the OS foreground app (same predicate as the
+/// caret). Picked via `cargo run --example pick_focused_editor_chrome`
+/// (variant `dim-white-round-rect`): a dim grey-white that reads as
+/// "this is wired for input" without competing with the bright caret.
+pub const FOCUSED_EDITOR_CHROME_COLOR: Color32 =
+    Color32::from_rgba_premultiplied(0xa0, 0xa0, 0xa0, 0xb0);
+
 /// Single source of truth for "should we draw a caret in this pane
 /// right now?" per [spec/04](../spec/04-prompt-editor.md#when-is-the-caret-shown).
 /// Returns `true` iff ALL three conditions hold:
