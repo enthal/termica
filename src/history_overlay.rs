@@ -289,7 +289,12 @@ pub fn paint_overlay(
                                 })
                             })
                             .collect();
-                        for r in rows {
+                        // Per the row-separator picker (variant
+                        // `more-spacing`), put a small breath of
+                        // vertical space between rows so adjacent
+                        // commands don't run together.
+                        let n_rows = rows.len();
+                        for (i, r) in rows.into_iter().enumerate() {
                             let is_selected = r.row == overlay.selected;
                             let clicked = paint_clickable_row(
                                 ui,
@@ -306,6 +311,9 @@ pub fn paint_overlay(
                             if clicked {
                                 action = Some(OverlayAction::Submit(r.text));
                                 break;
+                            }
+                            if i + 1 < n_rows {
+                                ui.add_space(ROW_GAP);
                             }
                         }
                     });
@@ -425,6 +433,13 @@ fn command_base_format(ui: &egui::Ui) -> egui::TextFormat {
 /// switching to a saturated warm color reads as a real highlight
 /// rather than a hover state.
 const MATCH_HIGHLIGHT: egui::Color32 = egui::Color32::from_rgb(255, 215, 90);
+
+/// Vertical space inserted between result rows. Chosen via the
+/// `pick_history_row_separator` visual picker — the "more spacing"
+/// variant won out over hairline rules and alternating backgrounds.
+/// Acts on top of egui's intrinsic item spacing, so 6.0 reads
+/// as a deliberate breath without being a gap.
+const ROW_GAP: f32 = 6.0;
 
 fn command_match_format(_ui: &egui::Ui) -> egui::TextFormat {
     egui::TextFormat {
