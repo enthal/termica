@@ -1678,6 +1678,42 @@ pub fn render_pane(
 
         let modes = slot.session.terminal().modes();
         let editor_active = slot.session.editor_is_active();
+
+        // ---- mouse wheel, hover-gated ---------------------------
+        //
+        // Non-alt-screen scrolling is handled by the outer
+        // `ScrollArea` natively (4A-render replaced alacritty's
+        // internal scrollback with the block-stack history). The
+        // alt-screen case still intercepts wheel events here and
+        // forwards them as arrow keystrokes — that's what full-
+        // screen TTY programs (vim, less, htop, fzf) expect.
+        //
+        // **Wheel bytes are written BEFORE the per-event key loop
+        // below.** Foreground programs read PTY stdin sequentially;
+        // a quit keystroke like `q` makes the program exit and stop
+        // reading, so any wheel bytes queued AFTER it stay in the
+        // PTY buffer and land at the SHELL as stray characters of
+        // the user's next command. Trackpad momentum scroll fading
+        // for several frames is the realistic trigger — the user
+        // lifts their fingers, presses `q` mid-fade, and gets
+        // arrow-key garbage on the next command line. See
+        // `input::compose_alt_screen_frame_bytes` for the ordering
+        // invariant + unit tests.
+        if !modal_open && rendered.response.hovered() {
+            let alt_screen = slot.session.terminal().is_alternate_screen();
+            if alt_screen {
+                let scroll_delta_y = ctx.input(|i| i.smooth_scroll_delta.y);
+                if scroll_delta_y.abs() > 0.0 {
+                    let lines = (scroll_delta_y / 50.0 * 3.0).round() as i32;
+                    if let Some(input::WheelOutcome::SendBytes(bytes)) =
+                        input::classify_wheel(lines, true, modes)
+                    {
+                        let _ = slot.session.write(&bytes);
+                    }
+                }
+            }
+        }
+
         for event in &events {
             // Belt and braces: skip the Ctrl+Shift+C key event so the
             // encoder never sees it (the encoder wouldn't emit bytes
@@ -1706,30 +1742,6 @@ pub fn render_pane(
             }
             if let Some(bytes) = input::encode_event(event, modes) {
                 let _ = slot.session.write(&bytes);
-            }
-        }
-    }
-
-    // ---- mouse wheel, hover-gated -------------------------------
-    //
-    // Non-alt-screen scrolling is handled by the outer `ScrollArea`
-    // natively (4A-render replaced alacritty's internal scrollback
-    // with the block-stack history). The alt-screen case still
-    // intercepts wheel events here and forwards them as arrow
-    // keystrokes — that's what full-screen TTY programs (vim, less,
-    // htop, fzf) expect.
-    if !modal_open && rendered.response.hovered() {
-        let alt_screen = slot.session.terminal().is_alternate_screen();
-        if alt_screen {
-            let scroll_delta_y = ctx.input(|i| i.smooth_scroll_delta.y);
-            if scroll_delta_y.abs() > 0.0 {
-                let lines = (scroll_delta_y / 50.0 * 3.0).round() as i32;
-                let modes = slot.session.terminal().modes();
-                if let Some(input::WheelOutcome::SendBytes(bytes)) =
-                    input::classify_wheel(lines, true, modes)
-                {
-                    let _ = slot.session.write(&bytes);
-                }
             }
         }
     }
