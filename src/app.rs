@@ -851,7 +851,7 @@ impl eframe::App for TermicaApp {
         let new_window_title = if desired_title.is_empty() {
             "Termica".to_string()
         } else {
-            format!("{desired_title} | Termica")
+            format!("{desired_title} — Termica")
         };
         if new_window_title != self.last_window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(new_window_title.clone()));
