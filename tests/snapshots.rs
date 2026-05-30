@@ -678,3 +678,130 @@ fn snapshot_paint_sealed_block_with_selection_in_command_only() {
         });
     harness.snapshot("paint_sealed_block_with_selection_in_command_only");
 }
+
+// ---- Ctrl+R history overlay (Phase 4J PR 6) -----------------------------
+
+/// Build a synthetic [`HistoryOverlay`] with deterministic entries
+/// + initial state. Pure POD construction; no DB, no filesystem.
+fn overlay_with_entries(
+    query: &str,
+    selected: usize,
+    scope: termica::history_overlay::OverlayScope,
+    entries: Vec<termica::history::Entry>,
+) -> termica::history_overlay::HistoryOverlay {
+    let mut overlay = termica::history_overlay::HistoryOverlay {
+        query: query.to_string(),
+        scope,
+        selected,
+        cached_entries: entries,
+        ranked: Vec::new(),
+    };
+    overlay.rerank(None);
+    overlay.selected = selected.min(overlay.ranked.len().saturating_sub(1));
+    overlay
+}
+
+fn entry(
+    text: &str,
+    ts: i64,
+    cwd: Option<&str>,
+    exit_code: Option<i32>,
+    source: &str,
+) -> termica::history::Entry {
+    termica::history::Entry {
+        id: ts,
+        text: text.to_string(),
+        started_at_ms: ts,
+        finished_at_ms: None,
+        exit_code,
+        cwd: cwd.map(|s| s.to_string()),
+        app_run_id: None,
+        pane_id: None,
+        source: source.to_string(),
+    }
+}
+
+#[test]
+fn snapshot_history_overlay_empty_query_shows_all_entries() {
+    let mut overlay = overlay_with_entries(
+        "",
+        0,
+        termica::history_overlay::OverlayScope::Global,
+        vec![
+            entry("cargo test --workspace", 500, Some("~/git/enthal/termica"), Some(0), "termica"),
+            entry("git status", 400, Some("~/git/enthal/termica"), Some(0), "termica"),
+            entry("ls -la", 300, None, None, "zsh"),
+            entry("cd src", 200, None, None, "zsh"),
+            entry("vim CLAUDE.md", 100, None, None, "bash"),
+        ],
+    );
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(900.0, 600.0)).build_ui(move |ui| {
+            let _ = termica::history_overlay::paint_overlay(ui, &mut overlay, 1, None);
+        });
+    harness.snapshot("history_overlay_empty_query");
+}
+
+#[test]
+fn snapshot_history_overlay_with_filter_typed() {
+    // Query "cargo" narrows the list to two entries; selection
+    // sits at the top.
+    let mut overlay = overlay_with_entries(
+        "cargo",
+        0,
+        termica::history_overlay::OverlayScope::Global,
+        vec![
+            entry("cargo test --workspace", 500, Some("~/git/enthal/termica"), Some(0), "termica"),
+            entry("git status", 400, None, None, "termica"),
+            entry("cargo run --release", 300, Some("~/git/enthal/termica"), Some(0), "termica"),
+            entry("ls", 200, None, None, "zsh"),
+        ],
+    );
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(900.0, 600.0)).build_ui(move |ui| {
+            let _ = termica::history_overlay::paint_overlay(ui, &mut overlay, 1, None);
+        });
+    harness.snapshot("history_overlay_with_filter");
+}
+
+#[test]
+fn snapshot_history_overlay_selected_second_row() {
+    // Same content as the empty-query case, but the selection has
+    // moved down one — the highlight should follow.
+    let mut overlay = overlay_with_entries(
+        "",
+        1,
+        termica::history_overlay::OverlayScope::Global,
+        vec![
+            entry("cargo test --workspace", 500, Some("~/git/enthal/termica"), Some(0), "termica"),
+            entry("git status", 400, Some("~/git/enthal/termica"), Some(0), "termica"),
+            entry("ls -la", 300, None, None, "zsh"),
+        ],
+    );
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(900.0, 600.0)).build_ui(move |ui| {
+            let _ = termica::history_overlay::paint_overlay(ui, &mut overlay, 1, None);
+        });
+    harness.snapshot("history_overlay_selected_second_row");
+}
+
+#[test]
+fn snapshot_history_overlay_pane_scope_no_matches() {
+    // Scope = Pane, but the query "xyz" doesn't match anything.
+    // Renders the "(no matches)" placeholder + the pane-scope
+    // label in the header.
+    let mut overlay = overlay_with_entries(
+        "xyz",
+        0,
+        termica::history_overlay::OverlayScope::Pane,
+        vec![
+            entry("cargo test", 200, None, None, "termica"),
+            entry("ls", 100, None, None, "termica"),
+        ],
+    );
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(900.0, 400.0)).build_ui(move |ui| {
+            let _ = termica::history_overlay::paint_overlay(ui, &mut overlay, 1, None);
+        });
+    harness.snapshot("history_overlay_pane_scope_no_matches");
+}

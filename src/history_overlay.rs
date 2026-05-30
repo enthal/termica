@@ -166,7 +166,19 @@ pub fn paint(ui: &mut egui::Ui, slot: &mut PaneSlot) -> Option<OverlayAction> {
     let pane_id = slot.session.pane_id();
     let current_cwd = slot.session.terminal().cwd().map(|p| p.display().to_string());
     let overlay = slot.ui.history_overlay.as_mut()?;
+    paint_overlay(ui, overlay, pane_id, current_cwd.as_deref())
+}
 
+/// The renderable inner of [`paint`], split out so snapshot tests
+/// can drive it with a synthetic `HistoryOverlay` instead of
+/// standing up a real `PaneSlot` (which needs a PTY). Same
+/// signature shape — input keys, return one [`OverlayAction`].
+pub fn paint_overlay(
+    ui: &mut egui::Ui,
+    overlay: &mut HistoryOverlay,
+    pane_id: u64,
+    current_cwd: Option<&str>,
+) -> Option<OverlayAction> {
     let area_id = ui.id().with(("history-overlay", pane_id));
     let screen_rect = ui.ctx().content_rect();
     let panel_w = (screen_rect.width() * 0.6).clamp(360.0, 720.0);
@@ -196,7 +208,7 @@ pub fn paint(ui: &mut egui::Ui, slot: &mut PaneSlot) -> Option<OverlayAction> {
                     resp.request_focus();
                 }
                 if overlay.query != prev_query {
-                    overlay.rerank(current_cwd.as_deref());
+                    overlay.rerank(current_cwd);
                 }
 
                 // Navigation keys. `ctx.input` is the source of
