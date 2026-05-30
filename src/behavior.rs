@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use eframe::egui;
-use egui_tiles::{Behavior, Tile, TileId, Tiles, UiResponse};
+use egui_tiles::{Behavior, ResizeState, Tile, TileId, Tiles, UiResponse};
 
 use crate::pane_slot::{PaneId, PaneSlot};
 use crate::render_pane::render_pane;
@@ -122,6 +122,21 @@ impl<'a> Behavior<PaneId> for TabBehavior<'a> {
         // halfway into this gap). Also reads as a clean tile
         // separation visually.
         16.0
+    }
+
+    fn resize_stroke(&self, style: &egui::Style, resize_state: ResizeState) -> egui::Stroke {
+        // egui_tiles' default `Idle` stroke uses `tab_bar_color`,
+        // which in dark mode is `extreme_bg_color` — near-black.
+        // With our widened 16 px gap, that paints a wide black
+        // stripe between panes that reads as a bug. Blend the
+        // idle gap with `panel_fill` so it becomes invisible;
+        // keep the bright hover / drag strokes egui's defaults so
+        // the splitter still affords interaction on hover.
+        match resize_state {
+            ResizeState::Idle => egui::Stroke::new(self.gap_width(style), style.visuals.panel_fill),
+            ResizeState::Hovering => style.visuals.widgets.hovered.fg_stroke,
+            ResizeState::Dragging => style.visuals.widgets.active.fg_stroke,
+        }
     }
 
     fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
