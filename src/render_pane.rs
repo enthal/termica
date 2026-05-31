@@ -589,6 +589,24 @@ pub fn render_pane(
     // scrolling natively in the non-alt-screen path; the alt-screen
     // path below intercepts the wheel and sends arrow keystrokes
     // instead.
+
+    // Pane-background widget: a click-and-drag sense covering the
+    // full pane rect, registered BEFORE any inner widget. Inner
+    // widgets (live grid, sealed blocks, editor footer) register
+    // later and so sit higher in egui's z-stack — they win
+    // exclusively at their own positions, leaving this background
+    // widget to fire only for clicks on the gray areas (gap above
+    // the block stack, gap between sealed blocks, strip between
+    // the block stack and the editor footer). Used solely as a
+    // focus-claim surface; it never starts a selection. Per
+    // spec/06 "Pointer routing": route via this Response, never
+    // via `ctx.input.press_origin` + `ui.max_rect().contains()`.
+    let pane_background_response = ui.interact(
+        ui.max_rect(),
+        ui.id().with(("pane-background", slot.session.pane_id())),
+        egui::Sense::click_and_drag(),
+    );
+
     let modifier_held = ctx.input(|i| i.modifiers.command);
     let pointer_pos = ctx.input(|i| i.pointer.latest_pos());
     let selection = slot.session.selection().copied();
@@ -1318,8 +1336,15 @@ pub fn render_pane(
                 None
             }
         });
+    // `pane_background_response` covers the full pane rect and
+    // was registered FIRST, so any inner widget at the same pixel
+    // overlays it in egui's z-stack and wins exclusively. The
+    // background only fires `is_pointer_button_down_on()` when
+    // the press landed on a gray area (no inner widget there) —
+    // exactly what we want for focus-on-background-click.
+    let background_pressed = pane_background_response.is_pointer_button_down_on();
     let any_pane_widget_pressed =
-        live_grid_pressed || editor_pressed || sealed_pressed_id.is_some();
+        live_grid_pressed || editor_pressed || sealed_pressed_id.is_some() || background_pressed;
 
     if !modal_open && any_pane_widget_pressed {
         focus_response.request_focus();
