@@ -170,11 +170,94 @@ A single dark theme in v1. Minimal, polished, high-contrast for terminal text. L
 | Status header data | `Pane.context: PaneContext` |
 | Persistence | `App.persistence: PersistenceHandle` ([08](08-persistence.md)) |
 
+## Pointer routing (binding rule)
+
+**Every pointer event — press, drag, click, hover — is routed
+through the [`egui::Response`] of the widget that received it.
+We do NOT poll global pointer state to figure out *which* widget
+got a press, and we do NOT do `rect.contains(global_press_origin)`
+tests to reconstruct routing.**
+
+Why this is normative (not a stylistic preference):
+
+- egui's interaction layer **already** resolves z-order, exclusive
+  drag ownership, modal overlay, and "topmost wins at the same
+  pixel." When two widgets occupy overlapping rects — and they
+  often do at the seams between `egui_tiles`'s splitter resize
+  handle, tab strips, and our pane content — egui assigns the
+  press to exactly one of them. That assignment lives in the
+  `Response`, not in `ctx.input`.
+- A press at coordinate `(x, y)` is **inside** every widget rect
+  that contains that coordinate. Multiple widgets can satisfy
+  `rect.contains(pos)` simultaneously even though only one of
+  them actually received the press. Asking each widget's
+  `Response::is_pointer_button_down_on()` returns `true` for
+  exactly one — the right one.
+- This is the egui idiom. Paint helpers (`paint_sealed_block`,
+  `paint_terminal`, the editor footer, …) return their
+  `Response` (or a struct that wraps the per-sub-widget
+  `Response`s); `render_pane` routes through those returns. Code
+  structure follows widget composition.
+
+### Allowed use of `ctx.input`
+
+- `ctx.input(|i| i.time)` — the current time, for multi-click
+  timing decisions. Independent of where a click landed.
+- `ctx.input(|i| i.modifiers.<X>)` — modifier-key state, for
+  Cmd-click and similar shortcuts at click time. Independent of
+  press location.
+- `ctx.input(|i| i.pointer.primary_pressed())` — pure timing
+  signal ("a primary press happened this frame, somewhere").
+  Never paired with a rect test to infer routing. Only paired
+  with a per-widget `Response::is_pointer_button_down_on()` —
+  the combination tells us "this specific widget just received
+  a press this frame", which lets us distinguish "start of a
+  gesture" from "continuing drag".
+
+### Forbidden
+
+- `ctx.input(|i| i.pointer.press_origin())` for routing decisions.
+- `ctx.input(|i| i.pointer.primary_down())` for routing decisions.
+- `rect.contains(global_press_origin)` to decide which widget
+  was clicked.
+- "Sub-widget rects retained in a side `Vec` for later hit-test"
+  patterns — only as a passive data side-channel for things like
+  the bounding rect of a wash overlay, never as a click-routing
+  surface.
+
+### Hazard (the leaky abstraction)
+
+The seam between an `egui_tiles` interaction (splitter resize, tab
+drag, tab drop) and our pane's `Sense::click_and_drag` widgets is
+where the global-state approach silently fails. The splitter
+widget correctly claims the press from egui's standpoint, but a
+neighboring `rect.contains(press_origin)` test naively sees the
+same coordinate inside its own widget's rect and starts a
+selection. Symptoms include: dragging the splitter selects text
+in both panes; dragging a tab strip selects text in the pane
+under it; splitter drag steals keyboard focus to whichever pane
+the press coordinate happens to overlap.
+
+These symptoms cluster at multi-pane / tab-drag boundaries — i.e.
+the exact surface that single-pane development doesn't exercise.
+A test that only opens one pane never sees them. The pointer-
+routing rule above is the structural fix; anything else is
+patching one symptom while the rest of the surface stays broken.
+
+### Process rule
+
+If a future change tempts you to read `ctx.input` global pointer
+state for routing — "just this once" — **stop and have a
+conversation with the user first**. Include the hazard in the
+discussion. We have already proved the failure mode; we do not
+need to reproduce it.
+
 ## Testing
 
 - **egui_kittest snapshots** of: empty pane, populated pane with selection, pane in `ShellPromptEditor` mode with editor and header, alternate-screen pane (renders no header chrome by default).
 - **Layout tests** (pure logic): split/close/reparent operations on the tile tree preserve pane state across reparents (no `Drop` of registered panes during tree mutation).
 - **Focus tests**: focus traversal across panes / tabs is deterministic.
+- **Pointer-routing tests**: a multi-pane scenario where the splitter (or a tab) and a pane's sealed block share a pixel column. A press on the splitter must NOT start a selection in either pane. A press on a sealed block must start a selection only in that pane. The strict-layer version drives synthetic responses with known `is_pointer_button_down_on()` values; the integration version uses an `egui_kittest` harness against the real layout.
 
 ---
 

@@ -605,14 +605,21 @@ pub fn render_pane(
     // any other modern terminal. The flag is re-evaluated per
     // frame; on exit we fall back to the normal block layout.
     let in_alt_screen = view.alt_screen;
-    // Capture each sealed block's painted rect during the loop so the
-    // click / drag handler below can hit-test against them. Empty in
-    // alt-screen mode (we don't paint blocks at all there).
-    // Each entry: (block_id, full rect of command + snapshot region,
-    // command-line count). The command_lines value lets the click /
-    // drag handler translate pointer y into the block's unified row
-    // space (rows 0..command_lines = command label, rest = snapshot).
-    let mut sealed_rects: Vec<(crate::block::BlockId, egui::Rect, usize)> = Vec::new();
+    // Capture each sealed block's painted sub-widget Responses
+    // during the loop. The click / drag handler below routes
+    // through these Responses (`response.clicked()`,
+    // `response.dragged()`, `response.is_pointer_button_down_on()`,
+    // `response.interact_pointer_pos()`) so egui's interaction
+    // layer owns the routing — z-order, exclusive drag ownership,
+    // overlap resolution. Reading global `ctx.input.primary_pressed`
+    // + intersecting it with a stored rect would give the wrong
+    // answer when a higher widget (egui_tiles' splitter resize
+    // handle, a tab being dragged) covers the same pixel, because
+    // the rect test doesn't know which widget egui assigned the
+    // press to. Empty in alt-screen mode (we don't paint blocks at
+    // all there).
+    let mut sealed_block_renders: Vec<(crate::block::BlockId, render::SealedBlockRender)> =
+        Vec::new();
 
     // Phase 4D — fixed-footer Prompt block. When the tail is a
     // `Prompt` AND the editor is active, reserve a strip at the
@@ -774,7 +781,7 @@ pub fn render_pane(
                             home,
                             *exit,
                         );
-                        sealed_rects.push((*id, sealed_render.rect, sealed_render.command_lines));
+                        sealed_block_renders.push((*id, sealed_render));
                         // Block separator — picked via
                         // `cargo run --example pick_block_separator`
                         // (variant `h10-18`). 10px gap + a barely-
@@ -929,12 +936,21 @@ pub fn render_pane(
     // Sealed-block link hover: when Cmd is held and the pointer is
     // over a URL / file-path inside a sealed block, switch to the
     // pointing-hand icon so the affordance matches what Cmd-click
-    // would do. `sealed_rects` was populated during the paint pass
-    // above; we re-use it to map pointer → block → (row, col).
+    // would do. We ask each block's snapshot Response whether it
+    // contains the pointer — egui resolves z-order so a higher
+    // widget (the splitter handle, a tab strip) correctly wins and
+    // none of our blocks fire `contains_pointer`.
     if modifier_held
         && let Some(pos) = pointer_pos
-        && let Some((block_id, block_rect, _cmd_lines)) =
-            sealed_rects.iter().find(|(_, r, _)| r.contains(pos)).copied()
+        && let Some((block_id, block_rect)) = sealed_block_renders.iter().find_map(|(id, r)| {
+            if r.snapshot.contains_pointer()
+                || r.command.as_ref().is_some_and(|c| c.contains_pointer())
+            {
+                Some((*id, r.bounding_rect()))
+            } else {
+                None
+            }
+        })
     {
         let (cl, sl) = slot.session.sealed_block_rows(block_id).unwrap_or((0, 0));
         let total_rows = cl + sl;
@@ -980,9 +996,10 @@ pub fn render_pane(
     // exact rect the editor occupies — used by the click / drag
     // handlers below to translate pointer pixels to byte offsets.
     // Focus lives on the per-pane focus anchor allocated AFTER this
-    // block; the editor footer's own `Response` is only used for
-    // hit-testing.
-    let footer_rect: Option<egui::Rect> = if footer_h > 0.0 {
+    // block; the editor footer's own `Response` is the routing
+    // surface for click / drag events.
+    let mut editor_response: Option<egui::Response> = None;
+    if footer_h > 0.0 {
         let chip_h = if has_prompt_cwd { row_h + 2.0 * render::CHIP_PAD_Y } else { 0.0 };
         let editor_h = footer_h - chip_h;
         let footer_origin = ui.next_widget_position();
@@ -1019,15 +1036,19 @@ pub fn render_pane(
             egui::Pos2::new(footer_origin.x, footer_origin.y + chip_h),
             egui::Vec2::new(ui.available_width(), editor_h),
         );
-        // Register the editor footer as a widget so egui knows there's
-        // a click-and-drag target here (cursor icon etc.). Focus is
-        // held by the per-pane focus anchor allocated below; the
-        // Response itself isn't used.
-        let _editor_response = ui.interact(
+        // Register the editor footer as a widget. The Response is
+        // the SINGLE source of truth for routing pointer events to
+        // the editor — click handlers below ask
+        // `editor_response.is_pointer_button_down_on()`,
+        // `.interact_pointer_pos()`, `.clicked()`, etc., never
+        // `editor_rect.contains(global_press_origin)`. Focus is
+        // held by the per-pane focus anchor; this response only
+        // routes pointer events.
+        editor_response = Some(ui.interact(
             editor_rect,
             ui.id().with(("editor-footer", slot.session.pane_id())),
             egui::Sense::click_and_drag(),
-        );
+        ));
 
         if let Some(editor) = slot.session.blocks().editor_on_tail() {
             let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
@@ -1152,11 +1173,7 @@ pub fn render_pane(
                 slot.ui.chrome_opacity,
             );
         }
-
-        Some(editor_rect)
-    } else {
-        None
-    };
+    }
 
     // Stable per-pane focus anchor.
     //
@@ -1203,41 +1220,30 @@ pub fn render_pane(
 
     // ---- mouse selection / link click + focus-on-press ----------
     //
-    // Clicking inside the grid does three things at once:
-    //   1. Grabs keyboard focus (so the keyboard gate below lets
-    //      this pane's events through).
-    //   2. Either opens a Cmd/Ctrl-clicked URL or starts a selection
-    //      (multi-click counter for char/word/line mode).
-    //   3. Resets click-counter timing.
+    // **Routing rule:** all pointer events are routed through each
+    // widget's own [`egui::Response`]. We do NOT poll global
+    // pointer state (`ctx.input.pointer.press_origin()`,
+    // `primary_down`, etc.) to figure out WHICH widget got a press
+    // — egui's interaction layer already did that, with full
+    // z-order awareness. A higher widget (the `egui_tiles`
+    // splitter resize handle, a tab strip widget, a modal overlay)
+    // wins exclusively, and only its `Response` reflects the
+    // press. Asking each widget gives a correct answer even when
+    // multiple widgets cover the same pixel; reading global state
+    // + intersecting it with stored rects does not.
+    //
+    // `ctx.input` is only consulted for state that isn't a press
+    // event: the current `time` (for the multi-click counter),
+    // and modifier keys at click time (for Cmd-click on links).
     let geom_after_paint = rendered.geometry;
     let to_point = |pos: egui::Pos2| pixel_to_grid_point(pos.x, pos.y, geom_after_paint);
-    let (primary_pressed, press_origin, primary_down, now) = ctx.input(|i| {
-        (i.pointer.primary_pressed(), i.pointer.press_origin(), i.pointer.primary_down(), i.time)
-    });
-
-    // Focus claim: a press *anywhere* in the pane — including the
-    // empty area above the bottom-aligned block stack, the gap
-    // between blocks, or the strip between the block stack and
-    // the editor footer — grabs keyboard focus. The selection
-    // branches below only fire when the press lands on a real
-    // hit-target (live grid / sealed block / editor footer); the
-    // "gray background" cases would otherwise leave the pane
-    // unfocused even though the user clicked into it.
-    let pane_rect = ui.max_rect();
-    if !modal_open
-        && primary_pressed
-        && let Some(pos) = press_origin
-        && pane_rect.contains(pos)
-    {
-        focus_response.request_focus();
-    }
-
-    // Editor hit-area: the fixed footer below the scroll area.
-    // Phase 4D anchors the editor to the viewport bottom, so the
-    // hit-test rect is exactly the footer rect we painted above.
-    // `None` when no footer was painted (alt-screen, tail not
-    // Prompt, or editor inactive).
-    let editor_rect: Option<egui::Rect> = footer_rect;
+    let now = ctx.input(|i| i.time);
+    // `primary_just_pressed` is timing-only — it tells us "a press
+    // happened somewhere this frame", which lets us distinguish a
+    // start-of-gesture from a continuing drag. It does NOT tell us
+    // WHICH widget got the press; that comes from per-widget
+    // `Response::is_pointer_button_down_on()`.
+    let primary_just_pressed = ctx.input(|i| i.pointer.primary_pressed());
 
     /// Translate a pointer pixel position inside the editor rect to
     /// a byte index in the editor's text. Out-of-rows clamps to end.
@@ -1253,26 +1259,8 @@ pub fn render_pane(
         crate::prompt_editor::byte_index_for_row_col(editor_text, row, col_chars)
     }
 
-    let click_in_editor = editor_rect.is_some_and(|r| press_origin.is_some_and(|p| r.contains(p)));
-
-    // Sealed-block hit-test: which block (if any) did the press land
-    // inside? Used by the click / drag handler below to start or
-    // extend a `BlockSelection`. Computed before the alacritty branch
-    // so a press on a sealed snapshot doesn't fall through to the
-    // live-grid path. The editor overlay takes precedence (it's
-    // painted on top of the live `Term`'s prompt row).
-    // `(block_id, full block rect, command_lines)` — the
-    // command_lines value lets `sealed_cursor_for_pos` translate y
-    // into the unified row space (command label rows come first).
-    let press_in_sealed_block: Option<(crate::block::BlockId, egui::Rect, usize)> =
-        if !click_in_editor && let Some(pos) = press_origin {
-            sealed_rects.iter().find(|(_, r, _)| r.contains(pos)).copied()
-        } else {
-            None
-        };
-
     /// Translate a pointer pixel position inside a sealed-block rect
-    /// to a `BlockCursor` in the block's unified row space (rows
+    /// to a [`BlockCursor`] in the block's unified row space (rows
     /// `0..command_lines` = command label; rest = snapshot). Clamps
     /// to the block's bounds — pointer above → row 0; below → last
     /// row; left → col 0; right → row_len. Per-row col is clamped
@@ -1291,155 +1279,238 @@ pub fn render_pane(
         crate::block_selection::BlockCursor::new(row, col)
     }
 
-    if !modal_open
-        && primary_pressed
-        && let Some(pos) = press_origin
-        && (rendered.response.rect.contains(pos)
-            || press_in_sealed_block.is_some()
-            || editor_rect.is_some_and(|r| r.contains(pos)))
-    {
-        focus_response.request_focus();
+    /// Update the multi-click counter (click_count, last_press_time,
+    /// last_press_pos) for a press that just landed at `pos`.
+    /// Returns the new click count (1, 2, or 3).
+    fn bump_multi_click(
+        slot_ui: &mut crate::pane_slot::PaneUiState,
+        now: f64,
+        pos: egui::Pos2,
+    ) -> u8 {
+        let dt = now - slot_ui.last_press_time;
+        let dist = (pos - slot_ui.last_press_pos).length();
+        if dt < MULTI_CLICK_WINDOW_SECS && dist < MULTI_CLICK_DISTANCE_PX {
+            slot_ui.click_count = (slot_ui.click_count + 1).min(3);
+        } else {
+            slot_ui.click_count = 1;
+        }
+        slot_ui.last_press_time = now;
+        slot_ui.last_press_pos = pos;
+        slot_ui.click_count
+    }
 
-        if let Some((block_id, block_rect, _cmd_lines)) = press_in_sealed_block {
-            let (cmd_lines, snap_lines) =
-                slot.session.sealed_block_rows(block_id).unwrap_or((0, 0));
-            let total_rows = cmd_lines + snap_lines;
-            let mut cursor = sealed_cursor_for_pos(block_rect, pos, cell_w, row_h, total_rows);
-            // Clamp col to the per-row length so an empty / short row
-            // doesn't yield a col past the end.
-            if let Some(row_len) = slot.session.sealed_row_len(block_id, cursor.row) {
-                cursor.col = cursor.col.min(row_len);
-            }
-
-            // Cmd-click on a URL / file-path inside the sealed block:
-            // open the link and skip selection entirely (the live-grid
-            // path has the same shortcut). Computed before the multi-
-            // click counter so a Cmd-click doesn't burn a click into
-            // a follow-up double-click word selection.
-            let sealed_link = slot.session.sealed_block_links(block_id, home).and_then(|links| {
-                links.iter().find(|l| l.contains(cursor.row, cursor.col)).cloned()
-            });
-            if modifier_held && let Some(link) = &sealed_link {
-                open_url(&link.url);
-                focus_response.request_focus();
-                // No selection / no drag-anchor; let the user keep
-                // typing into the editor footer.
+    // Does any widget inside this pane currently hold the pointer
+    // press? Each `is_pointer_button_down_on()` is exclusive — at
+    // most one widget on screen returns true. If ANY of ours
+    // returns true, the press lives inside this pane; focus
+    // belongs here. If none does, the press is on something else
+    // (splitter, tab strip, another pane) and we must not touch
+    // focus or start a selection.
+    let live_grid_pressed = rendered.response.is_pointer_button_down_on();
+    let editor_pressed = editor_response.as_ref().is_some_and(|r| r.is_pointer_button_down_on());
+    let sealed_pressed_id: Option<crate::block::BlockId> =
+        sealed_block_renders.iter().find_map(|(id, r)| {
+            if r.snapshot.is_pointer_button_down_on()
+                || r.command.as_ref().is_some_and(|c| c.is_pointer_button_down_on())
+            {
+                Some(*id)
             } else {
-                // Sealed-block press. Single → place an empty selection
-                // at the clicked cell (drag extends it); double → select
-                // the word OR the whole URL/path span if one is under
-                // the pointer; triple → select the line. Same multi-
-                // click counter that drives editor + live grid.
-                let dt = now - slot.ui.last_press_time;
-                let dist = (pos - slot.ui.last_press_pos).length();
-                if dt < MULTI_CLICK_WINDOW_SECS && dist < MULTI_CLICK_DISTANCE_PX {
-                    slot.ui.click_count = (slot.ui.click_count + 1).min(3);
-                } else {
-                    slot.ui.click_count = 1;
-                }
-                slot.ui.last_press_time = now;
-                slot.ui.last_press_pos = pos;
+                None
+            }
+        });
+    let any_pane_widget_pressed =
+        live_grid_pressed || editor_pressed || sealed_pressed_id.is_some();
 
-                match slot.ui.click_count {
-                    2 => {
-                        // Double-click on a URL or path span: select
-                        // the whole span as one unit (so `https://...`
-                        // doesn't fragment at `:` / `/` / `.` the way
-                        // the bare word-char predicate does).
-                        if let Some(link) = &sealed_link {
-                            let a =
-                                crate::block_selection::BlockCursor::new(link.row, link.col_start);
-                            let b = crate::block_selection::BlockCursor::new(
-                                link.row,
-                                link.col_end + 1,
-                            );
-                            slot.ui.sealed_drag_anchor = Some((block_id, a, b));
-                            slot.session.set_block_selection(
-                                crate::block_selection::BlockSelection::new(block_id, a, b),
-                            );
-                        } else if let Some((a, b)) =
-                            slot.session.sealed_word_range(block_id, cursor)
-                        {
-                            slot.ui.sealed_drag_anchor = Some((block_id, a, b));
-                            slot.session.set_block_selection(
-                                crate::block_selection::BlockSelection::new(block_id, a, b),
-                            );
+    if !modal_open && any_pane_widget_pressed {
+        focus_response.request_focus();
+    }
+
+    // ---- Sealed-block click / drag routing ----------------------
+    //
+    // Per-widget: the snapshot OR command label of one specific
+    // sealed block is receiving the press. Egui's interaction
+    // layer guarantees this is exclusive — at most one block fires
+    // per frame, never both panes during a splitter drag.
+    if !modal_open && let Some(block_id) = sealed_pressed_id {
+        // Find the response set for this block. The press may be
+        // on either sub-widget (command label or snapshot).
+        if let Some((_, sealed)) = sealed_block_renders.iter().find(|(id, _)| *id == block_id) {
+            let pos = sealed
+                .snapshot
+                .interact_pointer_pos()
+                .or_else(|| sealed.command.as_ref().and_then(|c| c.interact_pointer_pos()));
+            if let Some(pos) = pos {
+                let block_rect = sealed.bounding_rect();
+                let (cmd_lines, snap_lines) =
+                    slot.session.sealed_block_rows(block_id).unwrap_or((0, 0));
+                let total_rows = cmd_lines + snap_lines;
+                let mut cursor = sealed_cursor_for_pos(block_rect, pos, cell_w, row_h, total_rows);
+                if let Some(row_len) = slot.session.sealed_row_len(block_id, cursor.row) {
+                    cursor.col = cursor.col.min(row_len);
+                }
+
+                if primary_just_pressed {
+                    // -------- START a selection in this block --------
+                    let sealed_link =
+                        slot.session.sealed_block_links(block_id, home).and_then(|links| {
+                            links.iter().find(|l| l.contains(cursor.row, cursor.col)).cloned()
+                        });
+                    if modifier_held && let Some(link) = &sealed_link {
+                        // Cmd-click on a URL / path: open it, don't
+                        // start a selection.
+                        open_url(&link.url);
+                    } else {
+                        let click_count = bump_multi_click(&mut slot.ui, now, pos);
+                        match click_count {
+                            2 => {
+                                if let Some(link) = &sealed_link {
+                                    let a = crate::block_selection::BlockCursor::new(
+                                        link.row,
+                                        link.col_start,
+                                    );
+                                    let b = crate::block_selection::BlockCursor::new(
+                                        link.row,
+                                        link.col_end + 1,
+                                    );
+                                    slot.ui.sealed_drag_anchor = Some((block_id, a, b));
+                                    slot.session.set_block_selection(
+                                        crate::block_selection::BlockSelection::new(block_id, a, b),
+                                    );
+                                } else if let Some((a, b)) =
+                                    slot.session.sealed_word_range(block_id, cursor)
+                                {
+                                    slot.ui.sealed_drag_anchor = Some((block_id, a, b));
+                                    slot.session.set_block_selection(
+                                        crate::block_selection::BlockSelection::new(block_id, a, b),
+                                    );
+                                }
+                            }
+                            3 => {
+                                if let Some((a, b)) =
+                                    slot.session.sealed_line_range(block_id, cursor)
+                                {
+                                    slot.ui.sealed_drag_anchor = Some((block_id, a, b));
+                                    slot.session.set_block_selection(
+                                        crate::block_selection::BlockSelection::new(block_id, a, b),
+                                    );
+                                }
+                            }
+                            _ => {
+                                slot.ui.sealed_drag_anchor = None;
+                                slot.session.set_block_selection(
+                                    crate::block_selection::BlockSelection::new(
+                                        block_id, cursor, cursor,
+                                    ),
+                                );
+                            }
                         }
                     }
-                    3 => {
-                        if let Some((a, b)) = slot.session.sealed_line_range(block_id, cursor) {
-                            slot.ui.sealed_drag_anchor = Some((block_id, a, b));
-                            slot.session.set_block_selection(
-                                crate::block_selection::BlockSelection::new(block_id, a, b),
-                            );
+                } else if let Some(sel) = slot.session.block_selection().copied()
+                    && sel.block_id == block_id
+                {
+                    // -------- EXTEND the selection -------------------
+                    match (slot.ui.click_count, slot.ui.sealed_drag_anchor) {
+                        (2, Some((anchor_block, a_start, a_end))) if anchor_block == block_id => {
+                            if let Some((c_start, c_end)) =
+                                slot.session.sealed_word_range(block_id, cursor)
+                            {
+                                let start = a_start.min(c_start);
+                                let end = a_end.max(c_end);
+                                slot.session.update_block_selection_endpoints(start, end);
+                            }
                         }
-                    }
-                    _ => {
-                        slot.ui.sealed_drag_anchor = None;
-                        slot.session.set_block_selection(
-                            crate::block_selection::BlockSelection::new(block_id, cursor, cursor),
-                        );
+                        (3, Some((anchor_block, a_start, a_end))) if anchor_block == block_id => {
+                            if let Some((c_start, c_end)) =
+                                slot.session.sealed_line_range(block_id, cursor)
+                            {
+                                let start = a_start.min(c_start);
+                                let end = a_end.max(c_end);
+                                slot.session.update_block_selection_endpoints(start, end);
+                            }
+                        }
+                        _ => {
+                            slot.session.update_block_selection_endpoints(sel.anchor, cursor);
+                        }
                     }
                 }
             }
-        } else if click_in_editor && let Some(rect) = editor_rect {
-            // Pressing in the editor (or in the live grid below)
-            // ends any sealed-block selection — only one "current
-            // selection" per pane.
+        }
+    }
+
+    // ---- Editor footer click / drag routing ---------------------
+    if !modal_open
+        && editor_pressed
+        && let Some(editor_resp) = editor_response.as_ref()
+        && let Some(pos) = editor_resp.interact_pointer_pos()
+    {
+        let rect = editor_resp.rect;
+        let editor_text = slot
+            .session
+            .blocks()
+            .editor_on_tail()
+            .map(|e| e.text().to_string())
+            .unwrap_or_default();
+        let byte = editor_byte_for_pos(rect, pos, &editor_text, cell_w, row_h);
+
+        if primary_just_pressed {
+            // Press in the editor ends any sealed-block selection.
             slot.session.clear_block_selection();
             slot.ui.sealed_drag_anchor = None;
-            // Editor click. Single → place cursor; double → select
-            // word; triple → select line. Same multi-click counter
-            // the alacritty path uses.
-            let dt = now - slot.ui.last_press_time;
-            let dist = (pos - slot.ui.last_press_pos).length();
-            if dt < MULTI_CLICK_WINDOW_SECS && dist < MULTI_CLICK_DISTANCE_PX {
-                slot.ui.click_count = (slot.ui.click_count + 1).min(3);
-            } else {
-                slot.ui.click_count = 1;
-            }
-            slot.ui.last_press_time = now;
-            slot.ui.last_press_pos = pos;
-
-            let editor_text = slot
-                .session
-                .blocks()
-                .editor_on_tail()
-                .map(|e| e.text().to_string())
-                .unwrap_or_default();
-            let byte = editor_byte_for_pos(rect, pos, &editor_text, cell_w, row_h);
-            // Compute and remember the original anchor range so the
-            // drag handler can extend selection by word / line.
-            slot.ui.editor_drag_anchor = match slot.ui.click_count {
+            let click_count = bump_multi_click(&mut slot.ui, now, pos);
+            slot.ui.editor_drag_anchor = match click_count {
                 2 => Some(crate::prompt_editor::word_range_at(&editor_text, byte)),
                 3 => Some(crate::prompt_editor::line_range_at(&editor_text, byte)),
                 _ => None,
             };
             if let Some(editor) = slot.session.editor_mut() {
-                match slot.ui.click_count {
+                match click_count {
                     1 => editor.set_cursor(byte),
                     2 => editor.select_word_at(byte),
                     _ => editor.select_line_at(byte),
                 }
             }
         } else {
-            let press_pt = to_point(pos);
-            let link_under_press = links_in_view.iter().find(|l| l.contains(press_pt)).cloned();
+            // EXTEND while button is held.
+            match (slot.ui.click_count, slot.ui.editor_drag_anchor) {
+                (2, Some(anchor)) => {
+                    let cur = crate::prompt_editor::word_range_at(&editor_text, byte);
+                    let start = anchor.0.min(cur.0);
+                    let end = anchor.1.max(cur.1);
+                    if let Some(editor) = slot.session.editor_mut() {
+                        editor.set_selection(start, end);
+                    }
+                }
+                (3, Some(anchor)) => {
+                    let cur = crate::prompt_editor::line_range_at(&editor_text, byte);
+                    let start = anchor.0.min(cur.0);
+                    let end = anchor.1.max(cur.1);
+                    if let Some(editor) = slot.session.editor_mut() {
+                        editor.set_selection(start, end);
+                    }
+                }
+                _ => {
+                    if let Some(editor) = slot.session.editor_mut() {
+                        editor.set_cursor_extending(byte);
+                    }
+                }
+            }
+        }
+    }
 
+    // ---- Live-grid click / drag routing -------------------------
+    if !modal_open
+        && live_grid_pressed
+        && let Some(pos) = rendered.response.interact_pointer_pos()
+    {
+        let press_pt = to_point(pos);
+        let link_under_press = links_in_view.iter().find(|l| l.contains(press_pt)).cloned();
+
+        if primary_just_pressed {
             if modifier_held && let Some(link) = link_under_press {
                 open_url(&link.url);
             } else {
-                let dt = now - slot.ui.last_press_time;
-                let dist = (pos - slot.ui.last_press_pos).length();
-                if dt < MULTI_CLICK_WINDOW_SECS && dist < MULTI_CLICK_DISTANCE_PX {
-                    slot.ui.click_count = (slot.ui.click_count + 1).min(3);
-                } else {
-                    slot.ui.click_count = 1;
-                }
-                slot.ui.last_press_time = now;
-                slot.ui.last_press_pos = pos;
-
-                let mode = match slot.ui.click_count {
+                let click_count = bump_multi_click(&mut slot.ui, now, pos);
+                let mode = match click_count {
                     1 => SelectionMode::Char,
                     2 => SelectionMode::Word,
                     _ => SelectionMode::Line,
@@ -1449,105 +1520,14 @@ pub fn render_pane(
                 {
                     slot.session.start_url_selection(link.start, link.end);
                 } else {
-                    slot.session.start_selection(to_point(pos), mode);
+                    slot.session.start_selection(press_pt, mode);
                 }
             }
-        }
-    } else if !modal_open
-        && rendered.response.dragged()
-        && let Some(pos) = rendered.response.interact_pointer_pos()
-    {
-        // Live-grid drag. The editor lives on a different widget
-        // (the fixed footer) and routes through its own branch
-        // below; sealed-block drags route through a third branch.
-        slot.session.extend_selection(to_point(pos));
-    } else if !modal_open
-        && primary_down
-        && click_in_editor
-        && let Some(rect) = editor_rect
-        && let Some(pos) = ctx.input(|i| i.pointer.interact_pos())
-    {
-        // Editor drag. `rendered.response.dragged()` is false here
-        // because the press landed on the editor footer's widget,
-        // not the live-Term widget. Drive extension off `primary_down`
-        // + `click_in_editor` so the editor still receives drag
-        // updates throughout the gesture.
-        let editor_text = slot
-            .session
-            .blocks()
-            .editor_on_tail()
-            .map(|e| e.text().to_string())
-            .unwrap_or_default();
-        let byte = editor_byte_for_pos(rect, pos, &editor_text, cell_w, row_h);
-        match (slot.ui.click_count, slot.ui.editor_drag_anchor) {
-            (2, Some(anchor)) => {
-                let cur = crate::prompt_editor::word_range_at(&editor_text, byte);
-                let start = anchor.0.min(cur.0);
-                let end = anchor.1.max(cur.1);
-                if let Some(editor) = slot.session.editor_mut() {
-                    editor.set_selection(start, end);
-                }
-            }
-            (3, Some(anchor)) => {
-                let cur = crate::prompt_editor::line_range_at(&editor_text, byte);
-                let start = anchor.0.min(cur.0);
-                let end = anchor.1.max(cur.1);
-                if let Some(editor) = slot.session.editor_mut() {
-                    editor.set_selection(start, end);
-                }
-            }
-            _ => {
-                if let Some(editor) = slot.session.editor_mut() {
-                    editor.set_cursor_extending(byte);
-                }
-            }
-        }
-    } else if !modal_open
-        && primary_down
-        && let Some((block_id, block_rect, _cmd_lines)) = press_in_sealed_block
-        && let Some(sel) = slot.session.block_selection().copied()
-        && sel.block_id == block_id
-        && let Some(pos) = ctx.input(|i| i.pointer.interact_pos())
-    {
-        // Sealed-block drag. `rendered.response.dragged()` is false
-        // here because the press landed on a different widget (a
-        // sealed block's response, not the live `Term`'s); we drive
-        // the extension off `primary_down` + the active
-        // `BlockSelection`'s `block_id` to make sure we're still
-        // tracking the block where the press began. Cross-block drag
-        // is deferred to a follow-up.
-        let (cl, sl) = slot.session.sealed_block_rows(block_id).unwrap_or((0, 0));
-        let total_rows = cl + sl;
-        let mut cursor = sealed_cursor_for_pos(block_rect, pos, cell_w, row_h, total_rows);
-        if let Some(row_len) = slot.session.sealed_row_len(block_id, cursor.row) {
-            cursor.col = cursor.col.min(row_len);
-        }
-        match (slot.ui.click_count, slot.ui.sealed_drag_anchor) {
-            (2, Some((anchor_block, a_start, a_end))) if anchor_block == block_id => {
-                // Word-mode extension: union of (anchor word) ∪
-                // (word under pointer). Anchor stays fixed; head
-                // moves to the far end of the union.
-                if let Some((c_start, c_end)) = slot.session.sealed_word_range(block_id, cursor) {
-                    let start = a_start.min(c_start);
-                    let end = a_end.max(c_end);
-                    slot.session.update_block_selection_endpoints(start, end);
-                }
-            }
-            (3, Some((anchor_block, a_start, a_end))) if anchor_block == block_id => {
-                // Line-mode extension: union of (anchor row) ∪
-                // (row under pointer).
-                if let Some((c_start, c_end)) = slot.session.sealed_line_range(block_id, cursor) {
-                    let start = a_start.min(c_start);
-                    let end = a_end.max(c_end);
-                    slot.session.update_block_selection_endpoints(start, end);
-                }
-            }
-            _ => {
-                // Single-click drag: anchor is where the press
-                // landed (preserved on the `BlockSelection`); head
-                // tracks the pointer.
-                slot.session.update_block_selection_endpoints(sel.anchor, cursor);
-            }
+        } else if rendered.response.dragged() {
+            // EXTEND. Egui's `dragged()` is the canonical
+            // "this widget is being dragged" signal once the
+            // drag threshold is met.
+            slot.session.extend_selection(press_pt);
         }
     }
 

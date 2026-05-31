@@ -917,27 +917,52 @@ pub fn paint_command_label_with_selection(
 /// covered cells in the snapshot. The caller is responsible for
 /// passing `Some` only when the selection belongs to *this* block;
 /// `paint_sealed_block` does not know its own [`crate::block::BlockId`].
-/// Endpoints must already be in reading order (start ≤ end).
+/// Result of painting a sealed block: the per-sub-widget egui
+/// [`Response`]s plus the row count of the command label. Used by
+/// [`crate::render_pane`] to route click / drag events through
+/// egui's own interaction layer rather than reconstructing
+/// routing from global `ctx.input` state + manual rect-contains
+/// tests.
 ///
-/// Returns the [`Response`] over the *snapshot* region — i.e. the
-/// hit-testable rect for sealed-block selection. The command label
-/// region is excluded so that clicks on the label don't begin a
-/// selection that would visually start above the highlight.
-/// Result of painting a sealed block: the union [`Rect`] over the
-/// command label + snapshot regions (excluding the header chip),
-/// plus the row count of the command label. Used by
-/// [`crate::render_pane`] to translate pointer-pixel positions
-/// into a [`BlockCursor`] in the block's unified row space
-/// (`0..command_lines` = command rows, the rest = snapshot rows).
-#[derive(Debug, Clone, Copy)]
+/// **Click routing rule:** ALL pointer routing for sealed blocks
+/// goes through these [`Response`]s — `clicked()`, `dragged()`,
+/// `is_pointer_button_down_on()`, `interact_pointer_pos()`. Never
+/// fall back to global `ctx.input.primary_pressed()` +
+/// `rect.contains(press_origin)`. egui's interaction layer
+/// already resolves z-order (a higher widget — like `egui_tiles`'
+/// splitter resize handle — wins exclusively over a sealed block
+/// at the same pixel), and only the [`Response`] reflects that
+/// decision. Reading global state and intersecting it with a rect
+/// will give the wrong answer when widgets overlap, and the
+/// neighboring splitter / tab-strip rects DO overlap sealed
+/// blocks at pane edges.
+///
+/// `command` is `None` when the block has an empty command line
+/// (uncommon; the prompt-editor path always sends at least one
+/// row). `snapshot` is always present.
+#[derive(Debug, Clone)]
 pub struct SealedBlockRender {
-    /// Hit-test rect covering both command-label and snapshot
-    /// regions. The header chip is NOT included so clicks on the
-    /// chip don't start a selection.
-    pub rect: Rect,
+    /// Response over the command-label widget. Senses
+    /// `click_and_drag`. `None` when `command` was empty.
+    pub command: Option<Response>,
+    /// Response over the snapshot widget. Senses `click_and_drag`.
+    pub snapshot: Response,
     /// Number of rows the command label occupies. Snapshot rows
     /// start at this index in the unified row space.
     pub command_lines: usize,
+}
+
+impl SealedBlockRender {
+    /// Convenience: the union rect of command + snapshot. Some
+    /// renderers still want a "bounding box" for chrome / wash
+    /// painting; this gives them one without exposing it as a
+    /// click-routing surface.
+    pub fn bounding_rect(&self) -> Rect {
+        match &self.command {
+            Some(c) => c.rect.union(self.snapshot.rect),
+            None => self.snapshot.rect,
+        }
+    }
 }
 
 pub fn paint_sealed_block(
@@ -967,17 +992,13 @@ pub fn paint_sealed_block(
     // Split the unified selection into command and snapshot pieces.
     let (cmd_sel, snap_sel) = split_selection_at_row(selection, cmd_lines);
 
-    let cmd_rect = if !command.is_empty() {
-        Some(paint_command_label_with_selection(ui, command, cmd_sel).rect)
+    let command_response = if !command.is_empty() {
+        Some(paint_command_label_with_selection(ui, command, cmd_sel))
     } else {
         None
     };
 
-    let snap_rect = paint_styled_lines(ui, snapshot, snap_sel).rect;
-    let rect = match cmd_rect {
-        Some(c) => c.union(snap_rect),
-        None => snap_rect,
-    };
+    let snapshot_response = paint_styled_lines(ui, snapshot, snap_sel);
 
     if let Some(idx) = bg_idx {
         // Full-bleed wash: from the inter-block hairline above to
@@ -987,7 +1008,7 @@ pub fn paint_sealed_block(
         // is THIS strip of the transcript," not "the failed text
         // has a red wrapper."
         let pane_clip = ui.clip_rect();
-        let bottom_y = snap_rect.bottom();
+        let bottom_y = snapshot_response.rect.bottom();
         let wash = Rect::from_min_max(
             Pos2::new(pane_clip.left(), block_top_y - BLOCK_SEPARATOR_GAP),
             Pos2::new(pane_clip.right(), bottom_y + BLOCK_SEPARATOR_GAP),
@@ -996,7 +1017,11 @@ pub fn paint_sealed_block(
         ui.painter().set(idx, egui::Shape::rect_filled(wash, 0.0, FAILED_BLOCK_BG));
     }
 
-    SealedBlockRender { rect, command_lines: cmd_lines }
+    SealedBlockRender {
+        command: command_response,
+        snapshot: snapshot_response,
+        command_lines: cmd_lines,
+    }
 }
 
 /// Clip a unified-row [`BlockSelection`] range to the command
