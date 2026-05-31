@@ -489,6 +489,37 @@ pub fn cells_from_pixels(avail: egui::Vec2, cell_w: f32, row_h: f32) -> (u16, u1
     (rows.max(MIN_ROWS), cols.max(MIN_COLS))
 }
 
+/// `true` when egui currently has a pointer drag claimed by a
+/// widget that lives OUTSIDE this pane's rect — typically
+/// `egui_tiles`' splitter resize handle (in the gap between
+/// panes) or a tab being dragged in the tab strip. When this is
+/// `true`, the pane's mouse handlers must NOT start or extend any
+/// selection: the pointer motion belongs to the external drag,
+/// and otherwise we'd leak a sealed-block selection into every
+/// visible pane as the splitter (or tab) moves up and down.
+///
+/// `dragged_widget_rect = None` covers two cases: (a) nothing is
+/// being dragged at all (`ctx.dragged_id()` returned `None`), or
+/// (b) something is being dragged but `ctx.read_response()` had
+/// no entry for it. Both mean "no external drag we have to defend
+/// against".
+///
+/// A `Some(rect)` whose `center()` falls inside `pane_rect` is
+/// our own widget — the live grid, a sealed block, the editor
+/// footer — so the existing per-widget gates handle it correctly
+/// and we return `false`. A `Some(rect)` whose center is outside
+/// `pane_rect` is the external case we want to short-circuit.
+///
+/// Pure function so the gate is unit-testable without an egui
+/// context. See the regression tests below for the four cases
+/// (no drag, our drag, external drag, edge-of-pane drag).
+fn is_external_drag(dragged_widget_rect: Option<egui::Rect>, pane_rect: egui::Rect) -> bool {
+    match dragged_widget_rect {
+        None => false,
+        Some(r) => !pane_rect.contains(r.center()),
+    }
+}
+
 /// Render one pane into `ui`: status header, resize-PTY-to-cells,
 /// link scan + hover, terminal grid, mouse selection, scroll wheel,
 /// input encoding, copy shortcut.
@@ -1214,6 +1245,22 @@ pub fn render_pane(
     let (primary_pressed, press_origin, primary_down, now) = ctx.input(|i| {
         (i.pointer.primary_pressed(), i.pointer.press_origin(), i.pointer.primary_down(), i.time)
     });
+    let pane_rect = ui.max_rect();
+
+    // Hands-off gate when an OUTSIDE widget owns the current
+    // pointer drag — `egui_tiles`' splitter resize handle (in the
+    // gap between panes) or a tab being dragged in the tab strip.
+    // User reported: dragging the splitter selected sealed-block
+    // text in BOTH panes; dragging a tab between Containers did
+    // the same. The selection logic below has per-widget gates
+    // that look correct in isolation, but the global
+    // `primary_down` path used by the sealed-block extend can
+    // mis-fire in the presence of an egui_tiles drag (the
+    // splitter's drag motion leaks through). Setting this flag
+    // collapses ALL three selection/focus actions below — start,
+    // extend, focus claim — into no-ops.
+    let dragged_widget_rect = ctx.dragged_id().and_then(|id| ctx.read_response(id)).map(|r| r.rect);
+    let external_drag = is_external_drag(dragged_widget_rect, pane_rect);
 
     // Focus claim: a press *anywhere* in the pane — including the
     // empty area above the bottom-aligned block stack, the gap
@@ -1223,8 +1270,8 @@ pub fn render_pane(
     // hit-target (live grid / sealed block / editor footer); the
     // "gray background" cases would otherwise leave the pane
     // unfocused even though the user clicked into it.
-    let pane_rect = ui.max_rect();
     if !modal_open
+        && !external_drag
         && primary_pressed
         && let Some(pos) = press_origin
         && pane_rect.contains(pos)
@@ -1292,6 +1339,7 @@ pub fn render_pane(
     }
 
     if !modal_open
+        && !external_drag
         && primary_pressed
         && let Some(pos) = press_origin
         && (rendered.response.rect.contains(pos)
@@ -1454,6 +1502,7 @@ pub fn render_pane(
             }
         }
     } else if !modal_open
+        && !external_drag
         && rendered.response.dragged()
         && let Some(pos) = rendered.response.interact_pointer_pos()
     {
@@ -1462,6 +1511,7 @@ pub fn render_pane(
         // below; sealed-block drags route through a third branch.
         slot.session.extend_selection(to_point(pos));
     } else if !modal_open
+        && !external_drag
         && primary_down
         && click_in_editor
         && let Some(rect) = editor_rect
@@ -1503,6 +1553,7 @@ pub fn render_pane(
             }
         }
     } else if !modal_open
+        && !external_drag
         && primary_down
         && let Some((block_id, block_rect, _cmd_lines)) = press_in_sealed_block
         && let Some(sel) = slot.session.block_selection().copied()
@@ -1996,5 +2047,60 @@ mod tests {
         let (rows2, _cols2) = cells_from_pixels(egui::Vec2::new(800.0, 400.0), 10.0, 0.0);
         assert_eq!(rows2, MIN_ROWS);
         let _ = rows;
+    }
+
+    // ---- is_external_drag: drag-source-vs-pane hands-off gate -----
+
+    fn pane_rect_400x300() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0))
+    }
+
+    #[test]
+    fn external_drag_returns_false_when_nothing_dragged() {
+        // No drag in progress → no external drag.
+        assert!(!is_external_drag(None, pane_rect_400x300()));
+    }
+
+    #[test]
+    fn external_drag_returns_false_when_dragged_widget_is_inside_pane() {
+        // Sealed-block widget rect inside the pane's max_rect →
+        // it's our own drag; the existing per-widget gates
+        // handle it.
+        let inner = egui::Rect::from_min_size(egui::pos2(50.0, 100.0), egui::vec2(200.0, 80.0));
+        assert!(!is_external_drag(Some(inner), pane_rect_400x300()));
+    }
+
+    #[test]
+    fn external_drag_returns_true_when_dragged_widget_is_outside_pane() {
+        // egui_tiles splitter line_rect: lives in the gap to the
+        // RIGHT of the pane. Center sits outside the pane rect →
+        // external.
+        let gap = egui::Rect::from_min_size(egui::pos2(403.0, 0.0), egui::vec2(10.0, 300.0));
+        assert!(is_external_drag(Some(gap), pane_rect_400x300()));
+    }
+
+    #[test]
+    fn external_drag_uses_center_so_edge_overlap_is_not_external() {
+        // A widget whose RECT overlaps the pane but whose CENTER
+        // sits inside the pane counts as ours. Belt-and-braces
+        // for layout jitter at the pane boundary.
+        let straddle = egui::Rect::from_min_size(egui::pos2(390.0, 100.0), egui::vec2(50.0, 80.0));
+        // center.x = 390 + 25 = 415 → OUTSIDE the 400-wide pane
+        assert!(is_external_drag(Some(straddle), pane_rect_400x300()));
+        // And the inverse — straddling the LEFT edge with the
+        // center inside.
+        let straddle_l =
+            egui::Rect::from_min_size(egui::pos2(-10.0, 100.0), egui::vec2(50.0, 80.0));
+        // center.x = -10 + 25 = 15 → INSIDE
+        assert!(!is_external_drag(Some(straddle_l), pane_rect_400x300()));
+    }
+
+    #[test]
+    fn external_drag_is_true_for_tab_strip_above_pane() {
+        // Tab strip lives above the pane content area in
+        // egui_tiles' Tabs container layout. A tab being dragged
+        // sits in that strip — its center is OUTSIDE pane_rect.
+        let tab = egui::Rect::from_min_size(egui::pos2(50.0, -30.0), egui::vec2(100.0, 24.0));
+        assert!(is_external_drag(Some(tab), pane_rect_400x300()));
     }
 }
