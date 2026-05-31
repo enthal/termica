@@ -13,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// Read on open via `PRAGMA user_version` and compared against
 /// the embedded constant; mismatching versions trigger the
 /// migration ladder.
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 /// One row in `runs`. `pane_id` / `app_run_id` / `cwd` are `None`
 /// for entries replayed from a shell-history file (those formats
@@ -93,11 +93,28 @@ impl HistoryStore {
         for v in (current + 1)..=SCHEMA_VERSION {
             match v {
                 1 => self.apply_v1()?,
+                2 => self.apply_v2()?,
                 _ => unreachable!("no migration for v{v}"),
             }
         }
         self.conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
+    }
+
+    fn apply_v2(&self) -> rusqlite::Result<()> {
+        // Idempotent replay: a partial UNIQUE INDEX over the natural
+        // dedup key for replayed shell-history-file rows.
+        // `source = 'termica'` rows are excluded because each
+        // invocation IS a distinct row (running `ls` ten times
+        // produces ten captured runs). For replayed rows, the same
+        // file line replayed twice MUST collapse to one row —
+        // `INSERT OR IGNORE` in [`Self::record_replayed`] relies on
+        // this index.
+        self.conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_replay_unique
+                 ON runs(source, text, started_at)
+                 WHERE source != 'termica';",
+        )
     }
 
     fn apply_v1(&self) -> rusqlite::Result<()> {
@@ -166,18 +183,24 @@ impl HistoryStore {
     /// e.g. `"zsh"`, `"bash"`, `"fish"`. `started_at_ms` is the
     /// shell-recorded timestamp when available, or any stable
     /// value when not (bash without `HISTTIMEFORMAT` has no
-    /// per-entry timestamps; the parser uses file position).
+    /// per-entry timestamps; the replay loop substitutes a
+    /// file-position-derived value).
+    ///
+    /// Returns the newly-inserted row id, or `None` if a row with
+    /// the same `(source, text, started_at)` already existed and
+    /// the insert was a no-op. The unique index that makes this
+    /// idempotent lives in [`Self::apply_v2`].
     pub fn record_replayed(
         &self,
         text: &str,
         started_at_ms: i64,
         source: &str,
-    ) -> rusqlite::Result<i64> {
-        self.conn.execute(
-            "INSERT INTO runs (text, started_at, source) VALUES (?1, ?2, ?3)",
+    ) -> rusqlite::Result<Option<i64>> {
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO runs (text, started_at, source) VALUES (?1, ?2, ?3)",
             params![text, started_at_ms, source],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(if n == 0 { None } else { Some(self.conn.last_insert_rowid()) })
     }
 
     /// Pull the most recent `limit` rows under `scope`, newest
@@ -316,12 +339,48 @@ mod tests {
     #[test]
     fn record_replayed_entries_have_no_pane_or_app_run_metadata() {
         let s = store();
-        let id = s.record_replayed("git status", 500, "zsh").unwrap();
+        let id = s.record_replayed("git status", 500, "zsh").unwrap().expect("inserted");
         let got = s.get(id).unwrap().unwrap();
         assert_eq!(got.pane_id, None);
         assert_eq!(got.app_run_id, None);
         assert_eq!(got.cwd, None);
         assert_eq!(got.source, "zsh");
+    }
+
+    #[test]
+    fn record_replayed_is_idempotent_on_same_key() {
+        let s = store();
+        let first = s.record_replayed("ls", 100, "zsh").unwrap();
+        let second = s.record_replayed("ls", 100, "zsh").unwrap();
+        assert!(first.is_some(), "first insert returns the new row id");
+        assert!(second.is_none(), "second insert is a no-op (no new row)");
+        let entries = s.recent(&Scope::Global, 10).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn record_replayed_distinguishes_source_and_timestamp() {
+        // Same text, different source OR different timestamp →
+        // distinct rows. Only (source, text, started_at) collisions
+        // collapse.
+        let s = store();
+        s.record_replayed("ls", 100, "zsh").unwrap();
+        s.record_replayed("ls", 100, "bash").unwrap(); // different source
+        s.record_replayed("ls", 200, "zsh").unwrap(); // different ts
+        let entries = s.recent(&Scope::Global, 10).unwrap();
+        assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn record_submit_is_not_dedup_constrained() {
+        // Termica-captured rows must NOT collide on the unique
+        // index — running `ls` ten times produces ten rows.
+        let s = store();
+        for _ in 0..3 {
+            s.record_submit("ls", None, 1, "app", 100).unwrap();
+        }
+        let entries = s.recent(&Scope::Global, 10).unwrap();
+        assert_eq!(entries.len(), 3);
     }
 
     #[test]
