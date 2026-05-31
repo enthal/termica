@@ -26,6 +26,32 @@ App
 - **Tile tree**: `egui_tiles::Tree<PaneId>` owns layout. Leaves are pane IDs; the actual `Pane` lives in a registry owned by `App` (see [01](01-architecture.md)).
 - **Pane**: one PTY session. The smallest closeable unit.
 
+## Startup cwd and positional argument
+
+The first pane's cwd at process startup is resolved by this
+fallback chain:
+
+1. **Positional path argument** (`termica <path>`):
+   - `<path>` is a directory → first pane's cwd is `<path>`.
+   - `<path>` is a non-directory file → first pane's cwd is the
+     file's parent directory.
+   - `<path>` doesn't exist → fall through.
+2. **No positional arg, or step 1 fell through**: the cwd of the
+   process that spawned `termica` (`std::env::current_dir()`).
+3. **`current_dir()` errored** (deleted directory, permissions):
+   `$HOME` if set in the environment.
+4. **`$HOME` unset**: `/`.
+
+`termica` accepts at most one positional argument. Subsequent
+positional args are an error and the process exits non-zero.
+Option arguments (`--pick-chrome`, etc.) are independent of the
+positional path slot.
+
+Subsequent panes spawned during the session (Cmd+T, drag-drop,
+new tab via `[+]`) inherit cwd from the active pane in their
+parent Container per usual; this section is specifically about
+the first pane at process start.
+
 ## Why split tile / pane / registry
 
 - The `Tree<PaneId>` is the **layout**. It moves panes between tabs without touching their state.
