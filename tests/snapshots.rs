@@ -262,6 +262,76 @@ fn paint_terminal_with_include_history_renders_scrollback_rows() {
 }
 
 #[test]
+fn paint_terminal_with_include_history_stops_at_cursor_when_output_fits_grid() {
+    // Regression for the "panel-sized black void below the live
+    // output" bug. When a Running command's output fits the grid
+    // (e.g. `while true; do sleep 1; date; done` after a few
+    // seconds in a tall pane), the cursor sits at row N << screen_
+    // lines and the rows below it are empty. The previous
+    // `include_history=true` path painted ALL `(history_size +
+    // screen_lines)` rows, so the user saw the date lines at the
+    // top and `screen_lines - N - 1` empty rows of `DEFAULT_BG`
+    // below — a panel-tall black panel that snapped away the
+    // moment `CommandFinished` reset the grid.
+    //
+    // The fix clamps the painted region to `history_size +
+    // cursor_row + 1` viewport rows. The viewport rows above the
+    // cursor still paint (so a `tput cup` style program that
+    // writes above the cursor doesn't lose its top-half output);
+    // the rows below disappear because they have no content
+    // anyway.
+    use alacritty_terminal::grid::Dimensions;
+    let bytes = b"line a\r\nline b\r\nline c\r\n";
+    let term = term_from_bytes(20, 12, bytes);
+    let screen_lines = term.grid().screen_lines();
+    assert_eq!(screen_lines, 20, "test scaffolding");
+    let cursor_row = term.grid().cursor.point.line.0;
+    assert_eq!(cursor_row, 3, "test scaffolding: 3 CRLFs land cursor at row 3");
+    let history_size = term.grid().history_size();
+    assert_eq!(history_size, 0, "3 lines fit in a 20-row screen — no scrollback");
+
+    fn measure(include_history: bool, bytes: &[u8]) -> f32 {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_closure = captured.clone();
+        let term = term_from_bytes(20, 12, bytes);
+        let _harness =
+            Harness::builder().with_size(egui::Vec2::new(400.0, 800.0)).build_ui(move |ui| {
+                let rendered =
+                    render::paint_terminal(ui, &term, None, None, false, true, include_history);
+                *captured_for_closure.lock().unwrap() = Some(rendered.response.rect.height());
+            });
+        captured.lock().unwrap().expect("paint_terminal ran")
+    }
+
+    let h_full_viewport = measure(false, bytes);
+    let h_clamped = measure(true, bytes);
+    // Derive row_h from the no-history measurement: it paints
+    // exactly `screen_lines` rows tall, so row_h = h/screen_lines.
+    let row_h = h_full_viewport / (screen_lines as f32);
+
+    // The clamped paint must cover EXACTLY `cursor_row + 1` rows
+    // (plus the zero-sized history) — not `screen_lines`.
+    let expected_h = (cursor_row as u32 + 1) as f32 * row_h;
+    assert!(
+        (h_clamped - expected_h).abs() < 1.0,
+        "clamped paint height {h_clamped} should match {expected_h} \
+         (cursor_row+1 = {}, row_h = {row_h}); previous bug would have \
+         given {} ({} × row_h)",
+        cursor_row + 1,
+        h_full_viewport,
+        screen_lines,
+    );
+    // Sanity: the clamped paint is strictly shorter than the
+    // no-clamp (full-viewport) paint when output doesn't fill the
+    // grid.
+    assert!(
+        h_clamped < h_full_viewport,
+        "clamped paint must be shorter than the full viewport when output \
+         leaves rows below the cursor; got clamped={h_clamped}, full={h_full_viewport}",
+    );
+}
+
+#[test]
 fn snapshot_terminal_link_underline() {
     // A URL on row 0 with the Cmd/Ctrl-hover underline rendered. The
     // call site only passes a `Some(link)` when the modifier is held,
@@ -343,6 +413,58 @@ fn snapshot_paint_prompt_editor_with_text_and_cursor_at_end() {
             let _ = render::paint_prompt_editor(ui, &editor);
         });
     harness.snapshot("paint_prompt_editor_typed");
+}
+
+// Spec/04 "When is the caret shown?" — paired snapshots verifying
+// the caret is drawn IFF the window is foreground. Same editor
+// content; the only pixel delta is the caret column.
+
+#[test]
+fn snapshot_prompt_editor_caret_when_foreground() {
+    let mut editor = termica::prompt_editor::PromptEditor::new();
+    editor.insert_str("git status");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(400.0, 80.0)).build_ui(move |ui| {
+            let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
+            let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
+            let row_h = ui.fonts_mut(|f| f.row_height(&font_id));
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(400.0, row_h), egui::Sense::hover());
+            render::paint_prompt_editor_at(
+                ui.painter(),
+                &editor,
+                rect.min,
+                cell_w,
+                row_h,
+                &font_id,
+                render::should_show_caret(true, true, true),
+            );
+        });
+    harness.snapshot("prompt_editor_caret_foreground");
+}
+
+#[test]
+fn snapshot_prompt_editor_caret_when_window_not_foreground() {
+    let mut editor = termica::prompt_editor::PromptEditor::new();
+    editor.insert_str("git status");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(400.0, 80.0)).build_ui(move |ui| {
+            let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
+            let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
+            let row_h = ui.fonts_mut(|f| f.row_height(&font_id));
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(400.0, row_h), egui::Sense::hover());
+            // Same pane focus, but the app's window is NOT the OS
+            // foreground — the caret must be hidden.
+            render::paint_prompt_editor_at(
+                ui.painter(),
+                &editor,
+                rect.min,
+                cell_w,
+                row_h,
+                &font_id,
+                render::should_show_caret(true, true, false),
+            );
+        });
+    harness.snapshot("prompt_editor_caret_not_foreground");
 }
 
 // ---- whole-block snapshots (command + output together) -------------------
@@ -677,4 +799,234 @@ fn snapshot_paint_sealed_block_with_selection_in_command_only() {
                 render::paint_sealed_block(ui, "echo hello", &snapshot, sel, None, None, Some(0));
         });
     harness.snapshot("paint_sealed_block_with_selection_in_command_only");
+}
+
+// ---- Ctrl+R history overlay (Phase 4J PR 6) -----------------------------
+
+/// Fixed `now` used by every overlay snapshot — every entry's
+/// `started_at_ms` is expressed as an offset from this so the age
+/// formatter renders deterministically. Concrete value chosen to
+/// keep readers from squinting at a 13-digit epoch.
+const SNAP_NOW_MS: i64 = 1_700_000_000_000;
+
+const SEC: i64 = 1_000;
+const MIN: i64 = 60 * SEC;
+const HOUR: i64 = 60 * MIN;
+const DAY: i64 = 24 * HOUR;
+
+/// Build a synthetic [`HistoryOverlay`] with deterministic entries
+/// + initial state. Pure POD construction; no DB, no filesystem.
+fn overlay_with_entries(
+    query: &str,
+    selected: usize,
+    scope: termica::history_overlay::OverlayScope,
+    entries: Vec<termica::history::Entry>,
+) -> termica::history_overlay::HistoryOverlay {
+    let mut overlay = termica::history_overlay::HistoryOverlay {
+        query: query.to_string(),
+        scope,
+        selected,
+        cached_entries: entries,
+        ranked: Vec::new(),
+    };
+    overlay.rerank(None);
+    overlay.selected = selected.min(overlay.ranked.len().saturating_sub(1));
+    overlay
+}
+
+fn entry(
+    text: &str,
+    ts: i64,
+    cwd: Option<&str>,
+    exit_code: Option<i32>,
+    source: &str,
+) -> termica::history::Entry {
+    termica::history::Entry {
+        id: ts,
+        text: text.to_string(),
+        started_at_ms: ts,
+        finished_at_ms: None,
+        exit_code,
+        cwd: cwd.map(|s| s.to_string()),
+        app_run_id: None,
+        pane_id: None,
+        source: source.to_string(),
+    }
+}
+
+#[test]
+fn snapshot_history_overlay_empty_query_shows_all_entries() {
+    // Timestamps chosen to exercise every age-formatter branch:
+    // now / minutes / hours / yesterday / days / months / years.
+    let mut overlay = overlay_with_entries(
+        "",
+        0,
+        termica::history_overlay::OverlayScope::Global,
+        vec![
+            entry(
+                "cargo test --workspace",
+                SNAP_NOW_MS - 30 * SEC,
+                Some("~/git/enthal/termica"),
+                Some(0),
+                "termica",
+            ),
+            entry(
+                "git status",
+                SNAP_NOW_MS - 4 * MIN,
+                Some("~/git/enthal/termica"),
+                Some(0),
+                "termica",
+            ),
+            entry("ls -la", SNAP_NOW_MS - 3 * HOUR, None, None, "zsh"),
+            entry("cd src", SNAP_NOW_MS - DAY, None, None, "zsh"),
+            entry("vim CLAUDE.md", SNAP_NOW_MS - 3 * DAY, None, None, "bash"),
+            entry("rustup update", SNAP_NOW_MS - 60 * DAY, None, None, "bash"),
+            entry("brew install fish", SNAP_NOW_MS - 400 * DAY, None, None, "bash"),
+        ],
+    );
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(1100.0, 720.0)).build_ui(move |ui| {
+            let _ = termica::history_overlay::paint_overlay(ui, &mut overlay, 1, None, SNAP_NOW_MS);
+        });
+    harness.snapshot("history_overlay_empty_query");
+}
+
+#[test]
+fn snapshot_history_overlay_with_filter_typed() {
+    // Query "cargo" narrows the list to two entries; the matched
+    // substring renders in selection color + underline in each row.
+    let mut overlay = overlay_with_entries(
+        "cargo",
+        0,
+        termica::history_overlay::OverlayScope::Global,
+        vec![
+            entry(
+                "cargo test --workspace",
+                SNAP_NOW_MS - 2 * MIN,
+                Some("~/git/enthal/termica"),
+                Some(0),
+                "termica",
+            ),
+            entry("git status", SNAP_NOW_MS - 8 * MIN, None, None, "termica"),
+            entry(
+                "cargo run --release",
+                SNAP_NOW_MS - 45 * MIN,
+                Some("~/git/enthal/termica"),
+                Some(0),
+                "termica",
+            ),
+            entry("ls", SNAP_NOW_MS - 2 * HOUR, None, None, "zsh"),
+        ],
+    );
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(1100.0, 720.0)).build_ui(move |ui| {
+            let _ = termica::history_overlay::paint_overlay(ui, &mut overlay, 1, None, SNAP_NOW_MS);
+        });
+    harness.snapshot("history_overlay_with_filter");
+}
+
+#[test]
+fn snapshot_history_overlay_word_split_and_replayed_and_multiline() {
+    // One snapshot covers three behaviors at once so a future
+    // reader sees them composed:
+    //   - Word-split query "echo that" highlights BOTH words.
+    //   - The replayed `zsh` row has `started_at_ms < 0` so no age
+    //     column renders — just `zsh`.
+    //   - A multi-line command is folded to a single line with
+    //     "↲" glyphs replacing the embedded newlines.
+    let mut overlay = overlay_with_entries(
+        "echo that",
+        0,
+        termica::history_overlay::OverlayScope::Global,
+        vec![
+            entry(
+                "echo this that the other",
+                SNAP_NOW_MS - 3 * MIN,
+                Some("~/git/enthal/termica"),
+                Some(0),
+                "termica",
+            ),
+            entry("echo that\necho more", SNAP_NOW_MS - 12 * MIN, None, Some(0), "termica"),
+            entry("echo something else that exists", -2, None, None, "zsh"),
+        ],
+    );
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(1100.0, 720.0)).build_ui(move |ui| {
+            let _ = termica::history_overlay::paint_overlay(ui, &mut overlay, 1, None, SNAP_NOW_MS);
+        });
+    harness.snapshot("history_overlay_word_split_replayed_multiline");
+}
+
+#[test]
+fn snapshot_history_overlay_match_highlight_inside_command() {
+    // Pwd-in-PWD case from spec: query "pwd" matches "echo $PWD"
+    // case-insensitively. The "PWD" run renders in selection
+    // color + underline; the surrounding text stays plain.
+    let mut overlay = overlay_with_entries(
+        "pwd",
+        0,
+        termica::history_overlay::OverlayScope::Global,
+        vec![
+            entry("echo $PWD", SNAP_NOW_MS - 30 * SEC, None, None, "termica"),
+            entry("pwd", SNAP_NOW_MS - 5 * MIN, None, None, "termica"),
+            entry("echo \"pwd is $PWD\"", SNAP_NOW_MS - 12 * MIN, None, None, "termica"),
+        ],
+    );
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(1100.0, 720.0)).build_ui(move |ui| {
+            let _ = termica::history_overlay::paint_overlay(ui, &mut overlay, 1, None, SNAP_NOW_MS);
+        });
+    harness.snapshot("history_overlay_match_highlight");
+}
+
+#[test]
+fn snapshot_history_overlay_selected_second_row() {
+    let mut overlay = overlay_with_entries(
+        "",
+        1,
+        termica::history_overlay::OverlayScope::Global,
+        vec![
+            entry(
+                "cargo test --workspace",
+                SNAP_NOW_MS - 30 * SEC,
+                Some("~/git/enthal/termica"),
+                Some(0),
+                "termica",
+            ),
+            entry(
+                "git status",
+                SNAP_NOW_MS - 4 * MIN,
+                Some("~/git/enthal/termica"),
+                Some(0),
+                "termica",
+            ),
+            entry("ls -la", SNAP_NOW_MS - 2 * HOUR, None, None, "zsh"),
+        ],
+    );
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(1100.0, 720.0)).build_ui(move |ui| {
+            let _ = termica::history_overlay::paint_overlay(ui, &mut overlay, 1, None, SNAP_NOW_MS);
+        });
+    harness.snapshot("history_overlay_selected_second_row");
+}
+
+#[test]
+fn snapshot_history_overlay_pane_scope_no_matches() {
+    // Scope = Pane, but the query "xyz" doesn't match anything.
+    // Renders the "(no matches)" placeholder + the pane-scope
+    // label in the header.
+    let mut overlay = overlay_with_entries(
+        "xyz",
+        0,
+        termica::history_overlay::OverlayScope::Pane,
+        vec![
+            entry("cargo test", SNAP_NOW_MS - 3 * MIN, None, None, "termica"),
+            entry("ls", SNAP_NOW_MS - 10 * MIN, None, None, "termica"),
+        ],
+    );
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(1100.0, 600.0)).build_ui(move |ui| {
+            let _ = termica::history_overlay::paint_overlay(ui, &mut overlay, 1, None, SNAP_NOW_MS);
+        });
+    harness.snapshot("history_overlay_pane_scope_no_matches");
 }

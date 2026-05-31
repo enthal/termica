@@ -44,6 +44,29 @@ All mutations go through a small set of operations (`insert`, `delete`, `move_cu
 
 The cursor is a UTF-8 **byte index** that always lies on a `char` boundary. Selections are byte ranges with the same invariant. Use `str::char_indices()` and `floor_char_boundary` / `ceil_char_boundary`; never raw byte arithmetic. (Same rule as the other Rust projects in this org — see [CLAUDE.md](../CLAUDE.md).)
 
+### When is the caret shown?
+
+Single principle: **a visible (and flashing) caret means "your next keypress will be inserted here."** If that statement isn't true, the caret must not be drawn.
+
+The caret is shown for a pane if and only if **all three** of the following hold:
+
+1. The pane is in `ShellPromptEditor` mode (only state with a real editor).
+2. The pane currently holds in-app keyboard focus (split-screen: at most one pane per window).
+3. The Termica window is the OS's **foreground application** — i.e. the OS will route the next keystroke to us.
+
+If condition 3 is false (the user clicked another app, the window lost focus, the user is in another Space), the caret is hidden across **every** pane in the window. Showing a flashing caret in our window while keypresses land elsewhere is the exact UX mismatch this rule eliminates.
+
+The same principle applies to the raw-terminal cell cursor in [02](02-terminal-engine.md): when the app is not foreground the cell cursor renders dim / hollow, not as a blinking solid block, because keypresses aren't reaching the PTY either.
+
+eframe surfaces foreground state via `egui::ViewportInfo::focused` (the boolean is true exactly when the OS window is key/active). Read it through `ctx.input(|i| i.viewport().focused.unwrap_or(true))` and treat `None` as "assume foreground" so a backend that doesn't report the flag never silently hides the caret.
+
+A separate **focused-but-not-editing-yet** visual (e.g. a subtle rounded indicator over the editor area) is allowed and complementary to the caret rule: it says "this pane is wired to receive keypresses if you start typing," even though the editor isn't currently in `ShellPromptEditor` mode or hasn't grown a caret yet. The caret itself still follows the three conditions above.
+
+Tests:
+
+- Unit: pure boolean `should_show_caret(mode, has_focus, viewport_focused) -> bool`. Cover every cell of the 2×2×2 cube.
+- Snapshot: prompt editor with (focused + foreground) renders the caret; prompt editor with (focused + NOT foreground) renders without the caret. Same fixture otherwise so the only pixel delta is the caret.
+
 ### Editing keystrokes (in `ShellPromptEditor`)
 
 Standard text-editor mapping, OS-aware. macOS uses `Option`/`Cmd`; Linux/Windows uses `Ctrl`. The `Shift` modifier on any motion below extends the current selection from the existing anchor to the new cursor position rather than collapsing it.
@@ -285,6 +308,20 @@ Each block paints differently per state:
 The chrome between blocks is non-text (thin separator + space). Selection (below) passes through it; copy-to-clipboard does not include it.
 
 The `❯` and the chips are decorative — painted by Termica, not the shell's `PS1`. The integration script intentionally minimises `PS1` so the shell's own prompt drawing doesn't visually conflict with Termica's chrome ([03](03-shell-integration.md)).
+
+### Block visual chrome (shipped)
+
+Concrete visual rules that landed via `examples/pick_*` visual-picker decisions (see [09](09-testing.md)). Each is documented here as a constant in [`src/render.rs`](../src/render.rs); the comment on each constant names the picker variant that won.
+
+**Chips (block header).** Each chip (cwd, exit code) is a dark-grey rounded rectangle with a **1 px dim stroke** (`BLOCK_HEADER_CHIP_STROKE = #444`). The stroke is just enough to read the chip's edge against the very-similar panel background without competing with the chip text. `exit N` for non-zero `N` renders the text in red.
+
+**Failed-block background wash.** Sealed blocks whose command exited non-zero are painted on a warm-dark red wash (`FAILED_BLOCK_BG`, unmultiplied rgba≈`#80, #20, #20, alpha 0x18` ≈ 9%). The wash is implemented via the `painter.add(Shape::Noop) + painter.set()` pattern: a shape index is reserved BEFORE the chip + label + snapshot paint, and the rect is filled in after layout settles, so the wash sits underneath the content. Translucent enough that the styled snapshot text on top is fully legible.
+
+**Block separator.** Between sealed blocks: `BLOCK_SEPARATOR_GAP = 10 px` of vertical space, then a 1 px hairline (`BLOCK_SEPARATOR_HAIRLINE`, unmultiplied rgba `#a0, #a0, #a0, alpha 0x18` ≈ 9%) running the full pane width, then another 10 px. Total inter-block breath is ~21 px with the hairline centered.
+
+**Focused-editor chrome.** When the prompt-editor caret would be drawn ([§"When is the caret shown?"](#when-is-the-caret-shown)), a 1 px rounded outline (`FOCUSED_EDITOR_CHROME_COLOR`, premul rgba `#a0, #a0, #a0, alpha 0xb0`) is drawn around BOTH the chip bar AND the editor body together, 2 px outside the combined rect, 6 px corner radius. The outline says "this whole prompt surface is wired for input"; same predicate as the caret. (Visual tuning is open: see this branch's `pick_*` follow-ups.)
+
+**Color helper.** The const Color32 constructors require premultiplied values, so source colors written here as "unmultiplied" are pre-computed: each channel × (alpha / 255), rounded. The picker examples use `from_rgba_unmultiplied` at the call site for natural authoring; production code uses the precomputed `Color32::from_rgba_premultiplied` constants and the comment names the unmultiplied source.
 
 ## Layout: fixed-footer prompt, sticky-top header
 

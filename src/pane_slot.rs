@@ -114,6 +114,30 @@ pub struct PaneUiState {
     /// recent bell-driven flash started. `None` when no flash is
     /// active; the flash fades out over `BELL_FLASH_SECS`.
     pub(crate) bell_flash_started_at: Option<f64>,
+    /// `Some` while the Ctrl+R history overlay is open. Holds the
+    /// query string the user is typing, the active scope, the
+    /// current selection index, and the cached result snapshot.
+    /// Cleared on Esc / Enter / pane refocus.
+    pub history_overlay: Option<crate::history_overlay::HistoryOverlay>,
+    /// Editor cursor (byte index) observed on the previous frame.
+    /// Used by `render_pane` to detect caret motion and reset the
+    /// blink cycle to "visible" so a moved caret never lands during
+    /// an "off" half-cycle. `None` when the editor wasn't active
+    /// last frame.
+    pub(crate) last_cursor_byte: Option<usize>,
+    /// Wall-clock time (`ctx.input(|i| i.time)`) at which the
+    /// current caret blink cycle started. Bumped to `now` on each
+    /// detected caret motion; the visible/invisible square wave
+    /// is computed relative to this anchor.
+    pub(crate) caret_blink_anchor: f64,
+    /// Current opacity of the focused-editor chrome, in `[0, 1]`.
+    /// Driven toward `1.0` while the chrome should be shown
+    /// (caret-active conditions hold), toward `0.0` otherwise.
+    /// Animated over `CHROME_FADE_SECS` per direction so the chrome
+    /// fades in / out instead of popping. Persisted in `slot.ui`
+    /// because the chrome lives outside the painter's view of any
+    /// individual widget.
+    pub(crate) chrome_opacity: f32,
 }
 
 /// One pane's full state: the OS-resource [`PaneSession`] (PTY +

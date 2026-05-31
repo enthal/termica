@@ -194,6 +194,46 @@ pub enum WheelOutcome {
     SendBytes(Vec<u8>),
 }
 
+/// Build the ordered PTY payload for a single frame of input,
+/// combining alt-screen wheel motion with raw keystroke events.
+///
+/// **Invariant:** wheel-derived bytes ALWAYS precede key-derived
+/// bytes in the returned `Vec`. Foreground programs (`less`, `vim`,
+/// `htop`, `fzf`) read PTY stdin sequentially. A quit keystroke
+/// (`q` in `less`, `:q` in `vim`) causes the program to exit and
+/// stop reading; any wheel bytes queued AFTER the quit byte stay
+/// in the PTY input buffer and arrive at the SHELL after the
+/// program exits, where they land as stray characters in the
+/// user's next command. Trackpad momentum scroll is the realistic
+/// trigger — the user lifts their fingers, the smoothed delta
+/// keeps fading for several frames, and they press `q` mid-fade.
+///
+/// Pure helper so the ordering invariant is unit-testable without
+/// an egui context. `key_events` may include non-key events
+/// (`MouseMoved`, `Scroll`, …) — `encode_event` returns `None` for
+/// those and they are skipped. Editor-bound key events should be
+/// filtered out by the caller before passing them in here (they
+/// must not reach the PTY at all).
+pub fn compose_alt_screen_frame_bytes(
+    wheel_lines: i32,
+    wheel_alt_screen: bool,
+    key_events: &[&egui::Event],
+    modes: TerminalModes,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    if let Some(WheelOutcome::SendBytes(bytes)) =
+        classify_wheel(wheel_lines, wheel_alt_screen, modes)
+    {
+        out.extend(bytes);
+    }
+    for event in key_events {
+        if let Some(bytes) = encode_event(event, modes) {
+            out.extend(bytes);
+        }
+    }
+    out
+}
+
 /// Decide what to do with `lines` worth of wheel motion. Positive
 /// `lines` is "scroll up" (toward older content); negative is down.
 /// Returns `None` when the motion is too small to act on.
@@ -594,6 +634,58 @@ mod tests {
         // would land in less's "unknown ESC sequence" handler.
         let got = classify_wheel(2, true, app_cursor_modes()).expect("ss3 wheel");
         assert_eq!(got, WheelOutcome::SendBytes(b"\x1bOA\x1bOA".to_vec()));
+    }
+
+    // --- ordered frame payload (wheel-before-keys invariant) -------
+    //
+    // Regression for the `q`-during-momentum-scroll bug: less reads
+    // PTY stdin in order, `q` makes it exit; any wheel bytes that
+    // were queued AFTER `q` end up at the shell as stray input.
+
+    #[test]
+    fn compose_frame_orders_wheel_bytes_before_quit_keystroke() {
+        // 3 lines of momentum scroll + a `q` press in the same
+        // frame. Output must be: <wheel arrow-ups> then `q`. egui
+        // delivers a printable char as `Event::Text` alongside the
+        // `Event::Key` — `encode_event` only emits bytes for the
+        // `Text` path for unmodified letters, so that's what the
+        // test uses.
+        let q_text = egui::Event::Text("q".to_string());
+        let bytes = compose_alt_screen_frame_bytes(3, true, &[&q_text], app_cursor_modes());
+        // less is in DECCKM, so wheel-up = ArrowUp = `\x1bOA`.
+        // q = `q` (single byte).
+        assert_eq!(bytes, b"\x1bOA\x1bOA\x1bOAq".to_vec());
+        // And explicitly: q is the very last byte.
+        assert_eq!(*bytes.last().unwrap(), b'q', "q must be the last byte");
+        // And the wheel prefix is the whole sequence minus the last
+        // byte.
+        assert!(
+            bytes.starts_with(b"\x1bOA\x1bOA\x1bOA"),
+            "wheel bytes must precede the keystroke; got {:?}",
+            bytes
+        );
+    }
+
+    #[test]
+    fn compose_frame_with_no_wheel_returns_just_key_bytes() {
+        let q_text = egui::Event::Text("q".to_string());
+        let bytes = compose_alt_screen_frame_bytes(0, true, &[&q_text], default_modes());
+        assert_eq!(bytes, b"q".to_vec());
+    }
+
+    #[test]
+    fn compose_frame_with_no_keys_returns_just_wheel_bytes() {
+        let bytes = compose_alt_screen_frame_bytes(2, true, &[], default_modes());
+        assert_eq!(bytes, b"\x1b[A\x1b[A".to_vec());
+    }
+
+    #[test]
+    fn compose_frame_with_main_screen_wheel_emits_no_wheel_bytes() {
+        // Non-alt-screen wheel goes to ScrollDisplay, not PTY.
+        // Only the keystroke bytes should appear.
+        let q_text = egui::Event::Text("q".to_string());
+        let bytes = compose_alt_screen_frame_bytes(3, false, &[&q_text], default_modes());
+        assert_eq!(bytes, b"q".to_vec());
     }
 
     // --- application cursor mode (DECCKM) --------------------------

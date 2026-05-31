@@ -328,6 +328,22 @@ impl PaneSession {
         self.controller.tick_bootstrap_timeout(self.frame);
         self.record_pending_transitions();
 
+        // Sync the controller's alt-screen view BEFORE any
+        // lifecycle event runs. The bytes above may have toggled
+        // alacritty's alt-screen flag (`1049h` / `1049l`) — without
+        // catching that here, a `Precmd` event later in this drain
+        // would call `try_promote_to_editor` while the controller
+        // is still in stale `AlternateScreen` mode and refuse to
+        // promote (it requires `RawTerminal`). The post-loop
+        // edge-detect below still runs to catch any `1049h` that
+        // arrived without a matching event in this batch.
+        let alt = self.terminal.is_alternate_screen();
+        if alt != self.last_alt_screen {
+            self.controller.observe_alt_screen(alt, self.frame);
+            self.last_alt_screen = alt;
+            self.record_pending_transitions();
+        }
+
         // Feed lifecycle events extracted from the byte stream into
         // the controller AND the block stack. Order is preserved
         // per spec/03. The block stack reads the terminal snapshot
@@ -364,6 +380,36 @@ impl PaneSession {
             // command, so any pending continuation state is moot.
             if matches!(event, crate::markers::LifecycleEvent::Preexec { .. }) {
                 self.last_submitted = None;
+            }
+            // Zombie alt-screen recovery. `less`, `vim`, etc. enter
+            // the alternate screen via `\e[?1049h` and SHOULD restore
+            // via `\e[?1049l` on exit. In practice (less `q` on
+            // macOS, vim crash, ssh-disconnect-mid-program) the exit
+            // sequence can be skipped — alacritty's alt-screen flag
+            // stays true, the editor footer paints OVER a stale alt-
+            // grid, and an Esc / focus change unmasks the zombie.
+            // A fresh `Precmd` from the shell means: shell has
+            // resumed control, there is no longer a foreground
+            // program owning the screen, so any latent alt-screen
+            // must be cleared. Feed the exit sequence into the
+            // alacritty parser so it processes the transition the
+            // normal way (clears flag, restores grid), THEN notify
+            // the controller of the alt-screen drop synchronously —
+            // this is the load-bearing detail: the controller is
+            // still in `AlternateScreen` mode at this point, and the
+            // `try_promote_to_editor` call inside `observe_event`
+            // below requires `RawTerminal`. Without the synchronous
+            // edge notification, the post-loop edge-detect would
+            // drop alt-screen mode AFTER the Precmd was already
+            // consumed, leaving the pane stranded in `RawTerminal`
+            // with no editor. No-op when alt-screen is already off.
+            if matches!(event, crate::markers::LifecycleEvent::Precmd { .. })
+                && self.terminal.is_alternate_screen()
+            {
+                self.terminal.feed(b"\x1b[?1049l");
+                self.controller.observe_alt_screen(false, self.frame);
+                self.last_alt_screen = false;
+                self.record_pending_transitions();
             }
             // Phase 4J: persist Preexec → record_submit and
             // CommandFinished → record_finish. No-op if history is
@@ -480,6 +526,15 @@ impl PaneSession {
         &self.blocks
     }
 
+    /// Cmd+K / Ctrl+Shift+K: drop the sealed block scrollback AND
+    /// blank the live terminal grid. The shell process is
+    /// untouched — it'll redraw its prompt on the next prompt
+    /// cycle, or when the user presses Enter.
+    pub fn clear_scrollback(&mut self) {
+        self.blocks.clear_sealed();
+        self.terminal.clear_all();
+    }
+
     /// Stable per-pane id. Used to salt egui widget IDs that may
     /// otherwise collide when multiple panes are visible at once
     /// (e.g. each pane's `ScrollArea` needs its own state — see the
@@ -555,6 +610,24 @@ impl PaneSession {
         self.recall.abandon();
     }
 
+    /// Borrow the per-process history context for surfaces that
+    /// need to open queries directly (the `^R` overlay). Returns
+    /// `None` if persistence was disabled or unreachable at
+    /// startup.
+    pub fn history_ctx(&self) -> Option<&HistoryContext> {
+        self.history.as_ref()
+    }
+
+    /// Insert `text` into the editor as the buffer (replacing any
+    /// existing content) and place the caret at the end. Used by
+    /// the `^R` overlay after the user picks an entry.
+    pub fn replace_editor_buffer(&mut self, text: &str) {
+        if let Some(editor) = self.blocks.editor_on_tail_mut() {
+            editor.clear();
+            editor.insert_str(text);
+        }
+    }
+
     /// Submit the editor's current text to the PTY (spec/04
     /// §"Submission semantics"). The order is load-bearing:
     ///
@@ -589,6 +662,13 @@ impl PaneSession {
             }
             None => return Ok(()),
         };
+
+        // Reset history-recall state: the next `↑` should start a
+        // fresh walk from the most-recent entry, not from wherever
+        // the previous walk left the cursor. Without this, after
+        // submitting a recalled command, `↑` would resume from the
+        // old cursor position and skip the just-submitted entry.
+        self.recall.abandon();
 
         // 2. Eager demote BEFORE the PTY write.
         self.controller.submit_command(self.frame);
@@ -639,12 +719,11 @@ impl PaneSession {
 
     /// Demote the pane out of `ShellPromptEditor` back to
     /// `RawTerminal` (the canonical "Esc on the editor" gesture per
-    /// spec/05). Clears the editor buffer so the next promotion
-    /// starts fresh. No-op when not in `ShellPromptEditor`.
+    /// spec/05). Preserves the editor buffer so a stray Esc doesn't
+    /// nuke what the user just typed — they can promote back into
+    /// the editor (the next `Precmd`) and pick up where they left
+    /// off. No-op when not in `ShellPromptEditor`.
     pub fn leave_editor_esc(&mut self) {
-        if let Some(editor) = self.blocks.editor_on_tail_mut() {
-            editor.clear();
-        }
         self.controller.leave_editor_esc(self.frame);
         // Record the transition into the dump-events file so the
         // user-initiated demote shows up in diagnostics.
@@ -1477,6 +1556,200 @@ mod tests {
         for _ in 0..5 {
             session.drain();
             assert!(session.is_exited());
+        }
+    }
+
+    #[test]
+    fn precmd_after_unrecovered_alt_screen_clears_alt_screen_flag() {
+        // Strict-layer regression: when a foreground program enters
+        // the alt-screen (`\e[?1049h`) and exits WITHOUT emitting the
+        // matching `\e[?1049l` (real-world: `less q` on macOS, vim
+        // crash, ssh disconnect), the shell's next `precmd` marker
+        // MUST be enough to drop the zombie alt-screen flag AND
+        // promote back to the editor. Otherwise the editor footer
+        // paints over a stale alt-grid and `Esc` unmasks it.
+        //
+        // The order of bytes from the shell, with a deliberate sleep
+        // between the alt-screen entry and the second precmd so the
+        // pane-mode machine has time to observe the alt-screen edge
+        // (this is the realistic ordering: a frame tick happens
+        // while less is running):
+        //   1. integration_ready  →  RawTerminal
+        //   2. precmd             →  ShellPromptEditor (first prompt)
+        //   3. \e[?1049h          →  alt-screen flag goes ON; the
+        //                            edge-detect in drain() then
+        //                            transitions controller →
+        //                            AlternateScreen (THIS is what
+        //                            breaks naive Precmd-time
+        //                            recovery: try_promote_to_editor
+        //                            won't fire from AlternateScreen)
+        //   4. sleep 0.2          →  give the polling loop multiple
+        //                            drain cycles in alt-screen mode
+        //   5. precmd AGAIN       →  must (a) clear the alt-screen
+        //                            flag, (b) drop controller back
+        //                            to RawTerminal, (c) re-promote
+        //                            to ShellPromptEditor
+        // Three printf bursts separated by short sleeps mirror the
+        // real shell flow:
+        //   burst 1: integration_ready + first precmd  (→ editor)
+        //   burst 2: preexec + 1049h                   (→ alt-screen)
+        //   burst 3: second precmd, NO matching 1049l  (→ zombie)
+        // Without sleeps the bursts collapse into a single drain
+        // and the alt-screen excursion is hidden by the recovery,
+        // which doesn't reproduce the bug at all.
+        // Three printf bursts separated by short sleeps mirror the
+        // real shell flow:
+        //   burst 1: integration_ready + first precmd  (→ editor)
+        //   burst 2: preexec + 1049h                   (→ alt-screen)
+        //   burst 3: command_finished + second precmd, NO 1049l
+        //                                              (→ zombie)
+        // Without sleeps the bursts collapse into a single drain
+        // and the alt-screen excursion is hidden by the recovery,
+        // which doesn't reproduce the bug at all.
+        let cmd = "printf '\\033PTermica;{\"type\":\"integration_ready\",\
+                   \"session\":\"t\",\"value\":{\"shell\":\"zsh\",\"version\":1}}\\033\\\\\
+                   \\033PTermica;{\"type\":\"precmd\",\
+                   \"session\":\"t\",\"value\":\"/tmp\"}\\033\\\\'; \
+                   sleep 0.2; \
+                   printf '\\033PTermica;{\"type\":\"preexec\",\
+                   \"session\":\"t\",\"value\":\"less foo\"}\\033\\\\\
+                   \\033[?1049h'; \
+                   sleep 0.2; \
+                   printf '\\033PTermica;{\"type\":\"command_finished\",\
+                   \"session\":\"t\",\"value\":0}\\033\\\\\
+                   \\033PTermica;{\"type\":\"precmd\",\
+                   \"session\":\"t\",\"value\":\"/tmp\"}\\033\\\\'; \
+                   sleep 5";
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c(cmd), "t".into(), 0, None).expect("spawn");
+
+        // Confirm the realistic intermediate state: the controller
+        // entered AlternateScreen mode after 1049h. If we ever skip
+        // this state in the test (because the second precmd arrived
+        // in the same drain as 1049h), the test isn't exercising the
+        // bug.
+        let intermediate_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            session.drain();
+            if session.controller.mode() == PaneMode::AlternateScreen {
+                break;
+            }
+            if Instant::now() >= intermediate_deadline {
+                panic!(
+                    "test scaffolding: never reached AlternateScreen mode after 1049h; \
+                     got mode={:?}",
+                    session.controller.mode(),
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // Now spin drain() until the second precmd has been observed
+        // AND we are back to the editor with the alt-screen flag
+        // cleared.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            session.drain();
+            if session.editor_is_active() && !session.terminal.is_alternate_screen() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "after two precmds with a hung 1049h in between, expected \
+                     editor_is_active=true and alt_screen=false; got \
+                     editor_is_active={}, alt_screen={}, mode={:?}",
+                    session.editor_is_active(),
+                    session.terminal.is_alternate_screen(),
+                    session.controller.mode(),
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Belt + braces — the view snapshot the renderer consumes
+        // must also report alt_screen=false (it reads
+        // is_alternate_screen() inline, so this is a sanity check on
+        // the snapshot path).
+        assert!(
+            !session.view().alt_screen,
+            "view.alt_screen should be false after Precmd recovery"
+        );
+    }
+
+    #[test]
+    fn precmd_in_same_burst_as_1049l_still_promotes_to_editor() {
+        // Companion to the no-1049l zombie test, gating the
+        // intermittent variant the user reported: even when the
+        // foreground program DID emit `\e[?1049l` cleanly, if those
+        // bytes arrive in the same PTY chunk as `command_finished
+        // + precmd + PS1`, alacritty's alt-screen flag goes off
+        // mid-feed BUT the controller is still in
+        // `AlternateScreen` mode when the Precmd event runs
+        // `try_promote_to_editor` (the post-loop edge-detect
+        // hasn't run yet). Promotion was refused; editor never
+        // came back. The fix is to sync the controller's alt-
+        // screen view BEFORE the event loop so Precmd promotion
+        // sees the up-to-date mode.
+        //
+        // Burst sequence:
+        //   burst 1: integration_ready + first precmd  (→ editor)
+        //   burst 2: preexec + 1049h                   (→ alt-screen)
+        //   burst 3: 1049l + command_finished + precmd (→ should
+        //                                               restore
+        //                                               editor)
+        let cmd = "printf '\\033PTermica;{\"type\":\"integration_ready\",\
+                   \"session\":\"t\",\"value\":{\"shell\":\"zsh\",\"version\":1}}\\033\\\\\
+                   \\033PTermica;{\"type\":\"precmd\",\
+                   \"session\":\"t\",\"value\":\"/tmp\"}\\033\\\\'; \
+                   sleep 0.2; \
+                   printf '\\033PTermica;{\"type\":\"preexec\",\
+                   \"session\":\"t\",\"value\":\"less foo\"}\\033\\\\\
+                   \\033[?1049h'; \
+                   sleep 0.2; \
+                   printf '\\033[?1049l\
+                   \\033PTermica;{\"type\":\"command_finished\",\
+                   \"session\":\"t\",\"value\":0}\\033\\\\\
+                   \\033PTermica;{\"type\":\"precmd\",\
+                   \"session\":\"t\",\"value\":\"/tmp\"}\\033\\\\'; \
+                   sleep 5";
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c(cmd), "t".into(), 0, None).expect("spawn");
+
+        // Confirm we entered AlternateScreen mode (mirror the
+        // other zombie test's scaffolding so a chunking surprise
+        // can't silently degrade coverage).
+        let intermediate_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            session.drain();
+            if session.controller.mode() == PaneMode::AlternateScreen {
+                break;
+            }
+            if Instant::now() >= intermediate_deadline {
+                panic!(
+                    "test scaffolding: never reached AlternateScreen mode after 1049h; \
+                     got mode={:?}",
+                    session.controller.mode(),
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            session.drain();
+            if session.editor_is_active() && !session.terminal.is_alternate_screen() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "after a clean 1049l burst with command_finished+precmd in the \
+                     same chunk, expected editor_is_active=true and alt_screen=false; \
+                     got editor_is_active={}, alt_screen={}, mode={:?}",
+                    session.editor_is_active(),
+                    session.terminal.is_alternate_screen(),
+                    session.controller.mode(),
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
         }
     }
 

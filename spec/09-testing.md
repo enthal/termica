@@ -150,6 +150,33 @@ A small `benches/` directory or test-mode benchmark for two scenarios:
 
 These run rarely (e.g. on release tag), but a regression on either is a release-block.
 
+## Visual decision workflow (the picker)
+
+Aesthetic choices that snapshot tests can't decide for us — match-highlight color, separator opacity, focus-affordance shape, panel sizes, dim red intensities — go through `src/visual_picker.rs`, a reusable eframe app that renders N side-by-side variants and writes the chosen variant id to `/tmp/termica-picker-choice.txt` on click.
+
+A picker is a small binary in `examples/pick_*.rs` that:
+
+1. Defines 2–6 `Variant`s (each: stable kebab-case id + display label + a `Fn(&mut egui::Ui)` painter).
+2. Calls `visual_picker::run("decision title", variants, output_path)`.
+3. The window stays open until the user clicks a "Pick this" button. Closing without picking writes nothing — file absence means "cancelled."
+
+Pattern in this codebase:
+
+- The agent (or developer) authors variants when a visual choice is open.
+- The user runs the example (`cargo run --example pick_history_row_separator`), clicks, the file is written and the app exits.
+- The chosen id flows into the production code (typically as a constant) with a comment naming the picker variant that won. Picker files stay in `examples/` as a record of the decision.
+
+Picker-derived constants currently in the repo (see [`src/render.rs`](../src/render.rs) and [`src/history_overlay.rs`](../src/history_overlay.rs)):
+
+- `MATCH_HIGHLIGHT` — warm-gold + underline for `^R` matched-substring runs.
+- `ROW_GAP` — 6 px vertical breath between `^R` result rows.
+- `MIN_TAB_TITLE_CHARS = 7` — tab strip min width (~48 px for `~`).
+- `FOCUSED_EDITOR_CHROME_COLOR` — dim grey-white rounded outline around chip + editor.
+- `BLOCK_SEPARATOR_GAP = 10.0`, `BLOCK_SEPARATOR_HAIRLINE` — between sealed blocks.
+- `BLOCK_HEADER_CHIP_STROKE`, `FAILED_BLOCK_BG` — chip outline + dim red wash on non-zero exits.
+
+**Premultiplied alpha gotcha.** `Color32` const constructors only accept premultiplied values. Tiny alphas (`0x08`, `0x10`, …) on a high-RGB base (`0xa0`) silently misrender in the premul form (RGB > alpha is invalid premul and clamps), making "dimmer" variants render at the same brightness. Picker examples use `from_rgba_unmultiplied` so authoring is natural; production constants store the precomputed premul values and the comment names the unmultiplied source for clarity.
+
 ## The five safety rules, tested
 
 From [05](05-pane-modes.md), one test each:

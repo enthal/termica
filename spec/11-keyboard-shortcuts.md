@@ -59,7 +59,8 @@ These chords are only active when the focused pane is in `ShellPromptEditor` and
 | `Ctrl+D` on empty editor | `Ctrl+D` on empty editor | Send EOF to the shell (`exit` semantics). | ⏳ Phase 4 polish |
 | `Up` / `Down` | `Up` / `Down` | Walk pane-scope history. `↑` saves the in-progress buffer on the first press; `↓` restores it on the way back. Any non-arrow edit (text, paste, backspace, …) abandons the walk. | ✅ Phase 4J PR 5 |
 | `Tab` | `Tab` | Local completion (paths + history + `$PATH`). | ⏳ Phase 4I |
-| `Ctrl+R` / `Ctrl+P` / `Ctrl+N` / `Ctrl+S` / `Ctrl+G` | same | Consumed by the editor (no PTY leak) but no-op until [4J](10-roadmap.md#phase-4--editor-at-prompt-block-model-pivot) wires history walk + Ctrl+R popup. | ✅ Phase 4 polish ([#57](https://github.com/enthal/termica/pull/57)) |
+| `Ctrl+R` | `Ctrl+R` | Open the history overlay. Substring filter over the `runs` table; `↑`/`↓` to walk results, `Enter` to substitute, `Esc` to cancel, `Tab` to toggle scope (`global*` ↔ `this pane*`). Modal — all keystrokes route to the overlay until it closes. | ✅ Phase 4J PR 6 |
+| `Ctrl+P` / `Ctrl+N` / `Ctrl+S` / `Ctrl+G` | same | Consumed by the editor (no PTY leak) but no-op until follow-up PRs wire emacs-style navigation. | ✅ Phase 4 polish ([#57](https://github.com/enthal/termica/pull/57)) |
 
 Mouse (editor):
 

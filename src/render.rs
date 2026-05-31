@@ -104,6 +104,36 @@ pub const EDITOR_FG: Color32 = Color32::from_rgb(0x6e, 0xd0, 0xe8);
 /// can never be two cursors painted at once.
 pub const EDITOR_CURSOR_COLOR: Color32 = Color32::from_rgba_premultiplied(0x4a, 0xa8, 0xc0, 0xa0);
 
+/// Stroke color for the focused-editor chrome — the rounded outline
+/// that wraps the chip bar + editor body when the pane is focused
+/// AND the window is the OS foreground app (same predicate as the
+/// caret). Picked via `cargo run --example pick_focused_editor_chrome`
+/// (variant `dim-white-round-rect`): a dim grey-white that reads as
+/// "this is wired for input" without competing with the bright caret.
+pub const FOCUSED_EDITOR_CHROME_COLOR: Color32 =
+    Color32::from_rgba_premultiplied(0xa0, 0xa0, 0xa0, 0xb0);
+
+/// Single source of truth for "should we draw a caret in this pane
+/// right now?" per [spec/04](../spec/04-prompt-editor.md#when-is-the-caret-shown).
+/// Returns `true` iff ALL three conditions hold:
+///
+///   - `mode_is_editor`: the pane is in `ShellPromptEditor` (only state
+///     with a real editor caret).
+///   - `pane_has_focus`: this pane currently holds in-app keyboard focus.
+///   - `viewport_focused`: the Termica window is the OS foreground app
+///     (i.e. the OS will route the next keystroke to us).
+///
+/// Used by the prompt-editor caret AND by the raw-terminal cell
+/// cursor's "blinking solid" vs "dim hollow" choice — same principle,
+/// different surface ([spec/02](../spec/02-terminal-engine.md)).
+pub fn should_show_caret(
+    mode_is_editor: bool,
+    pane_has_focus: bool,
+    viewport_focused: bool,
+) -> bool {
+    mode_is_editor && pane_has_focus && viewport_focused
+}
+
 /// Foreground for the dim header line above each block. Roughly
 /// "muted grey" against `DEFAULT_BG` — readable but unmistakably
 /// secondary to the command + output text below. 4G renders cwd
@@ -210,7 +240,25 @@ pub fn paint_terminal(
     let cols = grid.columns();
     let screen_lines = grid.screen_lines();
     let history_size = if include_history { grid.history_size() } else { 0 };
-    let rows = history_size + screen_lines;
+    // When `include_history=true` (running commands outside alt-
+    // screen) the rows BELOW the cursor are empty by definition —
+    // a Running block's output flows sequentially top-to-bottom
+    // and the cursor stays at the last written row. Painting them
+    // would draw `screen_lines - cursor_row - 1` rows of pure
+    // `DEFAULT_BG` below the visible output: the panel-sized black
+    // void users reported the moment a long-running command kicked
+    // off in a tall pane. Clamp to `history_size + cursor_row + 1`
+    // so the painted area tracks the actual content height; when
+    // output overflows the screen the cursor sits at the last
+    // row and this collapses back to `history_size + screen_lines`
+    // (the pre-clamp behaviour). Alt-screen / no-history paths
+    // keep painting the full screen (a TUI owns its viewport).
+    let rows = if include_history {
+        let cursor_row = grid.cursor.point.line.0.max(0) as usize;
+        history_size + (cursor_row + 1).min(screen_lines)
+    } else {
+        screen_lines
+    };
     // Translate viewport rows (`0..rows`) to grid `Line` indices.
     // In the legacy (no-history) path, viewport row `r` maps to
     // grid line `r - display_offset`. When `include_history` is on
@@ -621,7 +669,49 @@ pub fn paint_prompt_editor_at(
 /// Background fill for the cwd / exit chip painted above each block.
 /// A near-black grey that sits clearly above `DEFAULT_BG` without
 /// shouting — it reads as "label affordance" rather than as content.
-pub const BLOCK_HEADER_CHIP_BG: Color32 = Color32::from_rgb(0x22, 0x22, 0x22);
+// Translucent chip fill so the failed-block wash (or any future
+// per-block bg) shows through DARKER inside each chip. Source =
+// unmultiplied rgba(0x22, 0x22, 0x22, 0xc0) — 75% opaque dark grey.
+// Premultiplied form: each channel × (alpha / 255) =
+// (0x22 * 0xc0 / 255, …) ≈ (0x19, 0x19, 0x19). Over the regular
+// panel bg this still reads as the previous opaque dark grey;
+// over the failed-block wash it darkens the red inside the chip.
+pub const BLOCK_HEADER_CHIP_BG: Color32 = Color32::from_rgba_premultiplied(0x19, 0x19, 0x19, 0xc0);
+
+/// 1px stroke around each chip in the block header. "Quite dim"
+/// per user direction — visible enough to outline the chip against
+/// the (very similar) block background, not so loud that it
+/// competes with the chip text inside.
+pub const BLOCK_HEADER_CHIP_STROKE: Color32 = Color32::from_rgb(0x44, 0x44, 0x44);
+
+/// Background wash painted behind a sealed block whose command
+/// finished with a non-zero exit code. Translucent — picked via
+/// `cargo run --example pick_failed_block_bg` (variant `a18` =
+/// alpha 0x18 ≈ 9%). Reads as a warm shadow, not a red fill, so
+/// the styled snapshot text on top stays fully legible.
+//
+// Stored premultiplied: each channel × (alpha / 255). Source is
+// unmultiplied rgba(0x80, 0x20, 0x20, 0x18):
+//   r = 128 * 0x18/255 ≈ 0x0c
+//   g =  32 * 0x18/255 ≈ 0x03
+//   b =  32 * 0x18/255 ≈ 0x03
+// → premul (0x0c, 0x03, 0x03, 0x18).
+pub const FAILED_BLOCK_BG: Color32 = Color32::from_rgba_premultiplied(0x0c, 0x03, 0x03, 0x18);
+
+/// Vertical space (top AND bottom of the hairline) inserted
+/// between sealed blocks. Picked via `pick_block_separator`,
+/// adjusted to 10 px per the user's preference between the 8px
+/// and 12px variants. Total inter-block "breath" is
+/// `2 * BLOCK_SEPARATOR_GAP + 1` px with the hairline centered.
+pub const BLOCK_SEPARATOR_GAP: f32 = 10.0;
+
+/// 1px hairline between sealed blocks. Picked variant `h8-18` =
+/// alpha 0x18 (~9%, "barely" visible). Stored in premultiplied
+/// form: each RGB channel must be ≤ alpha. unmultiplied
+/// `rgba(0xa0, 0xa0, 0xa0, 0x18)` premultiplies to roughly
+/// `(0x10, 0x10, 0x10, 0x18)` — a barely-perceptible warm dim grey.
+pub const BLOCK_SEPARATOR_HAIRLINE: Color32 =
+    Color32::from_rgba_premultiplied(0x10, 0x10, 0x10, 0x18);
 
 /// Padding inside each chip, in logical pixels. Affects both the
 /// horizontal padding around the text and the chip's `corner_radius`
@@ -693,9 +783,11 @@ pub fn paint_block_header(
     let painter = ui.painter_at(rect);
 
     let radius = CHIP_CORNER_RADIUS as u8;
+    let chip_stroke = egui::Stroke::new(1.0, BLOCK_HEADER_CHIP_STROKE);
     if !cwd_text.is_empty() {
         let chip_rect = Rect::from_min_size(rect.min, Vec2::new(cwd_chip_w, chip_h));
         painter.rect_filled(chip_rect, radius, BLOCK_HEADER_CHIP_BG);
+        painter.rect_stroke(chip_rect, radius, chip_stroke, egui::StrokeKind::Inside);
         painter.text(
             Pos2::new(chip_rect.min.x + CHIP_PAD_X, chip_rect.min.y + CHIP_PAD_Y),
             egui::Align2::LEFT_TOP,
@@ -709,6 +801,7 @@ pub fn paint_block_header(
         let chip_rect =
             Rect::from_min_size(Pos2::new(chip_x, rect.min.y), Vec2::new(exit_chip_w, chip_h));
         painter.rect_filled(chip_rect, radius, BLOCK_HEADER_CHIP_BG);
+        painter.rect_stroke(chip_rect, radius, chip_stroke, egui::StrokeKind::Inside);
         painter.text(
             Pos2::new(chip_rect.min.x + CHIP_PAD_X, chip_rect.min.y + CHIP_PAD_Y),
             egui::Align2::LEFT_TOP,
@@ -856,6 +949,18 @@ pub fn paint_sealed_block(
     home: Option<&std::path::Path>,
     exit: Option<i32>,
 ) -> SealedBlockRender {
+    // Reserve a backing shape index BEFORE any paint so the
+    // failed-block bg wash sits underneath the chip + command +
+    // snapshot. Translucent chips ([`BLOCK_HEADER_CHIP_BG`]) then
+    // blend with the wash so the red shows through DARKER inside
+    // each chip — the user-specified visual.
+    let failed = matches!(exit, Some(n) if n != 0);
+    let bg_idx = if failed { Some(ui.painter().add(egui::Shape::Noop)) } else { None };
+
+    // Capture the chip's top-Y BEFORE the header paints so the
+    // wash can extend up to the inter-block hairline above.
+    let block_top_y = ui.next_widget_position().y;
+
     let _ = paint_block_header(ui, cwd, home, exit);
 
     let cmd_lines = if command.is_empty() { 0 } else { command.split('\n').count() };
@@ -873,6 +978,23 @@ pub fn paint_sealed_block(
         Some(c) => c.union(snap_rect),
         None => snap_rect,
     };
+
+    if let Some(idx) = bg_idx {
+        // Full-bleed wash: from the inter-block hairline above to
+        // the inter-block hairline below this block (= block_top -
+        // GAP to block_bottom + GAP). Horizontally flush to the
+        // pane edges (`ui.clip_rect`). Reads as "the failed slot
+        // is THIS strip of the transcript," not "the failed text
+        // has a red wrapper."
+        let pane_clip = ui.clip_rect();
+        let bottom_y = snap_rect.bottom();
+        let wash = Rect::from_min_max(
+            Pos2::new(pane_clip.left(), block_top_y - BLOCK_SEPARATOR_GAP),
+            Pos2::new(pane_clip.right(), bottom_y + BLOCK_SEPARATOR_GAP),
+        );
+        // Corner radius 0 so the wash truly is flush left/right.
+        ui.painter().set(idx, egui::Shape::rect_filled(wash, 0.0, FAILED_BLOCK_BG));
+    }
 
     SealedBlockRender { rect, command_lines: cmd_lines }
 }
@@ -1182,6 +1304,22 @@ mod tests {
     //! by snapshot tests in `tests/snapshots.rs`.
 
     use super::*;
+
+    /// 2×2×2 truth table for the caret-visibility rule. Spec/04
+    /// says the caret is shown iff `mode_is_editor && pane_has_focus
+    /// && viewport_focused`; everything else hides it.
+    #[test]
+    fn should_show_caret_is_three_way_and() {
+        for &mode in &[false, true] {
+            for &pane in &[false, true] {
+                for &vp in &[false, true] {
+                    let got = should_show_caret(mode, pane, vp);
+                    let want = mode && pane && vp;
+                    assert_eq!(got, want, "mode={mode}, pane_focus={pane}, viewport_focused={vp}",);
+                }
+            }
+        }
+    }
 
     #[test]
     fn named_default_returns_none() {

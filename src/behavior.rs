@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use eframe::egui;
-use egui_tiles::{Behavior, Tile, TileId, Tiles, UiResponse};
+use egui_tiles::{Behavior, ResizeState, Tile, TileId, Tiles, UiResponse};
 
 use crate::pane_slot::{PaneId, PaneSlot};
 use crate::render_pane::render_pane;
@@ -46,14 +46,25 @@ pub(crate) struct TabBehavior<'a> {
     /// reach the PTY because pane input is read before the modal
     /// renders later in the frame.
     pub(crate) modal_open: bool,
+    /// Live-tunable focused-editor chrome variant. Read each frame
+    /// from `TermicaApp.chrome_variant`; the second-window picker
+    /// viewport writes into the same `Arc<Mutex<…>>` so a click
+    /// in the picker updates the chrome on the next paint.
+    pub(crate) chrome_variant: crate::focused_chrome::ChromeVariant,
 }
 
 impl<'a> Behavior<PaneId> for TabBehavior<'a> {
     fn tab_title_for_pane(&mut self, pane_id: &PaneId) -> egui::WidgetText {
-        let term = self.panes.get(pane_id).map(|s| s.session.terminal());
+        let slot = self.panes.get(pane_id);
+        let term = slot.map(|s| s.session.terminal());
         let osc = term.and_then(|t| t.osc_title());
         let cwd = term.and_then(|t| t.cwd());
-        tab_title_for_with_osc(*pane_id, osc.as_deref(), cwd, self.home).into()
+        let running = running_command_for(slot);
+        pad_to_min_chars(
+            &tab_title_for_with_osc(*pane_id, osc.as_deref(), cwd, self.home, running.as_deref()),
+            MIN_TAB_TITLE_CHARS,
+        )
+        .into()
     }
 
     fn pane_ui(&mut self, ui: &mut egui::Ui, _tile_id: TileId, pane_id: &mut PaneId) -> UiResponse {
@@ -69,8 +80,9 @@ impl<'a> Behavior<PaneId> for TabBehavior<'a> {
         // out the rule: assume any UI element can render twice in
         // a frame and salt accordingly.
         let modal_open = self.modal_open;
+        let chrome_variant = self.chrome_variant;
         ui.push_id(("pane", pane_id.0), |ui| {
-            render_pane(ui, self.ctx, slot, self.home, modal_open);
+            render_pane(ui, self.ctx, slot, self.home, modal_open, chrome_variant);
         });
         UiResponse::None
     }
@@ -99,6 +111,44 @@ impl<'a> Behavior<PaneId> for TabBehavior<'a> {
             self.pending_closes.push(tile_id);
         }
         false
+    }
+
+    fn gap_width(&self, _style: &egui::Style) -> f32 {
+        // egui_tiles' default is 1.0 px — too tight for the
+        // focused-editor chrome to render its outer expand without
+        // bleeding into a neighboring pane on splits. 16 px gives
+        // the glow's 5–6 px outer radius room to land in the gap
+        // (the chrome's horizontal clip in `render_pane` extends
+        // halfway into this gap). Also reads as a clean tile
+        // separation visually.
+        16.0
+    }
+
+    fn resize_stroke(&self, style: &egui::Style, resize_state: ResizeState) -> egui::Stroke {
+        // egui_tiles' splitter stroke is painted AFTER each pane's
+        // contents (and the focused-editor chrome that extends a
+        // few px into the gap via `CHROME_OUTER_OVERHANG`). A wide
+        // opaque idle stroke (egui_tiles' default = `gap_width`
+        // wide in `tab_bar_color`) overpaints that overhang and
+        // visibly occludes the chrome where it crosses the gap.
+        //
+        // Idle: a 1 px hairline at low alpha. The hairline sits
+        // centered in the 16 px gap (~8 px from each pane edge);
+        // the chrome's overhang ends well inside that, so the
+        // hairline lives in the unoccupied middle and doesn't
+        // touch the chrome. Just enough to read as "there's a
+        // splitter here" without competing with content.
+        //
+        // Hover / Drag: egui's defaults — bright, full width — so
+        // the splitter is unmistakably interactive on touch.
+        match resize_state {
+            ResizeState::Idle => egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(0xa0, 0xa0, 0xa0, 0x30),
+            ),
+            ResizeState::Hovering => style.visuals.widgets.hovered.fg_stroke,
+            ResizeState::Dragging => style.visuals.widgets.active.fg_stroke,
+        }
     }
 
     fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
@@ -148,15 +198,21 @@ impl<'a> Behavior<PaneId> for TabBehavior<'a> {
         let Some(Tile::Pane(pane_id)) = tiles.get(tile_id) else {
             return "?".into();
         };
-        let term = self.panes.get(pane_id).map(|s| s.session.terminal());
+        let slot = self.panes.get(pane_id);
+        let term = slot.map(|s| s.session.terminal());
         let osc = term.and_then(|t| t.osc_title());
         let cwd = term.and_then(|t| t.cwd());
+        let running = running_command_for(slot);
         // No styling on the text itself any more. Active-in-container
         // is already differentiated by egui_tiles' default `tab_ui`
         // (brighter bg + connecting hline). The focused-for-the-whole-
         // app indicator is the blue bottom border painted in
         // [`on_tab_button`] below.
-        egui::RichText::new(tab_title_for_with_osc(*pane_id, osc.as_deref(), cwd, self.home)).into()
+        egui::RichText::new(pad_to_min_chars(
+            &tab_title_for_with_osc(*pane_id, osc.as_deref(), cwd, self.home, running.as_deref()),
+            MIN_TAB_TITLE_CHARS,
+        ))
+        .into()
     }
 
     fn on_tab_button(
@@ -209,4 +265,83 @@ pub fn paint_focused_tab_underline(response: &egui::Response) {
     let stroke = egui::Stroke::new(2.5, color);
     let y = rect.bottom() - 1.25;
     painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], stroke);
+}
+
+/// Minimum tab title length in characters. Chosen via the
+/// `pick_tab_min_width` visual picker — variant `3x` (≈48 px,
+/// 3× the natural width of the worst-case `~` title that the
+/// default home-directory pane shows on startup). egui_tiles has
+/// no min-tab-width knob, so we get the width via the title text:
+/// shorter titles are padded with spaces on each side. Symmetric
+/// padding keeps the text centered (`tab_ui` paints it left-aligned
+/// within the tab rect; the extra leading space shifts it
+/// rightward so the visual center matches the tab center).
+const MIN_TAB_TITLE_CHARS: usize = 7;
+
+/// Pad `text` with leading + trailing spaces until it reaches
+/// `min_chars`. Strings already `>= min_chars` are returned
+/// unchanged. Odd-shortfalls split the extra space toward the
+/// right so the result is consistently positioned across renders.
+fn pad_to_min_chars(text: &str, min_chars: usize) -> String {
+    let len = text.chars().count();
+    if len >= min_chars {
+        return text.to_string();
+    }
+    let shortfall = min_chars - len;
+    let left = shortfall / 2;
+    let right = shortfall - left;
+    let left_pad: String = std::iter::repeat_n(' ', left).collect();
+    let right_pad: String = std::iter::repeat_n(' ', right).collect();
+    format!("{left_pad}{text}{right_pad}")
+}
+
+/// Extract the currently-running command string for a pane (if
+/// any). When the pane's tail block is `Running`, this surfaces
+/// the recorded command line so [`tab_title_for_with_osc`] can use
+/// its first word as the tab title (`less`, `vim`, `htop`, …).
+/// Returns `None` for `Prompt` / `Sealed` tails — the cwd or OSC
+/// title wins in those states.
+pub(crate) fn running_command_for(slot: Option<&PaneSlot>) -> Option<String> {
+    let slot = slot?;
+    match slot.session.blocks().last()? {
+        crate::block::Block::Running { command, .. } => Some(command.clone()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pad_to_min_chars_leaves_long_titles_alone() {
+        assert_eq!(pad_to_min_chars("very-long-title", 7), "very-long-title");
+    }
+
+    #[test]
+    fn pad_to_min_chars_centers_short_title() {
+        // "~" → "   ~   " (3 spaces each side; 1 + 6 = 7).
+        assert_eq!(pad_to_min_chars("~", 7), "   ~   ");
+    }
+
+    #[test]
+    fn pad_to_min_chars_handles_odd_shortfall_with_extra_on_right() {
+        // "ab" + 5 short → split 2/3 (extra on right so the
+        // visual center sits to the right of the geometric one,
+        // matching egui_tiles' LEFT_CENTER paint origin).
+        assert_eq!(pad_to_min_chars("ab", 7), "  ab   ");
+    }
+
+    #[test]
+    fn pad_to_min_chars_is_noop_when_already_at_min() {
+        assert_eq!(pad_to_min_chars("abcdefg", 7), "abcdefg");
+    }
+
+    #[test]
+    fn pad_to_min_chars_handles_empty_string() {
+        // Defensive: a Behavior callback that returned an empty
+        // title shouldn't panic; the helper should pad it to a
+        // 7-space placeholder so the tab still has a clickable area.
+        assert_eq!(pad_to_min_chars("", 7), "       ");
+    }
 }

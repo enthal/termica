@@ -40,19 +40,34 @@ const MAX_TAB_TITLE_CHARS: usize = 25;
 /// Pure function so the rule is unit-testable without any egui
 /// plumbing.
 pub fn tab_title_for(pane_id: PaneId, cwd: Option<&Path>, home: Option<&Path>) -> String {
-    tab_title_for_with_osc(pane_id, None, cwd, home)
+    tab_title_for_with_osc(pane_id, None, cwd, home, None)
 }
 
-/// Variant of [`tab_title_for`] that prefers a shell-set OSC 0 / 2
-/// title when present (`osc_title`); falls back to the cwd-derived
-/// title otherwise, and to `pane <n>` when neither is available.
+/// Variant of [`tab_title_for`] that picks the most-informative
+/// title given everything the pane knows:
+///
+/// 1. **Running program** (e.g. `less`, `vim`, `htop`) — when
+///    `running_program` is `Some`, take the first whitespace-
+///    separated token. This is what surfaces in the tab AND the
+///    window title while an alt-screen or long-running program
+///    has the foreground; `less ~/big.log` ⇒ tab shows `less`.
+/// 2. **Shell-set OSC 0 / 2** title — if non-empty, used as-is.
+/// 3. **cwd-derived** — `~/git/enthal/termica` style.
+/// 4. **`pane <n>`** — final fallback when none of the above is known.
+///
 /// The same truncation rule applies to whichever title wins.
 pub fn tab_title_for_with_osc(
     pane_id: PaneId,
     osc_title: Option<&str>,
     cwd: Option<&Path>,
     home: Option<&Path>,
+    running_program: Option<&str>,
 ) -> String {
+    if let Some(p) = running_program
+        && let Some(word) = first_word(p)
+    {
+        return truncate_tab_title(word);
+    }
     if let Some(t) = osc_title
         && !t.trim().is_empty()
     {
@@ -63,6 +78,12 @@ pub fn tab_title_for_with_osc(
     };
     let raw = home_relative_cwd(c, home);
     truncate_tab_title(&raw)
+}
+
+/// First whitespace-separated word of `s`, or `None` when the
+/// string is empty/whitespace.
+fn first_word(s: &str) -> Option<&str> {
+    s.split_whitespace().next()
 }
 
 /// Render `cwd` with the user's `$HOME` substituted for `~`, in the
@@ -149,7 +170,7 @@ mod tests {
         let cwd = PathBuf::from("/Users/tim/git");
         let home = PathBuf::from("/Users/tim");
         assert_eq!(
-            tab_title_for_with_osc(PaneId(0), Some("vim foo.txt"), Some(&cwd), Some(&home)),
+            tab_title_for_with_osc(PaneId(0), Some("vim foo.txt"), Some(&cwd), Some(&home), None),
             "vim foo.txt"
         );
     }
@@ -161,13 +182,49 @@ mod tests {
         // user on a blank tab.
         let cwd = PathBuf::from("/Users/tim");
         let home = PathBuf::from("/Users/tim");
-        assert_eq!(tab_title_for_with_osc(PaneId(0), Some(""), Some(&cwd), Some(&home)), "~");
-        assert_eq!(tab_title_for_with_osc(PaneId(0), Some("   "), Some(&cwd), Some(&home)), "~");
+        assert_eq!(tab_title_for_with_osc(PaneId(0), Some(""), Some(&cwd), Some(&home), None), "~");
+        assert_eq!(
+            tab_title_for_with_osc(PaneId(0), Some("   "), Some(&cwd), Some(&home), None),
+            "~"
+        );
     }
 
     #[test]
     fn tab_title_with_osc_falls_back_to_pane_n_when_no_cwd_and_no_title() {
-        assert_eq!(tab_title_for_with_osc(PaneId(7), None, None, None), "pane 7");
+        assert_eq!(tab_title_for_with_osc(PaneId(7), None, None, None, None), "pane 7");
+    }
+
+    #[test]
+    fn tab_title_running_program_overrides_cwd_and_osc() {
+        let cwd = PathBuf::from("/Users/tim/git/enthal/termica");
+        let home = PathBuf::from("/Users/tim");
+        // While `less ~/big.log` is running, the tab reads `less`.
+        assert_eq!(
+            tab_title_for_with_osc(
+                PaneId(0),
+                Some("shell-set-title"),
+                Some(&cwd),
+                Some(&home),
+                Some("less ~/big.log"),
+            ),
+            "less"
+        );
+        // Multi-arg programs still surface as the first word.
+        assert_eq!(
+            tab_title_for_with_osc(
+                PaneId(0),
+                None,
+                Some(&cwd),
+                Some(&home),
+                Some("vim --noplugin foo.txt"),
+            ),
+            "vim"
+        );
+        // Empty / whitespace running program falls through.
+        assert_eq!(
+            tab_title_for_with_osc(PaneId(0), None, Some(&cwd), Some(&home), Some("")),
+            "~/git/enthal/termica"
+        );
     }
 
     #[test]
@@ -175,7 +232,7 @@ mod tests {
         // 100-char OSC title — the same truncation rule that applies
         // to cwd-derived titles should apply here.
         let long: String = "x".repeat(100);
-        let out = tab_title_for_with_osc(PaneId(0), Some(&long), None, None);
+        let out = tab_title_for_with_osc(PaneId(0), Some(&long), None, None, None);
         assert!(out.len() < long.len(), "long titles should be truncated; got {out}");
     }
 

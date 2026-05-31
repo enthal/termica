@@ -287,6 +287,17 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
             } else {
                 modifiers.ctrl && !modifiers.alt && matches!(key, Key::Delete)
             };
+            // Delete-to-line-start: macOS Cmd+Backspace (= the
+            // platform's `cmd+delete` per Apple's nomenclature),
+            // Linux/Windows Ctrl+U (readline / emacs convention).
+            // Joins onto the previous line when the caret is at the
+            // start of a non-first line; no-op at byte 0 of the
+            // buffer.
+            let delete_to_line_start = if is_macos {
+                modifiers.command && !modifiers.alt && matches!(key, Key::Backspace)
+            } else {
+                modifiers.ctrl && !modifiers.alt && !modifiers.shift && matches!(key, Key::U)
+            };
             if word_delete_left {
                 slot.session.clear_history_recall();
                 if let Some(editor) = slot.session.editor_mut() {
@@ -298,6 +309,13 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
                 slot.session.clear_history_recall();
                 if let Some(editor) = slot.session.editor_mut() {
                     editor.delete_word_right();
+                }
+                return true;
+            }
+            if delete_to_line_start {
+                slot.session.clear_history_recall();
+                if let Some(editor) = slot.session.editor_mut() {
+                    editor.delete_to_line_start();
                 }
                 return true;
             }
@@ -316,9 +334,44 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
             // the live `Term` — visible noise. `Ctrl+C` (`\x03`,
             // SIGINT) and `Ctrl+D` (`\x04`, EOF) deliberately stay
             // PTY-bound per spec/04.
+            // `Ctrl+R` opens the history overlay. If the editor
+            // already has text, prefill the search box with it so
+            // a partial command pre-narrows the results — same UX
+            // as zsh's incremental history-search-backward.
+            if modifiers.ctrl && !modifiers.shift && matches!(key, Key::R) {
+                if let Some(history) = slot.session.history_ctx().cloned()
+                    && let Some(mut overlay) = crate::history_overlay::HistoryOverlay::open(
+                        &history,
+                        slot.session.pane_id(),
+                    )
+                {
+                    let prefill =
+                        slot.session.editor_mut().map(|e| e.text().to_string()).unwrap_or_default();
+                    if !prefill.is_empty() {
+                        overlay.query = prefill;
+                        let cwd = slot.session.terminal().cwd().map(|p| p.display().to_string());
+                        overlay.rerank(cwd.as_deref());
+                    }
+                    slot.ui.history_overlay = Some(overlay);
+                }
+                return true;
+            }
+            // Emacs-style editing chords + history/completion chords
+            // are swallowed by the editor so they don't leak to the
+            // PTY as raw `\x01`, `\x0b`, … bytes. Without this,
+            // typing `Ctrl+A` or `Ctrl+K` while the editor was
+            // active wrote control bytes to the shell, which then
+            // tried to execute commands like `^Kls` and complained
+            // `command not found: ^K…`. `Ctrl+C` (`\x03`, SIGINT)
+            // and `Ctrl+D` (`\x04`, EOF) deliberately stay PTY-bound
+            // per spec/04, so the user can always interrupt a
+            // running program.
             if modifiers.ctrl
                 && !modifiers.shift
-                && matches!(key, Key::R | Key::P | Key::N | Key::S | Key::G)
+                && matches!(
+                    key,
+                    Key::A | Key::E | Key::K | Key::U | Key::W | Key::P | Key::N | Key::S | Key::G
+                )
             {
                 return true;
             }
@@ -450,6 +503,7 @@ pub fn render_pane(
     slot: &mut PaneSlot,
     home: Option<&Path>,
     modal_open: bool,
+    chrome_variant: crate::focused_chrome::ChromeVariant,
 ) {
     // Input routing in a multi-pane world:
     //
@@ -633,15 +687,23 @@ pub fn render_pane(
     // Outside alt-screen mode the grid is rendered with its full
     // history inline so a running command's earlier output stays
     // visible; the spacer must include those rows too.
+    //
+    // The non-alt-screen height MUST match
+    // `paint_terminal`'s `include_history=true` clamp at
+    // `history + cursor_row + 1` — otherwise the bottom-align
+    // spacer over-allocates by `screen_lines - cursor_row - 1`
+    // rows and the live output floats well above the editor
+    // footer with empty space below it.
     if will_paint_live_term {
         let grid = slot.session.terminal().grid();
-        let history = if in_alt_screen {
-            0
+        use alacritty_terminal::grid::Dimensions;
+        let paint_rows = if in_alt_screen {
+            grid.screen_lines()
         } else {
-            use alacritty_terminal::grid::Dimensions;
-            grid.history_size()
+            let cursor_row = grid.cursor.point.line.0.max(0) as usize;
+            grid.history_size() + (cursor_row + 1).min(grid.screen_lines())
         };
-        content_h += (history + grid.screen_lines()) as f32 * row_h;
+        content_h += paint_rows as f32 * row_h;
     }
     let top_spacer = (scroll_max_h - content_h).max(0.0);
 
@@ -713,10 +775,21 @@ pub fn render_pane(
                             *exit,
                         );
                         sealed_rects.push((*id, sealed_render.rect, sealed_render.command_lines));
-                        // Thin separator gap — spec/04 §"Visual
-                        // structure" calls for "non-text (thin
-                        // separator + space)".
-                        ui.add_space(4.0);
+                        // Block separator — picked via
+                        // `cargo run --example pick_block_separator`
+                        // (variant `h10-18`). 10px gap + a barely-
+                        // there 1px hairline at alpha 0x18 + another
+                        // 10px gap. Total ~21px of "breath" between
+                        // blocks with the hairline centered.
+                        ui.add_space(render::BLOCK_SEPARATOR_GAP);
+                        let avail_w = ui.available_width();
+                        let (sep_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(avail_w, 1.0), egui::Sense::hover());
+                        ui.painter().line_segment(
+                            [sep_rect.left_center(), sep_rect.right_center()],
+                            egui::Stroke::new(1.0, render::BLOCK_SEPARATOR_HAIRLINE),
+                        );
+                        ui.add_space(render::BLOCK_SEPARATOR_GAP);
                     }
                     crate::block::Block::Running { command, header, .. } => {
                         let _ = render::paint_block_header(ui, header.cwd.as_deref(), home, None);
@@ -794,13 +867,19 @@ pub fn render_pane(
             // — the outer ScrollArea handles navigation. In alt-
             // screen mode there's no scrollback to include and the
             // running program owns the screen at fixed size.
+            // Cell-cursor focus state per spec/02 (cross-ref to
+            // spec/04's caret-visibility rule): the bright `CURSOR_COLOR`
+            // is reserved for "this is where your next keypress
+            // lands." Both pane focus AND OS window foreground must
+            // be true; otherwise we render the dim/hollow color.
+            let cell_cursor_focused = slot.ui.focused && ctx.input(|i| i.focused);
             render::paint_terminal(
                 ui,
                 slot.session.terminal(),
                 selection.as_ref(),
                 highlighted_link,
                 hide_term_cursor,
-                slot.ui.focused,
+                cell_cursor_focused,
                 !in_alt_screen,
             )
         } else {
@@ -908,6 +987,19 @@ pub fn render_pane(
         let editor_h = footer_h - chip_h;
         let footer_origin = ui.next_widget_position();
 
+        // Caret visibility per spec/04 "When is the caret shown?":
+        // mode-is-editor + pane keyboard focus + OS window foreground.
+        // Lifted to here (above the chip + editor paint) so the
+        // focused-editor chrome (the rounded outline that wraps BOTH
+        // the chip and the editor) can use the same predicate without
+        // recomputing it.
+        let editor_in_mode = slot.session.blocks().editor_on_tail().is_some();
+        let pane_focused = ctx
+            .memory(|m| m.has_focus(egui::Id::new(("termica-pane-focus", slot.session.pane_id()))));
+        let viewport_focused = ctx.input(|i| i.focused);
+        let caret_active =
+            render::should_show_caret(editor_in_mode, pane_focused, viewport_focused);
+
         if has_prompt_cwd
             && let Some(crate::block::Block::Prompt { header, .. }) = slot.session.blocks().last()
         {
@@ -939,21 +1031,21 @@ pub fn render_pane(
 
         if let Some(editor) = slot.session.blocks().editor_on_tail() {
             let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
-            // Caret visibility tracks the pane focus anchor (defined
-            // below the footer block but with a stable id). Read
-            // from `ctx.memory` directly so the OS window-focus flag
-            // (`egui::InputState::focused`) — known to be unreliable
-            // on macOS, see egui#7588 — can't suppress the caret
-            // while the editor is the actual keyboard target.
-            //
-            // Blink: ~1.6 Hz square wave. The repaint request fires
-            // only while focused so idle panes don't burn wakeups.
-            let pane_focused = ctx.memory(|m| {
-                m.has_focus(egui::Id::new(("termica-pane-focus", slot.session.pane_id())))
-            });
+            // Detect caret motion across frames and reset the blink
+            // anchor so the "visible" half-cycle starts AT the
+            // moment of the move. Without this, a caret motion
+            // landing in the middle of an "off" half-cycle is
+            // invisible until the next blink — the user briefly
+            // can't see where the caret is. Standard editor UX.
             let time = ctx.input(|i| i.time);
-            let caret_visible = pane_focused && (time * 1.6) as i64 % 2 == 0;
-            if pane_focused {
+            let current_cursor = editor.cursor();
+            if slot.ui.last_cursor_byte != Some(current_cursor) {
+                slot.ui.caret_blink_anchor = time;
+                slot.ui.last_cursor_byte = Some(current_cursor);
+            }
+            let elapsed = (time - slot.ui.caret_blink_anchor).max(0.0);
+            let caret_visible = caret_active && (elapsed * 1.6) as i64 % 2 == 0;
+            if caret_active {
                 ctx.request_repaint_after(std::time::Duration::from_millis(312));
             }
             // Use `ui.painter()` (unclipped to the current ui) rather
@@ -971,7 +1063,96 @@ pub fn render_pane(
                 &font_id,
                 caret_visible,
             );
+        } else {
+            // Editor not on tail this frame — forget the cursor
+            // tracker so re-opening the editor in a new prompt
+            // starts a fresh blink cycle.
+            slot.ui.last_cursor_byte = None;
         }
+
+        // Focused-editor chrome. Dispatched via the
+        // [`crate::focused_chrome::paint`] table so the second
+        // OS window (chrome picker) can swap the variant live.
+        // The chip bar + editor are wrapped as a single visual
+        // unit — the user asked for "include the chip bar."
+        //
+        // Wraparound fix: use `ctx.layer_painter(layer_id)` to
+        // get a painter on the SAME layer (so the chrome paints
+        // on top of the chip + editor that landed there earlier)
+        // with `Rect::EVERYTHING` for the clip rect.
+        // `Painter::with_clip_rect` *intersects* with the existing
+        // clip rather than replacing it, so the previous
+        // `clone().with_clip_rect(viewport_rect)` didn't widen
+        // the pane's tight clip and three sides of the stroke got
+        // cut. Same trick the focused-tab underline uses
+        // (`behavior::paint_focused_tab_underline`).
+        // Animate the focused-editor chrome's opacity toward the
+        // caret-active target. Half-second fade either direction so
+        // the chrome breathes in/out instead of popping. While the
+        // value is in transit we request a fast repaint so the
+        // animation runs smoothly even if the PTY is idle.
+        const CHROME_FADE_SECS: f32 = 0.5;
+        let target_opacity: f32 = if caret_active { 1.0 } else { 0.0 };
+        let dt = ctx.input(|i| i.stable_dt);
+        let step = (dt / CHROME_FADE_SECS).clamp(0.0, 1.0);
+        slot.ui.chrome_opacity = if (slot.ui.chrome_opacity - target_opacity).abs() <= step {
+            target_opacity
+        } else if slot.ui.chrome_opacity < target_opacity {
+            slot.ui.chrome_opacity + step
+        } else {
+            slot.ui.chrome_opacity - step
+        };
+        if slot.ui.chrome_opacity != target_opacity {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+
+        if slot.ui.chrome_opacity > 0.0 {
+            // Body width comes from the ui's CLIP rect, not its
+            // available-width / layout rect. egui_tiles can give
+            // the pane_ui a layout rect that's wider than the
+            // pane and rely on the clip_rect to keep paint inside
+            // the pane — which is exactly why the editor's text
+            // content clips correctly at the pane's right edge
+            // while a decoration drawn at `available_width`
+            // overshoots into the divider or off-screen.
+            let pane_clip = ui.clip_rect();
+            let body_w = (pane_clip.right() - footer_origin.x).max(0.0);
+            let chip_rect = if has_prompt_cwd {
+                Some(egui::Rect::from_min_size(footer_origin, egui::vec2(body_w, chip_h)))
+            } else {
+                None
+            };
+            let combined =
+                egui::Rect::from_min_size(footer_origin, egui::vec2(body_w, chip_h + editor_h));
+            // Chrome painter: layer-painter (so we're not clipped
+            // to the footer's tight vertical clip — variants paint
+            // a few px above + below the body, which `ui.painter()`
+            // would chop), but with a CLIP RECT that includes a few
+            // pixels OUTSIDE the pane's horizontal bounds so the
+            // chrome's outer L/R strokes (glow expands by 5+ px)
+            // actually render. Without this overhang, the side
+            // strokes are clipped exactly at the pane edge and only
+            // the top + bottom edges show. egui_tiles' gap_width is
+            // bumped to 16 px in `behavior.rs` so this 8 px overhang
+            // sits inside the splitter gap and never bleeds into a
+            // neighbor pane. The vertical infinity keeps the
+            // bottom/top edges intact (footer's natural clip would
+            // chop them).
+            const CHROME_OUTER_OVERHANG: f32 = 8.0;
+            let chrome_clip = egui::Rect::from_min_max(
+                egui::pos2(pane_clip.left() - CHROME_OUTER_OVERHANG, -f32::INFINITY),
+                egui::pos2(pane_clip.right() + CHROME_OUTER_OVERHANG, f32::INFINITY),
+            );
+            let painter = ctx.layer_painter(ui.layer_id()).with_clip_rect(chrome_clip);
+            crate::focused_chrome::paint(
+                &painter,
+                chip_rect,
+                combined,
+                chrome_variant,
+                slot.ui.chrome_opacity,
+            );
+        }
+
         Some(editor_rect)
     } else {
         None
@@ -1505,6 +1686,42 @@ pub fn render_pane(
 
         let modes = slot.session.terminal().modes();
         let editor_active = slot.session.editor_is_active();
+
+        // ---- mouse wheel, hover-gated ---------------------------
+        //
+        // Non-alt-screen scrolling is handled by the outer
+        // `ScrollArea` natively (4A-render replaced alacritty's
+        // internal scrollback with the block-stack history). The
+        // alt-screen case still intercepts wheel events here and
+        // forwards them as arrow keystrokes — that's what full-
+        // screen TTY programs (vim, less, htop, fzf) expect.
+        //
+        // **Wheel bytes are written BEFORE the per-event key loop
+        // below.** Foreground programs read PTY stdin sequentially;
+        // a quit keystroke like `q` makes the program exit and stop
+        // reading, so any wheel bytes queued AFTER it stay in the
+        // PTY buffer and land at the SHELL as stray characters of
+        // the user's next command. Trackpad momentum scroll fading
+        // for several frames is the realistic trigger — the user
+        // lifts their fingers, presses `q` mid-fade, and gets
+        // arrow-key garbage on the next command line. See
+        // `input::compose_alt_screen_frame_bytes` for the ordering
+        // invariant + unit tests.
+        if !modal_open && rendered.response.hovered() {
+            let alt_screen = slot.session.terminal().is_alternate_screen();
+            if alt_screen {
+                let scroll_delta_y = ctx.input(|i| i.smooth_scroll_delta.y);
+                if scroll_delta_y.abs() > 0.0 {
+                    let lines = (scroll_delta_y / 50.0 * 3.0).round() as i32;
+                    if let Some(input::WheelOutcome::SendBytes(bytes)) =
+                        input::classify_wheel(lines, true, modes)
+                    {
+                        let _ = slot.session.write(&bytes);
+                    }
+                }
+            }
+        }
+
         for event in &events {
             // Belt and braces: skip the Ctrl+Shift+C key event so the
             // encoder never sees it (the encoder wouldn't emit bytes
@@ -1521,35 +1738,18 @@ pub fn render_pane(
             // events — typing into the editor must NOT also echo to
             // the shell. `apply_event_to_editor` returns `true` when
             // it owned the event.
+            // While the Ctrl+R overlay is open it is modal: events
+            // are owned by the overlay's `TextEdit` + the `ctx.input`
+            // navigation checks in `crate::history_overlay::paint`.
+            // We just skip the editor / PTY paths so nothing leaks.
+            if slot.ui.history_overlay.is_some() {
+                continue;
+            }
             if editor_active && apply_event_to_editor(event, slot) {
                 continue;
             }
             if let Some(bytes) = input::encode_event(event, modes) {
                 let _ = slot.session.write(&bytes);
-            }
-        }
-    }
-
-    // ---- mouse wheel, hover-gated -------------------------------
-    //
-    // Non-alt-screen scrolling is handled by the outer `ScrollArea`
-    // natively (4A-render replaced alacritty's internal scrollback
-    // with the block-stack history). The alt-screen case still
-    // intercepts wheel events here and forwards them as arrow
-    // keystrokes — that's what full-screen TTY programs (vim, less,
-    // htop, fzf) expect.
-    if !modal_open && rendered.response.hovered() {
-        let alt_screen = slot.session.terminal().is_alternate_screen();
-        if alt_screen {
-            let scroll_delta_y = ctx.input(|i| i.smooth_scroll_delta.y);
-            if scroll_delta_y.abs() > 0.0 {
-                let lines = (scroll_delta_y / 50.0 * 3.0).round() as i32;
-                let modes = slot.session.terminal().modes();
-                if let Some(input::WheelOutcome::SendBytes(bytes)) =
-                    input::classify_wheel(lines, true, modes)
-                {
-                    let _ = slot.session.write(&bytes);
-                }
             }
         }
     }
@@ -1579,6 +1779,43 @@ pub fn render_pane(
             paint_bell_flash_border(ui.painter(), ui.max_rect(), alpha_factor);
             let remaining_ms = ((BELL_FLASH_SECS - elapsed) * 1000.0).max(0.0) as u64;
             ctx.request_repaint_after(std::time::Duration::from_millis(remaining_ms.min(16)));
+        }
+    }
+
+    // Phase 4J PR 6: paint the Ctrl+R history overlay on top of
+    // everything else if it's open, and apply its returned action
+    // (Submit / Cancel / ToggleScope). The overlay's `TextEdit` +
+    // `ctx.input` navigation checks own the input; the event loop
+    // above just blocked the editor / PTY paths while it's open.
+    if let Some(action) = crate::history_overlay::paint(ui, slot) {
+        use crate::history_overlay::OverlayAction;
+        match action {
+            OverlayAction::Submit(text) => {
+                slot.session.replace_editor_buffer(&text);
+                slot.ui.history_overlay = None;
+                // Submit closes the overlay; the keyboard belongs
+                // to THIS pane's editor (we just dropped a command
+                // into it). Without this, egui's focus migrates
+                // to whichever widget gets activated next — in a
+                // split-screen layout that's typically the first
+                // tile's active tab, NOT the pane the user just
+                // submitted into.
+                slot.ui.needs_focus = true;
+            }
+            OverlayAction::Cancel => {
+                slot.ui.history_overlay = None;
+                slot.ui.needs_focus = true;
+            }
+            OverlayAction::ToggleScope => {
+                if let Some(history) = slot.session.history_ctx().cloned()
+                    && let Some(overlay) = slot.ui.history_overlay.as_mut()
+                {
+                    overlay.toggle_scope();
+                    overlay.refresh_entries(&history, slot.session.pane_id());
+                    let cwd = slot.session.terminal().cwd().map(|p| p.display().to_string());
+                    overlay.rerank(cwd.as_deref());
+                }
+            }
         }
     }
 }

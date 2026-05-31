@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
@@ -138,12 +139,35 @@ pub struct TermicaApp {
     /// [spec/07 §"Pane-scope recall"](../spec/07-history-and-search.md#pane-scope-recall--).
     #[allow(dead_code)]
     pub(crate) app_run_id: String,
+    /// Live-tunable focused-editor chrome variant. The main pane
+    /// renderer consults this every frame; the picker viewport
+    /// (a second OS window opened via `--pick-chrome`) writes into
+    /// the same `Arc<Mutex<…>>` so a click in the picker shows the
+    /// new chrome in the main window immediately.
+    pub(crate) chrome_variant: Arc<Mutex<crate::focused_chrome::ChromeVariant>>,
+    /// True while the picker viewport is meant to be alive. Set by
+    /// `--pick-chrome` and cleared when the user closes the
+    /// picker window. The picker keeps its own ViewportId so egui
+    /// can route close events back to us.
+    pub(crate) picker_viewport_open: Arc<AtomicBool>,
+    /// Most-recently-sent OS window title. We compute the desired
+    /// title each frame (`<active-tab-title> | Termica`) and only
+    /// dispatch a `ViewportCommand::Title` when it changes — the
+    /// command crosses an OS boundary and a no-op call per frame
+    /// would be wasteful.
+    last_window_title: String,
 }
 
 impl TermicaApp {
     /// Construct an app with one initial pane in a single Tabs
     /// container at the root of the tree.
     pub fn new() -> Self {
+        Self::new_with_options(TermicaAppOptions::default())
+    }
+
+    /// Construct with options — used by `--pick-chrome` to open the
+    /// chrome picker viewport on startup.
+    pub fn new_with_options(opts: TermicaAppOptions) -> Self {
         let home = home::home_dir();
         let event_recorder = init_event_recorder();
         let history = init_history_store(home.as_deref());
@@ -166,6 +190,9 @@ impl TermicaApp {
             event_recorder,
             history,
             app_run_id,
+            chrome_variant: Arc::new(Mutex::new(opts.initial_chrome_variant)),
+            picker_viewport_open: Arc::new(AtomicBool::new(opts.open_chrome_picker)),
+            last_window_title: String::new(),
         };
         app.bootstrap();
         app
@@ -247,18 +274,10 @@ impl TermicaApp {
                 }
             }
             PaneAction::NextTab => {
-                if let Some(parent_tabs) =
-                    self.tile_for_pane(pane_id).and_then(|t| self.parent_tabs_of(t))
-                {
-                    self.cycle_active_tab(parent_tabs, 1);
-                }
+                self.cycle_pane_global(pane_id, 1);
             }
             PaneAction::PrevTab => {
-                if let Some(parent_tabs) =
-                    self.tile_for_pane(pane_id).and_then(|t| self.parent_tabs_of(t))
-                {
-                    self.cycle_active_tab(parent_tabs, -1);
-                }
+                self.cycle_pane_global(pane_id, -1);
             }
             PaneAction::CloseTab => {
                 // Closing the *last* tab is equivalent to quitting:
@@ -292,35 +311,57 @@ impl TermicaApp {
                 self.quit_requested = true;
             }
             PaneAction::ClearScrollback => {
-                // Cmd+K: blank the viewport, drop scrollback, home
-                // the cursor. The shell is not signalled — it'll
-                // redraw its prompt on the next prompt cycle (or
-                // when the user presses Enter).
+                // Cmd+K / Ctrl+Shift+K: drop the sealed-block
+                // history AND blank the live terminal grid. The
+                // shell process is untouched — it'll redraw its
+                // prompt on the next prompt cycle (or when the
+                // user presses Enter). Previously this only cleared
+                // the alacritty grid, leaving the block stack
+                // visually intact, so the user saw nothing change.
                 if let Some(slot) = self.panes.get_mut(&pane_id) {
-                    slot.session.terminal_mut().clear_all();
+                    slot.session.clear_scrollback();
                 }
             }
         }
     }
 
-    /// Move the active tab of `tabs_tile` by `delta` positions
-    /// (wraps around). Used for Cmd+Shift+] / [.
-    fn cycle_active_tab(&mut self, tabs_tile: TileId, delta: i32) {
-        let Some(Tile::Container(egui_tiles::Container::Tabs(tabs))) =
-            self.tree.tiles.get_mut(tabs_tile)
-        else {
-            return;
-        };
-        if tabs.children.is_empty() {
+    /// Cycle keyboard focus to the next/prev pane GLOBALLY across
+    /// every `Container` in the workspace, in DFS tree order
+    /// (left→right, top→bottom). Used for Cmd+Shift+] / [.
+    ///
+    /// The previous behaviour confined cycling to the focused
+    /// pane's parent `Container::Tabs` — a Cmd+Shift+] from the
+    /// rightmost tab in the left container of a horizontal split
+    /// wrapped back to the leftmost tab of the SAME container,
+    /// never reaching the right container. The user wants the
+    /// shortcut to walk every tab everywhere, so this version
+    /// flattens the tree and steps through that list.
+    ///
+    /// For the destination pane, we set its parent `Tabs`'s
+    /// active child (so the tab becomes visible) and flag
+    /// `slot.ui.needs_focus` so `render_pane` claims keyboard
+    /// focus on its next render. Panes whose parent isn't a Tabs
+    /// container (e.g., the only child of a SplitH) still get the
+    /// focus flag — they're already visible.
+    fn cycle_pane_global(&mut self, from: PaneId, delta: i32) {
+        let panes = collect_panes_in_tree_order(&self.tree);
+        if panes.len() <= 1 {
             return;
         }
-        let len = tabs.children.len() as i32;
-        let current =
-            tabs.active.and_then(|a| tabs.children.iter().position(|c| *c == a)).unwrap_or(0)
-                as i32;
-        let next = ((current + delta).rem_euclid(len)) as usize;
-        let new_active = tabs.children[next];
-        tabs.set_active(new_active);
+        let Some(current_idx) = panes.iter().position(|(p, _)| *p == from) else {
+            return;
+        };
+        let next_idx = ((current_idx as i32 + delta).rem_euclid(panes.len() as i32)) as usize;
+        let (new_pane, new_tile) = panes[next_idx];
+        if let Some(parent) = self.tree.tiles.parent_of(new_tile)
+            && let Some(Tile::Container(egui_tiles::Container::Tabs(tabs))) =
+                self.tree.tiles.get_mut(parent)
+        {
+            tabs.set_active(new_tile);
+        }
+        if let Some(slot) = self.panes.get_mut(&new_pane) {
+            slot.ui.needs_focus = true;
+        }
     }
 
     /// Spawn a new pane and add it as a tab inside the given Tabs
@@ -371,9 +412,46 @@ impl Default for TermicaApp {
 
 impl eframe::App for TermicaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Ask for a redraw soon so PTY output keeps flowing even
-        // when the user is idle.
-        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        // Drain every pane up front so this frame decides the next
+        // repaint cadence from actual activity. Drained panes also
+        // reset their `slot.ui.focused` mirror.
+        //
+        // Idle (no PTY bytes arrived this frame): 300 ms = ~3 fps —
+        // enough to keep the channel from backing up but cheap on
+        // CPU. egui is reactive: any input event (mouse, key,
+        // viewport command) repaints immediately regardless. The
+        // caret-blink and bell-flash paths schedule their own
+        // shorter timers when those features are active.
+        //
+        // Active (any pane consumed bytes): 50 ms = 20 fps so a
+        // streaming command still feels live.
+        //
+        // Previous behaviour was an unconditional 50 ms repaint
+        // request — 20 fps forever, regardless of activity. With
+        // the chrome-picker viewport open as a second window, that
+        // doubled per-frame work and pushed CPU to ~100% even when
+        // the shell was idle.
+        let mut had_activity = false;
+        for slot in self.panes.values_mut() {
+            if slot.session.drain() > 0 {
+                had_activity = true;
+            }
+            slot.ui.focused = false;
+        }
+        let next = if had_activity { 50 } else { 300 };
+        ctx.request_repaint_after(std::time::Duration::from_millis(next));
+
+        // Chrome picker viewport (second OS window). Stays open
+        // as long as `picker_viewport_open` is true; the picker
+        // clears the flag on its own close-request so subsequent
+        // frames don't keep scheduling it.
+        if self.picker_viewport_open.load(Ordering::Relaxed) {
+            show_chrome_picker_viewport(
+                ctx,
+                self.chrome_variant.clone(),
+                self.picker_viewport_open.clone(),
+            );
+        }
 
         // macOS' Cmd+Q (and the red traffic-light close button on any
         // OS) is delivered by winit as a *viewport close request*,
@@ -418,10 +496,10 @@ impl eframe::App for TermicaApp {
         // sticks to a pane that no longer has keyboard focus.
         // (Real egui focus is unaffected — that's stored in egui's
         // memory; only our mirror needs the reset.)
-        for slot in self.panes.values_mut() {
-            slot.session.drain();
-            slot.ui.focused = false;
-        }
+        // (The per-pane `drain()` + `slot.ui.focused = false` loop
+        // moved to the top of `update()` so the result of the drain
+        // can drive the per-frame repaint cadence. See the comment
+        // above `had_activity`.)
 
         // Auto-close panes whose shell process has exited. The
         // shell `exit`ing (user typed exit, Ctrl+D, or `exit N`)
@@ -464,6 +542,7 @@ impl eframe::App for TermicaApp {
                 pending_closes: &mut self.pending_closes,
                 pending_close_confirm: &mut self.pending_close_confirm,
                 modal_open,
+                chrome_variant: *self.chrome_variant.lock().expect("chrome variant mutex"),
             };
             self.tree.ui(&mut behavior, ui);
             self.new_tab_requested_in = behavior.new_tab_requested_in;
@@ -752,6 +831,44 @@ impl eframe::App for TermicaApp {
             self.focus_history.insert(0, focused);
         }
 
+        // OS window title: `<active-pane-title> | Termica` where
+        // the active-pane title is the same string the tab strip
+        // shows (running program ⇒ that program's name; else OSC
+        // shell-set ⇒ that; else cwd-derived). Only dispatched when
+        // it changes — `ViewportCommand::Title` crosses an OS
+        // boundary and a no-op call per frame would be wasteful.
+        let pane_for_title =
+            self.focused_pane.or_else(|| self.focus_history.first().copied()).or_else(|| {
+                self.tree
+                    .tiles
+                    .iter()
+                    .find_map(|(_, t)| if let Tile::Pane(id) = t { Some(*id) } else { None })
+            });
+        let desired_title = pane_for_title
+            .and_then(|id| {
+                let slot = self.panes.get(&id)?;
+                let osc = slot.session.terminal().osc_title();
+                let cwd = slot.session.terminal().cwd();
+                let running = crate::behavior::running_command_for(Some(slot));
+                Some(crate::tab_title::tab_title_for_with_osc(
+                    id,
+                    osc.as_deref(),
+                    cwd,
+                    self.home.as_deref(),
+                    running.as_deref(),
+                ))
+            })
+            .unwrap_or_default();
+        let new_window_title = if desired_title.is_empty() {
+            "Termica".to_string()
+        } else {
+            format!("{desired_title} — Termica")
+        };
+        if new_window_title != self.last_window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(new_window_title.clone()));
+            self.last_window_title = new_window_title;
+        }
+
         // Garbage-collect panes whose tiles are no longer in the
         // tree (removed via `pending_closes`). Drops their
         // PaneSession, closing the PTY and ending the reader thread.
@@ -815,4 +932,159 @@ fn init_history_store(home: Option<&std::path::Path>) -> Option<Arc<Mutex<Histor
         let _stats = replay_into(&store, &ReplayPaths::from_home(h));
     }
     Some(Arc::new(Mutex::new(store)))
+}
+
+/// Walk the tile tree DFS, collecting `(PaneId, TileId)` for every
+/// leaf pane in tree order (left→right, top→bottom). Pure helper
+/// used by [`TermicaApp::cycle_pane_global`] to give a deterministic
+/// "next pane" relative to the current focus, across all
+/// `Container`s in the workspace.
+///
+/// Returns an empty `Vec` when the tree has no root.
+fn collect_panes_in_tree_order(tree: &egui_tiles::Tree<PaneId>) -> Vec<(PaneId, TileId)> {
+    fn walk(tiles: &egui_tiles::Tiles<PaneId>, tile_id: TileId, out: &mut Vec<(PaneId, TileId)>) {
+        match tiles.get(tile_id) {
+            Some(Tile::Pane(p)) => out.push((*p, tile_id)),
+            Some(Tile::Container(c)) => {
+                for child in c.children_vec() {
+                    walk(tiles, child, out);
+                }
+            }
+            None => {}
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(root) = tree.root {
+        walk(&tree.tiles, root, &mut out);
+    }
+    out
+}
+
+/// Optional knobs for `TermicaApp::new_with_options`. Defaults
+/// match what `TermicaApp::new` produced before — no behaviour
+/// change unless the caller asks for it.
+#[derive(Debug, Clone, Default)]
+pub struct TermicaAppOptions {
+    /// Open the chrome-picker viewport (second OS window) on
+    /// startup. The picker shares an `Arc<Mutex<ChromeVariant>>`
+    /// with the main window so clicks live-update the chrome.
+    pub open_chrome_picker: bool,
+    /// Initial value of [`TermicaApp::chrome_variant`].
+    pub initial_chrome_variant: crate::focused_chrome::ChromeVariant,
+}
+
+/// Paint the focused-editor chrome picker into a deferred
+/// Viewport (second OS window). Reads + writes the shared
+/// `Arc<Mutex<ChromeVariant>>` so a click in this window
+/// updates the main window's chrome on the next frame.
+///
+/// Closing the window via the OS close button clears
+/// `picker_viewport_open` so subsequent frames stop scheduling
+/// the viewport.
+pub(crate) fn show_chrome_picker_viewport(
+    ctx: &egui::Context,
+    variant: Arc<Mutex<crate::focused_chrome::ChromeVariant>>,
+    open: Arc<AtomicBool>,
+) {
+    let viewport_id = egui::ViewportId::from_hash_of("termica-chrome-picker");
+    let builder = egui::ViewportBuilder::default()
+        .with_title("Termica · pick focused-editor chrome")
+        .with_inner_size([460.0, 720.0])
+        .with_min_inner_size([320.0, 360.0]);
+    ctx.show_viewport_deferred(viewport_id, builder, move |ctx, _class| {
+        if ctx.input(|i| i.viewport().close_requested()) {
+            open.store(false, Ordering::Relaxed);
+        }
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Focused-editor chrome");
+            ui.weak("Click a variant — the main window updates immediately and reclaims keyboard focus so you can keep typing.");
+            ui.weak("Close this window when you're done.");
+            ui.separator();
+            let current = *variant.lock().expect("chrome variant mutex");
+            let mut picked = false;
+            for (v, _id, label) in crate::focused_chrome::ChromeVariant::ALL {
+                let is_selected = *v == current;
+                let resp = ui.selectable_label(is_selected, *label);
+                if resp.clicked() {
+                    *variant.lock().expect("chrome variant mutex") = *v;
+                    picked = true;
+                }
+            }
+            ui.add_space(8.0);
+            ui.weak(format!("current: {} ({})", current.label(), current.id()));
+            // Return OS focus to the main Termica window after every
+            // pick so the user's typing lands in the prompt editor
+            // instead of getting stuck in the picker. Without this,
+            // clicking a variant grabs window focus per OS convention
+            // and the user has to manually re-click the main window.
+            if picked {
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+            }
+        });
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui_tiles::{Tiles, Tree};
+
+    /// Build a tree with two side-by-side Tabs containers:
+    ///   SplitH(
+    ///     Tabs(p1, p2),       <- left container
+    ///     Tabs(p3, p4, p5),   <- right container
+    ///   )
+    /// Returns the tree and the inserted (PaneId → TileId) mapping
+    /// in insertion order.
+    fn split_with_two_tab_containers() -> (Tree<PaneId>, Vec<(PaneId, TileId)>) {
+        let mut tiles: Tiles<PaneId> = Tiles::default();
+        let p1 = tiles.insert_pane(PaneId(1));
+        let p2 = tiles.insert_pane(PaneId(2));
+        let p3 = tiles.insert_pane(PaneId(3));
+        let p4 = tiles.insert_pane(PaneId(4));
+        let p5 = tiles.insert_pane(PaneId(5));
+        let left = tiles.insert_tab_tile(vec![p1, p2]);
+        let right = tiles.insert_tab_tile(vec![p3, p4, p5]);
+        let root = tiles.insert_horizontal_tile(vec![left, right]);
+        let tree = Tree::new("test", root, tiles);
+        let pairs = vec![
+            (PaneId(1), p1),
+            (PaneId(2), p2),
+            (PaneId(3), p3),
+            (PaneId(4), p4),
+            (PaneId(5), p5),
+        ];
+        (tree, pairs)
+    }
+
+    #[test]
+    fn collect_panes_walks_horizontal_split_left_to_right() {
+        let (tree, _) = split_with_two_tab_containers();
+        let got: Vec<PaneId> =
+            collect_panes_in_tree_order(&tree).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(got, vec![PaneId(1), PaneId(2), PaneId(3), PaneId(4), PaneId(5)]);
+    }
+
+    #[test]
+    fn collect_panes_returns_empty_on_empty_tree() {
+        let tiles: Tiles<PaneId> = Tiles::default();
+        // egui_tiles::Tree::empty creates a rootless tree.
+        let tree: Tree<PaneId> = Tree::empty("empty");
+        assert!(tree.root.is_none(), "scaffolding: empty tree should have no root");
+        assert!(collect_panes_in_tree_order(&tree).is_empty());
+        // Touch `tiles` so the unused-binding lint doesn't complain
+        // in CI; the empty-tree assertion above is the meat.
+        let _ = tiles;
+    }
+
+    #[test]
+    fn collect_panes_pane_id_to_tile_id_mapping_is_correct() {
+        let (tree, pairs) = split_with_two_tab_containers();
+        let got = collect_panes_in_tree_order(&tree);
+        // Same length, same ordering.
+        assert_eq!(got.len(), pairs.len());
+        for (got_pair, expected_pair) in got.iter().zip(pairs.iter()) {
+            assert_eq!(got_pair, expected_pair);
+        }
+    }
 }
