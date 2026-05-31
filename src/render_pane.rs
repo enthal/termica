@@ -237,6 +237,7 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
         // Plain printable text from the OS IME / keyboard layout.
         // If a selection is active, `insert_str` deletes it first.
         Event::Text(s) => {
+            slot.session.clear_history_recall();
             if let Some(editor) = slot.session.editor_mut() {
                 editor.insert_str(s);
             }
@@ -246,6 +247,7 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
         // clipboard contents into this event. Editor consumes; the
         // (unused-here) PTY paste path stays for `RawTerminal`.
         Event::Paste(s) => {
+            slot.session.clear_history_recall();
             if let Some(editor) = slot.session.editor_mut() {
                 editor.insert_str(s);
             }
@@ -285,12 +287,18 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
             } else {
                 modifiers.ctrl && !modifiers.alt && matches!(key, Key::Delete)
             };
-            if word_delete_left && let Some(editor) = slot.session.editor_mut() {
-                editor.delete_word_left();
+            if word_delete_left {
+                slot.session.clear_history_recall();
+                if let Some(editor) = slot.session.editor_mut() {
+                    editor.delete_word_left();
+                }
                 return true;
             }
-            if word_delete_right && let Some(editor) = slot.session.editor_mut() {
-                editor.delete_word_right();
+            if word_delete_right {
+                slot.session.clear_history_recall();
+                if let Some(editor) = slot.session.editor_mut() {
+                    editor.delete_word_right();
+                }
                 return true;
             }
             // Alt + Cmd combos (other than the moves above) bypass
@@ -315,8 +323,8 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
                 return true;
             }
             // The keys that own `slot.session` mutably (submit,
-            // demote) are handled BEFORE the editor borrow so the
-            // borrow checker sees a clean window.
+            // demote, history recall) are handled BEFORE the editor
+            // borrow so the borrow checker sees a clean window.
             match key {
                 Key::Enter if !modifiers.shift => {
                     let _ = slot.session.submit_editor_command();
@@ -330,10 +338,28 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
                     return true;
                 }
                 Key::Escape => {
+                    // Abandon any in-progress recall walk before
+                    // demotion so the next prompt opens clean.
+                    slot.session.clear_history_recall();
                     slot.session.leave_editor_esc();
                     return true;
                 }
+                Key::ArrowUp if !modifiers.shift && !modifiers.alt && !modifiers.command => {
+                    slot.session.editor_history_prev();
+                    return true;
+                }
+                Key::ArrowDown if !modifiers.shift && !modifiers.alt && !modifiers.command => {
+                    slot.session.editor_history_next();
+                    return true;
+                }
                 _ => {}
+            }
+            // From this point on, the keys mutate the editor. Any
+            // edit cancels an in-progress `↑`/`↓` walk so the next
+            // `↑` re-saves the (just-edited) buffer.
+            let recall_clearing = matches!(key, Key::Backspace | Key::Delete | Key::Enter);
+            if recall_clearing {
+                slot.session.clear_history_recall();
             }
             let Some(editor) = slot.session.editor_mut() else { return false };
             match key {
@@ -361,7 +387,6 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
                     }
                     true
                 }
-                Key::ArrowUp | Key::ArrowDown => true,
                 Key::Home => {
                     if modifiers.shift {
                         editor.move_home_extending();
