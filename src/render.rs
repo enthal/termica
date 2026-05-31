@@ -240,7 +240,25 @@ pub fn paint_terminal(
     let cols = grid.columns();
     let screen_lines = grid.screen_lines();
     let history_size = if include_history { grid.history_size() } else { 0 };
-    let rows = history_size + screen_lines;
+    // When `include_history=true` (running commands outside alt-
+    // screen) the rows BELOW the cursor are empty by definition —
+    // a Running block's output flows sequentially top-to-bottom
+    // and the cursor stays at the last written row. Painting them
+    // would draw `screen_lines - cursor_row - 1` rows of pure
+    // `DEFAULT_BG` below the visible output: the panel-sized black
+    // void users reported the moment a long-running command kicked
+    // off in a tall pane. Clamp to `history_size + cursor_row + 1`
+    // so the painted area tracks the actual content height; when
+    // output overflows the screen the cursor sits at the last
+    // row and this collapses back to `history_size + screen_lines`
+    // (the pre-clamp behaviour). Alt-screen / no-history paths
+    // keep painting the full screen (a TUI owns its viewport).
+    let rows = if include_history {
+        let cursor_row = grid.cursor.point.line.0.max(0) as usize;
+        history_size + (cursor_row + 1).min(screen_lines)
+    } else {
+        screen_lines
+    };
     // Translate viewport rows (`0..rows`) to grid `Line` indices.
     // In the legacy (no-history) path, viewport row `r` maps to
     // grid line `r - display_offset`. When `include_history` is on

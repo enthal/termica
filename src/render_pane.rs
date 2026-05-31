@@ -687,15 +687,23 @@ pub fn render_pane(
     // Outside alt-screen mode the grid is rendered with its full
     // history inline so a running command's earlier output stays
     // visible; the spacer must include those rows too.
+    //
+    // The non-alt-screen height MUST match
+    // `paint_terminal`'s `include_history=true` clamp at
+    // `history + cursor_row + 1` — otherwise the bottom-align
+    // spacer over-allocates by `screen_lines - cursor_row - 1`
+    // rows and the live output floats well above the editor
+    // footer with empty space below it.
     if will_paint_live_term {
         let grid = slot.session.terminal().grid();
-        let history = if in_alt_screen {
-            0
+        use alacritty_terminal::grid::Dimensions;
+        let paint_rows = if in_alt_screen {
+            grid.screen_lines()
         } else {
-            use alacritty_terminal::grid::Dimensions;
-            grid.history_size()
+            let cursor_row = grid.cursor.point.line.0.max(0) as usize;
+            grid.history_size() + (cursor_row + 1).min(grid.screen_lines())
         };
-        content_h += (history + grid.screen_lines()) as f32 * row_h;
+        content_h += paint_rows as f32 * row_h;
     }
     let top_spacer = (scroll_max_h - content_h).max(0.0);
 

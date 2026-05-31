@@ -262,6 +262,76 @@ fn paint_terminal_with_include_history_renders_scrollback_rows() {
 }
 
 #[test]
+fn paint_terminal_with_include_history_stops_at_cursor_when_output_fits_grid() {
+    // Regression for the "panel-sized black void below the live
+    // output" bug. When a Running command's output fits the grid
+    // (e.g. `while true; do sleep 1; date; done` after a few
+    // seconds in a tall pane), the cursor sits at row N << screen_
+    // lines and the rows below it are empty. The previous
+    // `include_history=true` path painted ALL `(history_size +
+    // screen_lines)` rows, so the user saw the date lines at the
+    // top and `screen_lines - N - 1` empty rows of `DEFAULT_BG`
+    // below — a panel-tall black panel that snapped away the
+    // moment `CommandFinished` reset the grid.
+    //
+    // The fix clamps the painted region to `history_size +
+    // cursor_row + 1` viewport rows. The viewport rows above the
+    // cursor still paint (so a `tput cup` style program that
+    // writes above the cursor doesn't lose its top-half output);
+    // the rows below disappear because they have no content
+    // anyway.
+    use alacritty_terminal::grid::Dimensions;
+    let bytes = b"line a\r\nline b\r\nline c\r\n";
+    let term = term_from_bytes(20, 12, bytes);
+    let screen_lines = term.grid().screen_lines();
+    assert_eq!(screen_lines, 20, "test scaffolding");
+    let cursor_row = term.grid().cursor.point.line.0;
+    assert_eq!(cursor_row, 3, "test scaffolding: 3 CRLFs land cursor at row 3");
+    let history_size = term.grid().history_size();
+    assert_eq!(history_size, 0, "3 lines fit in a 20-row screen — no scrollback");
+
+    fn measure(include_history: bool, bytes: &[u8]) -> f32 {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_closure = captured.clone();
+        let term = term_from_bytes(20, 12, bytes);
+        let _harness =
+            Harness::builder().with_size(egui::Vec2::new(400.0, 800.0)).build_ui(move |ui| {
+                let rendered =
+                    render::paint_terminal(ui, &term, None, None, false, true, include_history);
+                *captured_for_closure.lock().unwrap() = Some(rendered.response.rect.height());
+            });
+        captured.lock().unwrap().expect("paint_terminal ran")
+    }
+
+    let h_full_viewport = measure(false, bytes);
+    let h_clamped = measure(true, bytes);
+    // Derive row_h from the no-history measurement: it paints
+    // exactly `screen_lines` rows tall, so row_h = h/screen_lines.
+    let row_h = h_full_viewport / (screen_lines as f32);
+
+    // The clamped paint must cover EXACTLY `cursor_row + 1` rows
+    // (plus the zero-sized history) — not `screen_lines`.
+    let expected_h = (cursor_row as u32 + 1) as f32 * row_h;
+    assert!(
+        (h_clamped - expected_h).abs() < 1.0,
+        "clamped paint height {h_clamped} should match {expected_h} \
+         (cursor_row+1 = {}, row_h = {row_h}); previous bug would have \
+         given {} ({} × row_h)",
+        cursor_row + 1,
+        h_full_viewport,
+        screen_lines,
+    );
+    // Sanity: the clamped paint is strictly shorter than the
+    // no-clamp (full-viewport) paint when output doesn't fill the
+    // grid.
+    assert!(
+        h_clamped < h_full_viewport,
+        "clamped paint must be shorter than the full viewport when output \
+         leaves rows below the cursor; got clamped={h_clamped}, full={h_full_viewport}",
+    );
+}
+
+#[test]
 fn snapshot_terminal_link_underline() {
     // A URL on row 0 with the Cmd/Ctrl-hover underline rendered. The
     // call site only passes a `Some(link)` when the modifier is held,
