@@ -621,18 +621,27 @@ pub fn render_pane(
     let top_spacer = (scroll_max_h - content_h).max(0.0);
 
     // Consume any pending "submit just happened — go to bottom" flag.
-    // When set, force a scroll offset large enough that egui clamps
-    // it to the bottom of the scrollable content, regardless of
-    // where the user had scrolled to before pressing Enter.
+    // The post-content `ui.scroll_to_cursor` (below) does the actual
+    // snap; we just need the bool here to decide whether to call it.
+    //
+    // Earlier versions called `ScrollArea::vertical_scroll_offset(f32::INFINITY)`
+    // hoping egui would clamp it to "bottom of content." It doesn't:
+    // egui assigns the raw offset into the persisted scroll state
+    // BEFORE its scroll-bar code runs the clamp, and the clamp is
+    // gated behind `if show_factor == 0.0 { continue; }` — so when
+    // the scroll bars aren't visible (content fits the viewport,
+    // very common right after submit) the clamp is skipped and
+    // `state.offset.y` is persisted as `f32::INFINITY` for the next
+    // frame. The viewport / content-rect math then propagates that
+    // infinity (NaN-prone) and the whole ScrollArea renders blank.
+    // That was the "scrollback vanishes / alt-screen blank after the
+    // 2nd command in a pane" regression.
     let force_to_bottom = std::mem::take(&mut slot.ui.scroll_to_bottom_pending);
-    let mut scroll_area = egui::ScrollArea::vertical()
+    let scroll_area = egui::ScrollArea::vertical()
         .id_salt(("pane-blocks", slot.session.pane_id()))
         .stick_to_bottom(true)
         .auto_shrink([false, false])
         .max_height(scroll_max_h);
-    if force_to_bottom {
-        scroll_area = scroll_area.vertical_scroll_offset(f32::INFINITY);
-    }
     let scroll_inner = scroll_area.show(ui, |ui| {
         // Top spacer bottom-aligns short content (computed
         // above). In alt-screen mode `content_h` is 0 and the
@@ -794,6 +803,16 @@ pub fn render_pane(
                 },
             }
         };
+
+        // If the user just submitted a command, snap to the bottom
+        // of the now-laid-out content. `scroll_to_cursor` aligns the
+        // *next* widget position (which is past everything we've
+        // added above) with the requested edge of the viewport —
+        // equivalent to "scroll all the way down" but using a
+        // finite, well-defined offset that egui clamps correctly.
+        if force_to_bottom {
+            ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+        }
 
         (rendered, links_in_view, highlighted_link.cloned())
     });

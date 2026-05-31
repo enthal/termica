@@ -95,6 +95,52 @@ Regenerate with `UPDATE_SNAPSHOTS=1 cargo test`. The snapshot review protocol fr
 
 Snapshot threshold lives in `kittest.toml` ([knauty's pattern](../../knauty/kittest.toml)), with a higher tolerance on Linux than macOS because of font-rendering differences across GPUs.
 
+### 4b. Synthetic `PaneSession` harness — multi-frame `render_pane` tests
+
+The snapshot layer above asserts what a pane looks like in *one* frame. A whole class of bugs only manifests across frames: scroll-offset state poisoning that survives into the next paint, focus migration on submit, cursor-anchor drift after `clear_all`, alt-screen takeover sticking after the program exits. The two scroll regressions in PR #86 and the alt-screen-blank fallout were both exactly this shape — a single-frame test cannot catch them.
+
+We need a synthetic `PaneSession` fixture so `render_pane` runs under `egui_kittest` with no real PTY in the loop. This is currently missing; the next bug fix in this class should land it as the infrastructure PR before the fix.
+
+**What to build:**
+
+- `PaneSession::synthetic_for_tests(rows, cols, pane_id)`: constructor that builds a `PaneSession` with no `PtySession`, no reader thread, no `wrapper_dir`, no recorder. The internal `bytes_rx` is a `mpsc::Receiver` whose `Sender` is exposed via a sibling helper so a test can push raw VT bytes deterministically; `drain()` consumes them the same way the production path does. `pty.write()` / `resize()` become no-ops on the synthetic variant (a `#[cfg(test)]` enum or a small trait, whichever is simpler).
+- `PaneSession::inject_lifecycle(event)` (test-only): pushes a `LifecycleEvent` directly into the controller, bypassing the DCS-JSON parse. Lets tests drive `Preexec → CommandFinished → Precmd` without standing up a real shell or hand-crafting marker bytes.
+- `PaneSlot::synthetic(pane_id)`: thin wrapper that pairs the synthetic session with a default `PaneUiState`.
+- `kittest::Harness::builder().build_ui(|ui| render_pane(ui, ctx, &mut slot, None, false))` is the entry point. The test calls `harness.step()` to advance one frame; between steps it pushes bytes, injects lifecycle events, or sets `slot.ui.*` flags and asserts on the resulting `slot` / pane render.
+
+**Canonical first test** (the one that would have caught #86 + the regression that lived briefly on its successor PR):
+
+```rust
+// fix/polish-22-scroll-to-bottom-without-infinity regression.
+// pwd × 2 — second submit must not poison ScrollArea state.
+let mut slot = PaneSlot::synthetic(PaneId(1));
+let mut harness = Harness::builder().build_ui(|ui| {
+    render_pane(ui, ui.ctx(), &mut slot, None, false);
+});
+push_bytes(&slot, b"$ "); harness.step();
+submit_command(&mut slot, "pwd"); harness.step();
+push_bytes(&slot, b"/home/test\n$ "); harness.step();
+submit_command(&mut slot, "pwd"); harness.step();
+push_bytes(&slot, b"/home/test\n$ "); harness.step();
+assert_visible_text_contains(&harness, "/home/test");
+assert!(scroll_offset_finite(&harness));
+```
+
+The assertion shape that matters: after two submits, the rendered block stack is still visible (content didn't vanish), the `ScrollArea` offset is finite (not poisoned by `f32::INFINITY`), and a third byte arrival still paints in the visible region. Each is one line; together they nail the class of bug.
+
+**Where it sits in the layer table:**
+
+| Layer | What it catches |
+|---|---|
+| Unit | Pure logic — no UI, no PTY |
+| VT golden | Engine reaction to a byte stream |
+| Integration | Real shell, real PTY |
+| `egui_kittest` snapshot | Single-frame pane appearance |
+| **Synthetic `PaneSession` harness** | **Multi-frame `render_pane` state — scroll, focus, anchor drift, alt-screen takeover** |
+| Perf smoke | Throughput / latency budgets |
+
+The synthetic harness sits between the snapshot layer (one frame) and integration (real shell). It is the *only* layer that can test the interaction of `render_pane`, `PaneSlot::ui`, and inter-frame ScrollArea/Memory state without a real PTY and without paying integration-test latency. Any bug fix whose root cause is "frame N's state survives into frame N+1 wrong" belongs here.
+
 ### 5. Perf smoke
 
 A small `benches/` directory or test-mode benchmark for two scenarios:
