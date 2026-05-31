@@ -37,10 +37,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod capture;
 pub mod db;
 pub mod replay;
 pub mod shell_files;
 
+pub use capture::{CaptureState, HistoryContext, on_event as capture_on_event};
 pub use db::{Entry, HistoryStore, Scope};
 pub use replay::{ReplayPaths, ReplayStats, replay_into};
 pub use shell_files::{ParsedEntry, parse_bash_history, parse_fish_history, parse_zsh_history};
