@@ -262,6 +262,24 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
                 }
                 return true;
             }
+            // Cmd+Z / Cmd+Shift+Z — undo / redo. Per spec/04
+            // §"Undo / redo": Cmd is the "command" modifier on both
+            // platforms (egui maps Ctrl→command on Linux/Windows),
+            // so a single `modifiers.command` check covers both.
+            // Editor consumes; the chord doesn't reach the PTY.
+            // History recall is cleared because undo/redo is a
+            // mutating op from the recall machinery's perspective.
+            if modifiers.command && !modifiers.alt && matches!(key, Key::Z) {
+                slot.session.clear_history_recall();
+                if let Some(editor) = slot.session.editor_mut() {
+                    if modifiers.shift {
+                        editor.redo();
+                    } else {
+                        editor.undo();
+                    }
+                }
+                return true;
+            }
             // Word / line / doc boundary moves. Bindings differ by
             // OS — `classify_editor_motion` encodes both conventions.
             if let Some((motion, extending)) =
@@ -1755,7 +1773,11 @@ pub fn render_pane(
         {
             ctx.copy_text(text);
             if cut_pressed && let Some(editor) = slot.session.editor_mut() {
-                editor.delete_selection();
+                // Use `cut()` not `delete_selection()` so the cut is
+                // a real undo point that captures the selection. Per
+                // spec/04 §"Undo / redo": `select → cut → undo`
+                // restores the cut text AND re-selects it.
+                let _ = editor.cut();
             }
         } else if copy_pressed {
             if let Some(text) = slot.session.block_selection_text() {

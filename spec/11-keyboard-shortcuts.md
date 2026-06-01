@@ -51,7 +51,8 @@ These chords are only active when the focused pane is in `ShellPromptEditor` and
 | `Shift+Enter` | `Shift+Enter` | Insert a newline (multiline edit). | ✅ Phase 4B ([#53](https://github.com/enthal/termica/pull/53)) |
 | `Esc` | `Esc` | Leave editor; demote to `RawTerminal`. | ✅ Phase 4B |
 | `Cmd+A` | `Ctrl+A` | Select all editor contents. | ✅ Phase 4D-poly ([#59](https://github.com/enthal/termica/pull/59)) |
-| `Cmd+C / V / X` | `Ctrl+C / V / X` | Copy / paste / cut from the editor's selection. | ✅ Phase 4D-poly ([#59](https://github.com/enthal/termica/pull/59)) |
+| `Cmd+C / V / X` | `Ctrl+C / V / X` | Copy / paste / cut from the editor's selection. Cut records one undo entry so `select → cut → undo` restores the cut text **selected** ([04 §Undo/redo](04-prompt-editor.md#undo--redo)). | ✅ Phase 4D-poly ([#59](https://github.com/enthal/termica/pull/59)) |
+| `Cmd+Z` / `Cmd+Shift+Z` | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo, scoped to the current editing session (reset on submit). Restores text **and** selection — see [04 §Undo/redo](04-prompt-editor.md#undo--redo). | ✅ Phase 4 polish |
 | Arrow ← / → | Arrow ← / → | Move caret one char (with `Shift` extends selection). | ✅ Phase 4B |
 | `Option+ArrowLeft` / `Option+ArrowRight` | `Ctrl+ArrowLeft` / `Ctrl+ArrowRight` | Move caret by word boundary (with `Shift` extends selection). | ✅ Phase 4D-poly ([#60](https://github.com/enthal/termica/pull/60)) |
 | `Cmd+ArrowLeft` / `Cmd+ArrowRight` | `Home` / `End` | Move caret to line start / end (with `Shift` extends selection). | ✅ Phase 4D-poly ([#60](https://github.com/enthal/termica/pull/60)) |

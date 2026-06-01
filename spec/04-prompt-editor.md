@@ -118,6 +118,74 @@ Multiline is first-class. `Shift+Enter` inserts a newline. Enter submits. The re
 
 For multi-line commands sent to a shell that supports them (`{}` block, here-doc), the whole buffer is sent verbatim followed by a final newline. We do not auto-quote, auto-escape, or pre-validate shell syntax — that's the shell's job.
 
+### Undo / redo
+
+Undo and redo are scoped to **one editing session per command** — the editor's undo stack starts fresh after every submit and grows until the user presses Enter again. There is no cross-command undo; the previous command is gone the moment it's sent. The stack lives on the editor (per-pane), not on the pane or workspace.
+
+**`Cmd+Z` / `Cmd+Shift+Z` (macOS) — `Ctrl+Z` / `Ctrl+Shift+Z` (Linux/Windows)** are the bindings. Shift+Z is the convention for redo on macOS; Linux follows the same chord because it's well-understood.
+
+#### What gets captured
+
+Every undo entry is a snapshot of three values, taken **before** a mutating operation:
+
+```rust
+struct UndoEntry {
+    text: String,
+    cursor: usize,                    // byte index, char-boundary invariant
+    selection_anchor: Option<usize>,  // byte index, char-boundary invariant
+}
+```
+
+Selection is included because the user expects undo to restore **what they were looking at**, not just the text. Specifically:
+
+- **select → cut → undo** restores the text AND re-selects exactly what was cut, so the same range is highlighted again. A second cut (`Cmd+X`) re-cuts it, a paste pastes over it, a keystroke replaces it. This is the round-trip the user reaches for after a mistaken cut.
+- **select → paste → undo** restores the text that was replaced AND re-selects it, so the next paste does the same replacement again. Without selection restore, the user has to re-select the original range by hand — every paste mistake costs them double.
+- **type → undo** restores the buffer to its pre-typing state with the cursor where it was. Selection state is whatever it was pre-typing (usually `None`).
+
+#### Coalescing rule (which operations push a new entry)
+
+A naive "one entry per character" undo would force the user to mash Cmd+Z 15 times to recover from a fat-finger paste-then-type. We coalesce **single-character typing runs** but break the coalesce on anything that's NOT continuing typing:
+
+- **Typing a single character at the cursor** with the previous op also a single-char insertion ⇒ append to the current run, **do not** push a new entry. The existing top entry (capturing pre-run state) is what `undo` restores to.
+- **Backspace** with the previous op also a single-char backspace ⇒ append to the current backspace run.
+- **Forward delete** with the previous op also a single-char forward delete ⇒ append.
+- **Anything else** breaks the run and pushes a new entry capturing pre-op state. Specifically:
+  - Multi-char insert (paste, set from history).
+  - Cut.
+  - Selection-replacement (insert / backspace / delete forward against a non-empty selection).
+  - Word-delete (`delete_word_left` / `delete_word_right`).
+  - Delete-to-line-start.
+  - Any cursor move or selection change (these are not undo points themselves but they end the current coalesce run; the next typing keystroke pushes a fresh entry).
+  - Programmatic `set_from_history` (history walk) — see [§History walk (Up/Down)](#history-walk-updown). Each history substitution is its own undo entry.
+
+The coalescing state is one `Option<OpKind>` field on the undo stack; it's cleared when the buffer is cleared, when the editor is reset after submit, and on every cursor / selection change. Two consecutive identical ops only coalesce when the cursor moved by **exactly one char** in the expected direction (insert → advanced by one char; backspace → retreated by one char). A pasted run of "abc" that arrives as `insert_str("abc")` is one undo entry — not three — because it's a single multi-char insert.
+
+#### Reset on submit
+
+On `submit_editor_command` ([§Submission semantics](#submission-semantics-enter), step 6 "reset_after_submit"), the undo stack AND the redo stack are cleared, and the coalesce state is cleared. The previous command is sealed; its editor history doesn't follow into the next prompt.
+
+#### Redo stack interaction
+
+`undo()` pops the top entry, captures the current state as a redo entry, and applies the popped entry to the editor. `redo()` does the inverse: pops from redo, captures current as undo, applies. **Any mutating operation that pushes a new undo entry clears the redo stack** — once you start editing again from an intermediate undo point, the forward path is gone. Standard editor convention.
+
+#### Test surface (strict layer)
+
+- Fresh editor: undo / redo are no-ops.
+- `type abc → undo` ⇒ buffer "", cursor 0, no selection.
+- `type abc → undo → redo` ⇒ buffer "abc", cursor 3.
+- `type ab → backspace → undo` ⇒ buffer "ab", cursor 2.
+- `type abc → move_left → type x → undo` ⇒ buffer "abc", cursor 2 (the cursor position right before the `x` was inserted; the move_left was not an undo point but ended the prior typing run).
+- `select_all "abc" → type x → undo` ⇒ buffer "abc", selection covering "abc", cursor at "abc".len().
+- `select "ab" → cut → undo` ⇒ buffer "abc", cursor at 2, selection covering "ab".
+- `select "ab" → paste "xyz" → undo` ⇒ buffer "abc", cursor at 2, selection covering "ab".
+- Typing 10 chars produces 1 undo entry (coalesce).
+- 5 backspaces produce 1 undo entry (coalesce).
+- Typing then backspacing produces 2 entries (the backspace break the coalesce).
+- `submit` clears both stacks.
+- Redo cleared after any new mutation past the current undo position.
+
+Coalescing decisions are pure functions of `(prev_op, current_op, cursor_delta)` — extract as a free helper for direct test coverage rather than only exercising it through the editor.
+
 ## Submission semantics (Enter)
 
 This is the single most subtle operation in the codebase. The order matters.
