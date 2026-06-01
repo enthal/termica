@@ -1841,6 +1841,40 @@ pub fn render_pane(
             }
         }
     }
+
+    // Debug overlay: when `TERMICA_DEBUG_PANE_STATE=1` is set in
+    // the environment, paint a small text box in the top-left of
+    // each pane showing its mode-machine + block-stack state.
+    // Used to diagnose the "tab 1 enters RawTerminal when Ctrl+R
+    // closes in tab 2" intermittent bug and similar focus-perturbation
+    // edge cases. Costs nothing when the env var is unset (just a
+    // single env_var lookup per pane per frame, which is cached
+    // after the first call). Not part of the production UI.
+    if std::env::var("TERMICA_DEBUG_PANE_STATE").is_ok_and(|v| v == "1") {
+        let mode = slot.session.pane_mode();
+        let tail = match slot.session.blocks().last() {
+            Some(crate::block::Block::Prompt { .. }) => "Prompt",
+            Some(crate::block::Block::Running { .. }) => "Running",
+            Some(crate::block::Block::Sealed { .. }) => "Sealed",
+            None => "<empty>",
+        };
+        let editor = slot.session.blocks().editor_on_tail().is_some();
+        let focused = focus_response.has_focus();
+        let pid = slot.session.pane_id();
+        let text =
+            format!("pane={pid:?} focus={focused} mode={mode:?} tail={tail} editor={editor}");
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new(("pane-debug", pid)),
+        ));
+        let origin = ui.max_rect().min + egui::vec2(4.0, 4.0);
+        // Black-on-yellow chip so it can't be mistaken for shell output.
+        let galley =
+            painter.layout_no_wrap(text, egui::FontId::monospace(11.0), egui::Color32::BLACK);
+        let bg = egui::Rect::from_min_size(origin, galley.size() + egui::vec2(6.0, 4.0));
+        painter.rect_filled(bg, 2.0, egui::Color32::from_rgb(0xff, 0xe8, 0x80));
+        painter.galley(origin + egui::vec2(3.0, 2.0), galley, egui::Color32::BLACK);
+    }
 }
 
 #[cfg(test)]
