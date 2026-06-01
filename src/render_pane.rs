@@ -391,6 +391,15 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
                     return true;
                 }
                 Key::Escape => {
+                    // DEBUG: trace which pane processed the Esc that
+                    // demoted via this path. Disable by unsetting
+                    // TERMICA_DEBUG_PANE_STATE.
+                    if std::env::var("TERMICA_DEBUG_PANE_STATE").is_ok_and(|v| v == "1") {
+                        eprintln!(
+                            "[termica-debug] Esc → leave_editor_esc on pane={:?}",
+                            slot.session.pane_id()
+                        );
+                    }
                     // Abandon any in-progress recall walk before
                     // demotion so the next prompt opens clean.
                     slot.session.clear_history_recall();
@@ -1624,6 +1633,26 @@ pub fn render_pane(
     slot.ui.focused = focus_response.has_focus();
 
     // ---- keyboard input, focus-gated ----------------------------
+    let _gate_open = !modal_open && focus_response.has_focus();
+    if std::env::var("TERMICA_DEBUG_PANE_STATE").is_ok_and(|v| v == "1") {
+        let has_esc = ctx.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(e, egui::Event::Key { key: egui::Key::Escape, pressed: true, .. })
+            })
+        });
+        if has_esc {
+            let global_focus = ctx.memory(|m| m.focused());
+            eprintln!(
+                "[termica-debug] Esc-in-events on pane={:?} gate_open={} \
+                 focus_id_matches_anchor={} global_focus_id={:?} anchor_id={:?}",
+                slot.session.pane_id(),
+                _gate_open,
+                focus_response.has_focus(),
+                global_focus,
+                focus_response.id,
+            );
+        }
+    }
     if !modal_open && focus_response.has_focus() {
         let is_macos = cfg!(target_os = "macos");
         let events: Vec<egui::Event> = ctx.input(|i| i.events.clone());
