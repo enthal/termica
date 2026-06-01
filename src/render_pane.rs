@@ -605,6 +605,40 @@ pub fn render_pane(
     // any other modern terminal. The flag is re-evaluated per
     // frame; on exit we fall back to the normal block layout.
     let in_alt_screen = view.alt_screen;
+
+    // Pane-background hover sentinel for focus-on-background-click.
+    //
+    // A `Sense::hover()` widget covering the full pane rect — NO
+    // click sense, NO drag sense. This deliberately stays out of
+    // egui's drag-candidate bookkeeping so it can't slow drags
+    // down, can't compete with inner widgets for press
+    // ownership, and can't form a focus-claim feedback loop with
+    // the chrome-opacity animation (cf. the 2ad7eb2 → 9dad5ca
+    // revert: a `Sense::click_and_drag` version of this widget
+    // sent CPU to 100%).
+    //
+    // `Response::contains_pointer()` is egui-doc-defined as "true
+    // if the pointer is over this widget AND no other widget is
+    // covering this response rectangle" — so it's z-order aware.
+    // When the user clicks on a sealed block, that block covers
+    // this background and `contains_pointer()` is false here;
+    // the inner-widget focus claim handles that case. When the
+    // user clicks on truly empty pane space, no inner widget
+    // covers the spot and `contains_pointer()` is true.
+    //
+    // Pairing this with `ctx.input.pointer.primary_pressed()`
+    // (pure timing — "a primary press happened this frame
+    // somewhere") gives "a press happened this frame, on an
+    // uncovered area of this pane". Per spec/06 "Pointer
+    // routing", `primary_pressed` is allowed as a pure timing
+    // signal when paired with a per-widget Response signal that
+    // does the routing. `contains_pointer()` is the routing
+    // signal here.
+    let pane_background_hover = ui.interact(
+        ui.max_rect(),
+        ui.id().with(("pane-background-hover", slot.session.pane_id())),
+        egui::Sense::hover(),
+    );
     // Capture each sealed block's painted sub-widget Responses
     // during the loop. The click / drag handler below routes
     // through these Responses (`response.clicked()`,
@@ -1321,7 +1355,16 @@ pub fn render_pane(
     let any_pane_widget_pressed =
         live_grid_pressed || editor_pressed || sealed_pressed_id.is_some();
 
-    if !modal_open && any_pane_widget_pressed {
+    // Focus-on-background-click: if a primary press happened this
+    // frame AND the pointer is currently over an uncovered area of
+    // this pane (no inner widget covers the spot at z-order), the
+    // user clicked on the pane's gray background — claim focus.
+    // `contains_pointer()` is z-order aware (see egui Response
+    // docs), so this never fires when the press lands on an inner
+    // widget; those go through `any_pane_widget_pressed` above.
+    let background_press = primary_just_pressed && pane_background_hover.contains_pointer();
+
+    if !modal_open && (any_pane_widget_pressed || background_press) {
         focus_response.request_focus();
     }
 
