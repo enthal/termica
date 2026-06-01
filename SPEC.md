@@ -21,6 +21,7 @@ Three properties drive every design choice:
 | 02 | [Terminal engine](spec/02-terminal-engine.md) | PTY, `alacritty_terminal`, the egui cell renderer, input encoding |
 | 03 | [Shell integration](spec/03-shell-integration.md) | OSC 133 + Termica markers, bash & zsh scripts, the installer |
 | 04 | [Prompt editor](spec/04-prompt-editor.md) | Editor model, multiline, Enter semantics, echo handling, Tab |
+| 04a | [Tab completion](spec/04a-completion.md) | Hybrid completion engine — CLI-native drivers, shell sidecars, popup widget, ranking |
 | 05 | [Pane modes](spec/05-pane-modes.md) | The state machine — transitions, invariants, the five safety rules |
 | 06 | [Workspace & tiles](spec/06-workspace-and-tiles.md) | Windows, tabs, panes via `egui_tiles`, status header |
 | 07 | [History & search](spec/07-history-and-search.md) | Pane-local + global history, search scopes, command blocks |

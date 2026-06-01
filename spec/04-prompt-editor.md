@@ -195,7 +195,9 @@ Echo suppression is one of the strict-layer tests ([CLAUDE.md](../CLAUDE.md)): w
 
 ## Tab handling
 
-Tab is local completion. It does **not** send `\t` to the PTY. Sources:
+Tab is local completion. It does **not** send `\t` to the PTY.
+
+**v1 (Phase 4I)** ships three local sources:
 
 1. **Path completion** for the token under the cursor that looks like a path or starts with `/`, `./`, `../`, or `~/`.
 2. **Command history** for the entire buffer when cursor is past whitespace (suggests previous matching commands).
@@ -203,7 +205,7 @@ Tab is local completion. It does **not** send `\t` to the PTY. Sources:
 
 Ranking: prefer recent / same-cwd / non-zero-exit-history matches. The popup is a native egui widget with arrow-key navigation and Tab/Enter to accept.
 
-Deep shell completion (`compgen`, ZLE menu) is **post-MVP** ([10](10-roadmap.md)). The argument: most users have moved completion guidance into their own muscle memory; we ship a competent local default and revisit if real-world usage shows it's insufficient.
+**Post-MVP**, the engine grows two more sources behind the same popup: **CLI-native drivers** (`kubectl __complete`, `gh __complete`, cobra `__complete`, `aws_completer`, `git --list-cmds`, …) and a **per-pane shell sidecar** (bash / zsh / fish loaded with the user's rc, talking to Termica over a private stdio JSON protocol). The full design — protocol, lifecycle, ranking, caching, failure modes — lives in [04a — Tab completion](04a-completion.md). Slices land as separate PRs starting with CLI-native drivers, then fish (the easiest sidecar), then bash, then zsh.
 
 ## Syntax highlighting
 
