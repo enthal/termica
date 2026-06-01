@@ -1861,8 +1861,13 @@ pub fn render_pane(
         let editor = slot.session.blocks().editor_on_tail().is_some();
         let focused = focus_response.has_focus();
         let pid = slot.session.pane_id();
-        let text =
-            format!("pane={pid:?} focus={focused} mode={mode:?} tail={tail} editor={editor}");
+        let alt_flag = slot.session.terminal().is_alternate_screen();
+        let last = slot.session.controller().last_transition().clone();
+        let text = format!(
+            "pane={pid:?} focus={focused} mode={mode:?} tail={tail} editor={editor} \
+             altflag={alt_flag} last: {:?}\u{2192}{:?} {:?}@{}",
+            last.from, last.to, last.reason, last.at,
+        );
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
             egui::Id::new(("pane-debug", pid)),
