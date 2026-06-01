@@ -279,7 +279,22 @@ pub fn paint_terminal(
     // cells that actually differ from the pane default.
     painter.rect_filled(rect, 0.0, DEFAULT_BG);
 
-    for row in 0..rows {
+    // Cull rows that are entirely outside the parent `ScrollArea`'s
+    // visible viewport. With `include_history=true` the painted
+    // region can be tens of thousands of rows tall (5 000 lines of
+    // scrollback × `row_h`); without this gate every row's cells
+    // get walked every paint, even when 99% of them are scrolled
+    // off-screen. The painter clips its shapes correctly, but the
+    // per-cell shape-generation cost was still O(rows × cols) per
+    // paint — visible as a ~300 ms spike on every idle repaint with
+    // 5 000+ lines of history, scaling linearly with scrollback
+    // depth. The cull turns it into O(visible_rows × cols).
+    let clip = ui.clip_rect();
+    let first_visible_row = ((clip.top() - rect.min.y) / row_h).floor().max(0.0) as usize;
+    let last_visible_row = ((clip.bottom() - rect.min.y) / row_h).ceil().max(0.0) as usize + 1;
+    let row_range = first_visible_row..last_visible_row.min(rows);
+
+    for row in row_range {
         for col in 0..cols {
             let grid_line = (row as i32) - effective_display_offset;
             let pt = Point::new(Line(grid_line), Column(col));
@@ -421,7 +436,19 @@ pub fn paint_styled_lines(
         painter.rect_filled(rect, 0.0, DEFAULT_BG);
     }
 
+    // Cull rows outside the parent ScrollArea's viewport — same
+    // motivation as `paint_terminal`. Sealed-block snapshots can
+    // be thousands of rows (e.g. `cat large-file`) and every paint
+    // would otherwise walk every row even when only a slice is
+    // on-screen.
+    let clip = ui.clip_rect();
+    let first_visible_row = ((clip.top() - rect.min.y) / row_h).floor().max(0.0) as usize;
+    let last_visible_row = ((clip.bottom() - rect.min.y) / row_h).ceil().max(0.0) as usize + 1;
+
     for (row_idx, line) in lines.iter().enumerate() {
+        if row_idx < first_visible_row || row_idx >= last_visible_row {
+            continue;
+        }
         for (col, cell) in line.cells.iter().enumerate() {
             let x = rect.min.x + col as f32 * cell_w;
             let y = rect.min.y + row_idx as f32 * row_h;
