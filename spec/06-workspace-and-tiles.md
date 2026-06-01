@@ -100,6 +100,51 @@ Exactly one pane is "active" per workspace. Focus follows mouse click or keyboar
 
 Background panes still **render** (their PTY keeps emitting; their grid updates) and still **persist** (scrollback writes); they just don't receive input.
 
+### Focusing a pane
+
+A pointer click anywhere within a pane's rectangle — on a sealed block, on the live grid, on the editor body, on the pane background between blocks, on any chrome — focuses that pane. The pane background acts as a passive focus-catcher so a click that lands "between" any other interactive widget still moves focus to the pane.
+
+The implementation routes this via an `egui::Response` with `Sense::hover()` on the pane's `max_rect`, read for `clicked()`:
+
+```rust
+let bg = ui.interact(max_rect, ui.id().with("pane-bg"), egui::Sense::hover());
+if bg.clicked() {
+    request_focus_on_this_pane();
+}
+```
+
+Sense matters and is normative:
+
+- **`Sense::hover()`** is the right choice. `Response::clicked()` is true on a hover-sense widget when the press *and* release both happened over its rect and no overlapping interactive widget claimed them. That's exactly the semantics we want: "if a click happened in this pane and nothing else handled it, focus the pane." A hover sense never competes with the live `Term`'s mouse selection, the editor's caret placement, or the sealed-block selection drags — egui's z-order routes the actual gesture to those widgets first and our background only catches the genuinely-unclaimed clicks.
+- **`Sense::click_and_drag()` on the background is forbidden.** It was tried; it competes with every inner widget, paints the pane at 100% CPU through repaint-on-hover, and steals selection drags. The pointer-routing rule above [§Pointer routing](#pointer-routing-binding-rule) is the structural reason: a click-and-drag sense on a rect-spanning background widget changes the resolved z-order in ways that ripple through every overlapping interaction.
+
+Why we need this at all: without a focus-catcher, clicking the gap between two sealed blocks (or the empty area below a short transcript) does nothing — none of the underlying widgets focus the pane, and the click is lost.
+
+### Keyboard input gates on prior-frame focus
+
+A pane processes a frame's keyboard events only if **it held in-app keyboard focus at frame start** — i.e. before any `request_focus()` call this frame. The two-step pattern in [`src/render_pane.rs`](../src/render_pane.rs) is:
+
+```rust
+// Step 1: read focus state BEFORE any request_focus() call this frame.
+let had_focus_at_frame_start = focus_response.has_focus();
+
+// Step 2: optionally request focus (takes effect on the NEXT frame).
+if !modal_open && (needs_focus || nothing_focused) {
+    focus_response.request_focus();
+}
+
+// Step 3: apply this frame's keystrokes only if THIS pane was already focused.
+if !modal_open && had_focus_at_frame_start {
+    apply_keys_to_editor_or_pty(...);
+}
+```
+
+This is the structural fix for a cross-pane focus race. The race: `egui::Memory::focused_widget` is a single global slot. When the focused widget's `event_filter` declares it doesn't claim `Esc` (the default for `TextEdit`), egui clears the focus slot synchronously on `Esc` *before* widgets process the keystroke. In a multi-pane layout, this lets a single `Esc` (or any focus-grab-adjacent keystroke) appear to fire on two panes in the same frame — the pane that *was* focused but had its slot just cleared, *and* the pane whose `request_focus()` runs this frame and now matches the (just-cleared) slot. Both apply the keystroke. Symptom: pressing `Ctrl+R` in pane B demotes pane A out of `ShellPromptEditor` because pane A also processes the same `Ctrl+R` in the same frame.
+
+Gating on `has_focus()` **evaluated before any `request_focus()` call** eliminates the race: a focus claim made this frame doesn't grant this frame's keystrokes. Focus always takes effect on the next frame; today's keys only land in the pane that owned focus at the start of today's frame.
+
+This is normative. Any future refactor of the focus / keyboard wiring MUST preserve the read-pre-focus-state → maybe-request-focus → apply-keys-only-if-was-focused order. The covering test lives next to the routing change in `render_pane.rs`.
+
 ## Status header
 
 The header is a row of structured widgets above each pane's editor/transcript area. It replaces most of what `$PS1` used to carry.

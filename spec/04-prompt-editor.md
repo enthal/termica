@@ -86,7 +86,7 @@ Standard text-editor mapping, OS-aware. macOS uses `Option`/`Cmd`; Linux/Windows
 | Shift + Enter | Insert newline (multiline) | same |
 | Tab | Local completion popup ([Phase 4I](10-roadmap.md#phase-4--editor-at-prompt-block-model-pivot)) | same |
 | Ctrl + R | History popup (fuzzy search; [Phase 4J](10-roadmap.md#phase-4--editor-at-prompt-block-model-pivot)) | same |
-| Up / Down | History walk (pane-local first), unless completion popup is open | same |
+| Up / Down | Multiline-aware history walk (see [§History walk (Up/Down)](#history-walk-updown) below). Inert while the completion or history popup is open — those widgets consume `↑`/`↓` for their own list navigation. | same |
 | Esc | Dismiss popup; if no popup, leave editor → demote to `RawTerminal` | same |
 | Ctrl + C on empty editor | Send SIGINT to PTY (terminal-mode parity) | same |
 | Ctrl + D on empty editor | Send EOF to PTY (terminal-mode parity) | same |
@@ -167,7 +167,7 @@ The submit path is **suffix-only on the second submit**:
 
 - `submit_editor_command` remembers the full text in `last_submitted: Option<String>`.
 - On the next submit, if the new editor text begins with `last_submitted`, only the **suffix beyond it** is written to the PTY (with a leading `\n` stripped, since the restore added one). The shell already received the prefix on the first submit; resending it would duplicate every line, and the `EchoSuppressor` (which was primed for the first half) would mismatch and disengage.
-- `last_submitted` is cleared on the next `Preexec` lifecycle event — i.e., the shell has actually started executing a complete command, so the multi-line dance is over.
+- `last_submitted` is cleared on the next `Preexec` **or** `Precmd` lifecycle event, whichever arrives first. `Preexec` is the canonical clear — the shell has accepted a complete command and is about to execute it. `Precmd` is a backstop: if a `Preexec` is never observed (the shell aborted the line, an integration script swallowed the marker, the read boundary fell wrong and the parser dropped it), the next prompt redraw still resets the suffix-only-submit state so the user's next command can't "vanish" into an empty-suffix send. Without this backstop a single missing `Preexec` leaves the editor in suffix mode indefinitely; the next typed command appears to disappear because only the empty bytes beyond `last_submitted` are sent. The covering strict-layer test lives in [`src/pane.rs`](../src/pane.rs) (`precmd_clears_last_submitted_as_backstop_for_missed_preexec`).
 
 `EchoSuppressor::expect` treats both `\n` and `\r` in the expected stream as `\r\n` because the kernel's tty discipline applies ONLCR to **every** echoed newline, not only the trailing one. Without this rule the second multi-line submit would have a partially-matching prefix and disengage suppression mid-stream, leaking the second segment as duplicate echo into the running block.
 
@@ -218,6 +218,37 @@ A minimal shell tokenizer in-house for v1:
 - comments (`#`)
 
 Tree-sitter is overkill for v1. We will reach for it if and when the in-house tokenizer can't keep up with what we want to highlight.
+
+## History walk (Up/Down)
+
+`↑` and `↓` walk pane-scope history when the buffer is single-line and grow into a precise, multiline-aware rule when it isn't. The shape:
+
+```
+    multiline buffer (caret somewhere inside)
+
+    ┌─ row 0 ────────── line A
+    │  row 1 ────────── line B  ← caret
+    └─ row 2 ────────── line C
+
+    ↑ on row 0 → step back through history (save buffer + caret first time)
+    ↑ on row > 0 → move caret to row − 1 within the editor
+    ↓ on last row → walk forward toward newer entries (restore at the head)
+    ↓ on row < last → move caret to row + 1 within the editor
+```
+
+Precise rule:
+
+- **`↑` with caret on row > 0** (i.e. there is a previous line in the editor): move the caret to that previous line, preserving the desired column (the column of the caret when the user first started moving vertically — same convention as every other text editor). Do **not** step into history.
+- **`↑` with caret on row 0** (no previous line in the editor; this is the single-line case by definition): step back to the previous pane-scope history entry. On the first such step from a non-empty (or empty) buffer, save the **current text** *and* the **current caret byte index** as the in-progress snapshot. Replace the buffer with the history entry; caret goes to the end of the substituted text (existing convention).
+- **`↓` with caret on row < last row**: move the caret to the next line, preserving the desired column. Do **not** step in history.
+- **`↓` with caret on the last row** (no next line in the editor): walk toward newer entries. If already at the newest entry, returning to the "head" restores the in-progress snapshot — **text *and* caret position** — exactly as they were when `↑` first stepped away. If no snapshot was ever taken (e.g. `↓` pressed without any prior `↑`), `↓` is a no-op.
+- **Any non-arrow edit** (text input, paste, cut, backspace, delete, undo, drag-select) **abandons the walk**: the in-progress snapshot is dropped, history navigation resets, and the next `↑` starts a fresh save.
+- **Modifier combinations** that already have other meanings (`Cmd+↑/↓`, `Shift+↑/↓`, `Option+↑/↓`) take their existing meaning per the keymap above and never step in history. Only the bare arrow keys participate.
+- **When the completion popup or `^R` history overlay is open**, `↑`/`↓` route to that widget's list navigation. The editor doesn't see them.
+
+The in-progress snapshot is the single piece of state this section adds beyond plain history step-back/step-forward: `Option<{ text: String, cursor: usize }>`. It lives on the `PromptController`'s recall state ([`src/shell.rs`](../src/shell.rs) / [`src/pane.rs`](../src/pane.rs)) so the editor can be reconstituted exactly. The caret restore is what makes the round-trip feel right: a user who started typing `git push origin` and pressed `↑` once to glance at the last command expects `↓` to put them back with the caret right where it was — not at the end of `git push origin`, where every other terminal puts it.
+
+Strict-layer tests cover: the multiline move-by-line motion (caret tracking with a 4-row buffer); the row-0/row-last edge that steps into history; the desired-column preservation through repeated `↑`/`↓` across lines of varying length; the snapshot save on first `↑` (text + caret); the snapshot restore on return-to-head (text + caret); abandonment on any non-arrow edit.
 
 ## History popup
 
