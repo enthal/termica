@@ -391,15 +391,6 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
                     return true;
                 }
                 Key::Escape => {
-                    // DEBUG: trace which pane processed the Esc that
-                    // demoted via this path. Disable by unsetting
-                    // TERMICA_DEBUG_PANE_STATE.
-                    if std::env::var("TERMICA_DEBUG_PANE_STATE").is_ok_and(|v| v == "1") {
-                        eprintln!(
-                            "[termica-debug] Esc → leave_editor_esc on pane={:?}",
-                            slot.session.pane_id()
-                        );
-                    }
                     // Abandon any in-progress recall walk before
                     // demotion so the next prompt opens clean.
                     slot.session.clear_history_recall();
@@ -1596,6 +1587,43 @@ pub fn render_pane(
     // The press handler above ALSO calls `request_focus` on click —
     // that path covers clicking inside a pane's grid (rather than
     // its tab title).
+    //
+    // **`had_focus_at_frame_start`** is captured BEFORE the
+    // `request_focus()` call below because the keyboard gate at
+    // the bottom of this function must use the focus state that
+    // existed at the *start* of this frame, not whatever
+    // `request_focus()` set mid-frame. egui's
+    // `Memory::request_focus()` updates `focused_widget`
+    // synchronously — so any subsequent `has_focus(id)` read
+    // returns `true` immediately, in the same frame. Without
+    // pinning the gate to the start-of-frame state, this race
+    // bites:
+    //
+    //   1. The user presses Esc while a TextEdit (the Ctrl+R
+    //      overlay's search box) has focus. egui's input
+    //      processor sees the TextEdit's `event_filter.escape`
+    //      is false, treats Esc as a focus-direction key, and
+    //      clears `focused_widget` to `None` BEFORE any render.
+    //   2. The leftmost pane renders first. Its focus-claim
+    //      branch sees `nothing_focused = true` → calls
+    //      `request_focus()` → its anchor immediately has focus.
+    //   3. The same frame's keyboard gate now opens — even
+    //      though the *user* never directed input at this pane —
+    //      and the same Esc event runs `apply_event_to_editor`,
+    //      which routes Esc to `leave_editor_esc()`. The pane
+    //      silently demotes `ShellPromptEditor → RawTerminal`.
+    //   4. The rightmost pane (the one the user was actually on)
+    //      then renders, requests focus via `needs_focus = true`
+    //      from the overlay-close path, and ends up focused.
+    //
+    // The leftmost pane is left in `RawTerminal` from a key the
+    // user never sent at it. By using `had_focus_at_frame_start`
+    // for the gate, focus claims (whether via `needs_focus`,
+    // `nothing_focused`, or a click) take effect on the NEXT
+    // frame's keyboard processing — never the same frame's. The
+    // current frame's events stay with whoever had focus at
+    // input-processing time.
+    let had_focus_at_frame_start = focus_response.has_focus();
     let needs_focus = std::mem::take(&mut slot.ui.needs_focus);
     let nothing_focused = ctx.memory(|m| m.focused().is_none());
     if !modal_open && (needs_focus || nothing_focused) {
@@ -1633,27 +1661,15 @@ pub fn render_pane(
     slot.ui.focused = focus_response.has_focus();
 
     // ---- keyboard input, focus-gated ----------------------------
-    let _gate_open = !modal_open && focus_response.has_focus();
-    if std::env::var("TERMICA_DEBUG_PANE_STATE").is_ok_and(|v| v == "1") {
-        let has_esc = ctx.input(|i| {
-            i.events.iter().any(|e| {
-                matches!(e, egui::Event::Key { key: egui::Key::Escape, pressed: true, .. })
-            })
-        });
-        if has_esc {
-            let global_focus = ctx.memory(|m| m.focused());
-            eprintln!(
-                "[termica-debug] Esc-in-events on pane={:?} gate_open={} \
-                 focus_id_matches_anchor={} global_focus_id={:?} anchor_id={:?}",
-                slot.session.pane_id(),
-                _gate_open,
-                focus_response.has_focus(),
-                global_focus,
-                focus_response.id,
-            );
-        }
-    }
-    if !modal_open && focus_response.has_focus() {
+    //
+    // Use `had_focus_at_frame_start` rather than
+    // `focus_response.has_focus()` here. See the long comment on
+    // `had_focus_at_frame_start` above for the failure mode this
+    // dodges (Ctrl+R overlay Esc → leftmost pane grabs focus
+    // mid-frame → leftmost pane processes the same Esc → silently
+    // demotes to RawTerminal even though the user was on a
+    // different pane).
+    if !modal_open && had_focus_at_frame_start {
         let is_macos = cfg!(target_os = "macos");
         let events: Vec<egui::Event> = ctx.input(|i| i.events.clone());
 
