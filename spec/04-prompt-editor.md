@@ -93,6 +93,8 @@ Standard text-editor mapping, OS-aware. macOS uses `Option`/`Cmd`; Linux/Windows
 
 The matching matrix lives in [`classify_editor_motion`](../src/render_pane.rs); both branches are unit-tested with the `is_macos` flag flipped explicitly so each OS's convention is verified on every CI run, not only on the host that runs CI. New motion keys are added there first, with tests, before any new row appears above.
 
+**Note on Cmd+↑/↓ vs scrollback nav.** Cmd+↑ / Cmd+↓ (macOS) and Ctrl+Home / Ctrl+End (Linux/Windows) are *editor* caret motions per the row above. Adding the Option / Alt modifier — `Cmd+Option+↑/↓` (macOS) / `Ctrl+Alt+↑/↓` (Linux/Windows) — escapes the editor and jumps the pane's scroll position to the top / bottom of the sealed-block stack instead. See [spec/11 §Shipped](11-keyboard-shortcuts.md#shipped-phase-1--phase-2) for the pane-level binding. The disambiguating modifier is intentional: a pane has both an editor and a scrollback that need independent "jump to ends" chords; Option / Alt is the standard way to layer an additional gesture on a chord without ambiguity.
+
 Shell-binding keys (`Ctrl+R`, `Ctrl+P`, `Ctrl+N`, `Ctrl+S`, `Ctrl+G`) are **consumed without effect** in the editor today: they don't reach the PTY (the editor swallows them) and they don't fire any app behaviour either, until [4J](10-roadmap.md#phase-4--editor-at-prompt-block-model-pivot) ships history walk and Ctrl+R popup. This is deliberate: forwarding them would leak literal `^R` glyphs into the editor while the user's muscle memory hasn't been wired up yet.
 
 `Ctrl+L` is a config decision: clear visible transcript ("editor convention") or send the bytes (`\f`) to the shell ("terminal convention"). Default: clear visible transcript, configurable.

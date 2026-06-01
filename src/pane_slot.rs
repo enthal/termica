@@ -51,6 +51,16 @@ pub enum PaneAction {
     /// the cursor home. The shell process is untouched and will
     /// redraw its prompt on the next prompt cycle.
     ClearScrollback,
+    /// Cmd+Option+Up (macOS) / Ctrl+Alt+Up (Linux/Windows): jump
+    /// the pane's scroll position to the very top of the
+    /// scrollback (the oldest sealed block becomes visible at the
+    /// pane viewport top). No-op in alt-screen mode — the running
+    /// program owns the viewport there.
+    ScrollToTop,
+    /// Cmd+Option+Down (macOS) / Ctrl+Alt+Down (Linux/Windows):
+    /// jump to the live tail (editor / running grid). Same chord
+    /// family as `ScrollToTop`; mirror direction.
+    ScrollToBottom,
 }
 
 /// Per-pane UI interaction state. Each pane gets its own multi-
@@ -104,8 +114,14 @@ pub struct PaneUiState {
     /// ScrollArea normally only sticks to the bottom when the user
     /// is already there, which means a submit while scrolled up
     /// would leave the new output off-screen. Cleared after one
-    /// frame's render consumes it.
+    /// frame's render consumes it. Also set by `PaneAction::ScrollToBottom`
+    /// (Cmd+Option+Down / Ctrl+Alt+Down).
     pub(crate) scroll_to_bottom_pending: bool,
+    /// "Force the scroll area to the top on next render." Set by
+    /// `PaneAction::ScrollToTop` (Cmd+Option+Up / Ctrl+Alt+Up) so
+    /// the user can jump to the oldest sealed block. Mirror of
+    /// `scroll_to_bottom_pending`. Cleared after one frame.
+    pub(crate) scroll_to_top_pending: bool,
     /// Last `bell_count` we observed on this pane's terminal. When
     /// the live count exceeds this on a render, a new bell happened
     /// since last frame and the visible flash kicks off.

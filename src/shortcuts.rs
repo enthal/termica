@@ -38,6 +38,27 @@ pub fn match_pane_shortcut(
     is_macos: bool,
 ) -> Option<PaneAction> {
     if is_macos {
+        // macOS Cmd+Option+Up/Down is the scrollback-jump chord —
+        // distinct from the Cmd-only family below because Cmd+Up /
+        // Cmd+Down are editor caret-to-doc-start / -end. Spec/04
+        // §"Editing keystrokes" reserves Cmd+↑/↓ for the editor; the
+        // scrollback jump adds Option to disambiguate.
+        if modifiers.mac_cmd
+            && modifiers.alt
+            && !modifiers.ctrl
+            && !modifiers.shift
+            && matches!(key, egui::Key::ArrowUp)
+        {
+            return Some(PaneAction::ScrollToTop);
+        }
+        if modifiers.mac_cmd
+            && modifiers.alt
+            && !modifiers.ctrl
+            && !modifiers.shift
+            && matches!(key, egui::Key::ArrowDown)
+        {
+            return Some(PaneAction::ScrollToBottom);
+        }
         // Mac: Cmd held, no Ctrl, no Alt. Shift varies per action.
         if !modifiers.mac_cmd || modifiers.ctrl || modifiers.alt {
             return None;
@@ -57,6 +78,26 @@ pub fn match_pane_shortcut(
             _ => None,
         }
     } else {
+        // Linux / Windows Ctrl+Alt+Up/Down: scrollback-jump. The
+        // bracket-pair tab-nav family uses Ctrl+Shift, so the Alt
+        // modifier disambiguates this chord from the editor's
+        // Ctrl+Home / Ctrl+End document moves.
+        if modifiers.ctrl
+            && modifiers.alt
+            && !modifiers.shift
+            && !modifiers.mac_cmd
+            && matches!(key, egui::Key::ArrowUp)
+        {
+            return Some(PaneAction::ScrollToTop);
+        }
+        if modifiers.ctrl
+            && modifiers.alt
+            && !modifiers.shift
+            && !modifiers.mac_cmd
+            && matches!(key, egui::Key::ArrowDown)
+        {
+            return Some(PaneAction::ScrollToBottom);
+        }
         // Linux / Windows: Ctrl+Shift held, no Cmd, no Alt. Shift is
         // required for every action; with the bracket pair it's
         // also the modifier that produces the curly-bracket key
@@ -263,5 +304,74 @@ mod tests {
             ..egui::Modifiers::default()
         };
         assert_eq!(match_pane_shortcut(egui::Key::T, ctrl_shift, true), None);
+    }
+
+    // --- Scrollback jump (Cmd+Option / Ctrl+Alt arrows) -----------
+
+    fn mac_cmd_alt() -> egui::Modifiers {
+        egui::Modifiers { mac_cmd: true, command: true, alt: true, ..egui::Modifiers::default() }
+    }
+
+    fn linux_ctrl_alt() -> egui::Modifiers {
+        egui::Modifiers { ctrl: true, alt: true, command: true, ..egui::Modifiers::default() }
+    }
+
+    #[test]
+    fn macos_cmd_option_up_maps_to_scroll_to_top() {
+        assert_eq!(
+            match_pane_shortcut(egui::Key::ArrowUp, mac_cmd_alt(), true),
+            Some(PaneAction::ScrollToTop)
+        );
+    }
+
+    #[test]
+    fn macos_cmd_option_down_maps_to_scroll_to_bottom() {
+        assert_eq!(
+            match_pane_shortcut(egui::Key::ArrowDown, mac_cmd_alt(), true),
+            Some(PaneAction::ScrollToBottom)
+        );
+    }
+
+    #[test]
+    fn macos_cmd_up_alone_does_not_map_to_scrollback_jump() {
+        // Cmd+Up alone is editor caret-to-doc-start (per spec/04).
+        // The Option modifier is what claims it for scrollback.
+        let cmd_only = mac_cmd_only();
+        assert_eq!(match_pane_shortcut(egui::Key::ArrowUp, cmd_only, true), None);
+    }
+
+    #[test]
+    fn linux_ctrl_alt_up_maps_to_scroll_to_top() {
+        assert_eq!(
+            match_pane_shortcut(egui::Key::ArrowUp, linux_ctrl_alt(), false),
+            Some(PaneAction::ScrollToTop)
+        );
+    }
+
+    #[test]
+    fn linux_ctrl_alt_down_maps_to_scroll_to_bottom() {
+        assert_eq!(
+            match_pane_shortcut(egui::Key::ArrowDown, linux_ctrl_alt(), false),
+            Some(PaneAction::ScrollToBottom)
+        );
+    }
+
+    #[test]
+    fn linux_ctrl_home_end_do_not_collide_with_scrollback_jump() {
+        // Ctrl+Home / Ctrl+End are editor doc-start / doc-end on
+        // Linux (per spec/04 §"Editing keystrokes" row). The
+        // matcher must not claim them as ScrollToTop/Bottom — the
+        // arrow variant carries Alt to disambiguate.
+        let ctrl_only = egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::default() };
+        assert_eq!(match_pane_shortcut(egui::Key::Home, ctrl_only, false), None);
+        assert_eq!(match_pane_shortcut(egui::Key::End, ctrl_only, false), None);
+    }
+
+    #[test]
+    fn macos_cmd_option_left_right_are_not_scrollback() {
+        // Only ArrowUp/ArrowDown participate. Left/Right with the
+        // same modifiers should NOT trigger.
+        assert_eq!(match_pane_shortcut(egui::Key::ArrowLeft, mac_cmd_alt(), true), None);
+        assert_eq!(match_pane_shortcut(egui::Key::ArrowRight, mac_cmd_alt(), true), None);
     }
 }
