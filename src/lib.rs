@@ -87,13 +87,35 @@ pub(crate) const MIN_COLS: u16 = 20;
 /// Run the native window. Used by `main` and any future end-to-end
 /// harness.
 pub fn run() -> eframe::Result<()> {
-    // Cheap arg sniff — no full clap dep needed for one boolean
-    // flag. `--pick-chrome` opens the focused-editor chrome picker
+    // Cheap arg sniff — no full clap dep needed for the current
+    // surface (one boolean flag + one optional positional path).
+    //
+    // `--pick-chrome` opens the focused-editor chrome picker
     // viewport (a second OS window) on startup. Clicks in that
     // window live-update the chrome of the main window.
-    let pick_chrome = std::env::args().any(|a| a == "--pick-chrome");
-    let app_opts =
-        crate::app::TermicaAppOptions { open_chrome_picker: pick_chrome, ..Default::default() };
+    //
+    // Positional path argument: see
+    // [spec/06 §"Startup cwd and positional argument"](spec/06-workspace-and-tiles.md#startup-cwd-and-positional-argument).
+    // At most one positional arg is allowed; extras print to
+    // stderr and exit non-zero.
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let pick_chrome = raw_args.iter().any(|a| a == "--pick-chrome");
+    let positionals: Vec<&str> =
+        raw_args.iter().filter(|a| !a.starts_with("--")).map(|s| s.as_str()).collect();
+    if positionals.len() > 1 {
+        eprintln!(
+            "termica: too many positional arguments ({} given); expected at most one path",
+            positionals.len()
+        );
+        std::process::exit(2);
+    }
+    let positional_path = positionals.first().map(std::path::Path::new);
+    let startup_cwd = crate::app::resolve_startup_cwd(positional_path);
+    let app_opts = crate::app::TermicaAppOptions {
+        open_chrome_picker: pick_chrome,
+        startup_cwd: Some(startup_cwd),
+        ..Default::default()
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])

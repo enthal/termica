@@ -156,6 +156,10 @@ pub struct TermicaApp {
     /// command crosses an OS boundary and a no-op call per frame
     /// would be wasteful.
     last_window_title: String,
+    /// Resolved first-pane starting cwd, set from
+    /// `TermicaAppOptions.startup_cwd`. Consumed once by
+    /// [`Self::bootstrap`] (via `take`) and never read again.
+    startup_cwd: Option<PathBuf>,
 }
 
 impl TermicaApp {
@@ -193,6 +197,7 @@ impl TermicaApp {
             chrome_variant: Arc::new(Mutex::new(opts.initial_chrome_variant)),
             picker_viewport_open: Arc::new(AtomicBool::new(opts.open_chrome_picker)),
             last_window_title: String::new(),
+            startup_cwd: opts.startup_cwd,
         };
         app.bootstrap();
         app
@@ -212,11 +217,19 @@ impl TermicaApp {
         let shell = resolve_shell_from_env();
         let recorder = self.event_recorder.clone();
         let history = self.history_ctx();
+        // First pane's starting cwd. Resolved per
+        // spec/06 "Startup cwd and positional argument" — caller
+        // (typically `run()`) computes it via `resolve_startup_cwd`
+        // from the CLI positional arg + environment and passes it
+        // in `TermicaAppOptions.startup_cwd`. `None` falls back to
+        // `current_dir()` here, kept so test callers that don't
+        // care about cwd don't have to thread the option through.
+        let cwd = self.startup_cwd.take().or_else(|| std::env::current_dir().ok());
         let session = PaneSession::spawn_managed(
             MIN_ROWS.max(24),
             MIN_COLS.max(80),
             shell,
-            None,
+            cwd,
             pane_id.0,
             recorder,
             history,
@@ -971,6 +984,52 @@ pub struct TermicaAppOptions {
     pub open_chrome_picker: bool,
     /// Initial value of [`TermicaApp::chrome_variant`].
     pub initial_chrome_variant: crate::focused_chrome::ChromeVariant,
+    /// First pane's starting cwd. See
+    /// [spec/06 §"Startup cwd and positional argument"](../spec/06-workspace-and-tiles.md#startup-cwd-and-positional-argument)
+    /// for the resolution chain (positional arg → `current_dir`
+    /// → `$HOME` → `/`). Use [`resolve_startup_cwd`] to compute it
+    /// from a CLI positional arg + the environment. `None` falls
+    /// back to whatever `current_dir()` returns inside `bootstrap`
+    /// — the pre-spec behaviour, kept for tests that don't care.
+    pub startup_cwd: Option<PathBuf>,
+}
+
+/// Resolve the first pane's starting cwd per
+/// [spec/06 §"Startup cwd and positional argument"](../spec/06-workspace-and-tiles.md#startup-cwd-and-positional-argument).
+///
+/// Pure helper — takes the positional path (if any) and the env
+/// vars + filesystem queries it needs as ambient state. Returns
+/// the resolved `PathBuf`; never panics, never fails.
+///
+/// Fallback chain:
+/// 1. `positional_path` is a directory → it.
+/// 2. `positional_path` is a non-directory file with a parent →
+///    that parent directory.
+/// 3. Else `std::env::current_dir()` if it succeeds.
+/// 4. Else `$HOME` if set.
+/// 5. Else `/`.
+pub fn resolve_startup_cwd(positional_path: Option<&std::path::Path>) -> PathBuf {
+    if let Some(p) = positional_path {
+        let meta = std::fs::metadata(p);
+        if let Ok(m) = meta {
+            if m.is_dir() {
+                return p.to_path_buf();
+            }
+            if let Some(parent) = p.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                return parent.to_path_buf();
+            }
+        }
+        // p doesn't exist or has no usable parent → fall through.
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        return cwd;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home);
+    }
+    PathBuf::from("/")
 }
 
 /// Paint the focused-editor chrome picker into a deferred
@@ -1086,5 +1145,43 @@ mod tests {
         for (got_pair, expected_pair) in got.iter().zip(pairs.iter()) {
             assert_eq!(got_pair, expected_pair);
         }
+    }
+
+    // ---- resolve_startup_cwd: spec/06 fallback chain --------------
+
+    #[test]
+    fn resolve_startup_cwd_positional_directory_used_as_is() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let resolved = resolve_startup_cwd(Some(dir.path()));
+        assert_eq!(resolved, dir.path().to_path_buf());
+    }
+
+    #[test]
+    fn resolve_startup_cwd_positional_file_uses_parent_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("a-file.txt");
+        std::fs::write(&file_path, b"x").expect("write");
+        let resolved = resolve_startup_cwd(Some(&file_path));
+        assert_eq!(resolved, dir.path().to_path_buf());
+    }
+
+    #[test]
+    fn resolve_startup_cwd_missing_path_falls_back_to_current_dir() {
+        // The path doesn't exist → fall through to current_dir().
+        // We only assert that the fallback is NOT the bogus path,
+        // since current_dir() depends on the test runner's cwd.
+        let bogus = std::path::PathBuf::from("/this/path/should/not/exist/ever-termica");
+        let resolved = resolve_startup_cwd(Some(&bogus));
+        assert_ne!(resolved, bogus);
+        // And it must be either current_dir() or $HOME or /; all
+        // of those are absolute paths.
+        assert!(resolved.is_absolute(), "fallback cwd must be absolute, got {resolved:?}");
+    }
+
+    #[test]
+    fn resolve_startup_cwd_no_positional_falls_back_to_current_dir() {
+        let resolved = resolve_startup_cwd(None);
+        // current_dir() should succeed in the test environment.
+        assert_eq!(resolved, std::env::current_dir().expect("current_dir in test"));
     }
 }

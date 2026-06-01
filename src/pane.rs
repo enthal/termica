@@ -378,7 +378,27 @@ impl PaneSession {
             }
             // `Preexec` = the shell actually started executing the
             // command, so any pending continuation state is moot.
-            if matches!(event, crate::markers::LifecycleEvent::Preexec { .. }) {
+            // `Precmd` ALSO clears it as a backstop for the case
+            // where Preexec is missed (shell hook race under load,
+            // dropped marker, etc.) but the next prompt cycle does
+            // emit Precmd. Without this backstop, a stale
+            // `last_submitted` from the previous command would
+            // make a subsequent submit whose text starts with that
+            // stale value (including identical re-submits) send
+            // only the empty / wrong diff — the command appears
+            // to "vanish": editor clears, nothing reaches the
+            // shell, no Preexec → no Running block → nothing in
+            // history. Precmd never fires for the PS2 continuation
+            // prompt, so the legitimate continuation flow is
+            // unaffected: between a `Submit` and a `Continuation`
+            // marker (PS2 → `last_submitted` consulted to restore
+            // the editor + the next-submit diff path), Precmd
+            // hasn't fired and the prefix is intact.
+            if matches!(
+                event,
+                crate::markers::LifecycleEvent::Preexec { .. }
+                    | crate::markers::LifecycleEvent::Precmd { .. }
+            ) {
                 self.last_submitted = None;
             }
             // Zombie alt-screen recovery. `less`, `vim`, etc. enter
@@ -1747,6 +1767,86 @@ mod tests {
                     session.editor_is_active(),
                     session.terminal.is_alternate_screen(),
                     session.controller.mode(),
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn precmd_clears_last_submitted_as_backstop_for_missed_preexec() {
+        // Bug-fix regression: `last_submitted` was only cleared on
+        // `Preexec`. If Preexec was missed (shell hook race under
+        // load, dropped marker, integration script edge case), the
+        // stale prefix would make the NEXT submit run the diff
+        // path (`text.starts_with(prev)`) and silently send only
+        // the delta. For an identical re-submit the delta is
+        // empty — the user types a command, hits Enter, the
+        // editor clears, but the shell receives just `\r`. The
+        // command appears to vanish: no Preexec, no Running
+        // block, no history entry, nothing.
+        //
+        // Fix: also clear `last_submitted` on `Precmd`. Precmd
+        // fires before each PS1 cycle and never for PS2
+        // continuation prompts, so the legitimate continuation
+        // path (between Submit and the Continuation event) is
+        // unaffected — Precmd does not fire there.
+        //
+        // Burst sequence the test drives:
+        //   1. integration_ready + first precmd → editor.
+        //   2. (no Preexec emitted — simulating the race.)
+        //   3. second precmd → must clear `last_submitted` even
+        //      though Preexec never arrived.
+        let cmd = "printf '\\033PTermica;{\"type\":\"integration_ready\",\
+                   \"session\":\"t\",\"value\":{\"shell\":\"zsh\",\"version\":1}}\\033\\\\\
+                   \\033PTermica;{\"type\":\"precmd\",\
+                   \"session\":\"t\",\"value\":\"/tmp\"}\\033\\\\'; \
+                   sleep 0.2; \
+                   printf '\\033PTermica;{\"type\":\"precmd\",\
+                   \"session\":\"t\",\"value\":\"/tmp\"}\\033\\\\'; \
+                   sleep 5";
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c(cmd), "t".into(), 0, None).expect("spawn");
+
+        // 1) Wait until the FIRST precmd promotes us to editor.
+        let stop = Instant::now() + Duration::from_secs(2);
+        loop {
+            session.drain();
+            if session.editor_is_active() {
+                break;
+            }
+            if Instant::now() >= stop {
+                panic!("editor never active");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // 2) Simulate the user submitting a command. After this
+        // call `last_submitted` should hold the text.
+        session.editor_mut().unwrap().insert_str("echo a");
+        session.submit_editor_command().expect("submit");
+        assert_eq!(
+            session.last_submitted.as_deref(),
+            Some("echo a"),
+            "test scaffolding: submit must set last_submitted"
+        );
+
+        // 3) Wait for the SECOND precmd to arrive. NO Preexec
+        // ever fires (the shell command in this test doesn't
+        // emit one). The backstop clear on Precmd must zero
+        // `last_submitted`.
+        let stop = Instant::now() + Duration::from_secs(3);
+        loop {
+            session.drain();
+            if session.last_submitted.is_none() {
+                break;
+            }
+            if Instant::now() >= stop {
+                panic!(
+                    "after second precmd with no Preexec in between, expected \
+                     last_submitted=None; still set to {:?} — Precmd backstop \
+                     is missing or broken",
+                    session.last_submitted
                 );
             }
             thread::sleep(Duration::from_millis(20));
