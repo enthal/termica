@@ -776,6 +776,49 @@ impl PromptEditor {
         self.cursor = i;
     }
 
+    /// Return the caret's `(row, col_chars)` position where `row` is
+    /// the index of the `\n`-delimited line and `col_chars` is the
+    /// char count on that line up to the cursor. Pure helper used
+    /// by the line-aware vertical moves below.
+    pub fn cursor_row_col_chars(&self) -> (usize, usize) {
+        let before = &self.text[..self.cursor];
+        let row = before.bytes().filter(|&b| b == b'\n').count();
+        let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let col = self.text[line_start..self.cursor].chars().count();
+        (row, col)
+    }
+
+    /// Move the caret up one editor line, preserving the column.
+    /// Returns `true` when the caret moved (there was a previous
+    /// line); `false` when already on row 0 — the caller uses the
+    /// return to decide whether to delegate to history walk per
+    /// [spec/04 §"History walk (Up/Down)"](../spec/04-prompt-editor.md#history-walk-updown).
+    ///
+    /// Clears selection.
+    pub fn move_up(&mut self) -> bool {
+        let (row, col) = self.cursor_row_col_chars();
+        if row == 0 {
+            return false;
+        }
+        self.cursor = byte_index_for_row_col(&self.text, row - 1, col);
+        self.selection_anchor = None;
+        true
+    }
+
+    /// Move the caret down one editor line. Returns `true` on a
+    /// successful move; `false` on the last row — same caller
+    /// contract as [`Self::move_up`].
+    pub fn move_down(&mut self) -> bool {
+        let (row, col) = self.cursor_row_col_chars();
+        let total_rows = self.text.split('\n').count();
+        if row + 1 >= total_rows {
+            return false;
+        }
+        self.cursor = byte_index_for_row_col(&self.text, row + 1, col);
+        self.selection_anchor = None;
+        true
+    }
+
     /// Move to byte 0. macOS Cmd+Up convention.
     pub fn move_doc_start(&mut self) {
         self.selection_anchor = None;
@@ -1803,6 +1846,122 @@ mod tests {
         // 2 is mid-é — clamp anchor to 1, head to 3 (end).
         e.set_selection(2, 99);
         assert_eq!(e.selection_range(), Some((1, 3)));
+    }
+
+    // ---- vertical caret moves (spec/04 §"History walk") ----------
+
+    #[test]
+    fn move_up_on_row_zero_returns_false_and_does_not_move() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hello");
+        e.set_cursor(2);
+        let moved = e.move_up();
+        assert!(!moved, "row 0 → no previous line");
+        assert_eq!(e.cursor(), 2);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn move_down_on_last_row_returns_false_and_does_not_move() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hello");
+        e.set_cursor(2);
+        let moved = e.move_down();
+        assert!(!moved, "single-line buffer: no next line");
+        assert_eq!(e.cursor(), 2);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn move_up_on_row_one_moves_to_row_zero_preserving_col() {
+        let mut e = PromptEditor::new();
+        e.insert_str("alpha\nbeta");
+        // Cursor at byte 7 = col 1 of row 1 (the 'e' in "beta").
+        e.set_cursor(7);
+        let moved = e.move_up();
+        assert!(moved);
+        // Row 0 col 1 = byte 1 ('l' in "alpha").
+        assert_eq!(e.cursor(), 1);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn move_down_on_row_zero_moves_to_row_one_preserving_col() {
+        let mut e = PromptEditor::new();
+        e.insert_str("alpha\nbeta");
+        // Cursor at byte 3 = col 3 of row 0 ('p' end).
+        e.set_cursor(3);
+        let moved = e.move_down();
+        assert!(moved);
+        // Row 1 col 3 = byte 9 ('a' in "beta").
+        assert_eq!(e.cursor(), 9);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn move_up_clamps_col_when_previous_line_is_shorter() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hi\nworld");
+        // Cursor at end of "world" — byte 8, col 5.
+        e.set_cursor(8);
+        let moved = e.move_up();
+        assert!(moved);
+        // Previous line "hi" is 2 chars; cursor lands at col 2 = byte 2.
+        assert_eq!(e.cursor(), 2);
+    }
+
+    #[test]
+    fn move_down_clamps_col_when_next_line_is_shorter() {
+        let mut e = PromptEditor::new();
+        e.insert_str("world\nhi");
+        // Cursor at byte 5 = end of "world", col 5.
+        e.set_cursor(5);
+        let moved = e.move_down();
+        assert!(moved);
+        // "hi" is 2 chars; cursor lands at end-of-line = byte 8.
+        assert_eq!(e.cursor(), 8);
+    }
+
+    #[test]
+    fn cursor_row_col_chars_for_various_positions() {
+        let mut e = PromptEditor::new();
+        e.insert_str("ab\ncde\nfgh");
+        e.set_cursor(0);
+        assert_eq!(e.cursor_row_col_chars(), (0, 0));
+        e.set_cursor(2);
+        assert_eq!(e.cursor_row_col_chars(), (0, 2));
+        e.set_cursor(3);
+        assert_eq!(e.cursor_row_col_chars(), (1, 0));
+        e.set_cursor(6);
+        assert_eq!(e.cursor_row_col_chars(), (1, 3));
+        e.set_cursor(7);
+        assert_eq!(e.cursor_row_col_chars(), (2, 0));
+    }
+
+    #[test]
+    fn move_up_clears_selection() {
+        let mut e = PromptEditor::new();
+        e.insert_str("ab\ncd");
+        e.set_cursor(3);
+        e.set_cursor_extending(5);
+        assert!(e.has_selection());
+        e.move_up();
+        assert!(!e.has_selection());
+    }
+
+    #[test]
+    fn move_up_handles_multibyte_chars_in_col_calc() {
+        let mut e = PromptEditor::new();
+        e.insert_str("😀😀\n😀😀😀");
+        // Cursor at end of row 1: byte = 8 (row 0) + 1 (\n) + 12 = 21.
+        e.set_cursor(21);
+        // Row 1, col 3 (chars).
+        assert_eq!(e.cursor_row_col_chars(), (1, 3));
+        let moved = e.move_up();
+        assert!(moved);
+        // Row 0 has 2 chars; cursor clamps to col 2 = byte 8.
+        assert_eq!(e.cursor(), 8);
+        assert_invariant(&e);
     }
 
     #[test]
