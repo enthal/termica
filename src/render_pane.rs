@@ -418,12 +418,19 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
                 Key::Enter if !modifiers.shift => {
                     let _ = slot.session.submit_editor_command();
                     // The user just submitted — force the scroll
-                    // area to the bottom on the next render so the
+                    // area to the bottom for several frames so the
                     // command's first output is visible even if the
                     // user had scrolled up to read older blocks.
-                    // Shift+Enter (multi-line continuation) does NOT
-                    // submit and stays out of this branch.
-                    slot.ui.scroll_to_bottom_pending = true;
+                    // The multi-frame snap (vs single-frame) walks
+                    // through the Preexec → Running transition,
+                    // which adds a command-label row to the block
+                    // stack one frame AFTER the submit. A single-
+                    // frame snap landed before that transition and
+                    // stick_to_bottom didn't reliably hold through
+                    // it, leaving the user at the TOP of the new
+                    // Running block. 6 frames covers the typical
+                    // shell-roundtrip latency.
+                    slot.ui.scroll_to_bottom_frames = 6;
                     return true;
                 }
                 Key::Escape => {
@@ -815,7 +822,19 @@ pub fn render_pane(
     // infinity (NaN-prone) and the whole ScrollArea renders blank.
     // That was the "scrollback vanishes / alt-screen blank after the
     // 2nd command in a pane" regression.
-    let force_to_bottom = std::mem::take(&mut slot.ui.scroll_to_bottom_pending);
+    // `force_to_bottom` fires for two paths:
+    // - One-shot `scroll_to_bottom_pending` (Cmd+Option+Down,
+    //   chrome picker, etc.) — take and clear.
+    // - Multi-frame `scroll_to_bottom_frames > 0` from submit —
+    //   decrement each frame, snap while non-zero. See the field
+    //   doc on `PaneUiState::scroll_to_bottom_frames`.
+    let one_shot_bottom = std::mem::take(&mut slot.ui.scroll_to_bottom_pending);
+    let multi_frame_bottom = slot.ui.scroll_to_bottom_frames > 0;
+    if multi_frame_bottom {
+        slot.ui.scroll_to_bottom_frames -= 1;
+        ctx.request_repaint();
+    }
+    let force_to_bottom = one_shot_bottom || multi_frame_bottom;
     let force_to_top = std::mem::take(&mut slot.ui.scroll_to_top_pending);
     // `stick_to_bottom` re-snaps the offset to max every frame the
     // user is at the bottom — which fights any top-snap attempt
@@ -838,28 +857,16 @@ pub fn render_pane(
         .stick_to_bottom(!force_to_top)
         .auto_shrink([false, false])
         .max_height(scroll_max_h);
-    // Direct offset overrides for both jump directions. The
-    // `scroll_to_cursor(TOP)` / `scroll_to_cursor(BOTTOM)` hints
-    // inside the scroll closure aren't reliable enough on their
-    // own — for `force_to_top` the in-frame "we're at the end"
-    // cache fought the hint, and the bottom-snap path had a user-
-    // visible regression where `Enter` to submit a command
-    // scrolled to the TOP of the new Running block instead of
-    // pinning the live tail to the bottom.
-    //
-    // Use `content_h - scroll_max_h` (our pre-layout estimate of
-    // the max scroll offset) for the bottom case. egui clamps the
-    // value if our estimate is slightly off; we never persist
-    // `f32::INFINITY`, which avoided the NaN trap that bit the
-    // earlier `force_to_top` attempt.
-    let scroll_area = if force_to_top {
-        scroll_area.vertical_scroll_offset(0.0)
-    } else if force_to_bottom {
-        let bottom_offset = (content_h - scroll_max_h).max(0.0);
-        scroll_area.vertical_scroll_offset(bottom_offset)
-    } else {
-        scroll_area
-    };
+    // `force_to_top` uses a direct offset override (0.0) because
+    // `scroll_to_cursor(TOP)` got swallowed by ScrollArea's "we're
+    // at the end" cache. `force_to_bottom` keeps using
+    // `scroll_to_cursor(BOTTOM)` inside the closure (line ~1060)
+    // because the bottom-snap needs egui's accurate post-layout
+    // measurement of where content ends; our pre-layout
+    // `content_h` estimate was sometimes off, sending the snap to
+    // the wrong place.
+    let scroll_area =
+        if force_to_top { scroll_area.vertical_scroll_offset(0.0) } else { scroll_area };
     let scroll_inner = scroll_area.show(ui, |ui| {
         // Scrollback-jump-to-top (Cmd+Option+Up / Ctrl+Alt+Up): snap
         // the next-widget-position (= top of content) to the TOP
@@ -2132,7 +2139,9 @@ pub fn render_pane(
                         Key::Escape => {
                             slot.ui.completion_popup = None;
                         }
-                        Key::Tab | Key::Enter => {
+                        Key::Enter => {
+                            // Enter always commits the selected
+                            // candidate and closes the popup.
                             if let Some(popup) = slot.ui.completion_popup.take() {
                                 let cursor = slot
                                     .session
@@ -2145,6 +2154,45 @@ pub fn render_pane(
                                     popup.accept(editor, current_token_len);
                                 }
                                 slot.session.clear_history_recall();
+                            }
+                        }
+                        Key::Tab => {
+                            // Smart-Tab: extend the typed token to
+                            // the longest prefix shared by selected
+                            // AND at least one other candidate.
+                            // - extension == selected.value → commit.
+                            // - extension.len() > current → extend,
+                            //   leave popup open, live-filter next
+                            //   frame.
+                            // - extension == current → no-op; user
+                            //   picks via Up/Down + Enter.
+                            let Some(popup_ref) = slot.ui.completion_popup.as_ref() else {
+                                continue;
+                            };
+                            let cursor = slot
+                                .session
+                                .blocks()
+                                .editor_on_tail()
+                                .map(|e| e.cursor())
+                                .unwrap_or(0);
+                            let current_token_len = cursor.saturating_sub(popup_ref.origin_byte);
+                            let extension = popup_ref.tab_extend(current_token_len).to_string();
+                            let selected_full = popup_ref.selected().value.clone();
+                            if extension == selected_full {
+                                if let Some(popup) = slot.ui.completion_popup.take()
+                                    && let Some(editor) = slot.session.editor_mut()
+                                {
+                                    popup.accept(editor, current_token_len);
+                                }
+                                slot.session.clear_history_recall();
+                            } else if extension.len() > current_token_len {
+                                if let Some(editor) = slot.session.editor_mut() {
+                                    let origin = popup_ref.origin_byte;
+                                    editor.set_selection(origin, cursor);
+                                    editor.insert_str(&extension);
+                                }
+                                slot.session.clear_history_recall();
+                                // Popup stays; live filter next frame.
                             }
                         }
                         Key::ArrowDown => {

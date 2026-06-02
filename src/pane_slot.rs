@@ -117,6 +117,16 @@ pub struct PaneUiState {
     /// frame's render consumes it. Also set by `PaneAction::ScrollToBottom`
     /// (Cmd+Option+Down / Ctrl+Alt+Down).
     pub(crate) scroll_to_bottom_pending: bool,
+    /// Number of consecutive frames to keep forcing the scroll to
+    /// bottom after a submit. The Preexec → Running transition
+    /// adds a command-label row to the block stack on a LATER
+    /// frame than the submit, and stick_to_bottom alone wasn't
+    /// reliably keeping the live tail pinned through that
+    /// transition (user landed at the TOP of the new Running
+    /// block). A short multi-frame snap window walks through the
+    /// transition and lands at the actual bottom. Decremented
+    /// each frame in `render_pane`; the snap fires while > 0.
+    pub(crate) scroll_to_bottom_frames: u8,
     /// "Force the scroll area to the top on next render." Set by
     /// `PaneAction::ScrollToTop` (Cmd+Option+Up / Ctrl+Alt+Up) so
     /// the user can jump to the oldest sealed block. Mirror of

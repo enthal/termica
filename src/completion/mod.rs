@@ -64,15 +64,16 @@ use std::path::{Path, PathBuf};
 ///   completion is a possible future addition; for now Tab
 ///   completion is purely structural (filesystem + `$PATH`).
 ///
-/// `_history_lookup` is kept on the signature so future slices
-/// can plug history back in without rewiring callers; the
-/// orchestrator currently doesn't call it.
+/// `history_lookup` is called to fetch recent global history when
+/// the `\$PATH` source runs — its only use is RE-RANKING the
+/// `\$PATH` executables by recency-of-first-word-use. History
+/// doesn't contribute candidates of its own.
 pub fn open_completion_at(
     editor_text: &str,
     cursor: usize,
     cwd: Option<&Path>,
     home: Option<&Path>,
-    _history_lookup: impl FnOnce() -> Vec<String>,
+    history_lookup: impl FnOnce() -> Vec<String>,
 ) -> Option<CompletionPopup> {
     let (token_start, token) = local::token_under_cursor(editor_text, cursor);
     let pathish = local::token_is_pathish(token);
@@ -127,11 +128,15 @@ pub fn open_completion_at(
     // ---- $PATH executable source ----------------------------------
     if cmd_pos && !token.contains('/') && !token.is_empty() {
         let exes = scan_path_executables();
-        sources.push(local::complete_path_executables(token, &exes));
+        let history = history_lookup();
+        sources.push(local::complete_path_executables_with_history(token, &exes, &history));
     }
 
-    // Intentionally NO history source — see the doc-comment on
-    // this function for the rationale.
+    // Intentionally NO history-as-lines source — see the
+    // doc-comment on this function. History is used as a RANKING
+    // signal for the `$PATH` source above (boosts recently-used
+    // command names to the top); it doesn't contribute candidates
+    // of its own.
 
     let merged = ranking::merge_ranked(sources, 200);
     CompletionPopup::new(token_start, token, merged)

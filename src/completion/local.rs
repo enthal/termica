@@ -209,6 +209,62 @@ pub fn complete_path_executables(prefix: &str, executables: &[String]) -> Vec<Co
     out
 }
 
+/// Like [`complete_path_executables`] but **sorts by global
+/// history recency**: executables whose name has been used as
+/// the FIRST WORD of a past command line rank above those that
+/// haven't, with the most recently-used ones first. Within each
+/// group the secondary sort is alphabetical.
+///
+/// "First word" is important — `echo git` in history boosts
+/// `echo`, NOT `git`. A user's earlier `git status` boosts `git`
+/// (used at position 0), but the `git` token in `echo git` is an
+/// argument and doesn't count.
+///
+/// `history` is in newest-first order. The first time we see an
+/// executable's name as a history entry's first word becomes its
+/// recency rank — earlier in the list = more recent = better.
+///
+/// Per the user's directive: only candidates that are also on
+/// `$PATH` appear — history doesn't add candidates, only re-
+/// orders the structural list. A history-only command that the
+/// user has since uninstalled (no longer on `$PATH`) vanishes
+/// from completion.
+pub fn complete_path_executables_with_history(
+    prefix: &str,
+    executables: &[String],
+    history: &[String],
+) -> Vec<CompletionCandidate> {
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+    let mut seen = std::collections::HashSet::new();
+    let exe_names: Vec<&String> = executables
+        .iter()
+        .filter(|name| name.starts_with(prefix))
+        .filter(|name| seen.insert((*name).clone()))
+        .collect();
+    let mut recency: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, line) in history.iter().enumerate() {
+        if let Some(first_word) = line.split_whitespace().next() {
+            recency.entry(first_word).or_insert(i);
+        }
+    }
+    let mut with_score: Vec<(&String, Option<usize>)> =
+        exe_names.into_iter().map(|n| (n, recency.get(n.as_str()).copied())).collect();
+    with_score.sort_by(|a, b| match (a.1, b.1) {
+        (Some(ai), Some(bi)) => ai.cmp(&bi).then_with(|| a.0.cmp(b.0)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.0.cmp(b.0),
+    });
+    with_score
+        .into_iter()
+        .map(|(name, _)| {
+            CompletionCandidate::simple(name.clone(), CompletionSource::PathExecutable)
+        })
+        .collect()
+}
+
 /// Filter a list of historical commands into candidates that
 /// prefix-match the typed buffer.
 ///
@@ -480,6 +536,68 @@ mod tests {
         let exes: Vec<String> = vec!["git".into(), "git".into(), "git".into()];
         let out = complete_path_executables("gi", &exes);
         assert_eq!(out.len(), 1);
+    }
+
+    // ---- complete_path_executables_with_history -----------------
+
+    #[test]
+    fn history_recency_brings_recently_used_command_to_top() {
+        // exes [git, gh, grep]; history (newest first):
+        // "gh status" — gh used.
+        // "git push"  — git used.
+        // "grep foo"  — grep used.
+        // Expected order (newest first): gh, git, grep.
+        let exes: Vec<String> = vec!["git".into(), "gh".into(), "grep".into()];
+        let history: Vec<String> = vec!["gh status".into(), "git push".into(), "grep foo".into()];
+        let out = complete_path_executables_with_history("g", &exes, &history);
+        let names: Vec<&str> = out.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(names, vec!["gh", "git", "grep"]);
+    }
+
+    #[test]
+    fn history_first_word_only_args_dont_count() {
+        // "echo git" should boost `echo`, NOT `git`. Here history
+        // only contains "echo git", and only `git` is on $PATH
+        // matching the prefix — so git gets no history rank and
+        // sorts purely alphabetical (just git here).
+        let exes: Vec<String> = vec!["git".into()];
+        let history: Vec<String> = vec!["echo git".into()];
+        let out = complete_path_executables_with_history("g", &exes, &history);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].value, "git");
+    }
+
+    #[test]
+    fn history_ranked_above_non_ranked() {
+        // exes [git, gh]; only git appears in history. git should
+        // sort above gh even though alphabetically gh < git.
+        let exes: Vec<String> = vec!["gh".into(), "git".into()];
+        let history: Vec<String> = vec!["git status".into()];
+        let out = complete_path_executables_with_history("g", &exes, &history);
+        let names: Vec<&str> = out.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(names, vec!["git", "gh"]);
+    }
+
+    #[test]
+    fn history_includes_only_path_executables() {
+        // History mentions "mycmd" first-word but it's not on
+        // $PATH. The completion popup must NOT include it.
+        let exes: Vec<String> = vec!["git".into()];
+        let history: Vec<String> = vec!["mycmd arg".into()];
+        let out = complete_path_executables_with_history("m", &exes, &history);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn history_repeated_uses_first_occurrence_index() {
+        // exes [git, gh]; history: "gh", "git", "gh" again.
+        // The repeated `gh` shouldn't push it lower — first
+        // occurrence is index 0 (most recent).
+        let exes: Vec<String> = vec!["git".into(), "gh".into()];
+        let history: Vec<String> = vec!["gh status".into(), "git log".into(), "gh pr list".into()];
+        let out = complete_path_executables_with_history("g", &exes, &history);
+        let names: Vec<&str> = out.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(names, vec!["gh", "git"]);
     }
 
     // ---- complete_from_history -----------------------------------
