@@ -705,11 +705,23 @@ pub fn paint_prompt_editor_at(
                 }
                 let clip_start = token.range.start.max(row_byte_start);
                 let clip_end = token.range.end.min(row_byte_end);
-                let text_slice = &full_text[clip_start..clip_end];
+                // `str::get` returns `None` for out-of-bounds or
+                // mid-char-boundary input — never panics — and we
+                // skip the token in that defensive case. Same
+                // structural-safety rule as the selection-paint fix
+                // above (and per CLAUDE.md / spec/04 §"Cursor /
+                // selection invariant"). The previous
+                // `&full_text[clip_start..clip_end]` would have
+                // panicked if a future tokenizer change ever emitted
+                // a range that wasn't on a char boundary; this can't.
+                let Some(text_slice) = full_text.get(clip_start..clip_end) else {
+                    continue;
+                };
                 if text_slice.is_empty() {
                     continue;
                 }
-                let col_chars = line.text[..clip_start - row_byte_start].chars().count();
+                let col_chars =
+                    chars_before_byte(line.text, clip_start.saturating_sub(row_byte_start));
                 let x = origin.x + col_chars as f32 * cell_w;
                 let color = color_for_token_kind(token.kind);
                 painter.text(

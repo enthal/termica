@@ -44,6 +44,15 @@ All mutations go through a small set of operations (`insert`, `delete`, `move_cu
 
 The cursor is a UTF-8 **byte index** that always lies on a `char` boundary. Selections are byte ranges with the same invariant. Use `str::char_indices()` and `floor_char_boundary` / `ceil_char_boundary`; never raw byte arithmetic. (Same rule as the other Rust projects in this org — see [CLAUDE.md](../CLAUDE.md).)
 
+**For renderer code that translates byte indices into column counts**, use the safe-slice helpers rather than direct slicing:
+
+- [`crate::render::chars_before_byte`] returns the char count of the prefix up to a given byte, with boundary-down degradation for any input (past-end, mid-multi-byte). Never panics.
+- For loading a substring to render, use `str::get(..)` (returns `Option<&str>`) instead of `&s[..]`. The `None` path degrades to "skip this paint" rather than panicking the whole frame.
+
+The renderer panicked twice during the Phase 4 polish push for exactly this reason — once on multi-row editor selection (selection start byte fell past one of the rows' lengths), once on the syntax-token paint loop next to it. Both used `line.text[..n].chars().count()` with `n` computed from cross-row byte arithmetic that wasn't guaranteed in-bounds. `chars_before_byte` is the structurally safe replacement; the renderer no longer indexes `&str` by raw byte. See [`src/render.rs::paint_prompt_editor_at`](../src/render.rs) for the canonical pattern.
+
+**Inside `PromptEditor`** the byte arithmetic on `self.text[..self.cursor]` etc. is safe-by-construction because every public method preserves the cursor invariant (set_cursor / set_cursor_extending clamp via [`clamp_to_char_boundary`](../src/prompt_editor.rs); move_* and delete_* walk char boundaries). The invariant is the safety net; any new method that touches `self.cursor` MUST preserve it, and a `debug_assert!(self.text.is_char_boundary(self.cursor))` at the end of the method is the right way to pin it.
+
 ### When is the caret shown?
 
 Single principle: **a visible (and flashing) caret means "your next keypress will be inserted here."** If that statement isn't true, the caret must not be drawn.
