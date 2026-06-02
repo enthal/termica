@@ -31,6 +31,7 @@
 pub mod block;
 pub mod block_links;
 pub mod block_selection;
+pub mod completion;
 pub mod echo_suppress;
 pub mod events;
 pub mod focused_chrome;
