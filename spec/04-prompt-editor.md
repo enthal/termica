@@ -440,25 +440,42 @@ The layout helper that decides which block is "sticky-eligible" and computes the
 
 ## Cross-block selection
 
-Selection coordinates are **pane-level**, not grid-level:
+Selection coordinates are **pane-level**, not grid-level. The actual types live in [`src/pane_selection.rs`](../src/pane_selection.rs):
 
 ```rust
 pub struct PaneSelection {
     pub anchor: PaneCursor,
     pub head:   PaneCursor,
-    pub mode:   SelectionMode,   // Char / Word / Line
 }
 
 pub struct PaneCursor {
     pub block_id: BlockId,
-    pub line:     usize,         // line within the block's content (0-indexed)
-    pub col:      usize,         // grapheme cluster index on that line
+    pub row:      usize,         // row within the block's unified row space
+    pub col:      usize,         // column on that row
 }
 ```
 
-When the user drags across a block boundary, the selection logically spans all text content between anchor and head. Each block translates "is this cell within my piece of the selection?" to a per-block highlight. Block chrome (header + separator) is visually unhighlighted even when the selection passes over it.
+A block's **unified row space** is `command_lines + snapshot_rows`: rows `0..command_lines` come from the command label split on `\n`; rows `command_lines..` come from the sealed `Vec<StyledLine>`. This is the same row space [`crate::block_selection`] uses for within-block selection, so the per-block helpers (`cell_word_range`, `cell_line_range`, `block_selection_text`) compose without translation.
 
-`Selection → text` walks blocks in anchor→head order, concatenating each block's `command + output` slice with a separating newline between blocks. Chrome is not included.
+Ordering of `PaneCursor` is lexicographic on `(block_id, row, col)`. Because [`BlockId`]s are allocated monotonically in creation order (the [`BlockStack`] invariant), this IS the visual top-to-bottom reading order of a pane — a lower-id block sits above a higher-id block.
+
+When the user drags across a block boundary, the selection logically spans all text content between anchor and head. Each block clips its piece via `PaneSelection::block_range_for(block_id, total_rows)`, which returns `Option<(BlockCursor, BlockCursor)>`:
+- Inside the selection's `[start.block_id, end.block_id]`: clipped per-block range.
+- Outside that range: `None`.
+- For the start block: `start_cursor .. end_of_block`. For the end block: `start_of_block .. end_cursor`. For interior blocks: full block.
+
+`Selection → text` (`pane_selection_text`) walks the sealed-block list in pane order, asks each block in range for its clipped slice via the within-block helper, and joins per-block payloads with `\n`. Block chrome (cwd / exit chips, separators) is visually unhighlighted even when the selection passes over it, and is not included in the copy payload.
+
+**Multi-click rule (Word / Line) — unified far-edge rule.** Double-click + drag and triple-click + drag work the same way whether the drag stays in one block or crosses block boundaries. The source-block anchor (the originally-double/triple-clicked word or line bounds) lives in `PaneUiState::sealed_drag_anchor` as `(BlockId, BlockCursor, BlockCursor)`. On every drag move, the renderer computes the word / line bounds under the pointer in the head's block, then calls [`crate::pane_selection::extend_multiclick_selection_endpoints`] with both endpoint's word/line bounds. The rule it applies:
+
+- **Each endpoint uses the far edge of its word/line within its block** — the edge facing AWAY from the other endpoint.
+- **Same block**: collapses to `(min(a_start, h_start), max(a_end, h_end))` — the rolling union the within-block drag has always done.
+- **Cross block, head AFTER anchor**: anchor cursor = `a_start` (upper edge of the upper block); head cursor = `h_end` (lower edge of the lower block). Both blocks' words/lines are FULLY highlighted.
+- **Cross block, head BEFORE anchor**: anchor cursor = `a_end`; head cursor = `h_start`. Same property — both endpoints' full words/lines highlighted.
+
+This unified rule replaces an earlier "stay in source block" carve-out. The carve-out's failure modes were two: (a) forward cross-block drag degraded to char-precision in the head block, (b) backward cross-block drag "lost" the anchor word in the source block because `PaneSelection::ordered()` flipped the endpoints and the anchor at the word's left edge became the high end of the selection, which made `block_range_for(anchor_block)` clip BEFORE the word. The far-edge rule eliminates both because the anchor cursor adapts to which end it represents in pane order.
+
+`PaneSelection` deliberately does NOT carry a `SelectionMode` field because mode lives at the gesture layer (the multi-click anchor in `PaneUiState`), not the selection-data layer. The clipped per-block ranges always describe character-precise endpoints — once a Word / Line anchor has snapped its endpoints outward, the `PaneCursor` values are already at word/line bounds.
 
 ## Resize: sealed blocks don't reflow
 

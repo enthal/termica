@@ -636,11 +636,13 @@ pub fn render_pane(
     let modifier_held = ctx.input(|i| i.modifiers.command);
     let pointer_pos = ctx.input(|i| i.pointer.latest_pos());
     let selection = slot.session.selection().copied();
-    // Read the sealed-block selection up front. The paint pass below
-    // gets a `Some((start, end))` for the matching sealed block; the
-    // click / drag handler farther down updates it on user input. The
-    // visual reflects last frame's state — a one-frame lag is invisible.
-    let block_sel = slot.session.block_selection().copied();
+    // Read the pane-spanning sealed-block selection up front. The
+    // paint pass below queries it per-block via
+    // `PaneSelection::block_range_for` to derive the clipped overlay
+    // range for each sealed block. The click / drag handler farther
+    // down updates the selection on user input. The visual reflects
+    // last frame's state — a one-frame lag is invisible.
+    let pane_sel = slot.session.pane_selection().copied();
 
     // Alt-screen mode (vim / less / htop / fzf / ssh-with-TUI):
     // the program below owns the whole grid and manages its own
@@ -875,9 +877,11 @@ pub fn render_pane(
             for block in slot.session.blocks().iter() {
                 match block {
                     crate::block::Block::Sealed { id, command, snapshot, header, exit, .. } => {
-                        let sel_for_this = block_sel
-                            .filter(|s| s.block_id == *id && !s.is_empty())
-                            .map(|s| s.ordered());
+                        let total_rows =
+                            (if command.is_empty() { 0 } else { command.split('\n').count() })
+                                + snapshot.len();
+                        let sel_for_this =
+                            pane_sel.as_ref().and_then(|s| s.block_range_for(*id, total_rows));
                         let sealed_render = render::paint_sealed_block(
                             ui,
                             command,
@@ -1385,6 +1389,95 @@ pub fn render_pane(
         crate::block_selection::BlockCursor::new(row, col)
     }
 
+    /// Resolve a screen-space pointer position to a sealed block + a
+    /// [`BlockCursor`] in that block's row space. Used by the
+    /// cross-block drag handler: when a press lands on block A and
+    /// the pointer is now over block B (or in the gap between
+    /// blocks, or above / below the painted list), this picks the
+    /// right target block for the selection's head cursor.
+    ///
+    /// `sealed_block_renders` is the list of currently-painted
+    /// sealed blocks in pane reading order (top to bottom). The
+    /// caller has already verified the press is on some sealed
+    /// block (`sealed_pressed_id.is_some()`); we never see an empty
+    /// list in practice.
+    ///
+    /// Resolution:
+    /// 1. **Above all blocks** (`pos.y < first.top`): clamp to first
+    ///    block, `(0, 0)`.
+    /// 2. **Below all blocks** (`pos.y >= last.bottom`): clamp to
+    ///    last block, last row, `col = usize::MAX` (gets clamped to
+    ///    row length by the caller's `sealed_row_len` lookup).
+    /// 3. **Inside a block's rect**: map to that block's cursor via
+    ///    [`sealed_cursor_for_pos`].
+    /// 4. **In a gap between two consecutive blocks**: snap to the
+    ///    end of the upper block (matches the "selection extends to
+    ///    end of last touched block" intuition for downward drags).
+    fn find_head_block_for_pos(
+        pos: egui::Pos2,
+        sealed_block_renders: &[(crate::block::BlockId, render::SealedBlockRender)],
+        cell_w: f32,
+        row_h: f32,
+        session: &crate::pane::PaneSession,
+    ) -> (crate::block::BlockId, crate::block_selection::BlockCursor) {
+        // Falls-through for empty list; callers only reach this when
+        // the press is on a sealed block, so the list is non-empty in
+        // practice. The fallback `BlockId(0)` is defensive.
+        let Some((first_id, first_render)) = sealed_block_renders.first() else {
+            return (crate::block::BlockId(0), crate::block_selection::BlockCursor::new(0, 0));
+        };
+        let first_rect = first_render.bounding_rect();
+        if pos.y < first_rect.top() {
+            return (*first_id, crate::block_selection::BlockCursor::new(0, 0));
+        }
+
+        let total_for = |bid: crate::block::BlockId| -> usize {
+            let (c, s) = session.sealed_block_rows(bid).unwrap_or((0, 0));
+            c + s
+        };
+
+        // Inside a block, or in a gap immediately above one.
+        let mut prev_block_end: Option<crate::block::BlockId> = None;
+        for (bid, render) in sealed_block_renders {
+            let rect = render.bounding_rect();
+            if pos.y < rect.top() {
+                // Gap between previous block and this one. Snap to
+                // the END of the previous block (which is the one
+                // visually above pos).
+                if let Some(prev_id) = prev_block_end {
+                    let prev_total = total_for(prev_id);
+                    let last_row = prev_total.saturating_sub(1);
+                    return (
+                        prev_id,
+                        crate::block_selection::BlockCursor::new(last_row, usize::MAX),
+                    );
+                }
+                // No previous block (pointer just above the first
+                // block's top — covered by the early-return above
+                // but defensive).
+                return (*bid, crate::block_selection::BlockCursor::new(0, 0));
+            }
+            if pos.y < rect.bottom() {
+                // Inside this block.
+                let total_rows = total_for(*bid);
+                let mut c = sealed_cursor_for_pos(rect, pos, cell_w, row_h, total_rows);
+                if let Some(row_len) = session.sealed_row_len(*bid, c.row) {
+                    c.col = c.col.min(row_len);
+                }
+                return (*bid, c);
+            }
+            prev_block_end = Some(*bid);
+        }
+
+        // Below all blocks: snap to end of the last painted block.
+        let (last_id, last_render) = sealed_block_renders.last().unwrap();
+        let last_total = total_for(*last_id);
+        let last_rect = last_render.bounding_rect();
+        let _ = last_rect;
+        let last_row = last_total.saturating_sub(1);
+        (*last_id, crate::block_selection::BlockCursor::new(last_row, usize::MAX))
+    }
+
     /// Update the multi-click counter (click_count, last_press_time,
     /// last_press_pos) for a press that just landed at `pos`.
     /// Returns the new click count (1, 2, or 3).
@@ -1445,30 +1538,47 @@ pub fn render_pane(
     // Per-widget: the snapshot OR command label of one specific
     // sealed block is receiving the press. Egui's interaction
     // layer guarantees this is exclusive — at most one block fires
-    // per frame, never both panes during a splitter drag.
-    if !modal_open && let Some(block_id) = sealed_pressed_id {
-        // Find the response set for this block. The press may be
-        // on either sub-widget (command label or snapshot).
-        if let Some((_, sealed)) = sealed_block_renders.iter().find(|(id, _)| *id == block_id) {
-            let pos = sealed
+    // per frame, never both panes during a splitter drag. egui's
+    // exclusive drag ownership also keeps that block's
+    // `is_pointer_button_down_on()` true even when the pointer
+    // moves OFF the block's rect, so this branch keeps running
+    // through a cross-block drag.
+    if !modal_open && let Some(origin_block_id) = sealed_pressed_id {
+        // Find the response set for the origin (press) block. The
+        // press may be on either sub-widget (command label or
+        // snapshot).
+        if let Some((_, sealed_origin)) =
+            sealed_block_renders.iter().find(|(id, _)| *id == origin_block_id)
+        {
+            let pos = sealed_origin
                 .snapshot
                 .interact_pointer_pos()
-                .or_else(|| sealed.command.as_ref().and_then(|c| c.interact_pointer_pos()));
+                .or_else(|| sealed_origin.command.as_ref().and_then(|c| c.interact_pointer_pos()));
             if let Some(pos) = pos {
-                let block_rect = sealed.bounding_rect();
-                let (cmd_lines, snap_lines) =
-                    slot.session.sealed_block_rows(block_id).unwrap_or((0, 0));
-                let total_rows = cmd_lines + snap_lines;
-                let mut cursor = sealed_cursor_for_pos(block_rect, pos, cell_w, row_h, total_rows);
-                if let Some(row_len) = slot.session.sealed_row_len(block_id, cursor.row) {
-                    cursor.col = cursor.col.min(row_len);
+                // Origin-block cursor: where the press / multi-click
+                // landed, in the origin block's row space.
+                let origin_rect = sealed_origin.bounding_rect();
+                let (origin_cmd_lines, origin_snap_lines) =
+                    slot.session.sealed_block_rows(origin_block_id).unwrap_or((0, 0));
+                let origin_total_rows = origin_cmd_lines + origin_snap_lines;
+                let mut origin_cursor =
+                    sealed_cursor_for_pos(origin_rect, pos, cell_w, row_h, origin_total_rows);
+                if let Some(row_len) =
+                    slot.session.sealed_row_len(origin_block_id, origin_cursor.row)
+                {
+                    origin_cursor.col = origin_cursor.col.min(row_len);
                 }
 
                 if primary_just_pressed {
-                    // -------- START a selection in this block --------
+                    // -------- START a selection in the press block ----
+                    // Anchor + head both land in the origin block;
+                    // multi-click expands within that block.
                     let sealed_link =
-                        slot.session.sealed_block_links(block_id, home).and_then(|links| {
-                            links.iter().find(|l| l.contains(cursor.row, cursor.col)).cloned()
+                        slot.session.sealed_block_links(origin_block_id, home).and_then(|links| {
+                            links
+                                .iter()
+                                .find(|l| l.contains(origin_cursor.row, origin_cursor.col))
+                                .cloned()
                         });
                     if modifier_held && let Some(link) = &sealed_link {
                         // Cmd-click on a URL / path: open it, don't
@@ -1476,6 +1586,15 @@ pub fn render_pane(
                         open_url(&link.url);
                     } else {
                         let click_count = bump_multi_click(&mut slot.ui, now, pos);
+                        let mk_anchor_head =
+                            |a: crate::block_selection::BlockCursor,
+                             b: crate::block_selection::BlockCursor|
+                             -> crate::pane_selection::PaneSelection {
+                                crate::pane_selection::PaneSelection::new(
+                                    crate::pane_selection::PaneCursor::in_block(origin_block_id, a),
+                                    crate::pane_selection::PaneCursor::in_block(origin_block_id, b),
+                                )
+                            };
                         match click_count {
                             2 => {
                                 if let Some(link) = &sealed_link {
@@ -1487,64 +1606,96 @@ pub fn render_pane(
                                         link.row,
                                         link.col_end + 1,
                                     );
-                                    slot.ui.sealed_drag_anchor = Some((block_id, a, b));
-                                    slot.session.set_block_selection(
-                                        crate::block_selection::BlockSelection::new(block_id, a, b),
-                                    );
+                                    slot.ui.sealed_drag_anchor = Some((origin_block_id, a, b));
+                                    slot.session.set_pane_selection(mk_anchor_head(a, b));
                                 } else if let Some((a, b)) =
-                                    slot.session.sealed_word_range(block_id, cursor)
+                                    slot.session.sealed_word_range(origin_block_id, origin_cursor)
                                 {
-                                    slot.ui.sealed_drag_anchor = Some((block_id, a, b));
-                                    slot.session.set_block_selection(
-                                        crate::block_selection::BlockSelection::new(block_id, a, b),
-                                    );
+                                    slot.ui.sealed_drag_anchor = Some((origin_block_id, a, b));
+                                    slot.session.set_pane_selection(mk_anchor_head(a, b));
                                 }
                             }
                             3 => {
                                 if let Some((a, b)) =
-                                    slot.session.sealed_line_range(block_id, cursor)
+                                    slot.session.sealed_line_range(origin_block_id, origin_cursor)
                                 {
-                                    slot.ui.sealed_drag_anchor = Some((block_id, a, b));
-                                    slot.session.set_block_selection(
-                                        crate::block_selection::BlockSelection::new(block_id, a, b),
-                                    );
+                                    slot.ui.sealed_drag_anchor = Some((origin_block_id, a, b));
+                                    slot.session.set_pane_selection(mk_anchor_head(a, b));
                                 }
                             }
                             _ => {
                                 slot.ui.sealed_drag_anchor = None;
-                                slot.session.set_block_selection(
-                                    crate::block_selection::BlockSelection::new(
-                                        block_id, cursor, cursor,
-                                    ),
-                                );
+                                slot.session.set_pane_selection(mk_anchor_head(
+                                    origin_cursor,
+                                    origin_cursor,
+                                ));
                             }
                         }
                     }
-                } else if let Some(sel) = slot.session.block_selection().copied()
-                    && sel.block_id == block_id
-                {
+                } else if let Some(sel) = slot.session.pane_selection().copied() {
                     // -------- EXTEND the selection -------------------
+                    //
+                    // Cross-block: the pointer may be over a different
+                    // sealed block than the origin. Find whichever
+                    // block the pointer is currently over (or clamp to
+                    // top / bottom of the painted list) and translate
+                    // `pos` to a cursor in that block's row space.
+                    let (head_block_id, head_cursor) = find_head_block_for_pos(
+                        pos,
+                        &sealed_block_renders,
+                        cell_w,
+                        row_h,
+                        &slot.session,
+                    );
                     match (slot.ui.click_count, slot.ui.sealed_drag_anchor) {
-                        (2, Some((anchor_block, a_start, a_end))) if anchor_block == block_id => {
-                            if let Some((c_start, c_end)) =
-                                slot.session.sealed_word_range(block_id, cursor)
+                        (2, Some((anchor_block, a_start, a_end))) => {
+                            // Word-mode drag, same-block OR cross-block:
+                            // the unified far-edge rule in
+                            // `extend_multiclick_selection_endpoints`
+                            // handles both. Pre-fix this branch ran
+                            // only when `anchor_block == head_block_id`
+                            // — cross-block drag fell through to
+                            // char mode in the head block and "lost"
+                            // the anchor word when dragged upward.
+                            if let Some(head_bounds) =
+                                slot.session.sealed_word_range(head_block_id, head_cursor)
                             {
-                                let start = a_start.min(c_start);
-                                let end = a_end.max(c_end);
-                                slot.session.update_block_selection_endpoints(start, end);
+                                let (anc_pc, head_pc) =
+                                    crate::pane_selection::extend_multiclick_selection_endpoints(
+                                        anchor_block,
+                                        (a_start, a_end),
+                                        head_block_id,
+                                        head_bounds,
+                                    );
+                                slot.session.update_pane_selection_endpoints(anc_pc, head_pc);
                             }
                         }
-                        (3, Some((anchor_block, a_start, a_end))) if anchor_block == block_id => {
-                            if let Some((c_start, c_end)) =
-                                slot.session.sealed_line_range(block_id, cursor)
+                        (3, Some((anchor_block, a_start, a_end))) => {
+                            // Line-mode drag — same rule, line bounds.
+                            if let Some(head_bounds) =
+                                slot.session.sealed_line_range(head_block_id, head_cursor)
                             {
-                                let start = a_start.min(c_start);
-                                let end = a_end.max(c_end);
-                                slot.session.update_block_selection_endpoints(start, end);
+                                let (anc_pc, head_pc) =
+                                    crate::pane_selection::extend_multiclick_selection_endpoints(
+                                        anchor_block,
+                                        (a_start, a_end),
+                                        head_block_id,
+                                        head_bounds,
+                                    );
+                                slot.session.update_pane_selection_endpoints(anc_pc, head_pc);
                             }
                         }
                         _ => {
-                            slot.session.update_block_selection_endpoints(sel.anchor, cursor);
+                            // Char mode (no multi-click anchor): just
+                            // move the head. Anchor stays pinned
+                            // wherever the press landed.
+                            let _ = sel; // anchor is still fine
+                            slot.session.update_pane_selection_head(
+                                crate::pane_selection::PaneCursor::in_block(
+                                    head_block_id,
+                                    head_cursor,
+                                ),
+                            );
                         }
                     }
                 }
@@ -1569,7 +1720,7 @@ pub fn render_pane(
 
         if primary_just_pressed {
             // Press in the editor ends any sealed-block selection.
-            slot.session.clear_block_selection();
+            slot.session.clear_pane_selection();
             slot.ui.sealed_drag_anchor = None;
             let click_count = bump_multi_click(&mut slot.ui, now, pos);
             slot.ui.editor_drag_anchor = match click_count {
@@ -1806,7 +1957,7 @@ pub fn render_pane(
                 let _ = editor.cut();
             }
         } else if copy_pressed {
-            if let Some(text) = slot.session.block_selection_text() {
+            if let Some(text) = slot.session.pane_selection_text() {
                 ctx.copy_text(text);
             } else if let Some(text) = slot.session.selection_text() {
                 ctx.copy_text(text);
