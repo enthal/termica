@@ -235,11 +235,24 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
     use egui::{Event, Key};
     match event {
         // Plain printable text from the OS IME / keyboard layout.
-        // If a selection is active, `insert_str` deletes it first.
+        // If a selection is active, the editor's insert paths
+        // delete it first.
+        //
+        // Undo coalescing: single-char text (the typical "user
+        // pressed one key") routes through `insert_char` so the
+        // run of typed characters folds into one undo entry (spec/
+        // 04 §"Undo / redo" coalescing rule). Multi-char text (IME
+        // composition commits, batched delivery from system text
+        // replacement, etc.) goes through `insert_str` as a single
+        // `OpKind::Other` entry — one paste, one undo.
         Event::Text(s) => {
             slot.session.clear_history_recall();
             if let Some(editor) = slot.session.editor_mut() {
-                editor.insert_str(s);
+                let mut chars = s.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) => editor.insert_char(c),
+                    _ => editor.insert_str(s),
+                }
             }
             true
         }
@@ -259,6 +272,24 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
             if modifiers.command && !modifiers.alt && matches!(key, Key::A) {
                 if let Some(editor) = slot.session.editor_mut() {
                     editor.select_all();
+                }
+                return true;
+            }
+            // Cmd+Z / Cmd+Shift+Z — undo / redo. Per spec/04
+            // §"Undo / redo": Cmd is the "command" modifier on both
+            // platforms (egui maps Ctrl→command on Linux/Windows),
+            // so a single `modifiers.command` check covers both.
+            // Editor consumes; the chord doesn't reach the PTY.
+            // History recall is cleared because undo/redo is a
+            // mutating op from the recall machinery's perspective.
+            if modifiers.command && !modifiers.alt && matches!(key, Key::Z) {
+                slot.session.clear_history_recall();
+                if let Some(editor) = slot.session.editor_mut() {
+                    if modifiers.shift {
+                        editor.redo();
+                    } else {
+                        editor.undo();
+                    }
                 }
                 return true;
             }
@@ -1755,7 +1786,11 @@ pub fn render_pane(
         {
             ctx.copy_text(text);
             if cut_pressed && let Some(editor) = slot.session.editor_mut() {
-                editor.delete_selection();
+                // Use `cut()` not `delete_selection()` so the cut is
+                // a real undo point that captures the selection. Per
+                // spec/04 §"Undo / redo": `select → cut → undo`
+                // restores the cut text AND re-selects it.
+                let _ = editor.cut();
             }
         } else if copy_pressed {
             if let Some(text) = slot.session.block_selection_text() {

@@ -584,6 +584,38 @@ pub fn paint_prompt_editor(ui: &mut egui::Ui, editor: &PromptEditor) -> Response
 /// at low DPI.
 const EDITOR_CARET_WIDTH: f32 = 2.0;
 
+/// Count the chars in `s` whose byte start is **strictly less than**
+/// `byte`. The return value is a column index suitable for the
+/// editor renderer's "how many cells from the left edge of this
+/// row" math.
+///
+/// Unconditionally safe: never panics, regardless of input. Per
+/// CLAUDE.md "structurally safe code over correct by coincidence"
+/// and spec/04 §"Cursor / selection invariant" — `&str` byte
+/// indexing must go through `char_indices` rather than raw slicing,
+/// so a stale, out-of-bounds, or mid-multi-byte-char `byte` value
+/// degrades to a sensible char count rather than panicking the
+/// renderer.
+///
+/// Semantics:
+/// - `byte == 0` → `0`.
+/// - `byte >= s.len()` → total char count of `s`.
+/// - `byte` lands on a char boundary inside `s` → chars before it.
+/// - `byte` lands inside a multi-byte char's bytes → chars before
+///   that char (degraded gracefully — same answer as the previous
+///   char boundary).
+pub fn chars_before_byte(s: &str, byte: usize) -> usize {
+    if byte >= s.len() {
+        return s.chars().count();
+    }
+    // `*b + c.len_utf8() <= byte` — include a char only when its
+    // ENTIRE byte range is at-or-before `byte`. For a mid-char
+    // `byte`, this excludes the containing char (boundary-down
+    // semantics), which is the "where would the caret render"
+    // answer the renderer wants.
+    s.char_indices().take_while(|(b, c)| *b + c.len_utf8() <= byte).count()
+}
+
 pub fn paint_prompt_editor_at(
     painter: &egui::Painter,
     editor: &PromptEditor,
@@ -613,25 +645,45 @@ pub fn paint_prompt_editor_at(
         let row_byte_end = row_byte_start + line.text.len();
 
         // Selection overlay UNDER the glyphs so text stays legible.
-        if let Some((sel_start, sel_end)) = selection_bytes {
+        //
+        // Per spec/04 §"Cursor / selection invariant" and the
+        // CLAUDE.md "structurally safe code" rule: NEVER index
+        // into a `&str` with raw byte arithmetic — even when the
+        // invariant says the index lies on a char boundary. A
+        // future change that loosens the invariant (paste with a
+        // mid-char byte, a refactor that swaps a clamp helper)
+        // turns the slice into a panic site. `chars_before_byte`
+        // is the unconditionally-safe replacement: any byte index
+        // (past the end, on a non-boundary, less than zero via
+        // saturating subtraction) yields a sensible char count.
+        //
+        // Rows the selection doesn't touch contribute nothing and
+        // are still skipped via the `chars_before_byte` semantics
+        // (a row whose start is past the selection's end produces
+        // a degenerate range that the rect_filled clamp absorbs),
+        // but we keep the explicit overlap guard for clarity and
+        // to avoid building a zero-width rect every frame.
+        if let Some((sel_start, sel_end)) = selection_bytes
+            && sel_end > row_byte_start
+            && sel_start <= row_byte_end
+        {
             let clip_start = sel_start.max(row_byte_start);
             let clip_end = sel_end.min(row_byte_end);
             let extends_past = sel_end > row_byte_end;
-            if clip_start < clip_end || extends_past {
-                let sel_start_chars = line.text[..clip_start - row_byte_start].chars().count();
-                let sel_end_chars = if extends_past {
-                    line.text.chars().count() + 1 // +1 cell for the \n
-                } else {
-                    line.text[..clip_end - row_byte_start].chars().count()
-                };
-                let x_start = origin.x + sel_start_chars as f32 * cell_w;
-                let x_end = origin.x + sel_end_chars as f32 * cell_w;
-                let rect = Rect::from_min_max(
-                    Pos2::new(x_start, y),
-                    Pos2::new(x_end.max(x_start + cell_w * 0.25), y + row_h),
-                );
-                painter.rect_filled(rect, 0.0, SELECTION_COLOR);
-            }
+            let sel_start_chars =
+                chars_before_byte(line.text, clip_start.saturating_sub(row_byte_start));
+            let sel_end_chars = if extends_past {
+                line.text.chars().count() + 1 // +1 cell for the \n
+            } else {
+                chars_before_byte(line.text, clip_end.saturating_sub(row_byte_start))
+            };
+            let x_start = origin.x + sel_start_chars as f32 * cell_w;
+            let x_end = origin.x + sel_end_chars as f32 * cell_w;
+            let rect = Rect::from_min_max(
+                Pos2::new(x_start, y),
+                Pos2::new(x_end.max(x_start + cell_w * 0.25), y + row_h),
+            );
+            painter.rect_filled(rect, 0.0, SELECTION_COLOR);
         }
 
         // Paint tokens that intersect this row. Tokens are emitted
@@ -1525,5 +1577,69 @@ mod tests {
         let plain = cell_colors(&cell_with_flags(Flags::empty())).0;
         let combined = cell_colors(&cell_with_flags(Flags::BOLD | Flags::DIM)).0;
         assert_ne!(plain, combined);
+    }
+
+    // ---- chars_before_byte (strict layer) ---------------------------
+    //
+    // Pure logic, panic-safe by contract. Per CLAUDE.md, this helper
+    // replaces raw byte slicing in the editor render path so a stale
+    // / out-of-bounds / non-char-boundary byte input never panics.
+    // Each branch of "byte = 0 | inside | at boundary | past end |
+    // mid multi-byte char" is covered below; multi-byte input
+    // exercises the UTF-8 walking.
+
+    #[test]
+    fn chars_before_byte_zero_is_zero() {
+        assert_eq!(chars_before_byte("hello", 0), 0);
+        assert_eq!(chars_before_byte("", 0), 0);
+    }
+
+    #[test]
+    fn chars_before_byte_full_length_returns_total_chars() {
+        assert_eq!(chars_before_byte("hello", 5), 5);
+        assert_eq!(chars_before_byte("", 0), 0);
+    }
+
+    #[test]
+    fn chars_before_byte_past_end_clamps_to_total() {
+        // The regression: a stale byte index past the end of the
+        // line. The old `line.text[..n].chars().count()` panicked
+        // here; this helper must not.
+        assert_eq!(chars_before_byte("hello", 6), 5);
+        assert_eq!(chars_before_byte("hello", 999), 5);
+        assert_eq!(chars_before_byte("", 5), 0);
+    }
+
+    #[test]
+    fn chars_before_byte_counts_chars_not_bytes_for_multibyte_input() {
+        // "héllo" — 'é' is 2 bytes; total bytes = 6, total chars = 5.
+        let s = "héllo";
+        assert_eq!(chars_before_byte(s, 0), 0);
+        assert_eq!(chars_before_byte(s, 1), 1); // before 'é'
+        assert_eq!(chars_before_byte(s, 3), 2); // after 'é' (boundary)
+        assert_eq!(chars_before_byte(s, 4), 3); // after 'l'
+        assert_eq!(chars_before_byte(s, 6), 5); // end of string
+    }
+
+    #[test]
+    fn chars_before_byte_mid_multibyte_char_degrades_gracefully() {
+        // Byte 2 lands INSIDE 'é' (bytes 1-2). Safe degradation:
+        // return the char count before 'é' (1) rather than panic.
+        let s = "héllo";
+        assert_eq!(chars_before_byte(s, 2), 1);
+    }
+
+    #[test]
+    fn chars_before_byte_with_4byte_emoji() {
+        // 😀 is 4 bytes. "a😀b" = 1 + 4 + 1 = 6 bytes, 3 chars.
+        let s = "a😀b";
+        assert_eq!(chars_before_byte(s, 0), 0);
+        assert_eq!(chars_before_byte(s, 1), 1); // after 'a'
+        assert_eq!(chars_before_byte(s, 5), 2); // after 😀
+        assert_eq!(chars_before_byte(s, 6), 3); // end
+        // Mid-emoji bytes degrade to "before the emoji".
+        assert_eq!(chars_before_byte(s, 2), 1);
+        assert_eq!(chars_before_byte(s, 3), 1);
+        assert_eq!(chars_before_byte(s, 4), 1);
     }
 }

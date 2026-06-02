@@ -678,6 +678,12 @@ impl PaneSession {
             Some(editor) => {
                 let t = editor.text().to_string();
                 editor.clear();
+                // Per spec/04 §"Undo / redo" reset-on-submit: the
+                // previous command's undo history doesn't follow into
+                // the next prompt. Done AFTER `clear` because `clear`
+                // pushes one undo entry (the pre-clear state), which
+                // we promptly throw away.
+                editor.reset_undo();
                 t
             }
             None => return Ok(()),

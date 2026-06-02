@@ -24,10 +24,19 @@
 //!   controller's `leave_editor_esc`; render-pane handles that
 //!   call.
 //!
-//! Selection / undo / history / completion live in later sub-PRs
-//! (4F / 4H+ in the roadmap). The struct fields for those are
-//! deliberately absent here so an out-of-scope feature can't quietly
-//! land "for free" before its tests do.
+//! History / completion live in later sub-PRs (4I / 4J in the
+//! roadmap). The struct fields for those are deliberately absent
+//! here so an out-of-scope feature can't quietly land "for free"
+//! before its tests do.
+//!
+//! Undo / redo (Phase 4 polish): [`UndoStack`] captures a snapshot
+//! of `(text, cursor, selection)` **before** every mutating op.
+//! Single-char typing / backspace / forward-delete coalesce; every
+//! other op pushes a new entry. `undo()` and `redo()` restore the
+//! full triple — text *and* selection — so `select → cut → undo`
+//! brings the cut text back **selected** (per
+//! [spec/04 §"Undo / redo"](../spec/04-prompt-editor.md#undo--redo)).
+//! Reset on submit.
 //!
 //! ## The cursor invariant
 //!
@@ -59,6 +68,128 @@ pub struct PromptEditor {
     /// active end that moves on extending operations). `None` ⇒ no
     /// selection. Always on a char boundary when `Some`.
     selection_anchor: Option<usize>,
+    /// Undo / redo stack scoped to one editing session. Reset on
+    /// submit (per spec/04 §"Undo / redo"). See [`UndoStack`].
+    undo: UndoStack,
+}
+
+/// One snapshot of editor state, taken **before** a mutating op.
+/// Restoring this snapshot returns the editor to that state
+/// exactly — including selection — so `select → cut → undo` brings
+/// the cut text back selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UndoEntry {
+    text: String,
+    cursor: usize,
+    selection_anchor: Option<usize>,
+}
+
+/// Op classification used by [`UndoStack`] to decide whether a new
+/// entry coalesces into the previous run.
+///
+/// `TypeChar` / `BackspaceChar` / `DeleteForwardChar` are the
+/// **only** coalesceable kinds. They coalesce when two consecutive
+/// ops have the same kind. Anything else — paste, cut, selection-
+/// replacement, word-delete, set-from-history — uses `Other` and
+/// pushes a new entry every time. Cursor moves and selection
+/// changes don't push entries at all; they call
+/// [`UndoStack::break_coalesce`] so the next coalesceable op starts
+/// a fresh run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpKind {
+    /// Single-char insert (`insert_char`, `insert_newline` for the
+    /// single-key case).
+    TypeChar,
+    /// Single-char backspace at the cursor (no selection deleted).
+    BackspaceChar,
+    /// Single-char `Delete` forward at the cursor (no selection).
+    DeleteForwardChar,
+    /// Anything else: paste, cut, multi-char insert, word-delete,
+    /// `set_from_history`, selection-replacement, etc.
+    Other,
+}
+
+/// Per-editor undo / redo state. Lives on [`PromptEditor`] and is
+/// reset on submit. See [spec/04 §"Undo / redo"](../spec/04-prompt-editor.md#undo--redo).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct UndoStack {
+    entries: Vec<UndoEntry>,
+    redo: Vec<UndoEntry>,
+    /// Kind of the most recent mutation. `None` after a cursor /
+    /// selection move (which doesn't itself push) — so the next
+    /// coalesceable op always starts a fresh run.
+    last_op: Option<OpKind>,
+}
+
+impl UndoStack {
+    /// True iff a new entry of kind `current` coalesces into the
+    /// most-recent entry (i.e. should NOT push). Pure function of
+    /// the two op kinds.
+    fn coalesces(&self, current: OpKind) -> bool {
+        matches!(current, OpKind::TypeChar | OpKind::BackspaceChar | OpKind::DeleteForwardChar)
+            && self.last_op == Some(current)
+    }
+
+    /// Record a pre-mutation snapshot under op kind `current`.
+    /// Coalesce if eligible; otherwise push to `entries`, clear the
+    /// redo stack, and set `last_op = Some(current)`.
+    fn record(&mut self, current: OpKind, pre: UndoEntry) {
+        if self.coalesces(current) {
+            // No push: the existing top entry already captures the
+            // start of this run.
+            self.last_op = Some(current);
+            return;
+        }
+        self.entries.push(pre);
+        self.redo.clear();
+        self.last_op = Some(current);
+    }
+
+    /// End the current coalesce run without pushing. Called after
+    /// cursor / selection moves so the next coalesceable op starts
+    /// a new run.
+    fn break_coalesce(&mut self) {
+        self.last_op = None;
+    }
+
+    /// Pop from `entries`, returning what to restore. Caller is
+    /// responsible for capturing the current state into `redo`
+    /// before applying.
+    fn pop_undo(&mut self) -> Option<UndoEntry> {
+        let e = self.entries.pop()?;
+        self.last_op = None;
+        Some(e)
+    }
+
+    fn push_redo(&mut self, snapshot: UndoEntry) {
+        self.redo.push(snapshot);
+    }
+
+    fn pop_redo(&mut self) -> Option<UndoEntry> {
+        let e = self.redo.pop()?;
+        self.last_op = None;
+        Some(e)
+    }
+
+    fn push_undo(&mut self, snapshot: UndoEntry) {
+        self.entries.push(snapshot);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.redo.clear();
+        self.last_op = None;
+    }
+
+    #[cfg(test)]
+    fn undo_depth(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn redo_depth(&self) -> usize {
+        self.redo.len()
+    }
 }
 
 impl PromptEditor {
@@ -114,6 +245,70 @@ impl PromptEditor {
     /// Clear any selection (cursor stays put).
     pub fn clear_selection(&mut self) {
         self.selection_anchor = None;
+        self.undo.break_coalesce();
+    }
+
+    // ---- Undo / redo (per spec/04 §"Undo / redo") --------------
+
+    /// Snapshot the editor's full `(text, cursor, selection)` state.
+    /// Captured BEFORE mutations so [`Self::undo`] can restore the
+    /// pre-op visual exactly — including selection. Cheap because
+    /// the editor buffer is at most a few hundred bytes (one shell
+    /// command); a full clone is fine.
+    fn snapshot(&self) -> UndoEntry {
+        UndoEntry {
+            text: self.text.clone(),
+            cursor: self.cursor,
+            selection_anchor: self.selection_anchor,
+        }
+    }
+
+    /// Replace state with `entry`. Used by [`Self::undo`] /
+    /// [`Self::redo`] to restore a captured snapshot.
+    fn restore_from(&mut self, entry: UndoEntry) {
+        self.text = entry.text;
+        self.cursor = entry.cursor;
+        self.selection_anchor = entry.selection_anchor;
+    }
+
+    /// Undo the last mutating op. Returns `true` if state changed.
+    /// Captures the current state into the redo stack so a
+    /// subsequent [`Self::redo`] can move forward again.
+    ///
+    /// `Cmd+Z` (macOS) / `Ctrl+Z` (Linux/Windows) routes here.
+    pub fn undo(&mut self) -> bool {
+        let Some(entry) = self.undo.pop_undo() else {
+            return false;
+        };
+        let current = self.snapshot();
+        self.restore_from(entry);
+        self.undo.push_redo(current);
+        true
+    }
+
+    /// Redo the last undone op. Returns `true` if state changed.
+    /// Captures the current state into the undo stack — symmetric
+    /// inverse of [`Self::undo`].
+    ///
+    /// `Cmd+Shift+Z` (macOS) / `Ctrl+Shift+Z` (Linux/Windows)
+    /// routes here.
+    pub fn redo(&mut self) -> bool {
+        let Some(entry) = self.undo.pop_redo() else {
+            return false;
+        };
+        let current = self.snapshot();
+        self.restore_from(entry);
+        self.undo.push_undo(current);
+        true
+    }
+
+    /// Wipe the undo stack. Called from
+    /// [`crate::pane::PaneSession::submit_editor_command`] after the
+    /// command has been sent to the PTY — per spec/04 §"Reset on
+    /// submit", undo is scoped to one editing session and doesn't
+    /// follow the user across commands.
+    pub fn reset_undo(&mut self) {
+        self.undo.clear();
     }
 
     /// Anchor a selection at the current cursor position. Subsequent
@@ -132,6 +327,7 @@ impl PromptEditor {
         }
         self.selection_anchor = Some(0);
         self.cursor = self.text.len();
+        self.undo.break_coalesce();
     }
 
     /// Delete the current selection. No-op when there is none.
@@ -163,6 +359,7 @@ impl PromptEditor {
         let clamped = clamp_to_char_boundary(&self.text, byte_idx);
         self.cursor = clamped;
         self.selection_anchor = None;
+        self.undo.break_coalesce();
     }
 
     /// Move the cursor extending the selection. If no selection was
@@ -171,32 +368,53 @@ impl PromptEditor {
     pub fn set_cursor_extending(&mut self, byte_idx: usize) {
         self.begin_selection_if_absent();
         self.cursor = clamp_to_char_boundary(&self.text, byte_idx);
+        self.undo.break_coalesce();
     }
 
     /// Clear the buffer and reset the cursor. Used by 4C's submit
-    /// after the command has been sent to the PTY.
+    /// after the command has been sent to the PTY (after `reset_undo`
+    /// is called — so the stack-clearing entry is harmless) and by
+    /// history substitution.
     pub fn clear(&mut self) {
+        let pre = self.snapshot();
+        let was_empty = self.text.is_empty() && self.selection_anchor.is_none();
         self.text.clear();
         self.cursor = 0;
         self.selection_anchor = None;
+        if !was_empty {
+            self.undo.record(OpKind::Other, pre);
+        }
     }
 
     /// Insert one character at the cursor and advance the cursor
     /// past it. If a selection exists, it's deleted first.
     /// Maintains the char-boundary invariant.
+    ///
+    /// Undo classification: `TypeChar` (coalesceable) when no
+    /// selection was deleted, `Other` (always a new entry) when a
+    /// selection was replaced.
     pub fn insert_char(&mut self, c: char) {
-        self.delete_selection();
+        let pre = self.snapshot();
+        let replaced_selection = self.delete_selection();
         self.text.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+        let op = if replaced_selection { OpKind::Other } else { OpKind::TypeChar };
+        self.undo.record(op, pre);
     }
 
     /// Insert a string at the cursor. If a selection exists, it's
     /// deleted first. Each byte must form a valid UTF-8 sequence
     /// with its neighbours (it's `&str`, so it does).
+    ///
+    /// Undo classification: always `Other` — a paste / multi-char
+    /// insert is one undo entry regardless of length. (Spec/04
+    /// §"Undo / redo" coalescing rule.)
     pub fn insert_str(&mut self, s: &str) {
+        let pre = self.snapshot();
         self.delete_selection();
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
+        self.undo.record(OpKind::Other, pre);
     }
 
     /// Insert a newline at the cursor. Multiline support: a
@@ -207,26 +425,56 @@ impl PromptEditor {
         self.insert_char('\n');
     }
 
+    /// Cut the current selection: capture the selected text, delete
+    /// it from the buffer, and record one undo entry capturing the
+    /// **pre-cut state including the selection**. Returns the cut
+    /// text (or `None` if no selection).
+    ///
+    /// Per spec/04 §"Undo / redo": `select → cut → undo` brings the
+    /// cut text back AND re-selects it, so the user can immediately
+    /// retry the cut (or replace it with a paste) without re-
+    /// selecting by hand.
+    ///
+    /// `Cmd+X` (macOS) / `Ctrl+X` (Linux/Windows) routes here.
+    pub fn cut(&mut self) -> Option<String> {
+        let text = self.selected_text()?.to_string();
+        let pre = self.snapshot();
+        self.delete_selection();
+        self.undo.record(OpKind::Other, pre);
+        Some(text)
+    }
+
     /// Delete the character immediately before the cursor — OR, if
     /// a selection exists, delete the selection. No-op when the
     /// cursor is at byte 0 with no selection.
+    ///
+    /// Undo classification: `BackspaceChar` (coalesceable) for the
+    /// single-char backspace path; `Other` for selection-replacement.
     pub fn backspace(&mut self) {
+        let pre = self.snapshot();
         if self.delete_selection() {
+            self.undo.record(OpKind::Other, pre);
             return;
         }
         if self.cursor == 0 {
-            return;
+            return; // no-op, don't push
         }
         let prev = prev_char_boundary(&self.text, self.cursor);
         self.text.replace_range(prev..self.cursor, "");
         self.cursor = prev;
+        self.undo.record(OpKind::BackspaceChar, pre);
     }
 
     /// Delete the character immediately after the cursor — OR, if a
     /// selection exists, delete the selection. No-op when the cursor
     /// is at the end with no selection.
+    ///
+    /// Undo classification: `DeleteForwardChar` (coalesceable) for
+    /// the single-char path; `Other` for selection-replacement.
     pub fn delete_forward(&mut self) {
+        let pre = self.snapshot();
         if self.delete_selection() {
+            self.undo.record(OpKind::Other, pre);
             return;
         }
         if self.cursor == self.text.len() {
@@ -234,6 +482,7 @@ impl PromptEditor {
         }
         let next = next_char_boundary(&self.text, self.cursor);
         self.text.replace_range(self.cursor..next, "");
+        self.undo.record(OpKind::DeleteForwardChar, pre);
     }
 
     /// Delete from the cursor backward to the start of the previous
@@ -243,7 +492,9 @@ impl PromptEditor {
     /// Option+Left / Ctrl+Left would have *moved over*. No-op at
     /// byte 0 with no selection.
     pub fn delete_word_left(&mut self) {
+        let pre = self.snapshot();
         if self.delete_selection() {
+            self.undo.record(OpKind::Other, pre);
             return;
         }
         if self.cursor == 0 {
@@ -274,6 +525,7 @@ impl PromptEditor {
         };
         self.text.replace_range(start..self.cursor, "");
         self.cursor = start;
+        self.undo.record(OpKind::Other, pre);
     }
 
     /// Delete from the caret to the **start of the current line**.
@@ -284,7 +536,9 @@ impl PromptEditor {
     /// existing `delete_word_right`, so this lands as Cmd-only.
     /// Standard macOS text-field behavior.
     pub fn delete_to_line_start(&mut self) {
+        let pre = self.snapshot();
         if self.delete_selection() {
+            self.undo.record(OpKind::Other, pre);
             return;
         }
         if self.cursor == 0 {
@@ -305,13 +559,16 @@ impl PromptEditor {
             self.cursor = line_start;
         }
         self.selection_anchor = None;
+        self.undo.record(OpKind::Other, pre);
     }
 
     /// Delete from the cursor forward to the end of the next word.
     /// Mirror of [`Self::delete_word_left`] for Option+Fn+Delete
     /// (macOS) / Ctrl+Delete (Linux). No-op at end of buffer.
     pub fn delete_word_right(&mut self) {
+        let pre = self.snapshot();
         if self.delete_selection() {
+            self.undo.record(OpKind::Other, pre);
             return;
         }
         if self.cursor == self.text.len() {
@@ -336,6 +593,7 @@ impl PromptEditor {
             i
         };
         self.text.replace_range(self.cursor..end, "");
+        self.undo.record(OpKind::Other, pre);
     }
 
     /// Move the cursor one character left. No-op at byte 0. Clears
@@ -356,6 +614,7 @@ impl PromptEditor {
         } else {
             self.selection_anchor = None;
         }
+        self.undo.break_coalesce();
         if self.cursor == 0 {
             return;
         }
@@ -380,6 +639,7 @@ impl PromptEditor {
         } else {
             self.selection_anchor = None;
         }
+        self.undo.break_coalesce();
         if self.cursor == self.text.len() {
             return;
         }
@@ -405,6 +665,7 @@ impl PromptEditor {
         } else {
             self.selection_anchor = None;
         }
+        self.undo.break_coalesce();
         let line_start = self.text[..self.cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
         self.cursor = line_start;
     }
@@ -427,6 +688,7 @@ impl PromptEditor {
         } else {
             self.selection_anchor = None;
         }
+        self.undo.break_coalesce();
         let line_end = self.text[self.cursor..]
             .find('\n')
             .map(|off| self.cursor + off)
@@ -454,6 +716,7 @@ impl PromptEditor {
         } else {
             self.selection_anchor = None;
         }
+        self.undo.break_coalesce();
         let mut i = self.cursor;
         // Skip non-word chars going back.
         while i > 0 {
@@ -492,6 +755,7 @@ impl PromptEditor {
         } else {
             self.selection_anchor = None;
         }
+        self.undo.break_coalesce();
         let mut i = self.cursor;
         // Skip non-word chars going forward.
         while i < self.text.len() {
@@ -516,24 +780,28 @@ impl PromptEditor {
     pub fn move_doc_start(&mut self) {
         self.selection_anchor = None;
         self.cursor = 0;
+        self.undo.break_coalesce();
     }
 
     /// Cmd+Shift+Up: doc-start with selection extension.
     pub fn move_doc_start_extending(&mut self) {
         self.begin_selection_if_absent();
         self.cursor = 0;
+        self.undo.break_coalesce();
     }
 
     /// Move to end of buffer. macOS Cmd+Down.
     pub fn move_doc_end(&mut self) {
         self.selection_anchor = None;
         self.cursor = self.text.len();
+        self.undo.break_coalesce();
     }
 
     /// Cmd+Shift+Down: doc-end with selection extension.
     pub fn move_doc_end_extending(&mut self) {
         self.begin_selection_if_absent();
         self.cursor = self.text.len();
+        self.undo.break_coalesce();
     }
 
     /// Set the selection to an explicit byte range. Both endpoints
@@ -551,6 +819,7 @@ impl PromptEditor {
             self.selection_anchor = Some(anchor);
             self.cursor = head;
         }
+        self.undo.break_coalesce();
     }
 
     /// Select the word containing or touching `byte_idx`. If the
@@ -568,6 +837,7 @@ impl PromptEditor {
             self.selection_anchor = Some(start);
             self.cursor = end;
         }
+        self.undo.break_coalesce();
     }
 
     /// Select the entire line containing `byte_idx`. Includes any
@@ -578,6 +848,7 @@ impl PromptEditor {
         let (start, end) = line_range_at(&self.text, byte_idx);
         self.selection_anchor = Some(start);
         self.cursor = end;
+        self.undo.break_coalesce();
     }
 
     /// Iterate the editor's content split on `\n`, yielding `(line,
@@ -1543,5 +1814,280 @@ mod tests {
         assert_eq!(clamp_to_char_boundary(s, 2), 1);
         // Past end clamps to end.
         assert_eq!(clamp_to_char_boundary(s, 99), 3);
+    }
+
+    // ---- undo / redo (spec/04 §"Undo / redo") --------------------
+
+    #[test]
+    fn undo_on_fresh_editor_is_noop_and_returns_false() {
+        let mut e = PromptEditor::new();
+        assert!(!e.undo());
+        assert!(e.is_empty());
+        assert_eq!(e.cursor(), 0);
+    }
+
+    #[test]
+    fn redo_with_empty_redo_stack_is_noop_and_returns_false() {
+        let mut e = PromptEditor::new();
+        e.insert_char('a');
+        // Nothing on the redo stack yet.
+        assert!(!e.redo());
+        assert_eq!(e.text(), "a");
+    }
+
+    #[test]
+    fn undo_after_type_returns_to_empty() {
+        let mut e = PromptEditor::new();
+        e.insert_char('a');
+        e.insert_char('b');
+        e.insert_char('c');
+        assert_eq!(e.text(), "abc");
+        // Three coalesceable inserts → one undo entry.
+        assert_eq!(e.undo.undo_depth(), 1);
+        assert!(e.undo());
+        assert!(e.is_empty());
+        assert_eq!(e.cursor(), 0);
+        assert!(!e.has_selection());
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn redo_after_undo_returns_to_typed_state() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hello");
+        e.undo();
+        assert!(e.is_empty());
+        assert!(e.redo());
+        assert_eq!(e.text(), "hello");
+        assert_eq!(e.cursor(), 5);
+    }
+
+    #[test]
+    fn typing_then_cursor_move_then_typing_yields_two_entries() {
+        let mut e = PromptEditor::new();
+        e.insert_str("abc");
+        e.move_left(); // breaks coalesce
+        e.insert_char('x');
+        // Two undo entries: pre-"abc" and pre-"x".
+        assert_eq!(e.undo.undo_depth(), 2);
+        assert_eq!(e.text(), "abxc");
+        // First undo: pre-"x" → "abc" with cursor at 2.
+        e.undo();
+        assert_eq!(e.text(), "abc");
+        assert_eq!(e.cursor(), 2);
+        // Second undo: pre-"abc" → "" with cursor at 0.
+        e.undo();
+        assert!(e.is_empty());
+    }
+
+    #[test]
+    fn select_cut_undo_restores_text_and_reselects_cut_range() {
+        // The user's key example: `select → cut → undo` brings the
+        // cut text back **selected** so a second cut (or paste-over)
+        // works on the same range.
+        let mut e = PromptEditor::new();
+        e.insert_str("abc");
+        e.reset_undo(); // simulate fresh post-submit state
+        e.set_selection(0, 2); // select "ab"
+        let cut_text = e.cut();
+        assert_eq!(cut_text.as_deref(), Some("ab"));
+        assert_eq!(e.text(), "c");
+        assert!(!e.has_selection());
+
+        // Undo: text returns AND selection returns.
+        assert!(e.undo());
+        assert_eq!(e.text(), "abc");
+        assert_eq!(e.selected_text(), Some("ab"));
+        assert_eq!(e.selection_range(), Some((0, 2)));
+    }
+
+    #[test]
+    fn select_paste_undo_restores_replaced_text_and_reselects_it() {
+        // The other key example: `select → paste → undo` brings the
+        // original text back **selected** so a subsequent paste
+        // redoes the same replacement.
+        let mut e = PromptEditor::new();
+        e.insert_str("abc");
+        e.reset_undo();
+        e.set_selection(0, 2); // select "ab"
+        e.insert_str("xyz"); // paste-replacement
+        assert_eq!(e.text(), "xyzc");
+        assert_eq!(e.cursor(), 3);
+
+        assert!(e.undo());
+        assert_eq!(e.text(), "abc");
+        assert_eq!(e.selected_text(), Some("ab"));
+        assert_eq!(e.selection_range(), Some((0, 2)));
+    }
+
+    #[test]
+    fn backspace_after_type_breaks_coalesce_two_entries() {
+        let mut e = PromptEditor::new();
+        e.insert_str("abc"); // entry 1 (Other / multi-char)
+        e.backspace(); // entry 2 (BackspaceChar)
+        assert_eq!(e.text(), "ab");
+        assert_eq!(e.undo.undo_depth(), 2);
+        // Undo: back to "abc".
+        e.undo();
+        assert_eq!(e.text(), "abc");
+        // Undo again: back to "".
+        e.undo();
+        assert!(e.is_empty());
+    }
+
+    #[test]
+    fn consecutive_backspaces_coalesce_into_one_entry() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hello"); // entry 1
+        e.backspace(); // entry 2 (BackspaceChar — new run)
+        e.backspace(); // coalesce
+        e.backspace(); // coalesce
+        assert_eq!(e.text(), "he");
+        // 2 entries total: "hello" pre-state and "hello" pre-first-
+        // backspace state.
+        assert_eq!(e.undo.undo_depth(), 2);
+        e.undo(); // back to "hello"
+        assert_eq!(e.text(), "hello");
+        e.undo(); // back to ""
+        assert!(e.is_empty());
+    }
+
+    #[test]
+    fn type_inserts_coalesce_into_one_entry() {
+        let mut e = PromptEditor::new();
+        for c in "hello world".chars() {
+            e.insert_char(c);
+        }
+        // All 11 single-char inserts coalesce.
+        assert_eq!(e.undo.undo_depth(), 1);
+        e.undo();
+        assert!(e.is_empty());
+    }
+
+    #[test]
+    fn insert_str_is_one_undo_entry_even_for_long_paste() {
+        let mut e = PromptEditor::new();
+        e.insert_str("a very long paste payload");
+        assert_eq!(e.undo.undo_depth(), 1);
+        e.undo();
+        assert!(e.is_empty());
+    }
+
+    #[test]
+    fn reset_undo_clears_both_stacks() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hello");
+        e.undo(); // now redo stack has 1
+        e.reset_undo();
+        assert_eq!(e.undo.undo_depth(), 0);
+        assert_eq!(e.undo.redo_depth(), 0);
+        assert!(!e.undo());
+        assert!(!e.redo());
+    }
+
+    #[test]
+    fn redo_cleared_after_new_mutation_past_undone_point() {
+        let mut e = PromptEditor::new();
+        e.insert_str("abc"); // entry 1
+        e.move_left();
+        e.insert_char('x'); // entry 2 → "abxc"
+        e.undo(); // back to "abc", redo has 1 entry
+        e.insert_char('y'); // new mutation → redo cleared
+        assert_eq!(e.text(), "abyc");
+        assert_eq!(e.undo.redo_depth(), 0);
+    }
+
+    #[test]
+    fn delete_forward_coalesce_then_break_on_move() {
+        let mut e = PromptEditor::new();
+        e.insert_str("abcdef");
+        e.move_home();
+        e.delete_forward(); // entry 2 (DeleteForwardChar)
+        e.delete_forward(); // coalesce
+        e.delete_forward(); // coalesce
+        assert_eq!(e.text(), "def");
+        assert_eq!(e.undo.undo_depth(), 2);
+
+        // Move ends coalesce; next delete_forward is a fresh run.
+        e.move_right();
+        e.delete_forward();
+        assert_eq!(e.undo.undo_depth(), 3);
+    }
+
+    #[test]
+    fn select_all_replace_with_type_undo_restores_full_selection() {
+        // After `select_all → type x`, undo returns the buffer AND
+        // re-selects what was replaced.
+        let mut e = PromptEditor::new();
+        e.insert_str("abc");
+        e.reset_undo();
+        e.select_all();
+        e.insert_char('x'); // selection-replacement → Other entry
+        assert_eq!(e.text(), "x");
+        assert!(e.undo());
+        assert_eq!(e.text(), "abc");
+        assert_eq!(e.selected_text(), Some("abc"));
+    }
+
+    #[test]
+    fn delete_word_left_is_single_undo_entry() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hello world");
+        // After `insert_str("hello world")` the entire word-left
+        // delete eats "world" (and stops before the space — see
+        // `delete_word_left_removes_word_from_end`), leaving
+        // "hello ".
+        e.delete_word_left();
+        assert_eq!(e.text(), "hello ");
+        let before_undo = e.text().to_string();
+        e.undo();
+        assert_eq!(e.text(), "hello world");
+        // Redo restores the word-delete.
+        e.redo();
+        assert_eq!(e.text(), before_undo);
+    }
+
+    #[test]
+    fn cursor_move_does_not_create_undo_entry_by_itself() {
+        let mut e = PromptEditor::new();
+        e.insert_char('a'); // 1 entry
+        let depth_before = e.undo.undo_depth();
+        e.move_home();
+        e.move_end();
+        e.move_word_left();
+        e.move_word_right();
+        e.set_cursor(0);
+        e.select_all();
+        assert_eq!(e.undo.undo_depth(), depth_before);
+    }
+
+    #[test]
+    fn undo_redo_roundtrip_preserves_full_state() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hello world");
+        e.set_selection(0, 5); // select "hello"
+        let snap_before = (e.text().to_string(), e.cursor(), e.selection_range());
+        e.insert_str("XX"); // replace → "XX world"
+        e.undo();
+        assert_eq!(
+            (e.text().to_string(), e.cursor(), e.selection_range()),
+            snap_before,
+            "undo restores full state"
+        );
+        e.redo();
+        assert_eq!(e.text(), "XX world");
+    }
+
+    #[test]
+    fn coalesces_predicate_pure_check() {
+        // Direct unit cover for the pure coalescing predicate.
+        let mut s = UndoStack::default();
+        assert!(!s.coalesces(OpKind::TypeChar), "no prev → never coalesces");
+        s.last_op = Some(OpKind::TypeChar);
+        assert!(s.coalesces(OpKind::TypeChar));
+        assert!(!s.coalesces(OpKind::BackspaceChar));
+        assert!(!s.coalesces(OpKind::Other));
+        s.last_op = Some(OpKind::Other);
+        assert!(!s.coalesces(OpKind::Other), "Other never coalesces with itself");
     }
 }
