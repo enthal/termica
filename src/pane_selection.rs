@@ -18,12 +18,13 @@
 //!
 //! ## What this module is NOT
 //!
-//! - It does not own multi-click mode (Word / Line vs. Char). Multi-
-//!   click drags currently stay within the source block ([§Mouse in
-//!   the editor](../spec/04-prompt-editor.md#mouse-in-the-editor) for
-//!   the editor; sealed-block multi-click uses
-//!   `BlockSelection`-shaped state via `PaneUiState::sealed_drag_anchor`).
-//!   Cross-block drag is always Char-mode.
+//! - It does not own multi-click mode (Word / Line vs. Char). The
+//!   click count + anchor word/line bounds live on
+//!   `PaneUiState::sealed_drag_anchor`. This module's
+//!   [`extend_multiclick_selection_endpoints`] takes those bounds
+//!   plus the head pointer's word/line bounds and returns the new
+//!   `(anchor, head)` PaneCursors — applies the same far-edge rule
+//!   for same-block and cross-block drags.
 //! - It does not paint anything. The renderer queries
 //!   [`PaneSelection::block_range_for`] per block to compute the per-
 //!   block range to overlay, and reuses [`crate::render`]'s existing
@@ -154,6 +155,79 @@ impl PaneSelection {
             end_of_block
         };
         Some((start_bc, end_bc))
+    }
+}
+
+/// Compute the new `(anchor, head)` PaneCursors for a multi-click
+/// drag-extend, given the original word/line bounds at the anchor
+/// block and the word/line bounds under the pointer at the head
+/// block.
+///
+/// **Rule:** each endpoint uses the FAR edge of its word/line
+/// within its block — the edge facing AWAY from the other
+/// endpoint. The two cases:
+///
+/// 1. **Same block** (`anchor_block == head_block`): the
+///    out-going `(anchor, head)` are `(min(a_start, h_start),
+///    max(a_end, h_end))` — the rolling union the within-block
+///    drag has always done.
+///
+/// 2. **Cross block** (`anchor_block != head_block`): direction
+///    of the drag (head above or below anchor in pane order)
+///    determines which edge each endpoint takes:
+///    - Head AFTER anchor (`head_block > anchor_block`): anchor
+///      = `a_start` (upper edge of upper block), head = `h_end`
+///      (lower edge of lower block).
+///    - Head BEFORE anchor (`head_block < anchor_block`): anchor
+///      = `a_end` (lower edge of lower block), head = `h_start`
+///      (upper edge of upper block).
+///
+/// This unifies same-block and cross-block multi-click extend
+/// behind one rule, and prevents two regressions the cross-block
+/// PR shipped with:
+///
+/// - Forward drag from a multi-click in block A down into block
+///   B would degrade to char-mode in B (no word/line snapping).
+/// - Backward drag from a multi-click in block A up into block U
+///   would "lose" the anchor word's highlight in A because
+///   `PaneSelection::ordered()` puts U first and `block_range_for(A)`
+///   then runs `(start_of_A, anchor_pos)` — putting the anchor
+///   at the word's START makes the range stop BEFORE the word.
+///   Using the word's END as the anchor cursor in that direction
+///   makes the range include the word.
+///
+/// Pure function: no egui, no PaneSession. Tested directly.
+pub fn extend_multiclick_selection_endpoints(
+    anchor_block: BlockId,
+    anchor_word_bounds: (BlockCursor, BlockCursor),
+    head_block: BlockId,
+    head_word_bounds: (BlockCursor, BlockCursor),
+) -> (PaneCursor, PaneCursor) {
+    let (a_start, a_end) = anchor_word_bounds;
+    let (h_start, h_end) = head_word_bounds;
+
+    if anchor_block == head_block {
+        // Same block — rolling union. Equivalent to picking the
+        // outer pair of endpoints across both bounds, which is
+        // what the existing within-block drag has always done.
+        let start = a_start.min(h_start);
+        let end = a_end.max(h_end);
+        return (
+            PaneCursor::in_block(anchor_block, start),
+            PaneCursor::in_block(anchor_block, end),
+        );
+    }
+
+    if head_block > anchor_block {
+        // Drag DOWN: anchor is the upper block (start of the
+        // selection in pane order). Use a_start as the
+        // upper/left edge; h_end as the lower/right edge.
+        (PaneCursor::in_block(anchor_block, a_start), PaneCursor::in_block(head_block, h_end))
+    } else {
+        // Drag UP: head is the upper block. anchor is the lower
+        // block; use a_end as the lower edge. Head uses h_start
+        // as the upper edge.
+        (PaneCursor::in_block(anchor_block, a_end), PaneCursor::in_block(head_block, h_start))
     }
 }
 
@@ -474,5 +548,130 @@ mod tests {
         let s = sel(pc(7, 0, 0), pc(7, 0, 8));
         // Trailing spaces are trimmed per the block_selection_text rule.
         assert_eq!(pane_selection_text(&blocks, &s), "hello");
+    }
+
+    // ---- extend_multiclick_selection_endpoints ---------------------
+    //
+    // Multi-click + drag extend rule (works for both word and line
+    // modes). Given the original word/line bounds at the anchor block
+    // and the word/line bounds at the head block, produce the new
+    // (anchor, head) PaneCursors so that BOTH endpoint blocks have
+    // their FULL word/line included.
+    //
+    // The rule: each endpoint uses the FAR EDGE of its word/line
+    // within its block — the edge facing AWAY from the other
+    // endpoint. For same-block selections this collapses to the
+    // existing rolling-union semantics (start = min, end = max).
+    // For cross-block selections it preserves the visual that the
+    // user expects: drag from "foo" in block A down to "bar" in
+    // block B and the selection covers `foo … bar` with FOO and
+    // BAR each fully highlighted, not char-truncated.
+    //
+    // Per the user-reported regression: pre-fix, the cross-block
+    // path silently degraded to char-mode for the head block and
+    // (for backward drag) "lost" the original anchor word in the
+    // start block because the anchor cursor stopped being on the
+    // word's far edge under `ordered()`. The unified far-edge rule
+    // fixes both.
+
+    fn bc(row: usize, col: usize) -> BlockCursor {
+        BlockCursor::new(row, col)
+    }
+
+    #[test]
+    fn extend_multiclick_same_block_unions_word_ranges() {
+        // Same block, head word later than anchor word: unioned.
+        // (anchor_start, head_end) covers both.
+        let anchor = BlockId(5);
+        let a_bounds = (bc(0, 0), bc(0, 3));
+        let h_bounds = (bc(0, 10), bc(0, 15));
+        let (anc, head) = extend_multiclick_selection_endpoints(anchor, a_bounds, anchor, h_bounds);
+        assert_eq!(anc, PaneCursor::new(BlockId(5), 0, 0));
+        assert_eq!(head, PaneCursor::new(BlockId(5), 0, 15));
+    }
+
+    #[test]
+    fn extend_multiclick_same_block_reverse_drag_unions_outward() {
+        // Same block but head word EARLIER than anchor word —
+        // still unions to the outer bounds (start = min, end = max).
+        let b = BlockId(5);
+        let a_bounds = (bc(2, 10), bc(2, 15)); // "anchor"
+        let h_bounds = (bc(0, 0), bc(0, 3)); // "head" earlier
+        let (anc, head) = extend_multiclick_selection_endpoints(b, a_bounds, b, h_bounds);
+        assert_eq!(anc, PaneCursor::new(BlockId(5), 0, 0));
+        assert_eq!(head, PaneCursor::new(BlockId(5), 2, 15));
+    }
+
+    #[test]
+    fn extend_multiclick_cross_block_forward_keeps_both_full_words() {
+        // BUG 1 repro: double-click word in block 5, drag down into
+        // block 7's word at cols 10..15. Pre-fix, head landed at
+        // char-precision in block 7. Fix: head uses h_end (far
+        // edge), anchor uses a_start (far edge of upper block).
+        let a_bounds = (bc(0, 0), bc(0, 3)); // word at start of block 5
+        let h_bounds = (bc(0, 10), bc(0, 15)); // word in block 7
+        let (anc, head) =
+            extend_multiclick_selection_endpoints(BlockId(5), a_bounds, BlockId(7), h_bounds);
+        assert_eq!(anc, PaneCursor::new(BlockId(5), 0, 0));
+        assert_eq!(head, PaneCursor::new(BlockId(7), 0, 15));
+    }
+
+    #[test]
+    fn extend_multiclick_cross_block_backward_keeps_both_full_words() {
+        // BUG 2 repro: double-click word in block 7, drag UP into
+        // block 5's word. Pre-fix, the anchor word at block 7
+        // disappeared because `ordered()` flipped the endpoints
+        // and the anchor at a_start became the high end of the
+        // selection — putting block 7's range at
+        // `(start_of_block_7, a_start)`, which doesn't include
+        // the word. Fix: anchor uses a_end (far edge of LOWER
+        // block); head uses h_start (far edge of UPPER block).
+        let a_bounds = (bc(0, 10), bc(0, 15)); // word in block 7
+        let h_bounds = (bc(0, 0), bc(0, 3)); // word in block 5 (upper)
+        let (anc, head) =
+            extend_multiclick_selection_endpoints(BlockId(7), a_bounds, BlockId(5), h_bounds);
+        // Anchor stays in block 7 but at the FAR edge (a_end).
+        assert_eq!(anc, PaneCursor::new(BlockId(7), 0, 15));
+        // Head in block 5 at the FAR edge (h_start).
+        assert_eq!(head, PaneCursor::new(BlockId(5), 0, 0));
+
+        // Sanity: the resulting selection's `ordered()` would put
+        // block 5 first; block_range_for(block 7) is the END
+        // block, range `(start_of_block, a_end=15)` — includes the
+        // original word at cols 10..15. ✓
+        let s = PaneSelection::new(anc, head);
+        let (start, end) = s.ordered();
+        assert_eq!(start.block_id, BlockId(5));
+        assert_eq!(end.block_id, BlockId(7));
+        assert_eq!(end.col, 15, "block 7 selection ends at the word's right edge");
+    }
+
+    #[test]
+    fn extend_multiclick_cross_block_with_degenerate_head_bounds_uses_pointer_col() {
+        // Pointer is over whitespace in the head block, so the
+        // word range there is degenerate `(col, col)`. The
+        // far-edge rule still applies — head lands at that col;
+        // the helper does NOT misinterpret degenerate bounds.
+        let a_bounds = (bc(0, 0), bc(0, 3));
+        let h_bounds = (bc(0, 7), bc(0, 7)); // degenerate
+        let (anc, head) =
+            extend_multiclick_selection_endpoints(BlockId(5), a_bounds, BlockId(7), h_bounds);
+        assert_eq!(anc, PaneCursor::new(BlockId(5), 0, 0));
+        assert_eq!(head, PaneCursor::new(BlockId(7), 0, 7));
+    }
+
+    #[test]
+    fn extend_multiclick_line_mode_uses_same_far_edge_rule() {
+        // The helper doesn't know "word" vs "line" — it just takes
+        // the bounds. Line bounds at row 0 of block 5 (cols 0..20)
+        // + bounds at row 2 of block 7 (cols 0..14) → block 5
+        // ends at row 0 col 0 (far edge), block 7 ends at row 2
+        // col 14 (far edge). Whole lines highlighted in each.
+        let a_bounds = (bc(0, 0), bc(0, 20));
+        let h_bounds = (bc(2, 0), bc(2, 14));
+        let (anc, head) =
+            extend_multiclick_selection_endpoints(BlockId(5), a_bounds, BlockId(7), h_bounds);
+        assert_eq!(anc, PaneCursor::new(BlockId(5), 0, 0));
+        assert_eq!(head, PaneCursor::new(BlockId(7), 2, 14));
     }
 }

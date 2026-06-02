@@ -466,7 +466,14 @@ When the user drags across a block boundary, the selection logically spans all t
 
 `Selection → text` (`pane_selection_text`) walks the sealed-block list in pane order, asks each block in range for its clipped slice via the within-block helper, and joins per-block payloads with `\n`. Block chrome (cwd / exit chips, separators) is visually unhighlighted even when the selection passes over it, and is not included in the copy payload.
 
-**Multi-click rule (Word / Line) is per-block.** Double-click + drag and triple-click + drag use a rolling word / line union, but the union is constrained to the source block — the block where the original double/triple click landed. When the drag head leaves that source block, multi-click expansion stops and char-mode hit-testing takes over for the cross-block segment. This keeps the rolling-union logic local; cross-block word/line union is post-MVP. The source-block anchor lives in `PaneUiState::sealed_drag_anchor` as `(BlockId, BlockCursor, BlockCursor)`.
+**Multi-click rule (Word / Line) — unified far-edge rule.** Double-click + drag and triple-click + drag work the same way whether the drag stays in one block or crosses block boundaries. The source-block anchor (the originally-double/triple-clicked word or line bounds) lives in `PaneUiState::sealed_drag_anchor` as `(BlockId, BlockCursor, BlockCursor)`. On every drag move, the renderer computes the word / line bounds under the pointer in the head's block, then calls [`crate::pane_selection::extend_multiclick_selection_endpoints`] with both endpoint's word/line bounds. The rule it applies:
+
+- **Each endpoint uses the far edge of its word/line within its block** — the edge facing AWAY from the other endpoint.
+- **Same block**: collapses to `(min(a_start, h_start), max(a_end, h_end))` — the rolling union the within-block drag has always done.
+- **Cross block, head AFTER anchor**: anchor cursor = `a_start` (upper edge of the upper block); head cursor = `h_end` (lower edge of the lower block). Both blocks' words/lines are FULLY highlighted.
+- **Cross block, head BEFORE anchor**: anchor cursor = `a_end`; head cursor = `h_start`. Same property — both endpoints' full words/lines highlighted.
+
+This unified rule replaces an earlier "stay in source block" carve-out. The carve-out's failure modes were two: (a) forward cross-block drag degraded to char-precision in the head block, (b) backward cross-block drag "lost" the anchor word in the source block because `PaneSelection::ordered()` flipped the endpoints and the anchor at the word's left edge became the high end of the selection, which made `block_range_for(anchor_block)` clip BEFORE the word. The far-edge rule eliminates both because the anchor cursor adapts to which end it represents in pane order.
 
 `PaneSelection` deliberately does NOT carry a `SelectionMode` field because mode lives at the gesture layer (the multi-click anchor in `PaneUiState`), not the selection-data layer. The clipped per-block ranges always describe character-precise endpoints — once a Word / Line anchor has snapped its endpoints outward, the `PaneCursor` values are already at word/line bounds.
 

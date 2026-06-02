@@ -1648,47 +1648,47 @@ pub fn render_pane(
                         &slot.session,
                     );
                     match (slot.ui.click_count, slot.ui.sealed_drag_anchor) {
-                        (2, Some((anchor_block, a_start, a_end)))
-                            if anchor_block == head_block_id =>
-                        {
-                            // Word-mode rolling union — same-block only.
-                            if let Some((c_start, c_end)) =
+                        (2, Some((anchor_block, a_start, a_end))) => {
+                            // Word-mode drag, same-block OR cross-block:
+                            // the unified far-edge rule in
+                            // `extend_multiclick_selection_endpoints`
+                            // handles both. Pre-fix this branch ran
+                            // only when `anchor_block == head_block_id`
+                            // — cross-block drag fell through to
+                            // char mode in the head block and "lost"
+                            // the anchor word when dragged upward.
+                            if let Some(head_bounds) =
                                 slot.session.sealed_word_range(head_block_id, head_cursor)
                             {
-                                let start = a_start.min(c_start);
-                                let end = a_end.max(c_end);
-                                slot.session.update_pane_selection_endpoints(
-                                    crate::pane_selection::PaneCursor::in_block(
+                                let (anc_pc, head_pc) =
+                                    crate::pane_selection::extend_multiclick_selection_endpoints(
                                         anchor_block,
-                                        start,
-                                    ),
-                                    crate::pane_selection::PaneCursor::in_block(anchor_block, end),
-                                );
+                                        (a_start, a_end),
+                                        head_block_id,
+                                        head_bounds,
+                                    );
+                                slot.session.update_pane_selection_endpoints(anc_pc, head_pc);
                             }
                         }
-                        (3, Some((anchor_block, a_start, a_end)))
-                            if anchor_block == head_block_id =>
-                        {
-                            // Line-mode rolling union — same-block only.
-                            if let Some((c_start, c_end)) =
+                        (3, Some((anchor_block, a_start, a_end))) => {
+                            // Line-mode drag — same rule, line bounds.
+                            if let Some(head_bounds) =
                                 slot.session.sealed_line_range(head_block_id, head_cursor)
                             {
-                                let start = a_start.min(c_start);
-                                let end = a_end.max(c_end);
-                                slot.session.update_pane_selection_endpoints(
-                                    crate::pane_selection::PaneCursor::in_block(
+                                let (anc_pc, head_pc) =
+                                    crate::pane_selection::extend_multiclick_selection_endpoints(
                                         anchor_block,
-                                        start,
-                                    ),
-                                    crate::pane_selection::PaneCursor::in_block(anchor_block, end),
-                                );
+                                        (a_start, a_end),
+                                        head_block_id,
+                                        head_bounds,
+                                    );
+                                slot.session.update_pane_selection_endpoints(anc_pc, head_pc);
                             }
                         }
                         _ => {
-                            // Char mode (and the cross-block path for
-                            // any click_count): just move the head.
-                            // Anchor stays pinned wherever the press
-                            // landed (set by the START branch above).
+                            // Char mode (no multi-click anchor): just
+                            // move the head. Anchor stays pinned
+                            // wherever the press landed.
                             let _ = sel; // anchor is still fine
                             slot.session.update_pane_selection_head(
                                 crate::pane_selection::PaneCursor::in_block(
