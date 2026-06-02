@@ -106,16 +106,22 @@ impl CompletionPopup {
 ///
 /// Up to `max_visible_rows` candidates render before the list
 /// scrolls.
+///
+/// Returns `Some(row_idx)` when the user clicked a row — the
+/// caller treats this as an `Accept` action (replaces the typed
+/// token with the clicked candidate's value, closes the popup).
+/// `None` when no row was clicked this frame.
 pub fn paint(
     ctx: &egui::Context,
     popup: &mut CompletionPopup,
     anchor: egui::Pos2,
     pane_id: u64,
     max_visible_rows: usize,
-) {
+) -> Option<usize> {
     let area_id = egui::Id::new(("completion-popup", pane_id));
     let row_h = 18.0;
     let panel_w = 380.0;
+    let mut clicked_row: Option<usize> = None;
 
     egui::Area::new(area_id)
         // Pivot at LEFT_BOTTOM means the bottom-left corner of
@@ -136,7 +142,16 @@ pub fn paint(
                     .show(ui, |ui| {
                         for (idx, cand) in popup.candidates.iter().enumerate() {
                             let selected = idx == popup.selected_index;
-                            paint_row(ui, cand, selected);
+                            let response = paint_row(ui, cand, selected);
+                            // Click on a row = accept that row.
+                            // Hover updates the selected_index so
+                            // the row visibly highlights as the
+                            // user moves over it.
+                            if response.clicked() {
+                                clicked_row = Some(idx);
+                            } else if response.hovered() {
+                                popup.selected_index = idx;
+                            }
                             // After painting the selected row, if
                             // a scroll was scheduled this frame
                             // (move_selection ran), align the
@@ -152,6 +167,7 @@ pub fn paint(
                 paint_keybind_hint(ui);
             });
         });
+    clicked_row
 }
 
 /// Bottom-of-popup keybinding strip. Per CLAUDE.md
@@ -164,14 +180,20 @@ fn paint_keybind_hint(ui: &mut egui::Ui) {
     ui.weak("[Tab / Enter] accept   [Up / Down] navigate   [Esc] cancel");
 }
 
-fn paint_row(ui: &mut egui::Ui, cand: &CompletionCandidate, selected: bool) {
+fn paint_row(ui: &mut egui::Ui, cand: &CompletionCandidate, selected: bool) -> egui::Response {
     let visuals = ui.visuals();
     let bg = if selected { visuals.selection.bg_fill } else { egui::Color32::TRANSPARENT };
     let fg = if selected { visuals.selection.stroke.color } else { visuals.text_color() };
     let dim = visuals.weak_text_color();
 
-    let row_rect = ui.allocate_space(egui::Vec2::new(ui.available_width(), 18.0));
-    let (_, rect) = row_rect;
+    // `allocate_response` returns an interactive widget covering
+    // the row rect; this is what surfaces clicks + hover state
+    // to the caller. (`allocate_space` is the read-only variant
+    // and was the source of "popup rows don't respond to
+    // clicks.")
+    let desired = egui::Vec2::new(ui.available_width(), 18.0);
+    let response = ui.allocate_response(desired, egui::Sense::click());
+    let rect = response.rect;
     if selected {
         ui.painter().rect_filled(rect, 2.0, bg);
     }
@@ -205,6 +227,7 @@ fn paint_row(ui: &mut egui::Ui, cand: &CompletionCandidate, selected: bool) {
         font,
         dim,
     );
+    response
 }
 
 #[cfg(test)]

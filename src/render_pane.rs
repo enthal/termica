@@ -1207,13 +1207,28 @@ pub fn render_pane(
             // the popup's bottom edge aligns with the editor's
             // top.
             if let Some(popup) = slot.ui.completion_popup.as_mut() {
-                crate::completion::popup::paint(
+                let clicked = crate::completion::popup::paint(
                     ctx,
                     popup,
                     editor_rect.min,
                     slot.session.pane_id(),
                     10,
                 );
+                // Click-to-accept: a row click sets the selected
+                // candidate AND accepts it, same as Tab/Enter.
+                if let Some(row_idx) = clicked {
+                    let Some(mut popup_taken) = slot.ui.completion_popup.take() else {
+                        unreachable!("just confirmed popup is Some via as_mut above")
+                    };
+                    popup_taken.selected_index = row_idx;
+                    let cursor =
+                        slot.session.blocks().editor_on_tail().map(|e| e.cursor()).unwrap_or(0);
+                    let current_token_len = cursor.saturating_sub(popup_taken.origin_byte);
+                    if let Some(editor) = slot.session.editor_mut() {
+                        popup_taken.accept(editor, current_token_len);
+                    }
+                    slot.session.clear_history_recall();
+                }
             }
         } else {
             // Editor not on tail this frame — forget the cursor
@@ -2040,6 +2055,16 @@ pub fn render_pane(
             }
         }
 
+        // Snapshot the editor's text + cursor BEFORE event
+        // processing so the after-loop live-filter pass can tell
+        // whether the buffer actually changed (a text edit) vs
+        // navigation-only frames (Up/Down in popup, or no
+        // editor events at all). Without this guard the live-
+        // filter would clobber `selected_index` after every
+        // Up/Down press, defeating popup navigation.
+        let editor_state_before: Option<(String, usize)> =
+            slot.session.blocks().editor_on_tail().map(|e| (e.text().to_string(), e.cursor()));
+
         for event in &events {
             // Belt and braces: skip the Ctrl+Shift+C key event so the
             // encoder never sees it (the encoder wouldn't emit bytes
@@ -2163,42 +2188,38 @@ pub fn render_pane(
 
         // ---- Completion popup live-filter ----------------------
         //
-        // After processing all this frame's events: if the popup
-        // is still open AND the editor's text/cursor moved (i.e.,
-        // the user typed, pasted, or backspaced), recompute the
-        // candidate list. The popup tracks `origin_byte` from
-        // when it was opened; if the caret has drifted before
-        // that point (user deleted past the token start), dismiss
-        // — the user has clearly given up on this completion.
+        // Only refresh when the editor's text/cursor actually
+        // changed this frame. Navigation-only frames (Up/Down in
+        // popup, idle frames) leave the buffer alone, and we
+        // MUST NOT replace the popup in those cases or
+        // `move_selection`'s state (selected_index +
+        // scroll_to_selected_pending) gets clobbered.
         //
-        // Otherwise call the orchestrator with the current
-        // buffer + cursor state. New candidate list replaces the
-        // old; `selected_index` resets to 0 (preserving it
-        // across refilter is a polish item).
+        // When text DID change: if the caret went past
+        // `origin_byte` (user backspaced through the token start),
+        // dismiss. Otherwise recompute the candidate list with
+        // the new buffer state. `selected_index` resets to 0
+        // (preserving it across refilter is a polish item).
         if slot.ui.completion_popup.is_some() {
-            let (editor_text, cursor) = {
-                let editor = slot.session.blocks().editor_on_tail();
-                (
-                    editor.map(|e| e.text().to_string()).unwrap_or_default(),
-                    editor.map(|e| e.cursor()).unwrap_or(0),
-                )
-            };
-            let origin = slot.ui.completion_popup.as_ref().map(|p| p.origin_byte).unwrap_or(0);
-            if cursor < origin {
-                // Caret went past the original token start —
-                // user backspaced too far. Dismiss.
-                slot.ui.completion_popup = None;
-            } else {
-                let cwd = slot.session.terminal().cwd().map(|p| p.to_path_buf());
-                let history_entries = slot.session.history_for_completion(200);
-                let new_popup = crate::completion::open_completion_at(
-                    &editor_text,
-                    cursor,
-                    cwd.as_deref(),
-                    home,
-                    || history_entries,
-                );
-                slot.ui.completion_popup = new_popup;
+            let editor_state_after: Option<(String, usize)> =
+                slot.session.blocks().editor_on_tail().map(|e| (e.text().to_string(), e.cursor()));
+            let buffer_changed = editor_state_before != editor_state_after;
+            if buffer_changed && let Some((editor_text, cursor)) = editor_state_after {
+                let origin = slot.ui.completion_popup.as_ref().map(|p| p.origin_byte).unwrap_or(0);
+                if cursor < origin {
+                    slot.ui.completion_popup = None;
+                } else {
+                    let cwd = slot.session.terminal().cwd().map(|p| p.to_path_buf());
+                    let history_entries = slot.session.history_for_completion(200);
+                    let new_popup = crate::completion::open_completion_at(
+                        &editor_text,
+                        cursor,
+                        cwd.as_deref(),
+                        home,
+                        || history_entries,
+                    );
+                    slot.ui.completion_popup = new_popup;
+                }
             }
         }
     }
