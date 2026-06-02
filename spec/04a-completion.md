@@ -1,0 +1,346 @@
+**← Previous:** [04 — Prompt editor](04-prompt-editor.md) | **Next:** [05 — Pane modes](05-pane-modes.md) →
+
+# 04a — Tab completion
+
+The headline feature within the headline feature. Tab in [the prompt editor](04-prompt-editor.md) does **not** send `\t` to the PTY; it opens a popup of completion candidates Termica computed locally. This document is the design for the hybrid completion engine that ships post-MVP: **CLI-native drivers** for the modern tools that already expose a completion endpoint (`kubectl __complete`, `aws_completer`, `gh __complete`, cobra `__complete`, …) combined with a **per-pane shell sidecar** for the long tail and user-defined completions (aliases, custom `complete -F` functions, fish abbreviations).
+
+The MVP — local path / `$PATH` / history completion — is the fallback when both upstream sources fail or take too long. It ships first ([Phase 4I](10-roadmap.md#phase-4--editor-at-prompt-block-model-pivot)). This document covers the deeper design that lands behind it once 4I is stable.
+
+## Why not just forward Tab to the shell
+
+Three things go wrong if we let the shell's line editor own Tab.
+
+1. **The shell's line editor is the thing Termica replaces.** [Spec/00 §"Why Termica"](00-overview.md) lists "a real completion popup" as one of the four headline features (alongside multiline editing, history search, and undo). A native popup is part of the product; forwarding Tab means we don't have one.
+2. **Multiline commands break.** When a user is editing a 5-line `for` loop in the Termica editor, the shell isn't seeing those lines — they don't exist on the PTY until Enter. The shell's line editor has nothing to complete against.
+3. **Mode safety breaks.** Tab routed to the PTY in `ShellPromptEditor` mode would echo through readline / ZLE / fish's line editor, producing visible glyphs in the live `Term` grid that don't correspond to anything the user actually typed. The editor's whole point is that the user types into Termica, not the shell.
+
+So Termica computes completions locally. The question is **where the candidates come from**, and that's the rest of this document.
+
+## Source priority (the hybrid)
+
+A single Tab keystroke fires all three sources in parallel. Results merge into one ranked popup; sources are tagged so the UI can show source-of-truth icons.
+
+| # | Source | Speed | Coverage |
+|---|---|---|---|
+| 1 | **CLI-native drivers** (`kubectl __complete`, `gh __complete`, `git --list-cmds`, …) | ~50–150 ms first call, ~10–30 ms cached | Excellent for big tools that ship a completion endpoint; nothing for tools that don't |
+| 2 | **Shell sidecar** (`bash`/`zsh`/`fish` process with the user's rc) | ~100–500 ms first call, ~30–80 ms cached | Picks up aliases, custom `complete -F`, fish abbreviations, kubectl/aws completions the user installed in their rc — anything the user's shell would complete |
+| 3 | **Local heuristics** (paths under cursor, `$PATH` executables, command history) | Synchronous, always under 10 ms | Always available; coarse coverage. The MVP path. |
+
+All three sources race to a 250 ms timeout. Whichever land within the timeout populate the popup; late results stream in afterward without disturbing the user's current selection. If nothing arrives by the timeout, the popup opens with source 3's local heuristics and a faint "searching…" affordance.
+
+The popup ALWAYS opens. A completion request never fails silently. Even if both sidecar and drivers crash, source 3 returns *something* — at minimum the paths under the cursor.
+
+## Source 1 — CLI-native drivers
+
+Modern CLIs expose a "complete this command line" endpoint independent of any shell. Termica calls it directly:
+
+| Tool | Endpoint | Notes |
+|---|---|---|
+| `kubectl` | `kubectl __complete <args...>` | The args are everything the user has typed so far, split on whitespace. The stdout is one candidate per line, optionally followed by a tab + description. |
+| `aws` | `aws_completer <COMP_LINE> <COMP_POINT>` | aws_completer is a small Python script Amazon ships with the AWS CLI; reads `COMP_LINE` env var and `COMP_POINT` (cursor offset). |
+| `gh` | `gh __complete <args...>` | cobra-based — same shape as kubectl. |
+| `git` | `git --list-cmds=builtins,others,nohelpers` (subcommands), then per-subcommand completions are sidecar territory | git's own completion endpoint is partial; bash-completion's `_git` function is much richer. Source 2 covers what source 1 can't here. |
+| `docker` | `docker __complete <args...>` | cobra-based. |
+| `gcloud` | (no native endpoint; sidecar only) | gcloud's completion is shell-script-only. |
+| `terraform` | `terraform <subcommand> -help-machine` (subcommands) + sidecar | partial native; sidecar fills the gap. |
+
+A small `completion::drivers` module knows about each tool and its endpoint. Adding a new tool is one match arm + a small parse function for that tool's output format (most are "candidate\tdescription" per line; aws_completer's output is whitespace-tokenized; cobra's `__complete` has a `:`-prefixed flag we ignore). The driver detection runs once at startup (or first-Tab-press) per tool: shell out to `kubectl __complete --help` etc. to confirm the endpoint exists, cache the result.
+
+**Driver detection failure** is silent. If `kubectl __complete` doesn't exist on the user's machine (older kubectl, no kubectl installed, kubectl is shadowed by an alias), source 1 produces no candidates for kubectl-prefixed commands and source 2 takes over. Same logic per-tool.
+
+**Driver process lifecycle**: each driver call is a one-shot subprocess. No long-running drivers. The cost is ~30–50 ms of fork+exec; the cache makes repeats free.
+
+**Per-tool cwd / env**: drivers run with `PaneSession::context().cwd` as CWD and the pane's environment. kubectl's context selection lives in `~/.kube/config` and the `KUBECONFIG` env var, both of which propagate naturally.
+
+## Source 2 — shell sidecar
+
+A long-lived companion shell per pane. Spawned on-demand when the user first presses Tab; one of three flavours depending on `PaneSession.shell`:
+
+```text
+┌─────────────────────┐                    ┌──────────────────────────┐
+│   Termica editor    │  COMPLETE request  │ Sidecar shell (bash/zsh/ │
+│   (ShellPromptEditor)│ ─────────────────▶│  fish), --no-pty,        │
+│                     │ ◀───────────────── │  user's rc loaded        │
+│                     │  candidates (json) │                          │
+└─────────────────────┘                    └──────────────────────────┘
+```
+
+The sidecar is **not** the user's interactive shell. It's a Termica-controlled sibling that loads the user's rc files in non-interactive mode so it can run `complete -p` (bash), `_main_complete` (zsh), or `complete -C` (fish) on demand. Termica writes RPC requests on its stdin; the sidecar writes JSON responses on its stdout. No PTY involved — it's pipe IPC.
+
+### Sidecar protocol (wire)
+
+Newline-delimited JSON over stdin/stdout. Termica controls the request side; the sidecar's vendored helper script controls the response side.
+
+**Request** (Termica → sidecar):
+
+```jsonc
+{ "id": 17, "type": "complete", "line": "kubectl get po", "point": 14 }
+{ "id": 18, "type": "complete", "line": "git ", "point": 4 }
+{ "id": 19, "type": "ping" }
+{ "id": 20, "type": "shutdown" }
+```
+
+`id` is a request correlation token; each response carries the same id.
+
+**Response** (sidecar → Termica):
+
+```jsonc
+{ "id": 17, "type": "candidates", "items": [
+  { "value": "pod", "display": "pod", "description": "Pods are…" },
+  { "value": "podsecuritypolicy", "display": "podsecuritypolicy" }
+] }
+{ "id": 19, "type": "pong" }
+{ "id": 20, "type": "shutdown_ack" }
+{ "type": "error", "id": 17, "reason": "completion-function-missing" }
+```
+
+`items[].description` is optional. Termica truncates descriptions to one line in the popup.
+
+### Bash sidecar
+
+Bash exposes completion via the `complete -p` builtin and the `COMPREPLY` array. Termica's bash sidecar script (vendored alongside the existing integration scripts in [`integration/`](../integration/)) does roughly this on each request:
+
+```sh
+# Sidecar helper, runs for every COMPLETE request.
+__termica_complete() {
+    local line="$1" point="$2"
+    local words=() current word_index
+    # 1. Split line into words with bash's own splitter so we
+    #    match what readline would see.
+    COMP_LINE="$line"
+    COMP_POINT="$point"
+    eval "COMP_WORDS=($line)"
+    COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 ))
+    # 2. Look up the function bound for this command.
+    local cmd="${COMP_WORDS[0]}"
+    local func
+    func=$(complete -p "$cmd" 2>/dev/null | sed -n 's/.* -F \([a-zA-Z_]*\) .*/\1/p')
+    if [[ -z "$func" ]]; then
+        # Fall back to bash's default: filename completion.
+        COMPREPLY=( $(compgen -f -- "${COMP_WORDS[$COMP_CWORD]}") )
+    else
+        "$func"
+    fi
+    # 3. Emit JSON.
+    printf '{"id":%d,"type":"candidates","items":[' "$3"
+    local first=1
+    for item in "${COMPREPLY[@]}"; do
+        if (( first == 0 )); then printf ','; fi
+        first=0
+        printf '{"value":%s,"display":%s}' "$(__termica_json_str "$item")" "$(__termica_json_str "$item")"
+    done
+    printf ']}\n'
+}
+```
+
+This is the production-tested approach used by [bash-preexec](https://github.com/rcaloras/bash-preexec) and a half-dozen completion bridges (`fzf`, `mcfly`, etc.). It works because `complete -p <cmd>` is bash's documented introspection mechanism.
+
+**Caveats:**
+- Some completion functions assume readline state (`READLINE_LINE`, `READLINE_POINT`). We set those alongside `COMP_*` so the common cases work; uncommon ones may break.
+- Completion functions that fork their own subshells will pick up the sidecar's environment, which is the user's rc-loaded one — usually fine, occasionally surprising.
+- Bash 3 (default on stock macOS) has subtle differences from bash 4+ in `compgen`. The sidecar bootstrap detects the bash version and degrades gracefully (fewer completions, never wrong ones).
+
+### Zsh sidecar
+
+Zsh's completion lives in the `compsys` ("new completion" framework). The procedure is gnarlier than bash but proven by [zsh-autocomplete](https://github.com/marlonrichert/zsh-autocomplete), [fzf-tab](https://github.com/Aloxaf/fzf-tab), and similar projects:
+
+```zsh
+# Sidecar helper.
+__termica_complete() {
+    local line=$1 point=$2 id=$3
+    # ZLE state surrogate. _main_complete is a ZLE widget but the
+    # state it reads (BUFFER, CURSOR, words, CURRENT, compstate) is
+    # all settable from a function.
+    BUFFER=$line
+    CURSOR=$point
+    typeset -a words
+    words=( ${(z)line} )
+    local CURRENT=${#words}
+    typeset -A compstate
+    compstate[insert]=  # don't actually insert into BUFFER
+    compstate[list]=list
+    # Run the system completer. It populates the global `reply`
+    # (and friends) which we extract.
+    _main_complete
+    # Emit JSON. zsh's completion stores results in `_main_complete`'s
+    # internal state; the simplest portable extraction is to scrape
+    # the `compstate[unambiguous]` head + the per-group lists.
+    # (Detailed extraction logic lives in the vendored helper.)
+}
+```
+
+The integration helper is more involved than the bash version. The key insight from fzf-tab et al. is that `_main_complete` populates `compstate` and the result groups via well-defined hooks, even when called outside a real `zle` keypress; the trick is replacing `compadd` with a wrapper that records its arguments instead of inserting them.
+
+**Zsh is the most fragile of the three sidecars.** Different zsh versions (5.x has been stable but minor version differences matter), different theme frameworks (oh-my-zsh, prezto, p10k) installing their own completion overrides, and different `compinit` insecurity warnings all need handling. The sidecar bootstrap runs `autoload -Uz compinit && compinit -i` (the `-i` skips the insecurity prompt; we accept the trade-off because user already trusts their own files); when extraction fails, source 3 (local heuristics) absorbs the gap.
+
+If a particular completion function panics inside our extraction wrapper, the sidecar isolates it: we run each request in a subshell so a bad completion can't poison subsequent ones.
+
+### Fish sidecar
+
+Fish is the cleanest of the three. It has a native `complete -C` CLI that returns completions on stdout:
+
+```fish
+$ fish -c 'complete -C "kubectl ge"'
+get	Display one or many resources
+…
+```
+
+No `compsys`-style ZLE state. No `COMPREPLY`. Just one CLI call per request. Our fish sidecar is a thin wrapper that reads JSON requests from stdin, runs `complete -C` for each, formats the response. The whole helper is ~30 lines.
+
+Fish is the **reference implementation** for the protocol — when in doubt about the wire shape or the lifecycle, look at the fish path first.
+
+### Sidecar lifecycle
+
+| Phase | Trigger | Action |
+|---|---|---|
+| Spawn | First Tab press in pane | Spawn the matching sidecar (`bash --rcfile`, `zsh -i`, `fish -i`) with stdio pipes. Detect shell from `PaneSession.shell` (the integration bootstrap already records this). |
+| Steady state | Subsequent Tab presses | Send `COMPLETE` requests; read responses. ~30–80 ms per call after warm-up. |
+| Idle timeout | No request for `SIDECAR_IDLE_SECS = 300` (5 min) | Send `shutdown`; close pipes. Re-spawn on next Tab. |
+| Crash | Sidecar process exits unexpectedly | Drop the handle, fall back to source 3 for this request. Re-spawn on next Tab; rate-limit re-spawn attempts at 1/sec to avoid fork bombs. |
+| Pane teardown | `PaneSession::drop` | Send `shutdown`; SIGKILL fallback after `SHUTDOWN_GRACE_MS = 500`. |
+
+**Cwd / env tracking**: the sidecar inherits the pane's cwd and env at spawn time. On `PaneSession::observe_lifecycle_event` for `Cwd { cwd }`, Termica sends a `{ "type": "cd", "path": "<cwd>" }` request so the sidecar's view of the filesystem stays aligned with the user's. Env changes (e.g. activating a virtualenv) propagate via the `__termica_envsync` hook in our integration scripts: when the integration sees `prompt_vars` with changed env keys, Termica forwards them to the sidecar as `{ "type": "setenv", "vars": {...} }`.
+
+This is the part that's most likely to drift in real usage and the part the test surface watches most carefully — see [§Testing](#testing) below.
+
+### Why a per-pane sidecar (not one per process)
+
+Could be ONE sidecar shared across all panes, but each pane wants its own cwd + env + kubectl context. Per-pane keeps the protocol simple (no pane-id routing on every request, no cross-pane state corruption) and the cost is modest: a single `bash --rcfile` with stdio pipes consumes ~5 MB and zero CPU when idle. With 5 panes that's 25 MB — fine.
+
+If a future profiling pass shows this is too much, the sidecar can be lazily-spawned (no sidecar until first Tab) and idle-timed-out (already the plan).
+
+## Source 3 — local heuristics
+
+Always available; lives in `completion::local`. No process spawn, no IPC. Pure functions over the editor buffer + the pane's cwd + the recorded history.
+
+| Sub-source | Trigger | Output |
+|---|---|---|
+| Path completion | Token under cursor matches `^[./~]` or contains `/` | Directory listing filtered by prefix; trailing `/` for dirs |
+| `$PATH` executable scan | First token (the command), no `/` in it | Walk `$PATH` once per Tab, filter by prefix; cache the executable list per cwd at 10s TTL |
+| History match | First token matches the start of a previous command | Pull from the `runs` table ([spec/07](07-history-and-search.md)) filtered by current cwd; ranks by recency × frequency |
+
+Local heuristics are **synchronous**. They run on the main thread, never spawn anything, and complete in well under 5 ms. They always populate the popup before sources 1 and 2 have a chance to respond — which is the point: the popup opens instantly, then the more-expensive sources stream in candidates as they arrive.
+
+## Popup widget
+
+A native egui popup, anchored to the editor's caret. Same widget surface as the [Ctrl+R history overlay](04-prompt-editor.md#history-popup) — they share the popup chrome helpers in [`src/render.rs`](../src/render.rs).
+
+```
+                        ┌──────────────────────────────────────┐
+   $ kubectl get po    │  ▷ pod                  k8s • Pods…  │  ← driver source
+                       │    podsecuritypolicy    k8s          │
+                       │  ▷ podlist              alias        │  ← sidecar (custom alias)
+                       │  ▷ podman                            │  ← local $PATH
+                       │                                      │
+                       │     [Tab] / [Enter]   ↑/↓   Esc      │
+                       └──────────────────────────────────────┘
+```
+
+### Visible affordances per row
+
+- **Source tag** (`k8s` / `alias` / `local` / `git` / …) on the right, dim. Tells the user where the candidate came from when the same prefix matches multiple sources.
+- **Description** (one line, truncated with ellipsis at viewport width) when the source provides one. None of the heuristics provide descriptions; drivers and sidecars often do.
+- **Prefix-match highlight** — the typed prefix is bold within each candidate's display string.
+
+### Keystrokes inside the popup
+
+| Key | Action |
+|---|---|
+| `Tab` | Accept the highlighted candidate (replace the token under the cursor). On a single-candidate result, the popup may auto-accept — configurable, default off. |
+| `Enter` | Same as Tab. |
+| `↑` / `↓` | Walk the candidate list. Wraps at the ends. Live-extends the highlighted candidate's preview into the editor (inline ghost text) — same convention as fish's autosuggestions. |
+| `Esc` | Dismiss without accepting. The editor buffer is restored to whatever it was before the popup opened. |
+| `Backspace` | Trim the last char from the partial typed prefix; the popup re-filters. If the prefix becomes empty AND the popup was opened by Tab (not by typing), the popup closes. |
+| Any printable char | Inserted into the editor; the popup re-filters on the new prefix. |
+| `Ctrl+R` | The history overlay takes precedence — close the completion popup, open the history overlay. |
+
+### Ranking
+
+The merged candidate list is ranked by a small score:
+
+```
+score = source_weight              // 1.0 for driver, 0.7 for sidecar, 0.5 for local
+      + 0.5 * prefix_match_density // typed-chars-matched / candidate-length
+      + 0.3 * recency_bonus        // 1 if this candidate has been chosen in this pane within `RECENT_WINDOW_SECS`; 0 otherwise
+      + 0.2 * cwd_bonus            // 1 if the candidate came from a source that knew the cwd (drivers + sidecar always; local for paths)
+```
+
+Ties broken alphabetically. The constants live in `src/completion/ranking.rs` and have unit tests over hand-crafted candidate lists so future tuning doesn't accidentally regress an established preference.
+
+### Source merge
+
+If two sources return the same `value`, they collapse into one row (preserving the longer description and the higher-priority source tag). This avoids "kubectl pod" appearing twice when both the kubectl driver and the user's `alias kubectl` sidecar entry produce it.
+
+## Caching
+
+The expensive sources (drivers, sidecar) cache aggressively. The cache key is `(source, tool, cwd, partial_line)` — a kubectl driver call for `kubectl get pods` in `/home/tim` is cached separately from the same call in `/home/tim/work`.
+
+| Cache | TTL | Invalidation |
+|---|---|---|
+| Driver detection (kubectl exists, gh exists, …) | Per-process | None — re-detected on next process start |
+| Driver call results (`kubectl __complete pod`) | 10 seconds | Cwd change; explicit refresh (Cmd+Shift+R inside popup) |
+| Sidecar call results | 5 seconds | Cwd change; env change; explicit refresh |
+| `$PATH` executable list | 10 seconds | Cwd change (yes — some env mutations change `$PATH`) |
+| History matches | 1 second | Submit (new history entry) |
+
+`$PATH` deserves its own TTL because some users use `direnv` / `asdf` / `nvm` / `mise` to install per-directory tool versions; the executable list changes on every `cd`.
+
+All caches are pane-scoped. Closing a pane drops its caches.
+
+## Integration with the editor
+
+The popup is a state on the editor — see the `completion: Option<CompletionPopup>` field in [the editor model](04-prompt-editor.md#the-editor-model). When the popup is open:
+
+- The editor still owns text + cursor + selection. The popup is a view layer over a snapshot of those.
+- Arrow keys route to the popup, not the editor's history walk (spec/04 §"History walk").
+- Backspace edits the editor buffer (and re-filters the popup), not the popup directly.
+- Submit (Enter) accepts the popup — does NOT submit the command. To submit the original buffer, press Esc first.
+- Click outside the popup closes it. Click on a candidate accepts it.
+
+The popup's "open" event is what creates the candidate request. Reopening (close → open) re-requests; we don't cache the popup's own state.
+
+## Trigger semantics
+
+Tab opens the popup. **Inside an active popup**, Tab cycles the highlighted candidate forward (with `Shift+Tab` for backward) — same convention as VS Code, JetBrains, etc. A second bare Tab (no candidate visible because all sources returned empty) inserts a literal `\t` only if `bash`/`zsh` style "expand-tabs" is configured ON; default is to do nothing (a tab in a command line is almost always a mistake).
+
+Auto-trigger on typing — like fish's autosuggestions popping up as you type — is **post-completion-spec**: a follow-up design that piggybacks on this engine. We don't promise it; we don't preclude it.
+
+## What this spec does NOT cover
+
+These are intentionally out of scope and have their own follow-ups:
+
+- **Inline ghost-text suggestions** as the user types (fish-style autosuggestions). Same engine, different render path. Future work.
+- **Multi-shell coordination**. Each pane has its own sidecar; we don't sync state across them. If a user has two zsh panes with different `KUBECONFIG`, each gets its own completions. That's correct, not a bug.
+- **Sandboxing**. The sidecar runs the user's rc with the user's privileges. Same trust model as the existing managed shell integration ([spec/03](03-shell-integration.md)).
+- **Completion of arguments to programs that take a DSL** (e.g. `git rebase -i HEAD~3` — the `HEAD~3` is git-revision syntax). The driver (`git --list-cmds` or the sidecar's `_git` function) handles it; we don't parse git revisions ourselves.
+- **Snippet expansion / template macros**. Future work; orthogonal to completion.
+- **Custom user-defined completion sources via plugins.** Phase 10+. The plugin API doesn't exist yet.
+
+## Testing
+
+The strict-layer rule ([CLAUDE.md](../CLAUDE.md)) applies to the whole completion stack: ranking, parsing, caching, request/response framing, and the popup state machine. Tests-first, same commit.
+
+- **Unit (strict)**: per-driver parse functions (`parse_kubectl_complete`, `parse_aws_completer`, …) take a recorded stdout string and a partial line and produce a `Vec<Candidate>`. Recorded fixtures live under [`testdata/completion/<tool>/`](../testdata/completion/).
+- **Unit (strict)**: `ranking::score(candidate, source, history)` is pure. Cover the four bonus components individually.
+- **Unit (strict)**: sidecar protocol framing — request / response JSON shape, id correlation, partial-read tolerance.
+- **Integration**: spawn a real bash sidecar with our integration helper installed, send a completion request, assert the JSON. Same for zsh. Same for fish (the easy one). Lives in [`tests/`](../tests/).
+- **Snapshot**: completion popup at various states (empty, single-source, multi-source, with descriptions, prefix-highlight) renders deterministically. `egui_kittest` per [spec/09](09-testing.md).
+- **Failure-mode tests**: driver missing → no kubectl candidates; sidecar crashes → fall through to local; sidecar slow (>250 ms) → popup opens with locals, drivers stream in later; ambiguous candidate from sidecar with malformed JSON → drop and continue.
+
+## Roadmap
+
+This design is targeted at **post-MVP**. The actual implementation slices:
+
+1. **Phase 4I — MVP local completion** (current placement). Source 3 only. Paths + `$PATH` + history. The popup widget lands here. Tab works for the common cases; advanced commands fall back to `\t`-doesn't-go-to-PTY → no completion.
+2. **Post-MVP — CLI-native drivers.** Add `kubectl __complete`, `gh __complete`, cobra `__complete`, `aws_completer`, `git --list-cmds`. Source 1 enabled; popup gains source tags. About 800–1200 LOC.
+3. **Post-MVP — Fish sidecar.** Cleanest of the three sidecars, so it lands first as the reference for the protocol. About 400–600 LOC including the helper script.
+4. **Post-MVP — Bash sidecar.** Vendored helper + idle-timeout lifecycle + crash recovery. About 800–1100 LOC.
+5. **Post-MVP — Zsh sidecar.** Most fragile; ships after the bash one stabilises so we have a known-good baseline. About 1000–1400 LOC including the helper.
+
+Each slice is a separate PR with its own GH Issue. The protocol is fixed at slice 2 and only versioned forward if a sidecar slice needs a new request kind.
+
+The original v1 stance in [spec/10 §"Post-MVP"](10-roadmap.md#post-mvp-probably-yes) — "Shell completion bridge (zsh + bash) via a private OSC request/response" — is **superseded by this document**. The bridge is no longer "OSC over the PTY"; it's a private stdio sidecar with newline-delimited JSON. Same intent, cleaner mechanism. Spec/10's row will be updated when slice 1 lands.
+
+---
+
+**← Previous:** [04 — Prompt editor](04-prompt-editor.md) | **Next:** [05 — Pane modes](05-pane-modes.md) →
