@@ -124,6 +124,15 @@ pub fn split_path_token(token: &str) -> (&str, &str) {
     if token == "/" {
         return ("/", "");
     }
+    // `~` alone is "the home directory" — treat it as a dir
+    // with empty file prefix so `resolve_dir` can expand it
+    // and we list home contents. Without this special case the
+    // token falls through the `rfind('/')` arm as
+    // `("", "~")` and we end up listing cwd filtered for files
+    // named `~` (always empty).
+    if token == "~" {
+        return ("~", "");
+    }
     match token.rfind('/') {
         Some(idx) => {
             // Keep the leading slash in dir for absolute paths.
@@ -391,9 +400,25 @@ mod tests {
     }
 
     #[test]
-    fn split_path_token_tilde_alone_keeps_as_dir() {
-        // `~/foo` splits to `(~, foo)`; `~` alone is degenerate.
+    fn split_path_token_tilde_alone_treats_as_home() {
+        // `~` alone is "list home dir" — same shape as `~/`
+        // but without the trailing slash.
+        assert_eq!(split_path_token("~"), ("~", ""));
         assert_eq!(split_path_token("~/foo"), ("~", "foo"));
+    }
+
+    #[test]
+    fn split_path_token_env_var_alone_falls_through_as_filename() {
+        // `$HOME` without a trailing `/` is the user still typing
+        // the var name; we don't trigger expansion until they
+        // commit it with `/`.
+        assert_eq!(split_path_token("$HOME"), ("", "$HOME"));
+    }
+
+    #[test]
+    fn split_path_token_env_var_with_trailing_slash_is_a_dir_token() {
+        assert_eq!(split_path_token("$HOME/"), ("$HOME", ""));
+        assert_eq!(split_path_token("$HOME/Doc"), ("$HOME", "Doc"));
     }
 
     // ---- complete_path_entries -----------------------------------

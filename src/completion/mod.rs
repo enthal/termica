@@ -136,9 +136,33 @@ pub fn open_completion_at(
 }
 
 /// Resolve a path-token's `dir_part` into a real filesystem path
-/// using `cwd` for relative paths and `home` for `~` expansion.
-/// Returns `None` for inputs we can't interpret.
+/// using `cwd` for relative paths, `home` for `~` expansion, and
+/// `env_lookup` for `$VAR` expansion. Returns `None` for inputs
+/// we can't interpret.
+///
+/// `env_lookup` is a function (not a closure capturing
+/// `std::env::var_os`) so tests can substitute a synthetic env
+/// without mutating the process. Production passes
+/// `std::env::var_os`. The lookup operates on **termica's**
+/// process environment, which inherits from the user's login
+/// shell — so `$HOME`, `$PATH`, anything they exported in their
+/// rc, etc. are all visible. Vars set inside the live PTY shell
+/// (e.g. `export FOO=bar` typed at the prompt) won't be visible
+/// because they live inside the child process; that's an
+/// acceptable v1 limitation.
 fn resolve_dir(dir_part: &str, cwd: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+    resolve_dir_with(dir_part, cwd, home, |name| std::env::var_os(name))
+}
+
+fn resolve_dir_with<F>(
+    dir_part: &str,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+    env_lookup: F,
+) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
     Some(match dir_part {
         "" | "." => cwd?.to_path_buf(),
         "/" => PathBuf::from("/"),
@@ -147,6 +171,22 @@ fn resolve_dir(dir_part: &str, cwd: Option<&Path>, home: Option<&Path>) -> Optio
         s if s.starts_with('/') => PathBuf::from(s),
         s if s.starts_with("./") => cwd?.join(s.strip_prefix("./").unwrap_or("")),
         s if s.starts_with("../") => cwd?.parent()?.to_path_buf().join(s.strip_prefix("../")?),
+        s if s.starts_with('$') => {
+            // `$VAR` or `$VAR/sub/dir`. Split into var name and
+            // the rest; look the name up; join the value with
+            // the rest.
+            let body = s.strip_prefix('$')?;
+            let (name, rest) = match body.find('/') {
+                Some(idx) => (&body[..idx], &body[idx + 1..]),
+                None => (body, ""),
+            };
+            if name.is_empty() {
+                return None;
+            }
+            let value = env_lookup(name)?;
+            let base = PathBuf::from(value);
+            if rest.is_empty() { base } else { base.join(rest) }
+        }
         s => cwd?.join(s),
     })
 }
@@ -266,6 +306,43 @@ mod tests {
         // Relative path but cwd is None — can't resolve.
         let resolved = resolve_dir("src", None, None);
         assert!(resolved.is_none());
+    }
+
+    fn fake_env_lookup(name: &str) -> Option<std::ffi::OsString> {
+        // Hand-curated minimal env for tests. Production calls
+        // `std::env::var_os` instead.
+        match name {
+            "HOME" => Some("/home/user".into()),
+            "TMPDIR" => Some("/tmp".into()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn resolve_dir_dollar_var_expands_to_lookup_value() {
+        let r = resolve_dir_with("$HOME", None, None, fake_env_lookup);
+        assert_eq!(r.as_deref(), Some(Path::new("/home/user")));
+        let r = resolve_dir_with("$TMPDIR", None, None, fake_env_lookup);
+        assert_eq!(r.as_deref(), Some(Path::new("/tmp")));
+    }
+
+    #[test]
+    fn resolve_dir_dollar_var_with_subpath_joins() {
+        let r = resolve_dir_with("$HOME/projects", None, None, fake_env_lookup);
+        assert_eq!(r.as_deref(), Some(Path::new("/home/user/projects")));
+        let r = resolve_dir_with("$HOME/projects/foo", None, None, fake_env_lookup);
+        assert_eq!(r.as_deref(), Some(Path::new("/home/user/projects/foo")));
+    }
+
+    #[test]
+    fn resolve_dir_dollar_var_undefined_returns_none() {
+        assert!(resolve_dir_with("$NOPE", None, None, fake_env_lookup).is_none());
+    }
+
+    #[test]
+    fn resolve_dir_lone_dollar_returns_none() {
+        // `$` alone is not a valid var reference.
+        assert!(resolve_dir_with("$", None, None, fake_env_lookup).is_none());
     }
 
     #[test]
