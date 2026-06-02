@@ -235,11 +235,24 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
     use egui::{Event, Key};
     match event {
         // Plain printable text from the OS IME / keyboard layout.
-        // If a selection is active, `insert_str` deletes it first.
+        // If a selection is active, the editor's insert paths
+        // delete it first.
+        //
+        // Undo coalescing: single-char text (the typical "user
+        // pressed one key") routes through `insert_char` so the
+        // run of typed characters folds into one undo entry (spec/
+        // 04 §"Undo / redo" coalescing rule). Multi-char text (IME
+        // composition commits, batched delivery from system text
+        // replacement, etc.) goes through `insert_str` as a single
+        // `OpKind::Other` entry — one paste, one undo.
         Event::Text(s) => {
             slot.session.clear_history_recall();
             if let Some(editor) = slot.session.editor_mut() {
-                editor.insert_str(s);
+                let mut chars = s.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) => editor.insert_char(c),
+                    _ => editor.insert_str(s),
+                }
             }
             true
         }
