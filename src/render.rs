@@ -613,25 +613,38 @@ pub fn paint_prompt_editor_at(
         let row_byte_end = row_byte_start + line.text.len();
 
         // Selection overlay UNDER the glyphs so text stays legible.
-        if let Some((sel_start, sel_end)) = selection_bytes {
+        //
+        // Skip rows the selection doesn't touch. The previous gate
+        // was `clip_start < clip_end || extends_past`, but
+        // `extends_past` is also true for rows *before* the
+        // selection starts when the selection spans multiple rows
+        // — and in that case `clip_start = sel_start` lies past
+        // this row's text, making `line.text[..clip_start -
+        // row_byte_start]` slice past the end of the string. The
+        // proper guard is "this row's byte range overlaps the
+        // selection's byte range": `sel_end > row_byte_start &&
+        // sel_start <= row_byte_end`. With that guard the slice
+        // bounds are always valid.
+        if let Some((sel_start, sel_end)) = selection_bytes
+            && sel_end > row_byte_start
+            && sel_start <= row_byte_end
+        {
             let clip_start = sel_start.max(row_byte_start);
             let clip_end = sel_end.min(row_byte_end);
             let extends_past = sel_end > row_byte_end;
-            if clip_start < clip_end || extends_past {
-                let sel_start_chars = line.text[..clip_start - row_byte_start].chars().count();
-                let sel_end_chars = if extends_past {
-                    line.text.chars().count() + 1 // +1 cell for the \n
-                } else {
-                    line.text[..clip_end - row_byte_start].chars().count()
-                };
-                let x_start = origin.x + sel_start_chars as f32 * cell_w;
-                let x_end = origin.x + sel_end_chars as f32 * cell_w;
-                let rect = Rect::from_min_max(
-                    Pos2::new(x_start, y),
-                    Pos2::new(x_end.max(x_start + cell_w * 0.25), y + row_h),
-                );
-                painter.rect_filled(rect, 0.0, SELECTION_COLOR);
-            }
+            let sel_start_chars = line.text[..clip_start - row_byte_start].chars().count();
+            let sel_end_chars = if extends_past {
+                line.text.chars().count() + 1 // +1 cell for the \n
+            } else {
+                line.text[..clip_end - row_byte_start].chars().count()
+            };
+            let x_start = origin.x + sel_start_chars as f32 * cell_w;
+            let x_end = origin.x + sel_end_chars as f32 * cell_w;
+            let rect = Rect::from_min_max(
+                Pos2::new(x_start, y),
+                Pos2::new(x_end.max(x_start + cell_w * 0.25), y + row_h),
+            );
+            painter.rect_filled(rect, 0.0, SELECTION_COLOR);
         }
 
         // Paint tokens that intersect this row. Tokens are emitted
