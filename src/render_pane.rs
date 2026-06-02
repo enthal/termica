@@ -838,8 +838,28 @@ pub fn render_pane(
         .stick_to_bottom(!force_to_top)
         .auto_shrink([false, false])
         .max_height(scroll_max_h);
-    let scroll_area =
-        if force_to_top { scroll_area.vertical_scroll_offset(0.0) } else { scroll_area };
+    // Direct offset overrides for both jump directions. The
+    // `scroll_to_cursor(TOP)` / `scroll_to_cursor(BOTTOM)` hints
+    // inside the scroll closure aren't reliable enough on their
+    // own — for `force_to_top` the in-frame "we're at the end"
+    // cache fought the hint, and the bottom-snap path had a user-
+    // visible regression where `Enter` to submit a command
+    // scrolled to the TOP of the new Running block instead of
+    // pinning the live tail to the bottom.
+    //
+    // Use `content_h - scroll_max_h` (our pre-layout estimate of
+    // the max scroll offset) for the bottom case. egui clamps the
+    // value if our estimate is slightly off; we never persist
+    // `f32::INFINITY`, which avoided the NaN trap that bit the
+    // earlier `force_to_top` attempt.
+    let scroll_area = if force_to_top {
+        scroll_area.vertical_scroll_offset(0.0)
+    } else if force_to_bottom {
+        let bottom_offset = (content_h - scroll_max_h).max(0.0);
+        scroll_area.vertical_scroll_offset(bottom_offset)
+    } else {
+        scroll_area
+    };
     let scroll_inner = scroll_area.show(ui, |ui| {
         // Scrollback-jump-to-top (Cmd+Option+Up / Ctrl+Alt+Up): snap
         // the next-widget-position (= top of content) to the TOP

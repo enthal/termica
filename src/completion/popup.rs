@@ -93,6 +93,61 @@ impl CompletionPopup {
         editor.set_selection(self.origin_byte, end);
         editor.insert_str(&self.selected().value);
     }
+
+    /// Compute the readline-style smart-Tab extension.
+    ///
+    /// Starting from the selected candidate's value at byte
+    /// `current_token_len`, walk forward one char at a time and
+    /// include each char as long as at least one OTHER candidate
+    /// also starts with the extended prefix. Stop at the first
+    /// char where the selected diverges from every other
+    /// candidate. The returned `&str` is the new full prefix the
+    /// editor should land at after Tab (NOT just the appended
+    /// suffix — the caller replaces the typed token with it
+    /// wholesale via `set_selection` + `insert_str`).
+    ///
+    /// Examples (current_token = "ab"):
+    /// - candidates `[abcx, abcy, abz]`, selected = `abcx`:
+    ///   pos 2 char 'c' → abcy matches "abc" → include. pos 3
+    ///   char 'x' → no other matches "abcx" → stop. Result:
+    ///   "abc". User can press Tab again with the now-filtered
+    ///   `[abcx, abcy]`; that pass finds no extension beyond
+    ///   "abc" (the candidates diverge at pos 3) so Tab is a
+    ///   no-op and the user picks via Up/Down + Enter.
+    /// - **Single candidate**: Tab is a full accept — there's
+    ///   nothing to disambiguate, so the user's clearly trying
+    ///   to commit.
+    /// - **No extension possible** (all other candidates diverge
+    ///   from selected immediately past the token): returns the
+    ///   current token unchanged; the caller treats that as
+    ///   "Tab can't extend, do nothing".
+    pub fn tab_extend(&self, current_token_len: usize) -> &str {
+        if self.candidates.len() == 1 {
+            return &self.selected().value;
+        }
+        let selected = self.selected().value.as_str();
+        if current_token_len >= selected.len() {
+            return selected;
+        }
+        let mut byte_pos = current_token_len;
+        while byte_pos < selected.len() {
+            let Some(next_char) = selected.get(byte_pos..).and_then(|s| s.chars().next()) else {
+                break;
+            };
+            let next_pos = byte_pos + next_char.len_utf8();
+            let Some(prefix_inc) = selected.get(..next_pos) else { break };
+            let any_other = self
+                .candidates
+                .iter()
+                .enumerate()
+                .any(|(i, c)| i != self.selected_index && c.value.starts_with(prefix_inc));
+            if !any_other {
+                break;
+            }
+            byte_pos = next_pos;
+        }
+        selected.get(..byte_pos).unwrap_or(selected)
+    }
 }
 
 /// Paint the popup as an `egui::Area` anchored at `anchor`.
@@ -287,6 +342,70 @@ mod tests {
         assert_eq!(e.text(), "ls Cargo.toml");
         // Caret lands at the end of the inserted text.
         assert_eq!(e.cursor(), e.len_bytes());
+    }
+
+    // ---- tab_extend (smart-Tab) -----------------------------------
+
+    fn cands(values: &[&str]) -> Vec<CompletionCandidate> {
+        values.iter().map(|v| cand(v)).collect()
+    }
+
+    #[test]
+    fn tab_extend_extends_to_shared_prefix_when_multiple_match() {
+        // Selected "abcx" against [abcx, abcy, abz]; current token
+        // "ab" (len 2). 'c' is shared by abcy → include. 'x' is
+        // unique → stop. Result: "abc".
+        let p = CompletionPopup::new(0, "ab", cands(&["abcx", "abcy", "abz"])).unwrap();
+        assert_eq!(p.tab_extend(2), "abc");
+    }
+
+    #[test]
+    fn tab_extend_unique_candidate_extends_to_full_value() {
+        // Single candidate → Tab is a full accept (nothing to
+        // disambiguate).
+        let p = CompletionPopup::new(0, "ab", cands(&["abcdef"])).unwrap();
+        assert_eq!(p.tab_extend(2), "abcdef");
+    }
+
+    #[test]
+    fn tab_extend_no_shared_extension_returns_current_token_prefix() {
+        // Selected "abcx" against [abcx, abdy, abez]; at pos 2
+        // selected's 'c' has no peer. Result: stays at "ab".
+        let p = CompletionPopup::new(0, "ab", cands(&["abcx", "abdy", "abez"])).unwrap();
+        assert_eq!(p.tab_extend(2), "ab");
+    }
+
+    #[test]
+    fn tab_extend_token_already_at_max_returns_full_value() {
+        // current_token_len equals selected.len() — nothing to
+        // walk past. Just return selected.
+        let p = CompletionPopup::new(0, "abc", cands(&["abc", "abcd"])).unwrap();
+        assert_eq!(p.tab_extend(3), "abc");
+    }
+
+    #[test]
+    fn tab_extend_handles_multibyte_chars_correctly() {
+        // Selected "café" (4 bytes including 2-byte é). Other
+        // candidate "calf". Current token "ca" (len 2). 'f' (in
+        // "calf") vs 'f' (no — selected has é at pos 2). At pos
+        // 2 selected's char is 'é'; 'calf' has 'l' there — diverge.
+        // Result: "ca".
+        let p = CompletionPopup::new(0, "ca", cands(&["café", "calf"])).unwrap();
+        assert_eq!(p.tab_extend(2), "ca");
+    }
+
+    #[test]
+    fn tab_extend_iterative_use_converges() {
+        // Apply tab_extend repeatedly with filtered candidates —
+        // each pass narrows the list, eventually no further
+        // extension is possible and the user must pick.
+        let p1 = CompletionPopup::new(0, "ab", cands(&["abcx", "abcy", "abz"])).unwrap();
+        assert_eq!(p1.tab_extend(2), "abc");
+        // After applying "abc", the filtered list is [abcx, abcy].
+        let p2 = CompletionPopup::new(0, "abc", cands(&["abcx", "abcy"])).unwrap();
+        // Selected = abcx; abcy has 'y' at pos 3 vs 'x' → diverge.
+        // No extension; "abc" stays.
+        assert_eq!(p2.tab_extend(3), "abc");
     }
 
     #[test]

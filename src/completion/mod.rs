@@ -52,21 +52,27 @@ use std::path::{Path, PathBuf};
 /// Trigger rules per spec/04 §"Tab handling":
 /// - **Path source** fires when the token is "path-shaped" (starts
 ///   with `~`, `/`, `./`, `../`, or contains a `/`) OR the token
-///   is empty and we're not in command position (typing the next
-///   argument with nothing typed yet).
+///   is empty / non-empty and we're not in command position.
 /// - **`$PATH` source** fires when we're in command position
 ///   (typing the command name, not an argument) AND the token has
 ///   no `/` (path tokens use the filesystem source instead).
-/// - **History source** always fires when there's a non-empty
-///   buffer prefix — `git st<Tab>` should surface `git status …`
-///   from past sessions regardless of where in the line the
-///   cursor lives.
+/// - **History as a completion source is intentionally OMITTED.**
+///   The earlier version surfaced full historical command lines,
+///   which the user found counter-productive — `↑` / `↓` arrow
+///   walk and `Ctrl+R` overlay are the right tools for "recall a
+///   past command" and they do that job. Word-level history
+///   completion is a possible future addition; for now Tab
+///   completion is purely structural (filesystem + `$PATH`).
+///
+/// `_history_lookup` is kept on the signature so future slices
+/// can plug history back in without rewiring callers; the
+/// orchestrator currently doesn't call it.
 pub fn open_completion_at(
     editor_text: &str,
     cursor: usize,
     cwd: Option<&Path>,
     home: Option<&Path>,
-    history_lookup: impl FnOnce() -> Vec<String>,
+    _history_lookup: impl FnOnce() -> Vec<String>,
 ) -> Option<CompletionPopup> {
     let (token_start, token) = local::token_under_cursor(editor_text, cursor);
     let pathish = local::token_is_pathish(token);
@@ -124,12 +130,8 @@ pub fn open_completion_at(
         sources.push(local::complete_path_executables(token, &exes));
     }
 
-    // ---- History source -------------------------------------------
-    let buffer_prefix = editor_text.get(..cursor).unwrap_or("");
-    if !buffer_prefix.trim_start().is_empty() {
-        let entries = history_lookup();
-        sources.push(local::complete_from_history(buffer_prefix, &entries, 50));
-    }
+    // Intentionally NO history source — see the doc-comment on
+    // this function for the rationale.
 
     let merged = ranking::merge_ranked(sources, 200);
     CompletionPopup::new(token_start, token, merged)
