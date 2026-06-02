@@ -335,6 +335,27 @@ impl TermicaApp {
                     slot.session.clear_scrollback();
                 }
             }
+            PaneAction::ScrollToTop => {
+                // Cmd+Option+Up (macOS) / Ctrl+Alt+Up (Linux/Windows):
+                // jump the pane's scroll position to the very top of
+                // the sealed-block stack. The render path consumes
+                // `scroll_to_top_pending` and calls
+                // `scroll_to_cursor(TOP)` at the start of the scroll
+                // closure. No-op in alt-screen mode (the live program
+                // owns the viewport).
+                if let Some(slot) = self.panes.get_mut(&pane_id) {
+                    slot.ui.scroll_to_top_pending = true;
+                }
+            }
+            PaneAction::ScrollToBottom => {
+                // Cmd+Option+Down / Ctrl+Alt+Down: jump to the live
+                // tail (editor / running grid). Reuses the existing
+                // `scroll_to_bottom_pending` flag the editor submit
+                // path also sets.
+                if let Some(slot) = self.panes.get_mut(&pane_id) {
+                    slot.ui.scroll_to_bottom_pending = true;
+                }
+            }
         }
     }
 

@@ -21,6 +21,7 @@ Single source of truth for every key combo Termica recognises as an *app-level* 
 | `Cmd+Shift+]` | `Ctrl+Shift+]` | Next tab in the parent Tabs container (wraps). | Phase 2A |
 | `Cmd+Shift+[` | `Ctrl+Shift+[` | Previous tab in the parent Tabs container (wraps). | Phase 2A |
 | `Cmd+K` | `Ctrl+Shift+K` | Clear scrollback **and** blank viewport on the focused pane. Cursor moves home. Shell is untouched; it redraws on next prompt cycle. | Phase 2 polish |
+| `Cmd+Option+Up` / `Cmd+Option+Down` | `Ctrl+Alt+Up` / `Ctrl+Alt+Down` | Jump the focused pane's scroll position to the top / bottom of the sealed-block stack. No-op in alt-screen mode. Cmd+Up / Cmd+Down alone (no Option) stay reserved for editor caret-to-doc-start / -end — the Option / Alt modifier disambiguates the scrollback jump. | Phase 4 polish |
 | `Cmd+Shift+C` | `Ctrl+Shift+C` | Copy current selection to clipboard if non-empty; otherwise no-op. | Phase 1E-k |
 | `Cmd+C` | `Ctrl+C` | Copy if selection is non-empty; otherwise SIGINT to the PTY. | spec/02:157 |
 

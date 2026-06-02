@@ -765,12 +765,40 @@ pub fn render_pane(
     // That was the "scrollback vanishes / alt-screen blank after the
     // 2nd command in a pane" regression.
     let force_to_bottom = std::mem::take(&mut slot.ui.scroll_to_bottom_pending);
+    let force_to_top = std::mem::take(&mut slot.ui.scroll_to_top_pending);
+    // `stick_to_bottom` re-snaps the offset to max every frame the
+    // user is at the bottom — which fights any top-snap attempt
+    // and silently swallows a Cmd+Option+Up jump while the user is
+    // glued to the live tail (the typical case while typing
+    // commands). Two-layer fix:
+    //  1. Disable stick-to-bottom for this frame when `force_to_top`
+    //     — the user is asking to leave the bottom, don't pin them.
+    //  2. Override the persisted scroll offset directly via
+    //     `vertical_scroll_offset(0.0)`. `scroll_to_cursor(TOP)`
+    //     writes into a frame-state hint that ScrollArea consumes
+    //     at the end of `show()`; it doesn't reliably win against
+    //     ScrollArea's internal "was at end" state. A direct offset
+    //     override at the builder level always wins.
+    //  Using `0.0` (not `f32::INFINITY`) avoids the NaN persistence
+    //  trap the bottom-snap path hit earlier — see the existing
+    //  `force_to_bottom` comment below.
     let scroll_area = egui::ScrollArea::vertical()
         .id_salt(("pane-blocks", slot.session.pane_id()))
-        .stick_to_bottom(true)
+        .stick_to_bottom(!force_to_top)
         .auto_shrink([false, false])
         .max_height(scroll_max_h);
+    let scroll_area =
+        if force_to_top { scroll_area.vertical_scroll_offset(0.0) } else { scroll_area };
     let scroll_inner = scroll_area.show(ui, |ui| {
+        // Scrollback-jump-to-top (Cmd+Option+Up / Ctrl+Alt+Up): snap
+        // the next-widget-position (= top of content) to the TOP
+        // edge of the viewport BEFORE the spacer + blocks are laid
+        // out. Counterpart to the bottom-snap call at the end of
+        // this closure. No-op in alt-screen mode because no content
+        // is laid out there.
+        if force_to_top && !in_alt_screen {
+            ui.scroll_to_cursor(Some(egui::Align::TOP));
+        }
         // Top spacer bottom-aligns short content (computed
         // above). In alt-screen mode `content_h` is 0 and the
         // alt-screen paint_terminal below claims the whole pane,
