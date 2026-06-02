@@ -135,6 +135,13 @@ pub struct PaneUiState {
     /// current selection index, and the cached result snapshot.
     /// Cleared on Esc / Enter / pane refocus.
     pub history_overlay: Option<crate::history_overlay::HistoryOverlay>,
+    /// `Some` while the Tab completion popup is open. Holds the
+    /// merged candidate list, the original typed token, the byte
+    /// range in the editor that gets replaced on accept, and the
+    /// currently-highlighted row. Cleared on Esc, accept, or any
+    /// non-navigation keystroke. See [`crate::completion`] +
+    /// [spec/04a](../spec/04a-completion.md).
+    pub completion_popup: Option<crate::completion::CompletionPopup>,
     /// Editor cursor (byte index) observed on the previous frame.
     /// Used by `render_pane` to detect caret motion and reset the
     /// blink cycle to "visible" so a moved caret never lands during

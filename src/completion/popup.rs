@@ -83,6 +83,93 @@ impl CompletionPopup {
     }
 }
 
+/// Paint the popup as an `egui::Area` anchored at `anchor`.
+/// Returns `true` while the popup is being shown (the caller
+/// uses this to gate `ctx.request_repaint` for the blinking
+/// caret).
+///
+/// The popup goes ABOVE `anchor` — that is, `anchor` is the
+/// top-left of the EDITOR, and the popup's bottom edge aligns
+/// with `anchor.y`. Up to `max_visible_rows` candidates render
+/// before the list scrolls.
+pub fn paint(
+    ctx: &egui::Context,
+    popup: &CompletionPopup,
+    anchor: egui::Pos2,
+    pane_id: u64,
+    max_visible_rows: usize,
+) {
+    let area_id = egui::Id::new(("completion-popup", pane_id));
+    let row_h = 18.0;
+    let panel_w = 380.0;
+    let visible = popup.candidates.len().min(max_visible_rows);
+    let estimated_h = (visible as f32) * row_h + 14.0;
+
+    egui::Area::new(area_id)
+        .fixed_pos(egui::Pos2::new(anchor.x, anchor.y - estimated_h - 4.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_min_width(panel_w);
+                let scroll_h = (max_visible_rows as f32) * row_h;
+                egui::ScrollArea::vertical()
+                    .max_height(scroll_h)
+                    .id_salt(("completion-popup-scroll", pane_id))
+                    .show(ui, |ui| {
+                        for (idx, cand) in popup.candidates.iter().enumerate() {
+                            let selected = idx == popup.selected_index;
+                            paint_row(ui, cand, selected);
+                        }
+                    });
+                ui.add_space(2.0);
+                ui.weak("[Tab/Enter] accept   [↑/↓] navigate   [Esc] cancel");
+            });
+        });
+}
+
+fn paint_row(ui: &mut egui::Ui, cand: &CompletionCandidate, selected: bool) {
+    let visuals = ui.visuals();
+    let bg = if selected { visuals.selection.bg_fill } else { egui::Color32::TRANSPARENT };
+    let fg = if selected { visuals.selection.stroke.color } else { visuals.text_color() };
+    let dim = visuals.weak_text_color();
+
+    let row_rect = ui.allocate_space(egui::Vec2::new(ui.available_width(), 18.0));
+    let (_, rect) = row_rect;
+    if selected {
+        ui.painter().rect_filled(rect, 2.0, bg);
+    }
+    // Display label, source tag, description — laid out left-to-right
+    // with the tag pinned to the right edge.
+    let painter = ui.painter();
+    let display = &cand.display;
+    let tag = cand.source.tag();
+    let font = egui::FontId::monospace(13.0);
+    painter.text(
+        egui::Pos2::new(rect.min.x + 6.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        display,
+        font.clone(),
+        fg,
+    );
+    if let Some(desc) = cand.description.as_deref() {
+        // Description center-right of the row.
+        painter.text(
+            egui::Pos2::new(rect.max.x - 60.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            desc,
+            font.clone(),
+            dim,
+        );
+    }
+    painter.text(
+        egui::Pos2::new(rect.max.x - 6.0, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        tag,
+        font,
+        dim,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::CompletionSource;

@@ -1194,11 +1194,29 @@ pub fn render_pane(
                 &font_id,
                 caret_visible,
             );
+
+            // Completion popup paints just above the editor when
+            // open. Routed through `egui::Area` (top-level
+            // overlay), so the call order here doesn't affect
+            // z-order; the position pin is `editor_rect.min` so
+            // the popup's bottom edge aligns with the editor's
+            // top.
+            if let Some(popup) = slot.ui.completion_popup.as_ref() {
+                crate::completion::popup::paint(
+                    ctx,
+                    popup,
+                    editor_rect.min,
+                    slot.session.pane_id(),
+                    10,
+                );
+            }
         } else {
             // Editor not on tail this frame — forget the cursor
             // tracker so re-opening the editor in a new prompt
             // starts a fresh blink cycle.
             slot.ui.last_cursor_byte = None;
+            // Editor gone — popup must go too.
+            slot.ui.completion_popup = None;
         }
 
         // Focused-editor chrome. Dispatched via the
@@ -2039,6 +2057,94 @@ pub fn render_pane(
             // We just skip the editor / PTY paths so nothing leaks.
             if slot.ui.history_overlay.is_some() {
                 continue;
+            }
+            // ---- Tab completion popup interception -----------------
+            //
+            // If the completion popup is open, navigation keys
+            // (Up/Down/Tab/Enter/Esc) drive it instead of the
+            // editor. Any other key dismisses the popup AND falls
+            // through to the editor, so the user's typing
+            // continues to land naturally — re-pressing Tab
+            // reopens with fresh candidates.
+            //
+            // If the popup is closed, a bare Tab keystroke opens
+            // it by calling the orchestrator. Tab with any
+            // modifier passes through to the editor's existing
+            // "consume Tab as no-op" path so we don't fight
+            // future Tab-modifier features.
+            if let egui::Event::Key { key, pressed: true, modifiers, .. } = event {
+                use egui::Key;
+                let no_mods =
+                    !modifiers.shift && !modifiers.alt && !modifiers.command && !modifiers.ctrl;
+                if slot.ui.completion_popup.is_some() && no_mods {
+                    let mut handled = true;
+                    match key {
+                        Key::Escape => {
+                            slot.ui.completion_popup = None;
+                        }
+                        Key::Tab | Key::Enter => {
+                            if let Some(popup) = slot.ui.completion_popup.take() {
+                                let cursor = slot
+                                    .session
+                                    .blocks()
+                                    .editor_on_tail()
+                                    .map(|e| e.cursor())
+                                    .unwrap_or(0);
+                                let current_token_len = cursor.saturating_sub(popup.origin_byte);
+                                if let Some(editor) = slot.session.editor_mut() {
+                                    popup.accept(editor, current_token_len);
+                                }
+                                slot.session.clear_history_recall();
+                            }
+                        }
+                        Key::ArrowDown => {
+                            if let Some(popup) = slot.ui.completion_popup.as_mut() {
+                                popup.move_selection(1);
+                            }
+                        }
+                        Key::ArrowUp => {
+                            if let Some(popup) = slot.ui.completion_popup.as_mut() {
+                                popup.move_selection(-1);
+                            }
+                        }
+                        _ => {
+                            // Dismiss popup AND let the key fall
+                            // through to the editor below.
+                            slot.ui.completion_popup = None;
+                            handled = false;
+                        }
+                    }
+                    if handled {
+                        continue;
+                    }
+                } else if editor_active
+                    && slot.ui.completion_popup.is_none()
+                    && matches!(key, Key::Tab)
+                    && no_mods
+                {
+                    // Tab in editor with no popup → open the popup.
+                    let editor_text;
+                    let cursor;
+                    {
+                        let editor = slot.session.blocks().editor_on_tail();
+                        editor_text = editor.map(|e| e.text().to_string()).unwrap_or_default();
+                        cursor = editor.map(|e| e.cursor()).unwrap_or(0);
+                    }
+                    let cwd = slot.session.terminal().cwd().map(|p| p.to_path_buf());
+                    let history_entries = slot.session.history_for_completion(200);
+                    let popup = crate::completion::open_completion_at(
+                        &editor_text,
+                        cursor,
+                        cwd.as_deref(),
+                        home,
+                        || history_entries,
+                    );
+                    if popup.is_some() {
+                        slot.ui.completion_popup = popup;
+                    }
+                    // Consume Tab whether or not the popup opened.
+                    continue;
+                }
             }
             if editor_active && apply_event_to_editor(event, slot) {
                 continue;

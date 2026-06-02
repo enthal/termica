@@ -37,6 +37,232 @@ pub mod ranking;
 
 pub use popup::CompletionPopup;
 
+use std::path::{Path, PathBuf};
+
+/// Orchestrate the three local sources and produce a popup, or
+/// `None` when there's nothing to show.
+///
+/// This is the entry point the renderer calls on `Tab`. Filesystem
+/// I/O and `$PATH` scanning happen here (synchronously — these are
+/// fast local reads at the typical scrollback / cwd scale). The
+/// history lookup is passed as a closure so callers can plug in
+/// their `HistoryStore` query without coupling this module to the
+/// DB type.
+///
+/// Trigger rules per spec/04 §"Tab handling":
+/// - **Path source** fires when the token is "path-shaped" (starts
+///   with `~`, `/`, `./`, `../`, or contains a `/`) OR the token
+///   is empty and we're not in command position (typing the next
+///   argument with nothing typed yet).
+/// - **`$PATH` source** fires when we're in command position
+///   (typing the command name, not an argument) AND the token has
+///   no `/` (path tokens use the filesystem source instead).
+/// - **History source** always fires when there's a non-empty
+///   buffer prefix — `git st<Tab>` should surface `git status …`
+///   from past sessions regardless of where in the line the
+///   cursor lives.
+pub fn open_completion_at(
+    editor_text: &str,
+    cursor: usize,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+    history_lookup: impl FnOnce() -> Vec<String>,
+) -> Option<CompletionPopup> {
+    let (token_start, token) = local::token_under_cursor(editor_text, cursor);
+    let pathish = local::token_is_pathish(token);
+    let cmd_pos = local::is_command_position(editor_text, cursor);
+
+    let mut sources: Vec<Vec<CompletionCandidate>> = Vec::new();
+
+    // ---- Path source ----------------------------------------------
+    let want_path = pathish || (token.is_empty() && !cmd_pos);
+    if want_path {
+        let (dir_part, file_prefix) = local::split_path_token(token);
+        if let Some(entries) = read_dir_entries(dir_part, cwd, home) {
+            // Path candidates carry the dir prefix in their `value`
+            // so accepting "Cargo.toml" when the token was "src/Ca"
+            // inserts the WHOLE "src/Cargo.toml". We rewrite the
+            // candidate values to be the full path-from-token-start.
+            let mut entries_cands = local::complete_path_entries(file_prefix, &entries);
+            if !dir_part.is_empty() {
+                for c in &mut entries_cands {
+                    // `/` joins both for absolute (`/` + `etc` → `/etc`)
+                    // and relative (`src` + `/` + `main.rs` →
+                    // `src/main.rs`); when dir is exactly `/` we use
+                    // `/{value}` so we don't end up with `//`.
+                    let full = if dir_part == "/" {
+                        format!("/{}", c.value)
+                    } else {
+                        format!("{}/{}", dir_part, c.value)
+                    };
+                    c.display = full.clone();
+                    c.value = full;
+                }
+            }
+            sources.push(entries_cands);
+        }
+    }
+
+    // ---- $PATH executable source ----------------------------------
+    if cmd_pos && !token.contains('/') && !token.is_empty() {
+        let exes = scan_path_executables();
+        sources.push(local::complete_path_executables(token, &exes));
+    }
+
+    // ---- History source -------------------------------------------
+    let buffer_prefix = editor_text.get(..cursor).unwrap_or("");
+    if !buffer_prefix.trim_start().is_empty() {
+        let entries = history_lookup();
+        sources.push(local::complete_from_history(buffer_prefix, &entries, 50));
+    }
+
+    let merged = ranking::merge_ranked(sources, 200);
+    CompletionPopup::new(token_start, token, merged)
+}
+
+/// Resolve a path-token's `dir_part` into a real filesystem path
+/// using `cwd` for relative paths and `home` for `~` expansion.
+/// Returns `None` for inputs we can't interpret.
+fn resolve_dir(dir_part: &str, cwd: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+    Some(match dir_part {
+        "" | "." => cwd?.to_path_buf(),
+        "/" => PathBuf::from("/"),
+        "~" => home?.to_path_buf(),
+        s if s.starts_with("~/") => home?.join(s.strip_prefix("~/")?),
+        s if s.starts_with('/') => PathBuf::from(s),
+        s if s.starts_with("./") => cwd?.join(s.strip_prefix("./").unwrap_or("")),
+        s if s.starts_with("../") => cwd?.parent()?.to_path_buf().join(s.strip_prefix("../")?),
+        s => cwd?.join(s),
+    })
+}
+
+/// Read a directory and return `(filename, is_dir)` for each
+/// entry. `None` on any I/O error so the caller skips the path
+/// source gracefully (typo in path, no read permission, etc.).
+fn read_dir_entries(
+    dir_part: &str,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<Vec<(String, bool)>> {
+    let path = resolve_dir(dir_part, cwd, home)?;
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&path).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        out.push((name, is_dir));
+    }
+    Some(out)
+}
+
+/// Walk `$PATH` and return every file we find. v1 doesn't
+/// validate executable bits (mode != 0o100 || st_mode & 0o111);
+/// users rarely have non-executable garbage on `$PATH` and the
+/// filter would add Unix-only syscalls. If this turns into noise,
+/// gate it behind a config flag.
+///
+/// Hidden entries (`.`-prefixed) are skipped — those are rarely
+/// commands anyway and would just bloat the candidate list.
+fn scan_path_executables() -> Vec<String> {
+    let path_env = std::env::var_os("PATH").unwrap_or_default();
+    let mut out = Vec::new();
+    for dir in std::env::split_paths(&path_env) {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') {
+                    continue;
+                }
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The orchestrator's pure-routing logic (which sources fire
+    // for which token / position) is tested via the individual
+    // `local::*` predicates already. These tests cover the
+    // resolve_dir / read_dir_entries seams that ARE pure of
+    // their inputs.
+
+    #[test]
+    fn resolve_dir_empty_uses_cwd() {
+        let cwd = PathBuf::from("/home/user");
+        let home = PathBuf::from("/home/user");
+        let resolved = resolve_dir("", Some(&cwd), Some(&home));
+        assert_eq!(resolved.as_deref(), Some(Path::new("/home/user")));
+    }
+
+    #[test]
+    fn resolve_dir_root_slash_returns_root() {
+        let cwd = PathBuf::from("/home/user");
+        let resolved = resolve_dir("/", Some(&cwd), None);
+        assert_eq!(resolved.as_deref(), Some(Path::new("/")));
+    }
+
+    #[test]
+    fn resolve_dir_absolute_keeps_path() {
+        let cwd = PathBuf::from("/home/user");
+        let resolved = resolve_dir("/etc", Some(&cwd), None);
+        assert_eq!(resolved.as_deref(), Some(Path::new("/etc")));
+    }
+
+    #[test]
+    fn resolve_dir_tilde_alone_returns_home() {
+        let home = PathBuf::from("/home/user");
+        let resolved = resolve_dir("~", None, Some(&home));
+        assert_eq!(resolved.as_deref(), Some(Path::new("/home/user")));
+    }
+
+    #[test]
+    fn resolve_dir_tilde_slash_expands_home() {
+        let home = PathBuf::from("/home/user");
+        let resolved = resolve_dir("~/projects", None, Some(&home));
+        assert_eq!(resolved.as_deref(), Some(Path::new("/home/user/projects")));
+    }
+
+    #[test]
+    fn resolve_dir_relative_joins_cwd() {
+        let cwd = PathBuf::from("/home/user");
+        let resolved = resolve_dir("src", Some(&cwd), None);
+        assert_eq!(resolved.as_deref(), Some(Path::new("/home/user/src")));
+    }
+
+    #[test]
+    fn resolve_dir_dot_slash_joins_cwd() {
+        let cwd = PathBuf::from("/home/user");
+        let resolved = resolve_dir("./src", Some(&cwd), None);
+        assert_eq!(resolved.as_deref(), Some(Path::new("/home/user/src")));
+    }
+
+    #[test]
+    fn resolve_dir_parent_with_dotdot_slashes() {
+        let cwd = PathBuf::from("/home/user");
+        let resolved = resolve_dir("../etc", Some(&cwd), None);
+        assert_eq!(resolved.as_deref(), Some(Path::new("/home/etc")));
+    }
+
+    #[test]
+    fn resolve_dir_without_cwd_or_home_returns_none() {
+        // Relative path but cwd is None — can't resolve.
+        let resolved = resolve_dir("src", None, None);
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn open_completion_at_no_history_no_match_returns_none() {
+        // Empty buffer, command position, history empty, no
+        // executables match the empty token (correctly — we don't
+        // dump $PATH on a bare Tab). Result: no popup.
+        let p = open_completion_at("", 0, None, None, Vec::new);
+        assert!(p.is_none());
+    }
+}
+
 /// One candidate in the completion popup.
 ///
 /// `value` is the bytes inserted into the editor when this
