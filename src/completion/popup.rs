@@ -84,14 +84,16 @@ impl CompletionPopup {
 }
 
 /// Paint the popup as an `egui::Area` anchored at `anchor`.
-/// Returns `true` while the popup is being shown (the caller
-/// uses this to gate `ctx.request_repaint` for the blinking
-/// caret).
 ///
-/// The popup goes ABOVE `anchor` — that is, `anchor` is the
-/// top-left of the EDITOR, and the popup's bottom edge aligns
-/// with `anchor.y`. Up to `max_visible_rows` candidates render
-/// before the list scrolls.
+/// `anchor` is the TOP-LEFT of the editor; the popup's BOTTOM-
+/// LEFT corner aligns with it (via `Area::pivot(LEFT_BOTTOM)`),
+/// so the popup grows upward and the editor stays unoccluded —
+/// regardless of how tall the candidate list ends up being. No
+/// pre-estimated height math, which means no risk of getting the
+/// estimate wrong and clipping into the editor.
+///
+/// Up to `max_visible_rows` candidates render before the list
+/// scrolls.
 pub fn paint(
     ctx: &egui::Context,
     popup: &CompletionPopup,
@@ -102,11 +104,14 @@ pub fn paint(
     let area_id = egui::Id::new(("completion-popup", pane_id));
     let row_h = 18.0;
     let panel_w = 380.0;
-    let visible = popup.candidates.len().min(max_visible_rows);
-    let estimated_h = (visible as f32) * row_h + 14.0;
 
     egui::Area::new(area_id)
-        .fixed_pos(egui::Pos2::new(anchor.x, anchor.y - estimated_h - 4.0))
+        // Pivot at LEFT_BOTTOM means the bottom-left corner of
+        // the area sits at `anchor` — i.e. the popup's bottom
+        // edge aligns with the editor's top edge and the popup
+        // grows upward.
+        .pivot(egui::Align2::LEFT_BOTTOM)
+        .fixed_pos(egui::Pos2::new(anchor.x, anchor.y - 4.0))
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
@@ -122,9 +127,19 @@ pub fn paint(
                         }
                     });
                 ui.add_space(2.0);
-                ui.weak("[Tab/Enter] accept   [↑/↓] navigate   [Esc] cancel");
+                paint_keybind_hint(ui);
             });
         });
+}
+
+/// Bottom-of-popup keybinding strip. Per CLAUDE.md
+/// "no Unicode pictographic icons in widget code" — Unicode
+/// arrows (`↑`/`↓`) render as tofu on some font setups. Plain
+/// text "Up/Down" is the v1 stand-in until an `icons.rs` module
+/// (planned in [spec/06 §Iconography](../../spec/06-workspace-and-tiles.md#iconography))
+/// supplies real triangle glyphs via `egui::Painter`.
+fn paint_keybind_hint(ui: &mut egui::Ui) {
+    ui.weak("[Tab / Enter] accept   [Up / Down] navigate   [Esc] cancel");
 }
 
 fn paint_row(ui: &mut egui::Ui, cand: &CompletionCandidate, selected: bool) {
