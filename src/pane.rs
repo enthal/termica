@@ -595,6 +595,7 @@ impl PaneSession {
         let pane_id = self.pane_id;
         let current_text =
             self.blocks.editor_on_tail().map(|e| e.text().to_string()).unwrap_or_default();
+        let current_cursor = self.blocks.editor_on_tail().map(|e| e.cursor()).unwrap_or_default();
         let app_run_id = ctx.app_run_id.clone();
         let outcome = self.recall.step_back(
             || {
@@ -608,6 +609,7 @@ impl PaneSession {
                     .unwrap_or_default()
             },
             &current_text,
+            current_cursor,
         );
         apply_recall_outcome(self.blocks.editor_on_tail_mut(), outcome)
     }
@@ -1064,9 +1066,18 @@ fn apply_recall_outcome(
 ) -> bool {
     let Some(editor) = editor else { return false };
     match outcome {
-        RecallOutcome::Replace { new_text } => {
+        RecallOutcome::Replace { new_text, new_cursor } => {
             editor.clear();
             editor.insert_str(&new_text);
+            // Per spec/04 §"History walk (Up/Down)" caret-restore
+            // rule: when returning to the in-progress buffer (the
+            // head of the walk), restore the caret to its saved
+            // position. For history entries, `new_cursor` is `None`
+            // and the caret stays at end-of-text (the convention
+            // every shell history walker uses).
+            if let Some(c) = new_cursor {
+                editor.set_cursor(c);
+            }
             true
         }
         RecallOutcome::Unchanged => false,

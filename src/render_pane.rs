@@ -429,11 +429,24 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
                     return true;
                 }
                 Key::ArrowUp if !modifiers.shift && !modifiers.alt && !modifiers.command => {
-                    slot.session.editor_history_prev();
+                    // Multiline-aware: if there's a previous editor
+                    // line, move the caret up within the buffer
+                    // (preserving column). Only on row 0 do we step
+                    // into history. Per spec/04 §"History walk
+                    // (Up/Down)".
+                    let moved_within_editor =
+                        slot.session.editor_mut().map(|e| e.move_up()).unwrap_or(false);
+                    if !moved_within_editor {
+                        slot.session.editor_history_prev();
+                    }
                     return true;
                 }
                 Key::ArrowDown if !modifiers.shift && !modifiers.alt && !modifiers.command => {
-                    slot.session.editor_history_next();
+                    let moved_within_editor =
+                        slot.session.editor_mut().map(|e| e.move_down()).unwrap_or(false);
+                    if !moved_within_editor {
+                        slot.session.editor_history_next();
+                    }
                     return true;
                 }
                 _ => {}
