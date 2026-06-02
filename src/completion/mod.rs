@@ -75,26 +75,41 @@ pub fn open_completion_at(
     let mut sources: Vec<Vec<CompletionCandidate>> = Vec::new();
 
     // ---- Path source ----------------------------------------------
-    let want_path = pathish || (token.is_empty() && !cmd_pos);
+    //
+    // Fires when the token is path-shaped OR we're in argument
+    // position (`ls C<Tab>` should suggest `./Cargo.toml` even
+    // though `C` alone isn't pathish). For the non-pathish arg-
+    // position case, prefix the accepted value with `./` so the
+    // shell unambiguously reads it as a relative path.
+    let want_path = pathish || !cmd_pos;
     if want_path {
         let (dir_part, file_prefix) = local::split_path_token(token);
         if let Some(entries) = read_dir_entries(dir_part, cwd, home) {
-            // Path candidates carry the dir prefix in their `value`
-            // so accepting "Cargo.toml" when the token was "src/Ca"
-            // inserts the WHOLE "src/Cargo.toml". We rewrite the
-            // candidate values to be the full path-from-token-start.
             let mut entries_cands = local::complete_path_entries(file_prefix, &entries);
+            // Rewrite each candidate's value so accepting it inserts
+            // the full path the user expects:
+            //
+            // - `src/Ca<Tab>` accepts `src/Cargo.toml` — the
+            //   dir prefix the user already typed is preserved.
+            // - `C<Tab>` (non-pathish, arg position) accepts
+            //   `./CLAUDE.md` — `./` prefix added so the shell
+            //   reads it as a path, not a command.
+            // - `/etc/pas<Tab>` accepts `/etc/passwd` — leading
+            //   slash kept, no extra `./`.
+            let prefix_with_dot_slash = !pathish && !cmd_pos && dir_part.is_empty();
             if !dir_part.is_empty() {
                 for c in &mut entries_cands {
-                    // `/` joins both for absolute (`/` + `etc` → `/etc`)
-                    // and relative (`src` + `/` + `main.rs` →
-                    // `src/main.rs`); when dir is exactly `/` we use
-                    // `/{value}` so we don't end up with `//`.
                     let full = if dir_part == "/" {
                         format!("/{}", c.value)
                     } else {
                         format!("{}/{}", dir_part, c.value)
                     };
+                    c.display = full.clone();
+                    c.value = full;
+                }
+            } else if prefix_with_dot_slash {
+                for c in &mut entries_cands {
+                    let full = format!("./{}", c.value);
                     c.display = full.clone();
                     c.value = full;
                 }

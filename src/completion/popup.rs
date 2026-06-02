@@ -27,6 +27,12 @@ pub struct CompletionPopup {
     pub original_token: String,
     pub candidates: Vec<CompletionCandidate>,
     pub selected_index: usize,
+    /// `true` when the selected row should be scrolled into view
+    /// on the next paint. Set by [`Self::move_selection`]; cleared
+    /// by [`paint`] after scrolling. Lets the user manually
+    /// scroll without the popup yanking back to the selection
+    /// every frame — we only scroll on a real selection change.
+    pub scroll_to_selected_pending: bool,
 }
 
 impl CompletionPopup {
@@ -47,6 +53,7 @@ impl CompletionPopup {
             original_token: original_token.into(),
             candidates,
             selected_index: 0,
+            scroll_to_selected_pending: false,
         })
     }
 
@@ -64,6 +71,11 @@ impl CompletionPopup {
         let len = self.candidates.len() as isize;
         let new_idx = ((self.selected_index as isize + delta).rem_euclid(len)) as usize;
         self.selected_index = new_idx;
+        // Schedule a scroll on the next paint so the newly-
+        // selected row is visible even when it would otherwise
+        // be below / above the scroll viewport (e.g. after
+        // wrap-around with `↑` from the first row to the last).
+        self.scroll_to_selected_pending = true;
     }
 
     /// Accept the highlighted candidate: replace the editor's
@@ -96,7 +108,7 @@ impl CompletionPopup {
 /// scrolls.
 pub fn paint(
     ctx: &egui::Context,
-    popup: &CompletionPopup,
+    popup: &mut CompletionPopup,
     anchor: egui::Pos2,
     pane_id: u64,
     max_visible_rows: usize,
@@ -117,6 +129,7 @@ pub fn paint(
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.set_min_width(panel_w);
                 let scroll_h = (max_visible_rows as f32) * row_h;
+                let scroll_pending = std::mem::take(&mut popup.scroll_to_selected_pending);
                 egui::ScrollArea::vertical()
                     .max_height(scroll_h)
                     .id_salt(("completion-popup-scroll", pane_id))
@@ -124,6 +137,15 @@ pub fn paint(
                         for (idx, cand) in popup.candidates.iter().enumerate() {
                             let selected = idx == popup.selected_index;
                             paint_row(ui, cand, selected);
+                            // After painting the selected row, if
+                            // a scroll was scheduled this frame
+                            // (move_selection ran), align the
+                            // row's center with the viewport
+                            // center so wrap-around at the ends
+                            // visibly jumps to the new position.
+                            if selected && scroll_pending {
+                                ui.scroll_to_cursor(Some(egui::Align::Center));
+                            }
                         }
                     });
                 ui.add_space(2.0);

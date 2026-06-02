@@ -370,6 +370,11 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
             // a partial command pre-narrows the results — same UX
             // as zsh's incremental history-search-backward.
             if modifiers.ctrl && !modifiers.shift && matches!(key, Key::R) {
+                // Ctrl+R replaces a live completion popup with the
+                // history overlay — having both up at once is
+                // visually confusing and the overlay is the
+                // user's clear intent.
+                slot.ui.completion_popup = None;
                 if let Some(history) = slot.session.history_ctx().cloned()
                     && let Some(mut overlay) = crate::history_overlay::HistoryOverlay::open(
                         &history,
@@ -1201,7 +1206,7 @@ pub fn render_pane(
             // z-order; the position pin is `editor_rect.min` so
             // the popup's bottom edge aligns with the editor's
             // top.
-            if let Some(popup) = slot.ui.completion_popup.as_ref() {
+            if let Some(popup) = slot.ui.completion_popup.as_mut() {
                 crate::completion::popup::paint(
                     ctx,
                     popup,
@@ -2108,9 +2113,11 @@ pub fn render_pane(
                             }
                         }
                         _ => {
-                            // Dismiss popup AND let the key fall
-                            // through to the editor below.
-                            slot.ui.completion_popup = None;
+                            // Non-navigation key. Let it fall
+                            // through to the editor for normal
+                            // edit handling; the after-loop live-
+                            // filter pass below will recompute
+                            // candidates with the new buffer.
                             handled = false;
                         }
                     }
@@ -2151,6 +2158,47 @@ pub fn render_pane(
             }
             if let Some(bytes) = input::encode_event(event, modes) {
                 let _ = slot.session.write(&bytes);
+            }
+        }
+
+        // ---- Completion popup live-filter ----------------------
+        //
+        // After processing all this frame's events: if the popup
+        // is still open AND the editor's text/cursor moved (i.e.,
+        // the user typed, pasted, or backspaced), recompute the
+        // candidate list. The popup tracks `origin_byte` from
+        // when it was opened; if the caret has drifted before
+        // that point (user deleted past the token start), dismiss
+        // — the user has clearly given up on this completion.
+        //
+        // Otherwise call the orchestrator with the current
+        // buffer + cursor state. New candidate list replaces the
+        // old; `selected_index` resets to 0 (preserving it
+        // across refilter is a polish item).
+        if slot.ui.completion_popup.is_some() {
+            let (editor_text, cursor) = {
+                let editor = slot.session.blocks().editor_on_tail();
+                (
+                    editor.map(|e| e.text().to_string()).unwrap_or_default(),
+                    editor.map(|e| e.cursor()).unwrap_or(0),
+                )
+            };
+            let origin = slot.ui.completion_popup.as_ref().map(|p| p.origin_byte).unwrap_or(0);
+            if cursor < origin {
+                // Caret went past the original token start —
+                // user backspaced too far. Dismiss.
+                slot.ui.completion_popup = None;
+            } else {
+                let cwd = slot.session.terminal().cwd().map(|p| p.to_path_buf());
+                let history_entries = slot.session.history_for_completion(200);
+                let new_popup = crate::completion::open_completion_at(
+                    &editor_text,
+                    cursor,
+                    cwd.as_deref(),
+                    home,
+                    || history_entries,
+                );
+                slot.ui.completion_popup = new_popup;
             }
         }
     }
