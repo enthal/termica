@@ -62,12 +62,13 @@ The PTY produces bytes. A dedicated background task — one per pane — drains 
 
 ### Write path
 
-Two writers:
+Three writers:
 
 - The `PromptController` writing a finished command on Enter (`ShellPromptEditor` → submit).
 - The input encoder when the pane is in `RawTerminal` / `AlternateScreen`.
+- **Automatic terminal query replies.** When a program probes the terminal and blocks on the answer — Primary/Secondary Device Attributes (`ESC [ c` / `ESC [ > c`), cursor-position / status reports (`ESC [ 6 n` / `ESC [ 5 n`) — `alacritty_terminal` generates the reply bytes during `feed` and surfaces them as `Event::PtyWrite`. The pane drains them after each feed (`TerminalState::drain_pty_responses`) and writes them straight back. This reply is not user input and never touches a pane mode; it is the terminal answering on the program's behalf. **Dropping it is a hang bug**: a program that uses the DA1 response as a sync barrier (e.g. `gh` via termenv) blocks until its own ~10s timeout. (Strict layer — tested.)
 
-Both go through `PtySession::write_bytes`. There is no third writer.
+All three go through `PtySession::write_bytes`. There is no fourth writer. The formatter-bearing query variants (`ColorRequest`, `TextAreaSizeRequest`) are not yet answered — they need theme / pixel-metric inputs not threaded down to the terminal layer, and programs degrade rather than hang on them.
 
 ## Terminal state
 

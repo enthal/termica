@@ -87,6 +87,19 @@ pub struct TerminalEventTracker {
     /// `String` is cheap because tab rendering runs at most a few
     /// times per second.
     title: Arc<std::sync::Mutex<Option<String>>>,
+    /// Bytes the terminal owes the program in reply to a query —
+    /// Primary/Secondary Device Attributes (`ESC [ c` / `ESC [ > c`),
+    /// cursor-position / status reports (`ESC [ 6 n` / `ESC [ 5 n`),
+    /// etc. alacritty emits these as `Event::PtyWrite` while a feed
+    /// is being processed; the owning [`crate::pane::PaneSession`]
+    /// drains them after each feed and writes them back to the PTY.
+    /// Dropping them hangs programs that block on the reply (e.g.
+    /// `gh` via termenv, which uses the DA1 response as a sync
+    /// barrier and waits ~10s before giving up). Interior mutability
+    /// because `send_event` only gets `&self`; the buffer is touched
+    /// only on the UI thread (during `feed`), so the `Mutex` is for
+    /// the trait's sake, never real contention.
+    pty_responses: Arc<std::sync::Mutex<Vec<u8>>>,
 }
 
 impl TerminalEventTracker {
@@ -124,8 +137,22 @@ impl EventListener for TerminalEventTracker {
             Event::ResetTitle => {
                 *self.title.lock().expect("title mutex poisoned") = None;
             }
-            // Other events (cwd via OSC 7, etc.) are still
-            // discarded; they'll hook in as new fields land.
+            Event::PtyWrite(text) => {
+                // A reply the program is waiting for (DA / DSR / …).
+                // Queue it; `PaneSession::drain` writes it to the PTY
+                // after the feed. See `pty_responses`.
+                self.pty_responses
+                    .lock()
+                    .expect("pty_responses mutex poisoned")
+                    .extend_from_slice(text.as_bytes());
+            }
+            // Remaining events (cwd via OSC 7, clipboard load/store,
+            // color + text-area-size requests, …) are still
+            // discarded; they'll hook in as new fields land. The
+            // formatter-bearing query variants (`ColorRequest`,
+            // `TextAreaSizeRequest`) need theme / pixel-metric inputs
+            // we don't yet thread down here; programs degrade rather
+            // than hang on those, unlike the DA/DSR replies above.
             _ => {}
         }
     }
@@ -233,6 +260,19 @@ impl TerminalState {
     /// are queued. Caller is the per-pane `PromptController`.
     pub fn drain_lifecycle_events(&mut self) -> Vec<crate::markers::LifecycleEvent> {
         self.osc.drain_events()
+    }
+
+    /// Take the bytes the terminal owes the program in reply to
+    /// queries seen since the last drain (Device Attributes, cursor-
+    /// position / status reports). Empty when nothing is pending. The
+    /// caller ([`crate::pane::PaneSession::drain`]) writes the result
+    /// straight back to the PTY master — without it, programs that
+    /// block on the reply hang until their internal timeout. See
+    /// [`TerminalEventTracker::pty_responses`].
+    pub fn drain_pty_responses(&mut self) -> Vec<u8> {
+        std::mem::take(
+            &mut *self.events.pty_responses.lock().expect("pty_responses mutex poisoned"),
+        )
     }
 
     /// Resize the grid in place. Unlike `TerminalState::new`, this
@@ -552,6 +592,43 @@ mod tests {
         let mut state = TerminalState::new(5, 20);
         state.feed(b"hello world");
         assert_row_contains(&state, 0, "hello world");
+    }
+
+    // ---- terminal query responses (DA / DSR) -------------------------
+    //
+    // Programs probe the terminal and BLOCK on the reply: a Primary
+    // Device Attributes query (`ESC [ c`) or a cursor-position report
+    // (`ESC [ 6 n`). alacritty produces the answer as an internal
+    // event; we must hand it back so callers can write it to the PTY.
+    // If we drop it, the program (e.g. `gh` via termenv's DA1 sync)
+    // hangs until its own ~10s timeout.
+
+    #[test]
+    fn da1_query_yields_pty_response() {
+        let mut state = TerminalState::new(5, 20);
+        state.feed(b"\x1b[c"); // Primary Device Attributes
+        let resp = state.drain_pty_responses();
+        assert_eq!(resp, b"\x1b[?6c", "DA1 must be answered with the VT220 attributes");
+        // A query character must not land on the grid.
+        assert_row_contains(&state, 0, "");
+        // Draining again returns nothing — the buffer was consumed.
+        assert!(state.drain_pty_responses().is_empty());
+    }
+
+    #[test]
+    fn dsr_cursor_position_yields_pty_response() {
+        let mut state = TerminalState::new(5, 20);
+        state.feed(b"hi"); // cursor now at row 1, col 3 (1-based)
+        state.feed(b"\x1b[6n"); // Device Status Report — cursor position
+        let resp = state.drain_pty_responses();
+        assert_eq!(resp, b"\x1b[1;3R");
+    }
+
+    #[test]
+    fn no_query_means_no_response() {
+        let mut state = TerminalState::new(5, 20);
+        state.feed(b"plain output, no queries");
+        assert!(state.drain_pty_responses().is_empty());
     }
 
     #[test]
