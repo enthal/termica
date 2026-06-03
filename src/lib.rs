@@ -86,6 +86,80 @@ use eframe::egui;
 pub(crate) const MIN_ROWS: u16 = 5;
 pub(crate) const MIN_COLS: u16 = 20;
 
+/// Stable application identifier. Used as the eframe app name, the
+/// Wayland/X11 `app_id` (which becomes the window's `StartupWMClass`
+/// for icon matching), and the basename of the Linux `.desktop` +
+/// icon files we install. Must stay in sync with `StartupWMClass`
+/// in [`desktop_entry_contents`].
+const APP_ID: &str = "termica";
+
+/// The window/dock/taskbar icon, embedded in the binary so there is
+/// no runtime file dependency. Decoded by [`load_app_icon`]; written
+/// verbatim to the XDG icon path by `install_desktop_entry` on Linux.
+const APP_ICON_PNG: &[u8] = include_bytes!("../assets/app_icon.png");
+
+/// Decode the embedded PNG into the RGBA buffer eframe wants for the
+/// window icon. Returns `None` if the bytes fail to decode — a
+/// missing window icon is a cosmetic loss, never worth panicking the
+/// whole app over, so we degrade rather than `expect`.
+fn load_app_icon() -> Option<egui::IconData> {
+    let image =
+        image::load_from_memory_with_format(APP_ICON_PNG, image::ImageFormat::Png).ok()?.to_rgba8();
+    let (width, height) = image.dimensions();
+    Some(egui::IconData { rgba: image.into_raw(), width, height })
+}
+
+/// Contents of the freedesktop `.desktop` entry installed on Linux so
+/// desktop environments (GNOME, KDE, Sway, …) can match the running
+/// window to a name and icon in task switchers and docks.
+///
+/// Kept pure — no `cfg`, no filesystem — so it is unit-testable on
+/// every platform. `StartupWMClass` MUST equal the `app_id` we set on
+/// the viewport (both [`APP_ID`]); that string is what the compositor
+/// reports for the live window and what it keys the icon lookup on.
+// Non-Linux production builds have no caller (the installer is
+// Linux-gated); the tests below still exercise it on every platform.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn desktop_entry_contents() -> String {
+    format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=Termica\n\
+         Comment=Native terminal workspace\n\
+         Exec={APP_ID}\n\
+         Icon={APP_ID}\n\
+         Terminal=false\n\
+         StartupWMClass={APP_ID}\n\
+         Categories=Development;System;TerminalEmulator;\n"
+    )
+}
+
+/// On Linux, install the icon and a `.desktop` entry into the user's
+/// XDG data dir (`$XDG_DATA_HOME` or `~/.local/share`) so the app is
+/// identifiable in the launcher and its window carries our icon. Both
+/// writes are skipped if the target already exists, and every step is
+/// best-effort: a failure here never blocks startup, it just means
+/// the desktop environment falls back to a generic icon.
+#[cfg(target_os = "linux")]
+fn install_desktop_entry() {
+    let Some(base) = directories::BaseDirs::new() else {
+        return;
+    };
+    let data_home = base.data_dir();
+
+    let icon_dir = data_home.join("icons/hicolor/256x256/apps");
+    let icon_path = icon_dir.join(format!("{APP_ID}.png"));
+    if !icon_path.exists() && std::fs::create_dir_all(&icon_dir).is_ok() {
+        let _ = std::fs::write(&icon_path, APP_ICON_PNG);
+    }
+
+    let app_dir = data_home.join("applications");
+    let desktop_path = app_dir.join(format!("{APP_ID}.desktop"));
+    if !desktop_path.exists() && std::fs::create_dir_all(&app_dir).is_ok() {
+        let _ = std::fs::write(&desktop_path, desktop_entry_contents());
+    }
+}
+
 /// Run the native window. Used by `main` and any future end-to-end
 /// harness.
 pub fn run() -> eframe::Result<()> {
@@ -118,11 +192,25 @@ pub fn run() -> eframe::Result<()> {
         startup_cwd: Some(startup_cwd),
         ..Default::default()
     };
+    // Linux: register the icon + launcher entry under XDG before we
+    // open the window, so the compositor can match it on first map.
+    #[cfg(target_os = "linux")]
+    install_desktop_entry();
+
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1200.0, 800.0])
+        .with_min_inner_size([400.0, 200.0])
+        .with_title("Termica")
+        // `app_id` drives the Wayland app_id / X11 WM_CLASS, which is
+        // how Linux desktops link the live window to the installed
+        // `.desktop` entry and its icon. Harmless on other platforms.
+        .with_app_id(APP_ID);
+    if let Some(icon) = load_app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 800.0])
-            .with_min_inner_size([400.0, 200.0])
-            .with_title("Termica"),
+        viewport,
         // macOS: suppress winit's default application menu. Its
         // Quit item calls `[NSApplication terminate:]` directly,
         // exiting before `update()` can render the quit-confirm
@@ -138,7 +226,7 @@ pub fn run() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "termica",
+        APP_ID,
         options,
         Box::new(|cc| {
             // Force dark theme always, regardless of the system
@@ -159,4 +247,31 @@ pub fn run() -> eframe::Result<()> {
             Ok(Box::new(TermicaApp::new_with_options(app_opts.clone())))
         }),
     )
+}
+
+#[cfg(test)]
+mod app_icon_tests {
+    use super::*;
+
+    #[test]
+    fn embedded_icon_decodes_to_square_rgba() {
+        let icon = load_app_icon().expect("embedded app icon must decode");
+        assert_eq!(icon.width, icon.height, "app icon should be square");
+        assert!(icon.width > 0, "app icon must have nonzero dimensions");
+        // RGBA: four bytes per pixel, exactly width*height pixels.
+        assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
+    }
+
+    #[test]
+    fn desktop_entry_wm_class_matches_app_id() {
+        let entry = desktop_entry_contents();
+        // The compositor keys icon lookup on StartupWMClass; it must
+        // equal the app_id we set on the viewport, or Linux desktops
+        // fall back to a generic icon.
+        assert!(entry.contains(&format!("StartupWMClass={APP_ID}\n")));
+        assert!(entry.contains(&format!("Exec={APP_ID}\n")));
+        assert!(entry.contains(&format!("Icon={APP_ID}\n")));
+        assert!(entry.starts_with("[Desktop Entry]\n"));
+        assert!(entry.contains("Type=Application\n"));
+    }
 }
