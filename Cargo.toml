@@ -28,6 +28,12 @@ path = "src/main.rs"
 eframe = { version = "0.33", default-features = true }
 egui = "0.33"
 
+# App-window icon: decode the embedded `assets/app_icon.png` into the
+# RGBA buffer `egui::IconData` wants. Already in the graph transitively
+# via eframe; we only need the PNG decoder, so strip the default codec
+# set to keep our direct surface minimal.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 # Phase 1C: pseudo-terminal plumbing. Synchronous spawn / read / write /
 # resize. The tokio/async layering arrives in Phase 1D once there is a
 # consumer that needs to drain PTY bytes into `alacritty_terminal`.
