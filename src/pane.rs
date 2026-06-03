@@ -643,6 +643,23 @@ impl PaneSession {
         self.history.as_ref()
     }
 
+    /// Pull recent commands from history for the Tab-completion
+    /// popup. Returns at most `limit` strings, newest first. Empty
+    /// when persistence is unavailable or the query fails — the
+    /// caller treats that as "no history candidates" gracefully.
+    ///
+    /// Scope: global (cross-pane). Tab completion prefers global
+    /// history because typing the same command across sessions is
+    /// the common case; pane-scoped history is for `↑/↓` walk.
+    pub fn history_for_completion(&self, limit: usize) -> Vec<String> {
+        let Some(ctx) = &self.history else { return Vec::new() };
+        let Ok(store) = ctx.store.lock() else { return Vec::new() };
+        store
+            .recent(&crate::history::Scope::Global, limit)
+            .map(|rows| rows.into_iter().map(|r| r.text).collect())
+            .unwrap_or_default()
+    }
+
     /// Insert `text` into the editor as the buffer (replacing any
     /// existing content) and place the caret at the end. Used by
     /// the `^R` overlay after the user picks an entry.

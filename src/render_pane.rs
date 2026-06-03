@@ -370,6 +370,11 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
             // a partial command pre-narrows the results — same UX
             // as zsh's incremental history-search-backward.
             if modifiers.ctrl && !modifiers.shift && matches!(key, Key::R) {
+                // Ctrl+R replaces a live completion popup with the
+                // history overlay — having both up at once is
+                // visually confusing and the overlay is the
+                // user's clear intent.
+                slot.ui.completion_popup = None;
                 if let Some(history) = slot.session.history_ctx().cloned()
                     && let Some(mut overlay) = crate::history_overlay::HistoryOverlay::open(
                         &history,
@@ -413,12 +418,19 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
                 Key::Enter if !modifiers.shift => {
                     let _ = slot.session.submit_editor_command();
                     // The user just submitted — force the scroll
-                    // area to the bottom on the next render so the
+                    // area to the bottom for several frames so the
                     // command's first output is visible even if the
                     // user had scrolled up to read older blocks.
-                    // Shift+Enter (multi-line continuation) does NOT
-                    // submit and stays out of this branch.
-                    slot.ui.scroll_to_bottom_pending = true;
+                    // The multi-frame snap (vs single-frame) walks
+                    // through the Preexec → Running transition,
+                    // which adds a command-label row to the block
+                    // stack one frame AFTER the submit. A single-
+                    // frame snap landed before that transition and
+                    // stick_to_bottom didn't reliably hold through
+                    // it, leaving the user at the TOP of the new
+                    // Running block. 6 frames covers the typical
+                    // shell-roundtrip latency.
+                    slot.ui.scroll_to_bottom_frames = 6;
                     return true;
                 }
                 Key::Escape => {
@@ -810,7 +822,19 @@ pub fn render_pane(
     // infinity (NaN-prone) and the whole ScrollArea renders blank.
     // That was the "scrollback vanishes / alt-screen blank after the
     // 2nd command in a pane" regression.
-    let force_to_bottom = std::mem::take(&mut slot.ui.scroll_to_bottom_pending);
+    // `force_to_bottom` fires for two paths:
+    // - One-shot `scroll_to_bottom_pending` (Cmd+Option+Down,
+    //   chrome picker, etc.) — take and clear.
+    // - Multi-frame `scroll_to_bottom_frames > 0` from submit —
+    //   decrement each frame, snap while non-zero. See the field
+    //   doc on `PaneUiState::scroll_to_bottom_frames`.
+    let one_shot_bottom = std::mem::take(&mut slot.ui.scroll_to_bottom_pending);
+    let multi_frame_bottom = slot.ui.scroll_to_bottom_frames > 0;
+    if multi_frame_bottom {
+        slot.ui.scroll_to_bottom_frames -= 1;
+        ctx.request_repaint();
+    }
+    let force_to_bottom = one_shot_bottom || multi_frame_bottom;
     let force_to_top = std::mem::take(&mut slot.ui.scroll_to_top_pending);
     // `stick_to_bottom` re-snaps the offset to max every frame the
     // user is at the bottom — which fights any top-snap attempt
@@ -833,6 +857,14 @@ pub fn render_pane(
         .stick_to_bottom(!force_to_top)
         .auto_shrink([false, false])
         .max_height(scroll_max_h);
+    // `force_to_top` uses a direct offset override (0.0) because
+    // `scroll_to_cursor(TOP)` got swallowed by ScrollArea's "we're
+    // at the end" cache. `force_to_bottom` keeps using
+    // `scroll_to_cursor(BOTTOM)` inside the closure (line ~1060)
+    // because the bottom-snap needs egui's accurate post-layout
+    // measurement of where content ends; our pre-layout
+    // `content_h` estimate was sometimes off, sending the snap to
+    // the wrong place.
     let scroll_area =
         if force_to_top { scroll_area.vertical_scroll_offset(0.0) } else { scroll_area };
     let scroll_inner = scroll_area.show(ui, |ui| {
@@ -1194,11 +1226,44 @@ pub fn render_pane(
                 &font_id,
                 caret_visible,
             );
+
+            // Completion popup paints just above the editor when
+            // open. Routed through `egui::Area` (top-level
+            // overlay), so the call order here doesn't affect
+            // z-order; the position pin is `editor_rect.min` so
+            // the popup's bottom edge aligns with the editor's
+            // top.
+            if let Some(popup) = slot.ui.completion_popup.as_mut() {
+                let clicked = crate::completion::popup::paint(
+                    ctx,
+                    popup,
+                    editor_rect.min,
+                    slot.session.pane_id(),
+                    10,
+                );
+                // Click-to-accept: a row click sets the selected
+                // candidate AND accepts it, same as Tab/Enter.
+                if let Some(row_idx) = clicked {
+                    let Some(mut popup_taken) = slot.ui.completion_popup.take() else {
+                        unreachable!("just confirmed popup is Some via as_mut above")
+                    };
+                    popup_taken.selected_index = row_idx;
+                    let cursor =
+                        slot.session.blocks().editor_on_tail().map(|e| e.cursor()).unwrap_or(0);
+                    let current_token_len = cursor.saturating_sub(popup_taken.origin_byte);
+                    if let Some(editor) = slot.session.editor_mut() {
+                        popup_taken.accept(editor, current_token_len);
+                    }
+                    slot.session.clear_history_recall();
+                }
+            }
         } else {
             // Editor not on tail this frame — forget the cursor
             // tracker so re-opening the editor in a new prompt
             // starts a fresh blink cycle.
             slot.ui.last_cursor_byte = None;
+            // Editor gone — popup must go too.
+            slot.ui.completion_popup = None;
         }
 
         // Focused-editor chrome. Dispatched via the
@@ -2017,6 +2082,16 @@ pub fn render_pane(
             }
         }
 
+        // Snapshot the editor's text + cursor BEFORE event
+        // processing so the after-loop live-filter pass can tell
+        // whether the buffer actually changed (a text edit) vs
+        // navigation-only frames (Up/Down in popup, or no
+        // editor events at all). Without this guard the live-
+        // filter would clobber `selected_index` after every
+        // Up/Down press, defeating popup navigation.
+        let editor_state_before: Option<(String, usize)> =
+            slot.session.blocks().editor_on_tail().map(|e| (e.text().to_string(), e.cursor()));
+
         for event in &events {
             // Belt and braces: skip the Ctrl+Shift+C key event so the
             // encoder never sees it (the encoder wouldn't emit bytes
@@ -2040,11 +2115,192 @@ pub fn render_pane(
             if slot.ui.history_overlay.is_some() {
                 continue;
             }
+            // ---- Tab completion popup interception -----------------
+            //
+            // If the completion popup is open, navigation keys
+            // (Up/Down/Tab/Enter/Esc) drive it instead of the
+            // editor. Any other key dismisses the popup AND falls
+            // through to the editor, so the user's typing
+            // continues to land naturally — re-pressing Tab
+            // reopens with fresh candidates.
+            //
+            // If the popup is closed, a bare Tab keystroke opens
+            // it by calling the orchestrator. Tab with any
+            // modifier passes through to the editor's existing
+            // "consume Tab as no-op" path so we don't fight
+            // future Tab-modifier features.
+            if let egui::Event::Key { key, pressed: true, modifiers, .. } = event {
+                use egui::Key;
+                let no_mods =
+                    !modifiers.shift && !modifiers.alt && !modifiers.command && !modifiers.ctrl;
+                if slot.ui.completion_popup.is_some() && no_mods {
+                    let mut handled = true;
+                    match key {
+                        Key::Escape => {
+                            slot.ui.completion_popup = None;
+                        }
+                        Key::Enter => {
+                            // Enter always commits the selected
+                            // candidate and closes the popup.
+                            if let Some(popup) = slot.ui.completion_popup.take() {
+                                let cursor = slot
+                                    .session
+                                    .blocks()
+                                    .editor_on_tail()
+                                    .map(|e| e.cursor())
+                                    .unwrap_or(0);
+                                let current_token_len = cursor.saturating_sub(popup.origin_byte);
+                                if let Some(editor) = slot.session.editor_mut() {
+                                    popup.accept(editor, current_token_len);
+                                }
+                                slot.session.clear_history_recall();
+                            }
+                        }
+                        Key::Tab => {
+                            // Smart-Tab: extend the typed token to
+                            // the longest prefix shared by selected
+                            // AND at least one other candidate.
+                            // - extension == selected.value → commit.
+                            // - extension.len() > current → extend,
+                            //   leave popup open, live-filter next
+                            //   frame.
+                            // - extension == current → no-op; user
+                            //   picks via Up/Down + Enter.
+                            let Some(popup_ref) = slot.ui.completion_popup.as_ref() else {
+                                continue;
+                            };
+                            let cursor = slot
+                                .session
+                                .blocks()
+                                .editor_on_tail()
+                                .map(|e| e.cursor())
+                                .unwrap_or(0);
+                            let current_token_len = cursor.saturating_sub(popup_ref.origin_byte);
+                            let extension = popup_ref.tab_extend(current_token_len).to_string();
+                            let selected_full = popup_ref.selected().value.clone();
+                            if extension == selected_full {
+                                if let Some(popup) = slot.ui.completion_popup.take()
+                                    && let Some(editor) = slot.session.editor_mut()
+                                {
+                                    popup.accept(editor, current_token_len);
+                                }
+                                slot.session.clear_history_recall();
+                            } else if extension.len() > current_token_len {
+                                if let Some(editor) = slot.session.editor_mut() {
+                                    let origin = popup_ref.origin_byte;
+                                    editor.replace_range(origin, cursor, &extension);
+                                }
+                                slot.session.clear_history_recall();
+                                // Popup stays; live filter next frame.
+                            } else {
+                                // No further extension possible —
+                                // the visible candidates diverge
+                                // past the current token. User has
+                                // already narrowed the list; same
+                                // muscle (Tab) should now commit
+                                // the selected candidate instead
+                                // of being a no-op.
+                                if let Some(popup) = slot.ui.completion_popup.take()
+                                    && let Some(editor) = slot.session.editor_mut()
+                                {
+                                    popup.accept(editor, current_token_len);
+                                }
+                                slot.session.clear_history_recall();
+                            }
+                        }
+                        Key::ArrowDown => {
+                            if let Some(popup) = slot.ui.completion_popup.as_mut() {
+                                popup.move_selection(1);
+                            }
+                        }
+                        Key::ArrowUp => {
+                            if let Some(popup) = slot.ui.completion_popup.as_mut() {
+                                popup.move_selection(-1);
+                            }
+                        }
+                        _ => {
+                            // Non-navigation key. Let it fall
+                            // through to the editor for normal
+                            // edit handling; the after-loop live-
+                            // filter pass below will recompute
+                            // candidates with the new buffer.
+                            handled = false;
+                        }
+                    }
+                    if handled {
+                        continue;
+                    }
+                } else if editor_active
+                    && slot.ui.completion_popup.is_none()
+                    && matches!(key, Key::Tab)
+                    && no_mods
+                {
+                    // Tab in editor with no popup → open the popup.
+                    let editor_text;
+                    let cursor;
+                    {
+                        let editor = slot.session.blocks().editor_on_tail();
+                        editor_text = editor.map(|e| e.text().to_string()).unwrap_or_default();
+                        cursor = editor.map(|e| e.cursor()).unwrap_or(0);
+                    }
+                    let cwd = slot.session.terminal().cwd().map(|p| p.to_path_buf());
+                    let history_entries = slot.session.history_for_completion(200);
+                    let popup = crate::completion::open_completion_at(
+                        &editor_text,
+                        cursor,
+                        cwd.as_deref(),
+                        home,
+                        || history_entries,
+                    );
+                    if popup.is_some() {
+                        slot.ui.completion_popup = popup;
+                    }
+                    // Consume Tab whether or not the popup opened.
+                    continue;
+                }
+            }
             if editor_active && apply_event_to_editor(event, slot) {
                 continue;
             }
             if let Some(bytes) = input::encode_event(event, modes) {
                 let _ = slot.session.write(&bytes);
+            }
+        }
+
+        // ---- Completion popup live-filter ----------------------
+        //
+        // Only refresh when the editor's text/cursor actually
+        // changed this frame. Navigation-only frames (Up/Down in
+        // popup, idle frames) leave the buffer alone, and we
+        // MUST NOT replace the popup in those cases or
+        // `move_selection`'s state (selected_index +
+        // scroll_to_selected_pending) gets clobbered.
+        //
+        // When text DID change: if the caret went past
+        // `origin_byte` (user backspaced through the token start),
+        // dismiss. Otherwise recompute the candidate list with
+        // the new buffer state. `selected_index` resets to 0
+        // (preserving it across refilter is a polish item).
+        if slot.ui.completion_popup.is_some() {
+            let editor_state_after: Option<(String, usize)> =
+                slot.session.blocks().editor_on_tail().map(|e| (e.text().to_string(), e.cursor()));
+            let buffer_changed = editor_state_before != editor_state_after;
+            if buffer_changed && let Some((editor_text, cursor)) = editor_state_after {
+                let origin = slot.ui.completion_popup.as_ref().map(|p| p.origin_byte).unwrap_or(0);
+                if cursor < origin {
+                    slot.ui.completion_popup = None;
+                } else {
+                    let cwd = slot.session.terminal().cwd().map(|p| p.to_path_buf());
+                    let history_entries = slot.session.history_for_completion(200);
+                    let new_popup = crate::completion::open_completion_at(
+                        &editor_text,
+                        cursor,
+                        cwd.as_deref(),
+                        home,
+                        || history_entries,
+                    );
+                    slot.ui.completion_popup = new_popup;
+                }
             }
         }
     }

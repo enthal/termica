@@ -425,6 +425,33 @@ impl PromptEditor {
         self.insert_char('\n');
     }
 
+    /// Replace `text[start..end]` with `replacement`, leaving the
+    /// caret at the END of the inserted text and the selection
+    /// cleared. Records ONE undo entry capturing the EDITOR'S
+    /// pre-call state — text, cursor, AND selection — so the
+    /// pre-call selection is what undo restores, not whatever
+    /// transient selection an `insert_str`-via-`set_selection`
+    /// dance would have created.
+    ///
+    /// This is the right primitive for completion popups (and
+    /// any other callsite that wants "replace this byte range
+    /// with this text" semantics without the
+    /// `set_selection`+`insert_str` round-trip leaking a
+    /// selection into the undo entry).
+    ///
+    /// Both `start` and `end` are clamped to char boundaries.
+    /// If `start > end` they're swapped.
+    pub fn replace_range(&mut self, start: usize, end: usize, replacement: &str) {
+        let pre = self.snapshot();
+        let start = clamp_to_char_boundary(&self.text, start);
+        let end = clamp_to_char_boundary(&self.text, end);
+        let (start, end) = (start.min(end), start.max(end));
+        self.text.replace_range(start..end, replacement);
+        self.cursor = start + replacement.len();
+        self.selection_anchor = None;
+        self.undo.record(OpKind::Other, pre);
+    }
+
     /// Cut the current selection: capture the selected text, delete
     /// it from the buffer, and record one undo entry capturing the
     /// **pre-cut state including the selection**. Returns the cut
@@ -2037,6 +2064,56 @@ mod tests {
         // Second undo: pre-"abc" → "" with cursor at 0.
         e.undo();
         assert!(e.is_empty());
+    }
+
+    #[test]
+    fn replace_range_undo_does_not_resurrect_phantom_selection() {
+        // Regression test for the completion-popup bug: when the
+        // popup accepted a candidate via the old set_selection +
+        // insert_str dance, the undo entry captured the transient
+        // selection over the typed-token range. Cmd+Z then
+        // restored that selection — but the user never made one.
+        //
+        // `replace_range` should preserve the editor's PRE-call
+        // selection state (`None` here) in the undo snapshot.
+        let mut e = PromptEditor::new();
+        e.insert_str("lsap C");
+        // Caret at end (byte 6); no selection.
+        assert!(!e.has_selection());
+        e.reset_undo();
+        // Simulate a completion accept: replace "C" (bytes 5..6)
+        // with "CLAUDE.md".
+        e.replace_range(5, 6, "CLAUDE.md");
+        assert_eq!(e.text(), "lsap CLAUDE.md");
+        assert!(!e.has_selection());
+        // Cmd+Z: text reverts, AND no phantom selection.
+        assert!(e.undo());
+        assert_eq!(e.text(), "lsap C");
+        assert_eq!(e.cursor(), 6);
+        assert!(
+            !e.has_selection(),
+            "undo must not resurrect a selection that wasn't there pre-accept"
+        );
+    }
+
+    #[test]
+    fn replace_range_clamps_and_swaps_endpoints() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hello");
+        // Swapped endpoints (end < start): should still replace
+        // bytes 0..5.
+        e.replace_range(5, 0, "bye");
+        assert_eq!(e.text(), "bye");
+    }
+
+    #[test]
+    fn replace_range_out_of_bounds_clamps_to_buffer_end() {
+        let mut e = PromptEditor::new();
+        e.insert_str("hi");
+        // end=999 — clamp to buffer end (2), so range is 0..2,
+        // replaced with "xyz".
+        e.replace_range(0, 999, "xyz");
+        assert_eq!(e.text(), "xyz");
     }
 
     #[test]
