@@ -2188,11 +2188,24 @@ pub fn render_pane(
                             } else if extension.len() > current_token_len {
                                 if let Some(editor) = slot.session.editor_mut() {
                                     let origin = popup_ref.origin_byte;
-                                    editor.set_selection(origin, cursor);
-                                    editor.insert_str(&extension);
+                                    editor.replace_range(origin, cursor, &extension);
                                 }
                                 slot.session.clear_history_recall();
                                 // Popup stays; live filter next frame.
+                            } else {
+                                // No further extension possible —
+                                // the visible candidates diverge
+                                // past the current token. User has
+                                // already narrowed the list; same
+                                // muscle (Tab) should now commit
+                                // the selected candidate instead
+                                // of being a no-op.
+                                if let Some(popup) = slot.ui.completion_popup.take()
+                                    && let Some(editor) = slot.session.editor_mut()
+                                {
+                                    popup.accept(editor, current_token_len);
+                                }
+                                slot.session.clear_history_recall();
                             }
                         }
                         Key::ArrowDown => {

@@ -90,8 +90,15 @@ impl CompletionPopup {
     /// `OpKind::Other` entry.
     pub fn accept(&self, editor: &mut PromptEditor, current_token_len: usize) {
         let end = self.origin_byte.saturating_add(current_token_len).min(editor.len_bytes());
-        editor.set_selection(self.origin_byte, end);
-        editor.insert_str(&self.selected().value);
+        // `replace_range` captures the editor's pre-call state
+        // (including selection = None) for the undo entry, so
+        // Cmd+Z restores the buffer WITHOUT a phantom selection
+        // over the typed-token range. The old set_selection +
+        // insert_str dance leaked the temporary selection into
+        // the undo entry, causing the user's complaint that
+        // undoing a completion brought back the text "selected
+        // even though it was not selected before."
+        editor.replace_range(self.origin_byte, end, &self.selected().value);
     }
 
     /// Compute the readline-style smart-Tab extension.
