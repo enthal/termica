@@ -48,14 +48,23 @@ impl Default for WatermarkSettings {
 pub const MIN_SIZE_FRAC: f32 = 0.05;
 pub const MAX_SIZE_FRAC: f32 = 1.0;
 
+/// Hard upper bound on the watermark's edge, in points: the icon's
+/// native resolution (256×256). On a large pane `size_frac` would
+/// otherwise scale the 256px texture up past 1:1 and it'd go soft;
+/// capping here keeps it crisp and stops the logo dominating a big
+/// window.
+pub const MAX_SIZE_PX: f32 = 256.0;
+
 /// Centered square destination rect for the watermark within `pane`.
 ///
 /// Edge = `size_frac` (clamped to `[MIN_SIZE_FRAC, MAX_SIZE_FRAC]`)
 /// times the pane's *shorter* side, so the square always fits even in
-/// a tall-thin or wide-short pane. Pure → unit-tested below.
+/// a tall-thin or wide-short pane — then capped at [`MAX_SIZE_PX`] so
+/// the icon is never upscaled past its native resolution. Pure →
+/// unit-tested below.
 pub fn watermark_rect(pane: egui::Rect, size_frac: f32) -> egui::Rect {
     let frac = size_frac.clamp(MIN_SIZE_FRAC, MAX_SIZE_FRAC);
-    let edge = pane.size().min_elem() * frac;
+    let edge = (pane.size().min_elem() * frac).min(MAX_SIZE_PX);
     egui::Rect::from_center_size(pane.center(), egui::vec2(edge, edge))
 }
 
@@ -171,6 +180,17 @@ mod tests {
         // Above MAX clamps down.
         let big = watermark_rect(pane, 5.0);
         assert_eq!(big.width(), 200.0 * MAX_SIZE_FRAC);
+    }
+
+    #[test]
+    fn watermark_rect_caps_at_native_resolution() {
+        // A large pane would scale the 256px icon up past 1:1; the
+        // edge is capped at MAX_SIZE_PX regardless of frac.
+        let pane = rect(2000.0, 1500.0);
+        let wm = watermark_rect(pane, 1.0);
+        assert_eq!(wm.width(), MAX_SIZE_PX);
+        assert_eq!(wm.height(), MAX_SIZE_PX);
+        assert_eq!(wm.center(), pane.center());
     }
 
     #[test]
