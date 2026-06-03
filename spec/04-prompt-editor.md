@@ -98,7 +98,7 @@ Standard text-editor mapping, OS-aware. macOS uses `Option`/`Cmd`; Linux/Windows
 | Up / Down | Multiline-aware history walk (see [§History walk (Up/Down)](#history-walk-updown) below). Inert while the completion or history popup is open — those widgets consume `↑`/`↓` for their own list navigation. | same |
 | Esc | Dismiss popup; if no popup, leave editor → demote to `RawTerminal` | same |
 | Ctrl + C on empty editor | Send SIGINT to PTY (terminal-mode parity) | same |
-| Ctrl + C on a typed line | Discard the line in the editor (readline parity); send **nothing** to the PTY | same |
+| Ctrl + C on a typed line | No-op: editor keeps its text, send **nothing** to the PTY (the gate swallows it) | same |
 | Ctrl + D on empty editor | Send EOF to PTY (terminal-mode parity) | same |
 
 The matching matrix lives in [`classify_editor_motion`](../src/render_pane.rs); both branches are unit-tested with the `is_macos` flag flipped explicitly so each OS's convention is verified on every CI run, not only on the host that runs CI. New motion keys are added there first, with tests, before any new row appears above.

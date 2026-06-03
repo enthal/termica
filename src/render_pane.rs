@@ -335,40 +335,14 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
                 }
                 return true;
             }
-            // Ctrl+C with a typed-but-unsubmitted line: readline
-            // parity — discard the line in the editor and consume the
-            // event so NOTHING reaches the PTY. The editor owns the
-            // line, not the shell; a stray `\x03` would abort the
-            // shell's (empty) line and desync it. On an EMPTY editor
-            // we fall through, and the boundary gate
-            // ([`pty_passthrough_allowed`]) lets the encoder emit
-            // `\x03` — terminal-parity SIGINT at an empty prompt
-            // (spec/04). `!mac_cmd` distinguishes Ctrl+C from macOS
-            // `Cmd+C` (copy); on Linux egui sets `command` for Ctrl
-            // but leaves `mac_cmd` false, so this matches both. Placed
-            // BEFORE the `command || alt → bypass` gate below so it
-            // still fires on Linux, where Ctrl carries `command`.
-            if matches!(key, Key::C)
-                && modifiers.ctrl
-                && !modifiers.shift
-                && !modifiers.alt
-                && !modifiers.mac_cmd
-            {
-                let has_text = slot.session.editor_mut().map(|e| !e.is_empty()).unwrap_or(false);
-                if !has_text {
-                    // Empty editor → let the encoder send SIGINT.
-                    return false;
-                }
-                slot.session.clear_history_recall();
-                slot.ui.completion_popup = None;
-                if let Some(editor) = slot.session.editor_mut() {
-                    editor.clear();
-                    // Drop the pre-clear undo entry: a discarded line
-                    // isn't something the user undoes back into.
-                    editor.reset_undo();
-                }
-                return true;
-            }
+            // Ctrl+C is deliberately NOT handled here. With a typed
+            // line it does nothing — the editor keeps its text and the
+            // boundary gate ([`pty_passthrough_allowed`]) swallows the
+            // chord so no `\x03` reaches (and desyncs) the shell. On an
+            // EMPTY editor it likewise falls through, and the gate then
+            // lets the encoder emit `\x03` — terminal-parity SIGINT at
+            // an empty prompt (spec/04). No buffer mutation either way:
+            // the user asked that Ctrl+C never discard a typed line.
             // Word / line / doc boundary moves. Bindings differ by
             // OS — `classify_editor_motion` encodes both conventions.
             if let Some((motion, extending)) =
@@ -466,8 +440,9 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
             // boundary gate ([`pty_passthrough_allowed`]) already
             // stops every non-signal chord from reaching the PTY, so
             // even chords NOT in this list (Ctrl+X/Y/Z, …) no longer
-            // leak. `Ctrl+C` / `Ctrl+D` are handled above (line
-            // discard / SIGINT-EOF gating), so they're absent here.
+            // leak. `Ctrl+C` / `Ctrl+D` are absent here: the gate
+            // swallows them on a typed line and lets the encoder send
+            // SIGINT / EOF on an empty editor.
             if modifiers.ctrl
                 && !modifiers.shift
                 && matches!(
@@ -2717,12 +2692,12 @@ mod tests {
         assert!(pty_passthrough_allowed(&key_ev(egui::Key::C, ctrl), false, false));
     }
 
-    // ---- Ctrl+C line-discard (readline parity) -----------------------
+    // ---- Ctrl+C on the editor ----------------------------------------
     //
     // Behavioral test through `apply_event_to_editor` on a real
-    // editor-active session: a typed line is discarded (not sent to the
-    // PTY), an empty editor falls through so the boundary gate can emit
-    // SIGINT.
+    // editor-active session: Ctrl+C is a no-op on a typed line (text
+    // untouched, not consumed → the boundary gate swallows it), and an
+    // empty editor falls through so the gate can emit SIGINT.
 
     fn spawn_editor_active_slot() -> PaneSlot {
         use crate::pane::PaneSession;
@@ -2755,14 +2730,16 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_on_typed_line_discards_it_and_is_consumed() {
+    fn ctrl_c_on_typed_line_leaves_text_untouched() {
         let mut slot = spawn_editor_active_slot();
         slot.session.editor_mut().unwrap().insert_str("echo too bad");
         let ctrl_c = key_ev(egui::Key::C, mods(true, false, false, false));
-        // Consumed by the editor → never reaches the encoder/PTY.
-        assert!(apply_event_to_editor(&ctrl_c, &mut slot));
-        // The typed line is gone.
-        assert!(slot.session.blocks().editor_on_tail().unwrap().is_empty());
+        // The editor does NOT consume it (falls through to the gate,
+        // which swallows it because the editor is non-empty) and the
+        // typed line is left exactly as it was — Ctrl+C is a no-op on a
+        // typed line, never a line-discard.
+        assert!(!apply_event_to_editor(&ctrl_c, &mut slot));
+        assert_eq!(slot.session.blocks().editor_on_tail().unwrap().text(), "echo too bad");
     }
 
     #[test]
