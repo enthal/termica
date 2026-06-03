@@ -2435,23 +2435,35 @@ pub fn render_pane(
         }
     }
 
+    // ---- blank-pane watermark overlay ---------------------------
+    //
+    // Painted last, on top of the terminal's opaque fill, so the faint
+    // app icon shows through. Shown while the pane is *pristine* — no
+    // command has sealed into scrollback yet (`has_sealed_blocks`) —
+    // and not in alt-screen (vim/less/etc. own the whole grid). Drawn
+    // in the base layer after all content, so Area-based popups (the
+    // completion popup) and modals still render above it.
+    //
+    // Visibility is eased, not binary: `animate_bool_with_time`
+    // advances a 0→1 factor across frames (and self-requests repaints
+    // while in flight), so the logo fades out when the first command
+    // runs and fades back in if scrollback is cleared to blank again.
+    // The animation id is pane-scoped via the surrounding `push_id`.
+    // See [`crate::watermark`].
+    let show_watermark = !in_alt_screen && !slot.session.blocks().has_sealed_blocks();
+    let watermark_fade = ctx.animate_bool_with_time(
+        ui.id().with("watermark-fade"),
+        show_watermark,
+        crate::watermark::FADE_SECS,
+    );
+    if watermark_fade > 0.0 {
+        crate::watermark::paint(ctx, ui.painter(), ui.max_rect(), watermark, watermark_fade);
+    }
+
     // Debug overlay: when `TERMICA_DEBUG_PANE_STATE=1` is set in
     // the environment, paint a small text box in the top-left of
     // each pane showing its mode-machine + block-stack state.
     // Used to diagnose the "tab 1 enters RawTerminal when Ctrl+R
-    // ---- blank-pane watermark overlay ---------------------------
-    //
-    // Painted last, on top of the terminal's opaque fill, so the faint
-    // app icon shows through. Gated on the pane being *pristine* — no
-    // command has sealed into scrollback yet (`has_sealed_blocks`) —
-    // and not in alt-screen (vim/less/etc. own the whole grid). Drawn
-    // in the base layer after all content, so Area-based popups (the
-    // completion popup) and modals still render above it. See
-    // [`crate::watermark`].
-    if !in_alt_screen && !slot.session.blocks().has_sealed_blocks() {
-        crate::watermark::paint(ctx, ui.painter(), ui.max_rect(), watermark);
-    }
-
     // closes in tab 2" intermittent bug and similar focus-perturbation
     // edge cases. Costs nothing when the env var is unset (just a
     // single env_var lookup per pane per frame, which is cached

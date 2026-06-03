@@ -55,6 +55,19 @@ pub const MAX_SIZE_FRAC: f32 = 1.0;
 /// window.
 pub const MAX_SIZE_PX: f32 = 256.0;
 
+/// Fade duration, seconds, for the watermark easing in (pane becomes
+/// blank) and out (its first command seals into scrollback). Short
+/// enough to feel responsive, long enough to read as a fade rather
+/// than a pop. Driven by egui's animation manager in the renderer.
+pub const FADE_SECS: f32 = 0.35;
+
+/// Base opacity scaled by a fade factor in `0.0..=1.0`, rounded to a
+/// `u8` alpha. Pure → unit-tested below; the fade factor itself comes
+/// from egui's frame-driven `animate_bool_with_time`.
+pub fn effective_alpha(base: u8, fade: f32) -> u8 {
+    (base as f32 * fade.clamp(0.0, 1.0)).round() as u8
+}
+
 /// Centered square destination rect for the watermark within `pane`.
 ///
 /// Edge = `size_frac` (clamped to `[MIN_SIZE_FRAC, MAX_SIZE_FRAC]`)
@@ -116,27 +129,35 @@ fn texture(ctx: &egui::Context, grayscale: bool) -> Option<egui::TextureHandle> 
     Some(handle)
 }
 
-/// Paint the watermark overlay into `pane_rect` per `settings`.
+/// Paint the watermark overlay into `pane_rect` per `settings`, scaled
+/// by `fade` (0.0..=1.0 — the renderer's eased blank↔non-blank
+/// factor).
 ///
 /// Callers gate on "is this pane blank?" (see
 /// [`crate::block::BlockStack::has_sealed_blocks`]) and on alt-screen
-/// mode; this function only honors `settings.enabled` and the texture
-/// being decodable. Paints in the caller's current layer/paint order,
-/// so call it *after* the terminal so the faint logo lands on top.
+/// mode; this function only honors `settings.enabled`, the fade
+/// factor, and the texture being decodable. Paints in the caller's
+/// current layer/paint order, so call it *after* the terminal so the
+/// faint logo lands on top.
 pub fn paint(
     ctx: &egui::Context,
     painter: &egui::Painter,
     pane_rect: egui::Rect,
     settings: WatermarkSettings,
+    fade: f32,
 ) {
-    if !settings.enabled || settings.alpha == 0 {
+    if !settings.enabled {
+        return;
+    }
+    let alpha = effective_alpha(settings.alpha, fade);
+    if alpha == 0 {
         return;
     }
     let Some(tex) = texture(ctx, settings.grayscale) else {
         return;
     };
     let rect = watermark_rect(pane_rect, settings.size_frac);
-    let tint = egui::Color32::from_white_alpha(settings.alpha);
+    let tint = egui::Color32::from_white_alpha(alpha);
     painter.image(tex.id(), rect, full_uv(), tint);
 }
 
@@ -191,6 +212,18 @@ mod tests {
         assert_eq!(wm.width(), MAX_SIZE_PX);
         assert_eq!(wm.height(), MAX_SIZE_PX);
         assert_eq!(wm.center(), pane.center());
+    }
+
+    #[test]
+    fn effective_alpha_scales_and_clamps() {
+        // Endpoints.
+        assert_eq!(effective_alpha(28, 0.0), 0);
+        assert_eq!(effective_alpha(28, 1.0), 28);
+        // Midpoint rounds.
+        assert_eq!(effective_alpha(28, 0.5), 14);
+        // Out-of-range fade is clamped, not extrapolated.
+        assert_eq!(effective_alpha(28, -1.0), 0);
+        assert_eq!(effective_alpha(28, 2.0), 28);
     }
 
     #[test]
