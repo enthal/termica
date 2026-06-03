@@ -96,7 +96,7 @@ Standard text-editor mapping, OS-aware. macOS uses `Option`/`Cmd`; Linux/Windows
 | Tab | Local completion popup ([Phase 4I](10-roadmap.md#phase-4--editor-at-prompt-block-model-pivot)) | same |
 | Ctrl + R | History popup (fuzzy search; [Phase 4J](10-roadmap.md#phase-4--editor-at-prompt-block-model-pivot)) | same |
 | Up / Down | Multiline-aware history walk (see [§History walk (Up/Down)](#history-walk-updown) below). Inert while the completion or history popup is open — those widgets consume `↑`/`↓` for their own list navigation. | same |
-| Esc | Dismiss popup; if no popup, leave editor → demote to `RawTerminal` | same |
+| Esc | Dismiss popup; if no popup, **no-op** (consumed, nothing sent to PTY) | same |
 | Ctrl + C on empty editor | Send SIGINT to PTY (terminal-mode parity) | same |
 | Ctrl + C on a typed line | No-op: editor keeps its text, send **nothing** to the PTY (the gate swallows it) | same |
 | Ctrl + D on empty editor | Send EOF to PTY (terminal-mode parity) | same |

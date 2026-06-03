@@ -475,10 +475,19 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
                     return true;
                 }
                 Key::Escape => {
-                    // Abandon any in-progress recall walk before
-                    // demotion so the next prompt opens clean.
-                    slot.session.clear_history_recall();
-                    slot.session.leave_editor_esc();
+                    // Esc is intentionally inert in the editor: it just
+                    // consumes the keystroke (so it never reaches the
+                    // PTY) and does nothing else. It USED to demote
+                    // `ShellPromptEditor → RawTerminal` via
+                    // `leave_editor_esc`, but dropping into raw I/O on
+                    // an Esc was confusing and looked like a bug, and
+                    // it solved no problem in practice. The demote
+                    // machinery (`PaneSession::leave_editor_esc` →
+                    // `PromptController::leave_editor_esc`, spec/05) is
+                    // deliberately left in place — unbound — in case a
+                    // future gesture wants it. (Popups are dismissed by
+                    // their own Esc interception earlier in the loop;
+                    // this arm only runs when none is open.)
                     return true;
                 }
                 Key::ArrowUp if !modifiers.shift && !modifiers.alt && !modifiers.command => {
@@ -1938,15 +1947,15 @@ pub fn render_pane(
     //      `request_focus()` → its anchor immediately has focus.
     //   3. The same frame's keyboard gate now opens — even
     //      though the *user* never directed input at this pane —
-    //      and the same Esc event runs `apply_event_to_editor`,
-    //      which routes Esc to `leave_editor_esc()`. The pane
-    //      silently demotes `ShellPromptEditor → RawTerminal`.
+    //      and the same event runs `apply_event_to_editor`, landing
+    //      in the wrong pane's editor (e.g. a typed character, or an
+    //      Enter that submits this pane's buffer).
     //   4. The rightmost pane (the one the user was actually on)
     //      then renders, requests focus via `needs_focus = true`
     //      from the overlay-close path, and ends up focused.
     //
-    // The leftmost pane is left in `RawTerminal` from a key the
-    // user never sent at it. By using `had_focus_at_frame_start`
+    // The leftmost pane just consumed a key the user never sent at
+    // it. By using `had_focus_at_frame_start`
     // for the gate, focus claims (whether via `needs_focus`,
     // `nothing_focused`, or a click) take effect on the NEXT
     // frame's keyboard processing — never the same frame's. The
@@ -2749,6 +2758,21 @@ mod tests {
         // NOT consumed → the caller's boundary gate lets the encoder
         // emit `\x03` (terminal-parity SIGINT at an empty prompt).
         assert!(!apply_event_to_editor(&ctrl_c, &mut slot));
+    }
+
+    #[test]
+    fn esc_is_inert_and_keeps_editor_mode() {
+        // Esc used to demote ShellPromptEditor → RawTerminal; it is now
+        // a consumed no-op. The pane stays in the editor and the typed
+        // line is preserved. (The demote machinery still exists, just
+        // unbound — see the Key::Escape arm.)
+        let mut slot = spawn_editor_active_slot();
+        slot.session.editor_mut().unwrap().insert_str("echo hi");
+        assert!(slot.session.editor_is_active());
+        let esc = key_ev(egui::Key::Escape, mods(false, false, false, false));
+        assert!(apply_event_to_editor(&esc, &mut slot)); // consumed, no PTY leak
+        assert!(slot.session.editor_is_active(), "Esc must not demote out of the editor");
+        assert_eq!(slot.session.blocks().editor_on_tail().unwrap().text(), "echo hi");
     }
 
     #[test]
