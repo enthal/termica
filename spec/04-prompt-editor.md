@@ -344,6 +344,7 @@ See [07](07-history-and-search.md) for the history storage and scopes.
 
 ## What the editor never does
 
+- **Never** stores a control character in the buffer. The insert primitives (`insert_char`, `insert_str`) drop every C0/C1 control code and DEL before it reaches the buffer; **newline is the sole exception** (the multiline line separator). A raw control byte would poison the submitted command — on submit the shell sees e.g. `\x03` (ETX) and aborts the line, so the typed command silently vanishes (never reaching scrollback or history) and the stale byte echoes as a `^C`-style literal in front of the next command. Filtering at the insert primitives makes that state unrepresentable for every caller. (Strict layer — tested.)
 - **Never** sends a keystroke to the PTY while in `ShellPromptEditor` mode, except via `submit()`, Ctrl+C, or Ctrl+D edge cases above.
 - **Never** writes to history mid-edit. Recording happens at submit only.
 - **Never** auto-corrects or auto-completes silently. The user always confirms.
