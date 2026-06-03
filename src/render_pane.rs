@@ -610,6 +610,7 @@ pub fn render_pane(
     home: Option<&Path>,
     modal_open: bool,
     chrome_variant: crate::focused_chrome::ChromeVariant,
+    watermark: crate::watermark::WatermarkSettings,
 ) {
     // Input routing in a multi-pane world:
     //
@@ -2438,6 +2439,19 @@ pub fn render_pane(
     // the environment, paint a small text box in the top-left of
     // each pane showing its mode-machine + block-stack state.
     // Used to diagnose the "tab 1 enters RawTerminal when Ctrl+R
+    // ---- blank-pane watermark overlay ---------------------------
+    //
+    // Painted last, on top of the terminal's opaque fill, so the faint
+    // app icon shows through. Gated on the pane being *pristine* — no
+    // command has sealed into scrollback yet (`has_sealed_blocks`) —
+    // and not in alt-screen (vim/less/etc. own the whole grid). Drawn
+    // in the base layer after all content, so Area-based popups (the
+    // completion popup) and modals still render above it. See
+    // [`crate::watermark`].
+    if !in_alt_screen && !slot.session.blocks().has_sealed_blocks() {
+        crate::watermark::paint(ctx, ui.painter(), ui.max_rect(), watermark);
+    }
+
     // closes in tab 2" intermittent bug and similar focus-perturbation
     // edge cases. Costs nothing when the env var is unset (just a
     // single env_var lookup per pane per frame, which is cached

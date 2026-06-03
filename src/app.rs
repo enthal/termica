@@ -150,6 +150,14 @@ pub struct TermicaApp {
     /// picker window. The picker keeps its own ViewportId so egui
     /// can route close events back to us.
     pub(crate) picker_viewport_open: Arc<AtomicBool>,
+    /// Live-tunable blank-pane watermark appearance. The pane renderer
+    /// reads a per-frame snapshot; the `--pick-watermark` viewport
+    /// writes into this same `Arc<Mutex<…>>` so slider drags show up
+    /// in the main window immediately. Same pattern as `chrome_variant`.
+    pub(crate) watermark: Arc<Mutex<crate::watermark::WatermarkSettings>>,
+    /// True while the watermark-tuner viewport is meant to be alive.
+    /// Set by `--pick-watermark`, cleared when its window is closed.
+    pub(crate) watermark_picker_open: Arc<AtomicBool>,
     /// Most-recently-sent OS window title. We compute the desired
     /// title each frame (`<active-tab-title> | Termica`) and only
     /// dispatch a `ViewportCommand::Title` when it changes — the
@@ -196,6 +204,8 @@ impl TermicaApp {
             app_run_id,
             chrome_variant: Arc::new(Mutex::new(opts.initial_chrome_variant)),
             picker_viewport_open: Arc::new(AtomicBool::new(opts.open_chrome_picker)),
+            watermark: Arc::new(Mutex::new(opts.initial_watermark)),
+            watermark_picker_open: Arc::new(AtomicBool::new(opts.open_watermark_picker)),
             last_window_title: String::new(),
             startup_cwd: opts.startup_cwd,
         };
@@ -487,6 +497,16 @@ impl eframe::App for TermicaApp {
             );
         }
 
+        // Watermark tuner viewport (second OS window), same lifecycle
+        // as the chrome picker above.
+        if self.watermark_picker_open.load(Ordering::Relaxed) {
+            show_watermark_picker_viewport(
+                ctx,
+                self.watermark.clone(),
+                self.watermark_picker_open.clone(),
+            );
+        }
+
         // macOS' Cmd+Q (and the red traffic-light close button on any
         // OS) is delivered by winit as a *viewport close request*,
         // not a `Key::Q` event. Our shortcut matcher never sees it,
@@ -577,6 +597,7 @@ impl eframe::App for TermicaApp {
                 pending_close_confirm: &mut self.pending_close_confirm,
                 modal_open,
                 chrome_variant: *self.chrome_variant.lock().expect("chrome variant mutex"),
+                watermark: *self.watermark.lock().expect("watermark mutex"),
             };
             self.tree.ui(&mut behavior, ui);
             self.new_tab_requested_in = behavior.new_tab_requested_in;
@@ -1005,6 +1026,12 @@ pub struct TermicaAppOptions {
     pub open_chrome_picker: bool,
     /// Initial value of [`TermicaApp::chrome_variant`].
     pub initial_chrome_variant: crate::focused_chrome::ChromeVariant,
+    /// Open the watermark-tuner viewport (second OS window) on
+    /// startup. Shares an `Arc<Mutex<WatermarkSettings>>` with the
+    /// main window so slider drags live-update the blank-pane overlay.
+    pub open_watermark_picker: bool,
+    /// Initial value of [`TermicaApp::watermark`].
+    pub initial_watermark: crate::watermark::WatermarkSettings,
     /// First pane's starting cwd. See
     /// [spec/06 §"Startup cwd and positional argument"](../spec/06-workspace-and-tiles.md#startup-cwd-and-positional-argument)
     /// for the resolution chain (positional arg → `current_dir`
@@ -1099,6 +1126,71 @@ pub(crate) fn show_chrome_picker_viewport(
             // and the user has to manually re-click the main window.
             if picked {
                 ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+            }
+        });
+    });
+}
+
+/// Paint the blank-pane watermark tuner into a deferred Viewport
+/// (second OS window, opened via `--pick-watermark`). Reads + writes
+/// the shared `Arc<Mutex<WatermarkSettings>>` so a slider drag here
+/// updates the main window's watermark on the next frame.
+///
+/// Closing the window clears `watermark_picker_open` so subsequent
+/// frames stop scheduling the viewport. Mirrors
+/// [`show_chrome_picker_viewport`].
+pub(crate) fn show_watermark_picker_viewport(
+    ctx: &egui::Context,
+    settings: Arc<Mutex<crate::watermark::WatermarkSettings>>,
+    open: Arc<AtomicBool>,
+) {
+    use crate::watermark::{MAX_SIZE_FRAC, MIN_SIZE_FRAC};
+
+    let viewport_id = egui::ViewportId::from_hash_of("termica-watermark-picker");
+    let builder = egui::ViewportBuilder::default()
+        .with_title("Termica · tune blank-pane watermark")
+        .with_inner_size([420.0, 320.0])
+        .with_min_inner_size([320.0, 240.0]);
+    ctx.show_viewport_deferred(viewport_id, builder, move |ctx, _class| {
+        if ctx.input(|i| i.viewport().close_requested()) {
+            open.store(false, Ordering::Relaxed);
+        }
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Blank-pane watermark");
+            ui.weak(
+                "Shows the app icon faintly behind a pane until its first command \
+                 runs. Drag a slider — the main window updates immediately.",
+            );
+            ui.separator();
+
+            // Snapshot, mutate locally, write back only on change so we
+            // don't hold the lock across the whole frame or churn the
+            // shared value when nothing moved.
+            let mut s = *settings.lock().expect("watermark mutex");
+            let before = s;
+
+            ui.checkbox(&mut s.enabled, "Enabled");
+            ui.add_enabled_ui(s.enabled, |ui| {
+                ui.add(egui::Slider::new(&mut s.alpha, 0..=255).text("Opacity (alpha)"));
+                ui.add(
+                    egui::Slider::new(&mut s.size_frac, MIN_SIZE_FRAC..=MAX_SIZE_FRAC)
+                        .text("Size (fraction of short side)"),
+                );
+                ui.checkbox(&mut s.grayscale, "Grayscale");
+            });
+
+            ui.add_space(8.0);
+            ui.weak(format!(
+                "current: alpha={} size={:.2} grayscale={} enabled={}",
+                s.alpha, s.size_frac, s.grayscale, s.enabled
+            ));
+
+            if s != before {
+                *settings.lock().expect("watermark mutex") = s;
+                // NB: unlike the chrome picker we deliberately do NOT
+                // steal focus back to the main window here — these are
+                // sliders, and a per-frame Focus command would yank the
+                // pointer-grab away mid-drag and break dragging.
             }
         });
     });

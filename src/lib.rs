@@ -53,6 +53,7 @@ pub mod shell;
 pub mod shell_syntax;
 pub mod terminal;
 pub mod visual_picker;
+pub mod watermark;
 
 mod app;
 mod behavior;
@@ -96,7 +97,7 @@ const APP_ID: &str = "termica";
 /// The window/dock/taskbar icon, embedded in the binary so there is
 /// no runtime file dependency. Decoded by [`load_app_icon`]; written
 /// verbatim to the XDG icon path by `install_desktop_entry` on Linux.
-const APP_ICON_PNG: &[u8] = include_bytes!("../assets/app_icon.png");
+pub(crate) const APP_ICON_PNG: &[u8] = include_bytes!("../assets/app_icon.png");
 
 /// Decode the embedded PNG into the RGBA buffer eframe wants for the
 /// window icon. Returns `None` if the bytes fail to decode — a
@@ -176,6 +177,10 @@ pub fn run() -> eframe::Result<()> {
     // stderr and exit non-zero.
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let pick_chrome = raw_args.iter().any(|a| a == "--pick-chrome");
+    // `--pick-watermark` opens the blank-pane watermark tuner in a
+    // second viewport (alpha / size / grayscale sliders), live-updating
+    // the main window. Mirrors `--pick-chrome`.
+    let pick_watermark = raw_args.iter().any(|a| a == "--pick-watermark");
     let positionals: Vec<&str> =
         raw_args.iter().filter(|a| !a.starts_with("--")).map(|s| s.as_str()).collect();
     if positionals.len() > 1 {
@@ -189,6 +194,7 @@ pub fn run() -> eframe::Result<()> {
     let startup_cwd = crate::app::resolve_startup_cwd(positional_path);
     let app_opts = crate::app::TermicaAppOptions {
         open_chrome_picker: pick_chrome,
+        open_watermark_picker: pick_watermark,
         startup_cwd: Some(startup_cwd),
         ..Default::default()
     };
