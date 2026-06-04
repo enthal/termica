@@ -110,7 +110,7 @@ The `Bootstrapping` initial state is stricter still: not even raw keystrokes go 
 | Direction | Gate |
 |---|---|
 | → `ShellPromptEditor` | Requires `precmd` lifecycle message; current mode = `RawTerminal`; frame debounce satisfied. |
-| ← `ShellPromptEditor` | Any of: Enter submit; Ctrl-C on empty editor (sends interrupt); window blur in modes where that matters; PTY exit; alternate-screen toggle. Eager — no waiting on lifecycle confirmation. (An explicit Esc-leave demote is **implemented but currently unbound** — `PromptController::leave_editor_esc` / `DemoteReason::Esc` remain, but Esc in the editor is a no-op per spec/04: dropping into raw I/O on an Esc was confusing and solved no problem. The machinery is retained for a future gesture.) |
+| ← `ShellPromptEditor` | Any of: Enter submit; window blur in modes where that matters; PTY exit; alternate-screen toggle. Eager — no waiting on lifecycle confirmation. (Ctrl+C is **not** a demote/interrupt trigger here — it's inert at an idle prompt per spec/04; interrupting a running program happens in `RawTerminal`. An explicit Esc-leave demote is **implemented but currently unbound** — `PromptController::leave_editor_esc` / `DemoteReason::Esc` remain, but Esc in the editor is a no-op per spec/04: dropping into raw I/O on an Esc was confusing and solved no problem. The machinery is retained for a future gesture.) |
 
 Demotion can happen "speculatively": for example, the user pressing Enter demotes immediately and the next `preexec` lifecycle message is treated as a confirming event, not a triggering one. If the message never arrives (shell crashed mid-Enter), the pane stays in `RawTerminal` and the command block is annotated as "no command_finished received" — but the pane is correct.
 

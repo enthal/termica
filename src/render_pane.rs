@@ -223,20 +223,25 @@ fn classify_editor_motion(
     None
 }
 
-/// Is this event the terminal-signal chord — Ctrl+C (SIGINT) or
-/// Ctrl+D (EOF) — that may deliberately reach the PTY from the prompt
-/// editor? Pure so the routing rule is unit-testable without an egui
+/// Is this event the EOF chord — Ctrl+D — the one keystroke that may
+/// deliberately reach the PTY from an idle prompt editor (exit the
+/// shell)? Pure so the routing rule is unit-testable without an egui
 /// event loop.
 ///
-/// `mac_cmd` is excluded so macOS `Cmd+C` (copy) and `Cmd+D` never
-/// match; `shift` is excluded so the `Ctrl+Shift+C` copy chord never
-/// matches. On Linux/Windows egui sets `command` for a Ctrl press but
-/// leaves `mac_cmd` false, so the same check recognises `Ctrl+C`
-/// there too.
-fn is_terminal_signal_chord(event: &egui::Event) -> bool {
+/// Notably NOT Ctrl+C: in `ShellPromptEditor` the shell is idle at a
+/// confirmed prompt, so there is no foreground program to interrupt —
+/// a SIGINT would only print a cosmetic `^C`. Interrupting a running
+/// program happens in `RawTerminal` (`editor_active = false`), where
+/// every keystroke already passes.
+///
+/// `mac_cmd` is excluded so macOS `Cmd+D` never matches; `shift` is
+/// excluded so a shifted combo never matches. On Linux/Windows egui
+/// sets `command` for a Ctrl press but leaves `mac_cmd` false, so the
+/// same check recognises `Ctrl+D` there too.
+fn is_eof_chord(event: &egui::Event) -> bool {
     matches!(
         event,
-        egui::Event::Key { key: egui::Key::C | egui::Key::D, pressed: true, modifiers, .. }
+        egui::Event::Key { key: egui::Key::D, pressed: true, modifiers, .. }
             if modifiers.ctrl && !modifiers.shift && !modifiers.alt && !modifiers.mac_cmd
     )
 }
@@ -244,16 +249,16 @@ fn is_terminal_signal_chord(event: &egui::Event) -> bool {
 /// May this keystroke event be written to the PTY, given the pane's
 /// editor state? Enforces spec/04's invariant at the input boundary:
 /// while the editor owns the line (`ShellPromptEditor`, `editor_active`),
-/// the ONLY keystrokes that reach the PTY are the terminal-parity edge
-/// cases on an EMPTY editor — Ctrl+C → SIGINT, Ctrl+D → EOF. Every
-/// other keystroke belongs to the editor and must not leak a raw byte
-/// to the shell: a stray control byte (`Ctrl+X/Y/Z`, …) sits in the
-/// shell's input and resurfaces prefixed to the next command's output,
-/// and `\x03` aborts the shell's line outright so the submitted
-/// command vanishes (never reaching scrollback or history).
+/// the ONLY keystroke that reaches the PTY is Ctrl+D (EOF) on an EMPTY
+/// editor — to exit an idle shell. Every other keystroke belongs to the
+/// editor and must not leak a raw byte to the shell: a stray control
+/// byte (`Ctrl+X/Y/Z`, …) sits in the shell's input and resurfaces
+/// prefixed to the next command's output, and `\x03` (Ctrl+C) aborts
+/// the shell's line — neither has any business at an idle prompt.
 ///
 /// When the editor is NOT active (`RawTerminal` / `AlternateScreen`)
-/// every event passes — the program below owns stdin.
+/// every event passes — the program below owns stdin, and that is where
+/// Ctrl+C → SIGINT interrupts a running program.
 ///
 /// This is the single structural gate that replaces the former
 /// per-letter consume list, which only covered a handful of chords
@@ -262,7 +267,7 @@ fn pty_passthrough_allowed(event: &egui::Event, editor_active: bool, editor_empt
     if !editor_active {
         return true;
     }
-    editor_empty && is_terminal_signal_chord(event)
+    editor_empty && is_eof_chord(event)
 }
 
 /// Route one egui event to the pane's [`PromptEditor`](crate::prompt_editor).
@@ -335,14 +340,17 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
                 }
                 return true;
             }
-            // Ctrl+C is deliberately NOT handled here. With a typed
-            // line it does nothing — the editor keeps its text and the
-            // boundary gate ([`pty_passthrough_allowed`]) swallows the
-            // chord so no `\x03` reaches (and desyncs) the shell. On an
-            // EMPTY editor it likewise falls through, and the gate then
-            // lets the encoder emit `\x03` — terminal-parity SIGINT at
-            // an empty prompt (spec/04). No buffer mutation either way:
-            // the user asked that Ctrl+C never discard a typed line.
+            // Ctrl+C is deliberately NOT handled here, and is fully
+            // inert in the editor: the boundary gate
+            // ([`pty_passthrough_allowed`]) swallows it whether the
+            // editor is empty or not, so no `\x03` ever reaches the
+            // shell. In `ShellPromptEditor` the shell is idle at a
+            // confirmed prompt — there's nothing to interrupt, and a
+            // SIGINT would only print a cosmetic `^C`. (Interrupting a
+            // running program happens in `RawTerminal`, where the
+            // editor is inactive and Ctrl+C passes straight through.)
+            // It also never mutates the buffer — Ctrl+C never discards
+            // a typed line.
             // Word / line / doc boundary moves. Bindings differ by
             // OS — `classify_editor_motion` encodes both conventions.
             if let Some((motion, extending)) =
@@ -440,9 +448,10 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
             // boundary gate ([`pty_passthrough_allowed`]) already
             // stops every non-signal chord from reaching the PTY, so
             // even chords NOT in this list (Ctrl+X/Y/Z, …) no longer
-            // leak. `Ctrl+C` / `Ctrl+D` are absent here: the gate
-            // swallows them on a typed line and lets the encoder send
-            // SIGINT / EOF on an empty editor.
+            // leak. `Ctrl+C` is absent: the gate swallows it
+            // unconditionally (inert at an idle prompt). `Ctrl+D` is
+            // absent too: the gate lets the encoder send EOF on an
+            // empty editor.
             if modifiers.ctrl
                 && !modifiers.shift
                 && matches!(
@@ -2313,14 +2322,14 @@ pub fn render_pane(
                 continue;
             }
             // Boundary gate (spec/04): while the editor owns the line,
-            // the editor consumed everything above except the
-            // terminal-parity edge cases. Anything else reaching here
-            // — a control chord the editor didn't claim (Ctrl+X/Y/Z,
-            // …) — must NOT leak a raw C0 byte to the shell, or it
-            // buffers and resurfaces prefixed to the next command, and
-            // `\x03` aborts the shell's line so the submitted command
-            // vanishes. `pty_passthrough_allowed` permits only
-            // Ctrl+C/Ctrl+D on an EMPTY editor (SIGINT / EOF).
+            // the editor consumed everything above except the EOF edge
+            // case. Anything else reaching here — a control chord the
+            // editor didn't claim (Ctrl+C, Ctrl+X/Y/Z, …) — must NOT
+            // leak a raw C0 byte to the shell, or it buffers and
+            // resurfaces prefixed to the next command (and `\x03` would
+            // print a cosmetic `^C` at the idle prompt).
+            // `pty_passthrough_allowed` permits only Ctrl+D on an EMPTY
+            // editor (EOF, to exit an idle shell).
             let editor_empty =
                 slot.session.blocks().editor_on_tail().map(|e| e.is_empty()).unwrap_or(true);
             if !pty_passthrough_allowed(event, editor_active, editor_empty) {
@@ -2627,23 +2636,26 @@ mod tests {
 
     // ---- pty_passthrough_allowed (editor owns the line) --------------
     //
-    // spec/04: while the editor owns the line (`ShellPromptEditor`), the
-    // ONLY keystrokes that may reach the PTY are the terminal-parity
-    // edge cases on an EMPTY editor — Ctrl+C → SIGINT, Ctrl+D → EOF.
-    // Every other chord is the editor's; leaking a raw C0 byte to the
-    // shell buffers it and surfaces it prefixed to the next command
-    // (`^X^Y^Z…`), and `\x03` aborts the shell's line so the submitted
-    // command vanishes.
+    // spec/04: while the editor owns the line (`ShellPromptEditor`) the
+    // shell is idle at a confirmed prompt — there is no foreground
+    // program to interrupt — so the ONLY keystroke that may reach the
+    // PTY is Ctrl+D (EOF) on an EMPTY editor (exit an idle shell).
+    // Ctrl+C is fully inert here: a SIGINT would only print a cosmetic
+    // `^C`. (Interrupting a running program happens in `RawTerminal`,
+    // `editor_active = false`, which passes everything.) Every other
+    // chord is the editor's; leaking a raw C0 byte to the shell buffers
+    // it and surfaces it prefixed to the next command (`^X^Y^Z…`).
 
     fn key_ev(key: egui::Key, m: egui::Modifiers) -> egui::Event {
         egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: m }
     }
 
     #[test]
-    fn editor_swallows_every_non_signal_control_chord() {
+    fn editor_swallows_ctrl_c_and_other_non_eof_chords() {
         let ctrl = mods(true, false, false, false);
-        for key in [egui::Key::X, egui::Key::Y, egui::Key::Z, egui::Key::B, egui::Key::F] {
-            // Neither empty nor non-empty editor may leak these.
+        // Ctrl+C is included now: it never reaches the PTY from the
+        // editor, empty or not (no cosmetic `^C` at an idle prompt).
+        for key in [egui::Key::C, egui::Key::X, egui::Key::Y, egui::Key::Z, egui::Key::B] {
             assert!(
                 !pty_passthrough_allowed(&key_ev(key, ctrl), true, true),
                 "Ctrl+{key:?} leaked to the PTY (empty editor)"
@@ -2656,46 +2668,36 @@ mod tests {
     }
 
     #[test]
-    fn editor_passes_sigint_and_eof_only_when_empty() {
+    fn editor_passes_eof_only_when_empty() {
         let ctrl = mods(true, false, false, false);
-        // Empty editor: SIGINT / EOF reach the PTY (terminal parity).
-        assert!(pty_passthrough_allowed(&key_ev(egui::Key::C, ctrl), true, true));
+        // Ctrl+D (EOF) on an empty editor exits the idle shell.
         assert!(pty_passthrough_allowed(&key_ev(egui::Key::D, ctrl), true, true));
-        // Non-empty editor: even Ctrl+C / Ctrl+D are swallowed here —
-        // the editor owns the line (Ctrl+C is handled upstream as a
-        // line-discard), so nothing reaches the shell.
-        assert!(!pty_passthrough_allowed(&key_ev(egui::Key::C, ctrl), true, false));
+        // On a typed line it's swallowed — the editor owns the line.
         assert!(!pty_passthrough_allowed(&key_ev(egui::Key::D, ctrl), true, false));
     }
 
     #[test]
-    fn linux_ctrl_c_sets_command_but_still_passes_when_empty() {
+    fn linux_ctrl_d_sets_command_but_still_passes_when_empty() {
         // egui maps Ctrl→`command` on Linux/Windows; `mac_cmd` stays
-        // false, so the signal-chord check must still recognise it.
+        // false, so the EOF chord check must still recognise it. Ctrl+C
+        // (also `command`) stays inert.
         let linux_ctrl = mods(true, false, false, true); // ctrl + command
-        assert!(pty_passthrough_allowed(&key_ev(egui::Key::C, linux_ctrl), true, true));
-        assert!(!pty_passthrough_allowed(&key_ev(egui::Key::X, linux_ctrl), true, true));
+        assert!(pty_passthrough_allowed(&key_ev(egui::Key::D, linux_ctrl), true, true));
+        assert!(!pty_passthrough_allowed(&key_ev(egui::Key::C, linux_ctrl), true, true));
     }
 
     #[test]
-    fn ctrl_shift_c_is_copy_not_signal() {
-        // Ctrl+Shift+C is the copy chord, never SIGINT — must not pass.
+    fn ctrl_shift_d_is_not_an_eof_chord() {
+        // Shift must exclude the chord (avoid accidental EOF combos).
         let ctrl_shift = mods(true, false, true, false);
-        assert!(!pty_passthrough_allowed(&key_ev(egui::Key::C, ctrl_shift), true, true));
-    }
-
-    #[test]
-    fn mac_cmd_c_is_copy_not_signal() {
-        // macOS Cmd+C is copy; `mac_cmd` excludes it from the chord.
-        let cmd =
-            egui::Modifiers { ctrl: false, alt: false, shift: false, command: true, mac_cmd: true };
-        assert!(!pty_passthrough_allowed(&key_ev(egui::Key::C, cmd), true, true));
+        assert!(!pty_passthrough_allowed(&key_ev(egui::Key::D, ctrl_shift), true, true));
     }
 
     #[test]
     fn raw_terminal_passes_every_keystroke() {
         // editor_active = false → the program below owns stdin; every
-        // event (including control chords) goes straight to the PTY.
+        // event (including Ctrl+C, the interrupt path) goes straight to
+        // the PTY.
         let ctrl = mods(true, false, false, false);
         assert!(pty_passthrough_allowed(&key_ev(egui::Key::X, ctrl), false, true));
         assert!(pty_passthrough_allowed(&key_ev(egui::Key::C, ctrl), false, false));
@@ -2704,9 +2706,9 @@ mod tests {
     // ---- Ctrl+C on the editor ----------------------------------------
     //
     // Behavioral test through `apply_event_to_editor` on a real
-    // editor-active session: Ctrl+C is a no-op on a typed line (text
-    // untouched, not consumed → the boundary gate swallows it), and an
-    // empty editor falls through so the gate can emit SIGINT.
+    // editor-active session: Ctrl+C is a no-op — on a typed line the
+    // text is untouched, on an empty editor nothing is sent (the
+    // boundary gate swallows it either way; no cosmetic `^C`).
 
     fn spawn_editor_active_slot() -> PaneSlot {
         use crate::pane::PaneSession;
@@ -2752,12 +2754,18 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_on_empty_editor_falls_through_for_sigint() {
+    fn ctrl_c_on_empty_editor_is_inert() {
         let mut slot = spawn_editor_active_slot();
+        assert!(slot.session.blocks().editor_on_tail().unwrap().is_empty());
         let ctrl_c = key_ev(egui::Key::C, mods(true, false, false, false));
-        // NOT consumed → the caller's boundary gate lets the encoder
-        // emit `\x03` (terminal-parity SIGINT at an empty prompt).
+        // apply_event_to_editor doesn't consume it; the boundary gate
+        // then swallows it (Ctrl+C is not the EOF chord), so no `\x03`
+        // reaches the shell — no cosmetic `^C` at an idle prompt. The
+        // editor is left empty and active.
         assert!(!apply_event_to_editor(&ctrl_c, &mut slot));
+        assert!(!pty_passthrough_allowed(&ctrl_c, true, true));
+        assert!(slot.session.editor_is_active());
+        assert!(slot.session.blocks().editor_on_tail().unwrap().is_empty());
     }
 
     #[test]
