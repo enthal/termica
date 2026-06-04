@@ -476,8 +476,16 @@ fn snapshot_paint_sealed_block_echo() {
     let snapshot = sealed_snapshot(3, 40, b"hello\r\n");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(500.0, 100.0)).build_ui(move |ui| {
-            let _ =
-                render::paint_sealed_block(ui, "echo hello", &snapshot, None, None, None, Some(0));
+            let _ = render::paint_sealed_block(
+                ui,
+                "echo hello",
+                &snapshot,
+                None,
+                None,
+                None,
+                Some(0),
+                std::time::Duration::from_millis(123),
+            );
         });
     harness.snapshot("paint_sealed_block_echo");
 }
@@ -489,7 +497,16 @@ fn snapshot_paint_sealed_block_ls_output() {
     let snapshot = sealed_snapshot(6, 40, b"Cargo.toml\r\nREADME.md\r\nsrc\r\ntests\r\n");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(500.0, 160.0)).build_ui(move |ui| {
-            let _ = render::paint_sealed_block(ui, "ls", &snapshot, None, None, None, Some(0));
+            let _ = render::paint_sealed_block(
+                ui,
+                "ls",
+                &snapshot,
+                None,
+                None,
+                None,
+                Some(0),
+                std::time::Duration::from_millis(1_500),
+            );
         });
     harness.snapshot("paint_sealed_block_ls_output");
 }
@@ -509,6 +526,7 @@ fn snapshot_paint_sealed_block_multiline_command() {
                 None,
                 None,
                 Some(0),
+                std::time::Duration::from_millis(34),
             );
         });
     harness.snapshot("paint_sealed_block_multiline_command");
@@ -706,7 +724,13 @@ fn snapshot_paint_block_header_cwd_only() {
     let home = std::path::PathBuf::from("/Users/tim");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 40.0)).build_ui(move |ui| {
-            let _ = render::paint_block_header(ui, Some(cwd.as_path()), Some(home.as_path()), None);
+            let _ = render::paint_block_header(
+                ui,
+                Some(cwd.as_path()),
+                Some(home.as_path()),
+                None,
+                None,
+            );
         });
     harness.snapshot("paint_block_header_cwd_only");
 }
@@ -717,8 +741,13 @@ fn snapshot_paint_block_header_zero_exit_hides_exit_chip() {
     let home = std::path::PathBuf::from("/Users/tim");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 40.0)).build_ui(move |ui| {
-            let _ =
-                render::paint_block_header(ui, Some(cwd.as_path()), Some(home.as_path()), Some(0));
+            let _ = render::paint_block_header(
+                ui,
+                Some(cwd.as_path()),
+                Some(home.as_path()),
+                Some(0),
+                None,
+            );
         });
     harness.snapshot("paint_block_header_zero_exit");
 }
@@ -731,7 +760,13 @@ fn snapshot_paint_block_header_substitutes_home_with_tilde() {
     let home = std::path::PathBuf::from("/Users/tim");
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(700.0, 40.0)).build_ui(move |ui| {
-            let _ = render::paint_block_header(ui, Some(cwd.as_path()), Some(home.as_path()), None);
+            let _ = render::paint_block_header(
+                ui,
+                Some(cwd.as_path()),
+                Some(home.as_path()),
+                None,
+                None,
+            );
         });
     harness.snapshot("paint_block_header_tilde_substitution");
 }
@@ -747,9 +782,29 @@ fn snapshot_paint_block_header_nonzero_exit_shows_red_annotation() {
                 Some(cwd.as_path()),
                 Some(home.as_path()),
                 Some(127),
+                None,
             );
         });
     harness.snapshot("paint_block_header_nonzero_exit");
+}
+
+#[test]
+fn snapshot_paint_block_header_with_duration() {
+    // The 4G duration: a dim `(…)` timer at the right of the header
+    // row, after the cwd and (here) the "exit 1" chip.
+    let cwd = std::path::PathBuf::from("/Users/tim/git/enthal/termica");
+    let home = std::path::PathBuf::from("/Users/tim");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 40.0)).build_ui(move |ui| {
+            let _ = render::paint_block_header(
+                ui,
+                Some(cwd.as_path()),
+                Some(home.as_path()),
+                Some(1),
+                Some(std::time::Duration::from_secs(125)),
+            );
+        });
+    harness.snapshot("paint_block_header_with_duration");
 }
 
 #[test]
@@ -767,6 +822,7 @@ fn snapshot_paint_sealed_block_with_header_and_failed_exit() {
                 Some(cwd.as_path()),
                 Some(home.as_path()),
                 Some(127),
+                std::time::Duration::from_millis(42),
             );
         });
     harness.snapshot("paint_sealed_block_with_header_and_failed_exit");
@@ -782,7 +838,16 @@ fn snapshot_paint_sealed_block_with_selection_spans_command_and_output() {
     let sel = Some((BlockCursor::new(0, 0), BlockCursor::new(1, 9)));
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(500.0, 140.0)).build_ui(move |ui| {
-            let _ = render::paint_sealed_block(ui, "ls", &snapshot, sel, None, None, Some(0));
+            let _ = render::paint_sealed_block(
+                ui,
+                "ls",
+                &snapshot,
+                sel,
+                None,
+                None,
+                Some(0),
+                std::time::Duration::from_millis(200),
+            );
         });
     harness.snapshot("paint_sealed_block_with_selection");
 }
@@ -795,8 +860,16 @@ fn snapshot_paint_sealed_block_with_selection_in_command_only() {
     let sel = Some((BlockCursor::new(0, 5), BlockCursor::new(0, 10)));
     let mut harness =
         Harness::builder().with_size(egui::Vec2::new(500.0, 100.0)).build_ui(move |ui| {
-            let _ =
-                render::paint_sealed_block(ui, "echo hello", &snapshot, sel, None, None, Some(0));
+            let _ = render::paint_sealed_block(
+                ui,
+                "echo hello",
+                &snapshot,
+                sel,
+                None,
+                None,
+                Some(0),
+                std::time::Duration::from_millis(200),
+            );
         });
     harness.snapshot("paint_sealed_block_with_selection_in_command_only");
 }
@@ -1207,6 +1280,7 @@ fn snapshot_sticky_header_pinned_at_top() {
             Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
             Some(std::path::Path::new("/Users/tim")),
             Some(1),
+            Some(std::time::Duration::from_millis(123)),
             "ls -la --color=always",
             1,
         );
@@ -1230,6 +1304,7 @@ fn snapshot_sticky_header_multiline_command_capped() {
             Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
             Some(std::path::Path::new("/Users/tim")),
             Some(0),
+            Some(std::time::Duration::from_secs(125)),
             "for f in *.rs; do\n  echo \"$f\"\n  wc -l \"$f\"\n  head -1 \"$f\"\n  tail -1 \"$f\"\ndone",
             1,
         );
@@ -1254,6 +1329,7 @@ fn snapshot_sticky_header_pushed_up_clips_at_top() {
             Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
             Some(std::path::Path::new("/Users/tim")),
             None,
+            Some(std::time::Duration::from_millis(34)),
             "cargo test --workspace",
             1,
         );
