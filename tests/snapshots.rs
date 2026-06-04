@@ -1031,6 +1031,140 @@ fn snapshot_history_overlay_pane_scope_no_matches() {
     harness.snapshot("history_overlay_pane_scope_no_matches");
 }
 
+// ---- Tab-completion popup (Phase 4I slice 1) --------------------------
+//
+// The popup paints via `egui::Area` with a LEFT_BOTTOM pivot at the
+// editor's top-left, so it grows UPWARD and never occludes the editor.
+// These snapshots pin the rendered widget — the data-model logic
+// (selection, tab_extend, accept) is unit-tested in `completion::popup`.
+// Pointer is never moved in the harness, so `hovered()` is false and the
+// selected row is exactly what we set — fully deterministic.
+
+use termica::completion::{CompletionCandidate, CompletionPopup, CompletionSource};
+
+/// Build a popup from `(value, source)` pairs and select `selected`.
+fn completion_popup(selected: usize, candidates: &[(&str, CompletionSource)]) -> CompletionPopup {
+    let cands: Vec<CompletionCandidate> =
+        candidates.iter().map(|(v, s)| CompletionCandidate::simple(*v, *s)).collect();
+    let mut popup = CompletionPopup::new(0, "", cands).expect("non-empty candidate list");
+    popup.selected_index = selected.min(popup.candidates.len().saturating_sub(1));
+    popup
+}
+
+/// Paint a completion popup into a snapshot harness. `anchor` is the
+/// editor top-left (the popup's bottom-left pivot); the popup grows up
+/// from there. `max_rows` mirrors the production value (10) unless a
+/// case wants to force scrolling.
+fn snapshot_completion_popup(
+    name: &str,
+    mut popup: CompletionPopup,
+    anchor: egui::Pos2,
+    max_rows: usize,
+    size: egui::Vec2,
+) {
+    let mut harness = Harness::builder().with_size(size).build_ui(move |ui| {
+        let ctx = ui.ctx().clone();
+        let _ = termica::completion::popup::paint(&ctx, &mut popup, anchor, 1, max_rows);
+    });
+    harness.snapshot(name);
+}
+
+#[test]
+fn snapshot_completion_popup_first_row_selected() {
+    // Command-position completion for "g": $PATH executables plus one
+    // history-ranked entry, so all three source tags can't appear here
+    // but the common $PATH + history mix does. First row selected (the
+    // default on open).
+    let popup = completion_popup(
+        0,
+        &[
+            ("git", CompletionSource::PathExecutable),
+            ("gh", CompletionSource::PathExecutable),
+            ("grep", CompletionSource::PathExecutable),
+            ("gradle", CompletionSource::History),
+            ("gzip", CompletionSource::PathExecutable),
+        ],
+    );
+    snapshot_completion_popup(
+        "completion_popup_first_row_selected",
+        popup,
+        egui::Pos2::new(24.0, 232.0),
+        10,
+        egui::Vec2::new(540.0, 260.0),
+    );
+}
+
+#[test]
+fn snapshot_completion_popup_lower_row_selected() {
+    // Same list, but the selection has moved down to row 3 ("gradle").
+    // The highlight band + selection text color move with it; every
+    // other row renders in the default text color.
+    let popup = completion_popup(
+        3,
+        &[
+            ("git", CompletionSource::PathExecutable),
+            ("gh", CompletionSource::PathExecutable),
+            ("grep", CompletionSource::PathExecutable),
+            ("gradle", CompletionSource::History),
+            ("gzip", CompletionSource::PathExecutable),
+        ],
+    );
+    snapshot_completion_popup(
+        "completion_popup_lower_row_selected",
+        popup,
+        egui::Pos2::new(24.0, 232.0),
+        10,
+        egui::Vec2::new(540.0, 260.0),
+    );
+}
+
+#[test]
+fn snapshot_completion_popup_narrowed_list() {
+    // After typing "gi" the list narrows to two candidates — the popup
+    // shrinks to fit (no fixed height) and stays bottom-anchored.
+    let popup = completion_popup(
+        0,
+        &[("git", CompletionSource::PathExecutable), ("git-lfs", CompletionSource::PathExecutable)],
+    );
+    snapshot_completion_popup(
+        "completion_popup_narrowed_list",
+        popup,
+        egui::Pos2::new(24.0, 232.0),
+        10,
+        egui::Vec2::new(540.0, 260.0),
+    );
+}
+
+#[test]
+fn snapshot_completion_popup_scrolls_growing_upward_near_bottom() {
+    // Path completion for "src/" with more candidates than
+    // `max_rows`, anchored near the bottom edge of the surface: the
+    // popup scrolls (only `max_rows` rows visible) AND grows upward
+    // from the anchor, leaving the editor row (at the anchor) clear.
+    let popup = completion_popup(
+        0,
+        &[
+            ("src/block.rs", CompletionSource::Path),
+            ("src/completion/", CompletionSource::Path),
+            ("src/history_overlay.rs", CompletionSource::Path),
+            ("src/input.rs", CompletionSource::Path),
+            ("src/lib.rs", CompletionSource::Path),
+            ("src/main.rs", CompletionSource::Path),
+            ("src/pane.rs", CompletionSource::Path),
+            ("src/render.rs", CompletionSource::Path),
+            ("src/render_pane.rs", CompletionSource::Path),
+            ("src/terminal.rs", CompletionSource::Path),
+        ],
+    );
+    snapshot_completion_popup(
+        "completion_popup_scrolls_growing_upward_near_bottom",
+        popup,
+        egui::Pos2::new(24.0, 408.0),
+        6,
+        egui::Vec2::new(540.0, 420.0),
+    );
+}
+
 #[test]
 fn snapshot_watermark_centered_in_narrow_pane() {
     // Regression guard for the blank-pane watermark centering: the logo
