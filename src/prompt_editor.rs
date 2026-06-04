@@ -394,6 +394,11 @@ impl PromptEditor {
     /// selection was deleted, `Other` (always a new entry) when a
     /// selection was replaced.
     pub fn insert_char(&mut self, c: char) {
+        if is_rejected_control(c) {
+            // Drop the keystroke entirely — no buffer change, no undo
+            // entry, no selection clear. See `is_rejected_control`.
+            return;
+        }
         let pre = self.snapshot();
         let replaced_selection = self.delete_selection();
         self.text.insert(self.cursor, c);
@@ -412,8 +417,13 @@ impl PromptEditor {
     pub fn insert_str(&mut self, s: &str) {
         let pre = self.snapshot();
         self.delete_selection();
-        self.text.insert_str(self.cursor, s);
-        self.cursor += s.len();
+        // Strip control characters (newline excepted) before they
+        // reach the buffer — a raw control byte poisons the submitted
+        // command. See `is_rejected_control`. The common case (no
+        // control chars) collects into an identical string.
+        let filtered: String = s.chars().filter(|&c| !is_rejected_control(c)).collect();
+        self.text.insert_str(self.cursor, &filtered);
+        self.cursor += filtered.len();
         self.undo.record(OpKind::Other, pre);
     }
 
@@ -1002,6 +1012,22 @@ pub fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// True for characters the editor refuses to store: C0/C1 control
+/// codes and DEL. **Newline is exempt** — it's the multiline editor's
+/// legitimate line separator (`insert_newline` inserts one, and a
+/// pasted multi-line string keeps its breaks).
+///
+/// A raw control byte in the buffer poisons the submitted command
+/// line: on submit the shell sees e.g. `\x03` (ETX, what Ctrl+C
+/// produces as text) and aborts the line, so the typed command
+/// silently vanishes — never reaching scrollback or history. The
+/// next valid command then runs with the stale control byte echoed
+/// in front of it as a `^C`-style literal. Filtering at the insert
+/// primitives makes that state unrepresentable for every caller.
+fn is_rejected_control(c: char) -> bool {
+    c != '\n' && c.is_control()
+}
+
 /// Clamp `i` to a char boundary at or below itself. Returns `s.len()`
 /// when `i >= s.len()`. The clamp direction (toward zero) is the
 /// "land where the user pointed at or just before" convention that
@@ -1131,6 +1157,71 @@ mod tests {
         // insert "XY" → "helXYlo", cursor at 5.
         assert_eq!(e.text(), "helXYlo");
         assert_eq!(e.cursor(), 5);
+        assert_invariant(&e);
+    }
+
+    // ---- control-character rejection ---------------------------------
+    //
+    // A raw control byte in the editor buffer poisons the submitted
+    // command: on submit the shell sees e.g. `\x03` (ETX) and aborts
+    // the line, so the command silently vanishes — not into scrollback,
+    // not into history. The editor must never store one. Newline is the
+    // sole exception (the multiline line separator).
+
+    #[test]
+    fn insert_char_drops_control_character() {
+        let mut e = PromptEditor::new();
+        e.insert_char('a');
+        e.insert_char('\u{3}'); // Ctrl+C → ETX
+        e.insert_char('b');
+        assert_eq!(e.text(), "ab");
+        assert_eq!(e.cursor(), 2);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn insert_char_dropped_control_is_a_no_op_for_undo() {
+        // A rejected control char must not create an undo entry or
+        // clear an active selection — it's as if the keystroke never
+        // happened.
+        let mut e = PromptEditor::new();
+        e.insert_char('a');
+        e.insert_char('\u{4}'); // Ctrl+D → EOT, dropped
+        // One undo removes the 'a' (the dropped char left no entry).
+        e.undo();
+        assert_eq!(e.text(), "");
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn insert_str_strips_control_characters() {
+        let mut e = PromptEditor::new();
+        e.insert_str("ab\u{3}cd\u{7f}ef"); // ETX + DEL embedded
+        assert_eq!(e.text(), "abcdef");
+        assert_eq!(e.cursor(), 6);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn insert_str_preserves_newline() {
+        // Newline is the multiline editor's legitimate line separator;
+        // a pasted multi-line string keeps its breaks.
+        let mut e = PromptEditor::new();
+        e.insert_str("a\nb");
+        assert_eq!(e.text(), "a\nb");
+        assert_eq!(e.cursor(), 3);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn insert_newline_still_inserts_newline() {
+        // `insert_newline` routes through `insert_char('\n')`; the
+        // control filter must exempt newline or multiline breaks.
+        let mut e = PromptEditor::new();
+        e.insert_char('a');
+        e.insert_newline();
+        e.insert_char('b');
+        assert_eq!(e.text(), "a\nb");
         assert_invariant(&e);
     }
 
