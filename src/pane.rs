@@ -320,6 +320,20 @@ impl PaneSession {
             }
         }
 
+        // Answer terminal queries the feed above produced. Programs
+        // probe the terminal (Primary/Secondary Device Attributes,
+        // cursor-position reports) and BLOCK on the reply; alacritty
+        // generated the response bytes during `feed`, and they must be
+        // written back to the PTY master or the program hangs until
+        // its own timeout (e.g. `gh` via termenv waits ~10s). A failed
+        // write means the child already went away, in which case the
+        // reply is moot — drop it silently rather than surfacing an
+        // error from this per-frame drain.
+        let responses = self.terminal.drain_pty_responses();
+        if !responses.is_empty() {
+            let _ = self.pty.write(&responses);
+        }
+
         // Advance the per-pane frame counter. Used by the controller
         // for bootstrap timeout + frame-debounce. We tick once per
         // drain regardless of whether bytes arrived — the controller
