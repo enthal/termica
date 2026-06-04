@@ -619,6 +619,7 @@ pub fn render_pane(
     home: Option<&Path>,
     modal_open: bool,
     chrome_variant: crate::focused_chrome::ChromeVariant,
+    watermark: crate::watermark::WatermarkSettings,
 ) {
     // Input routing in a multi-pane world:
     //
@@ -2441,6 +2442,38 @@ pub fn render_pane(
                 }
             }
         }
+    }
+
+    // ---- blank-pane watermark overlay ---------------------------
+    //
+    // Painted last, on top of the terminal's opaque fill, so the faint
+    // app icon shows through. Shown while the pane is *pristine* — no
+    // command has sealed into scrollback yet (`has_sealed_blocks`) —
+    // and not in alt-screen (vim/less/etc. own the whole grid). Drawn
+    // in the base layer after all content, so Area-based popups (the
+    // completion popup) and modals still render above it.
+    //
+    // Visibility is eased, not binary: `animate_bool_with_time`
+    // advances a 0→1 factor across frames (and self-requests repaints
+    // while in flight), so the logo fades out when the first command
+    // runs and fades back in if scrollback is cleared to blank again.
+    // The animation id is pane-scoped via the surrounding `push_id`.
+    // See [`crate::watermark`].
+    //
+    // Center on the pane's CLIP rect, not `max_rect`: egui_tiles can
+    // hand the pane_ui a layout rect wider than the pane (relying on
+    // the clip to keep paint inside), so centering on `max_rect` would
+    // bias the watermark rightward and let the clip chop it — the same
+    // overshoot the focused-chrome footer avoids above. `clip_rect` is
+    // the true visible pane bounds.
+    let show_watermark = !in_alt_screen && !slot.session.blocks().has_sealed_blocks();
+    let watermark_fade = ctx.animate_bool_with_time(
+        ui.id().with("watermark-fade"),
+        show_watermark,
+        crate::watermark::FADE_SECS,
+    );
+    if watermark_fade > 0.0 {
+        crate::watermark::paint(ctx, ui.painter(), ui.clip_rect(), watermark, watermark_fade);
     }
 
     // Debug overlay: when `TERMICA_DEBUG_PANE_STATE=1` is set in
