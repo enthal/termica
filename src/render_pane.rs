@@ -263,9 +263,9 @@ pub(crate) fn cap_command_for_sticky(command: &str, max: usize) -> String {
 /// isolation; the sticky-eligibility / position decision is the pure
 /// [`compute_sticky_header`].
 // Geometry (`viewport`, `paint_y`), chrome content (`cwd`, `home`,
-// `exit`, `command`), and the `ctx` / `pane_id` needed to spawn the
-// `Area` are all genuinely distinct inputs — same shape as the file's
-// other paint helpers.
+// `exit`, `duration`, `command`), and the `ctx` / `pane_id` needed to
+// spawn the `Area` are all genuinely distinct inputs — same shape as
+// the file's other paint helpers.
 #[allow(clippy::too_many_arguments)]
 pub fn paint_sticky_header(
     ctx: &egui::Context,
@@ -274,6 +274,7 @@ pub fn paint_sticky_header(
     cwd: Option<&std::path::Path>,
     home: Option<&std::path::Path>,
     exit: Option<i32>,
+    duration: Option<std::time::Duration>,
     command: &str,
     pane_id: u64,
 ) {
@@ -286,7 +287,7 @@ pub fn paint_sticky_header(
             // to the union of everything painted (chip + command).
             let strip_idx = ui.painter().add(egui::Shape::Noop);
             let top = ui.next_widget_position().y;
-            let _ = render::paint_block_header(ui, cwd, home, exit);
+            let _ = render::paint_block_header(ui, cwd, home, exit, duration);
             let capped = cap_command_for_sticky(command, STICKY_MAX_CMD_LINES);
             if !capped.is_empty() {
                 paint_command_label_static(ui, &capped);
@@ -1129,7 +1130,15 @@ pub fn render_pane(
             // duration chips defer to Phase 5's async-probe surface.
             for block in slot.session.blocks().iter() {
                 match block {
-                    crate::block::Block::Sealed { id, command, snapshot, header, exit, .. } => {
+                    crate::block::Block::Sealed {
+                        id,
+                        command,
+                        snapshot,
+                        header,
+                        exit,
+                        duration,
+                        ..
+                    } => {
                         let total_rows =
                             (if command.is_empty() { 0 } else { command.split('\n').count() })
                                 + snapshot.len();
@@ -1144,6 +1153,7 @@ pub fn render_pane(
                             header.cwd.as_deref(),
                             home,
                             *exit,
+                            *duration,
                         );
                         let cmd_h =
                             sealed_render.command.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
@@ -1177,7 +1187,10 @@ pub fn render_pane(
                     }
                     crate::block::Block::Running { id, command, header, .. } => {
                         let block_top = ui.next_widget_position().y;
-                        let hdr = render::paint_block_header(ui, header.cwd.as_deref(), home, None);
+                        // Running blocks don't show a duration yet — the
+                        // live ticking timer lands in 4G slice 2.
+                        let hdr =
+                            render::paint_block_header(ui, header.cwd.as_deref(), home, None, None);
                         let chip_h = hdr.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
                         let cmd_resp =
                             (!command.is_empty()).then(|| render::paint_command_label(ui, command));
@@ -1331,15 +1344,19 @@ pub fn render_pane(
     if !in_alt_screen
         && let Some((sticky_id, paint_y)) =
             compute_sticky_header(&block_extents, scroll_viewport.top())
-        && let Some((cwd, exit, command)) = slot.session.blocks().iter().find_map(|b| match b {
-            crate::block::Block::Sealed { id, header, exit, command, .. } if *id == sticky_id => {
-                Some((header.cwd.clone(), *exit, command.clone()))
-            }
-            crate::block::Block::Running { id, header, command, .. } if *id == sticky_id => {
-                Some((header.cwd.clone(), None, command.clone()))
-            }
-            _ => None,
-        })
+        && let Some((cwd, exit, duration, command)) =
+            slot.session.blocks().iter().find_map(|b| match b {
+                crate::block::Block::Sealed { id, header, exit, command, duration, .. }
+                    if *id == sticky_id =>
+                {
+                    Some((header.cwd.clone(), *exit, Some(*duration), command.clone()))
+                }
+                crate::block::Block::Running { id, header, command, .. } if *id == sticky_id => {
+                    // No live duration on running blocks yet (4G slice 2).
+                    Some((header.cwd.clone(), None, None, command.clone()))
+                }
+                _ => None,
+            })
     {
         paint_sticky_header(
             ctx,
@@ -1348,6 +1365,7 @@ pub fn render_pane(
             cwd.as_deref(),
             home,
             exit,
+            duration,
             &command,
             slot.session.pane_id(),
         );
@@ -1443,7 +1461,7 @@ pub fn render_pane(
         if has_prompt_cwd
             && let Some(crate::block::Block::Prompt { header, .. }) = slot.session.blocks().last()
         {
-            let _ = render::paint_block_header(ui, header.cwd.as_deref(), home, None);
+            let _ = render::paint_block_header(ui, header.cwd.as_deref(), home, None, None);
         }
 
         // Allocate the editor strip and paint into it. The widget
