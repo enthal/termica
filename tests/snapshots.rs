@@ -1165,6 +1165,78 @@ fn snapshot_completion_popup_scrolls_growing_upward_near_bottom() {
     );
 }
 
+// ---- Sticky-top block header (4E) -------------------------------------
+//
+// The sticky-eligibility / paint-position math is unit-tested in
+// `render_pane::compute_sticky_header`. These snapshots pin the rendered
+// pinned header: an opaque strip occluding the content scrolling under it
+// plus the cwd / exit chips, clipped to the viewport so a pushed-up header
+// slides under the top edge.
+
+/// Paint simulated scrolled output rows so the sticky strip has
+/// something to occlude in the snapshot.
+fn paint_fake_output_rows(ui: &egui::Ui, size: egui::Vec2) {
+    let painter = ui.painter().clone();
+    let font = egui::FontId::monospace(14.0);
+    let rows = (size.y / 20.0) as usize;
+    for i in 0..rows {
+        painter.text(
+            egui::pos2(8.0, 4.0 + i as f32 * 20.0),
+            egui::Align2::LEFT_TOP,
+            format!("output line {i:02} scrolling under the pinned header"),
+            font.clone(),
+            egui::Color32::from_gray(0xA0),
+        );
+    }
+}
+
+#[test]
+fn snapshot_sticky_header_pinned_at_top() {
+    // Header flush at the viewport top, occluding the output rows
+    // behind it. Non-zero exit so both the cwd and "exit 1" chips show.
+    let size = egui::Vec2::new(560.0, 220.0);
+    let mut harness = Harness::builder().with_size(size).build_ui(move |ui| {
+        paint_fake_output_rows(ui, size);
+        let ctx = ui.ctx().clone();
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        termica::paint_sticky_header(
+            &ctx,
+            viewport,
+            0.0,
+            Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
+            Some(std::path::Path::new("/Users/tim")),
+            Some(1),
+            20.0,
+            1,
+        );
+    });
+    harness.snapshot("sticky_header_pinned_at_top");
+}
+
+#[test]
+fn snapshot_sticky_header_pushed_up_clips_at_top() {
+    // The next block has pushed the pinned header up: paint_y is above
+    // the viewport top, so only the header's lower part shows (clipped
+    // at the top edge), sliding off as the next header rises.
+    let size = egui::Vec2::new(560.0, 220.0);
+    let mut harness = Harness::builder().with_size(size).build_ui(move |ui| {
+        paint_fake_output_rows(ui, size);
+        let ctx = ui.ctx().clone();
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        termica::paint_sticky_header(
+            &ctx,
+            viewport,
+            -12.0,
+            Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
+            Some(std::path::Path::new("/Users/tim")),
+            None,
+            20.0,
+            1,
+        );
+    });
+    harness.snapshot("sticky_header_pushed_up");
+}
+
 #[test]
 fn snapshot_watermark_centered_in_narrow_pane() {
     // Regression guard for the blank-pane watermark centering: the logo

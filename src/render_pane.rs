@@ -170,6 +170,94 @@ pub fn compute_footer_height(
     chrome_h + editor_rows as f32 * row_h + FOOTER_DESCENDER_PAD
 }
 
+/// Screen-space vertical extent of one block painted in the pane's
+/// scroll area, plus the height of its header chrome (`header_h ==
+/// 0.0` when the block paints no header — empty cwd and zero exit).
+/// Collected top→bottom during the block-paint loop and consumed by
+/// [`compute_sticky_header`]. `top`/`bottom`/`header_h` are all in the
+/// same screen-y space as the viewport top passed to that helper.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct BlockExtent {
+    pub id: crate::block::BlockId,
+    pub top: f32,
+    pub bottom: f32,
+    pub header_h: f32,
+}
+
+/// Decide which block's header pins to the viewport top (spec/04
+/// §"Layout: fixed-footer prompt, sticky-top header", rule 3) and the
+/// screen-y at which to paint it. Pure math, no egui — the spec-
+/// mandated unit-testable boundary.
+///
+/// `extents` are the blocks in top→bottom paint order; `viewport_top`
+/// is the screen-y of the scroll viewport's top edge (same space as
+/// the extents). The sticky block is the one straddling the viewport
+/// top — its header has scrolled (at least partly) above the edge
+/// while its body still extends below it. Returns `None` when the
+/// top-most visible block's header is still fully on-screen (painted
+/// normally in the scroll) or that block paints no header.
+///
+/// The pinned header normally sits flush at `viewport_top`, but the
+/// next block pushes it up as it climbs toward the top (the iOS
+/// section-header handoff): the returned y can be up to `header_h`
+/// above `viewport_top`, at which point the next block takes over as
+/// the sticky one.
+pub(crate) fn compute_sticky_header(
+    extents: &[BlockExtent],
+    viewport_top: f32,
+) -> Option<(crate::block::BlockId, f32)> {
+    let idx = extents.iter().position(|b| b.top < viewport_top && viewport_top < b.bottom)?;
+    let b = extents[idx];
+    if b.header_h <= 0.0 {
+        return None;
+    }
+    let paint_y = match extents.get(idx + 1) {
+        Some(next) => viewport_top.min(next.top - b.header_h),
+        None => viewport_top,
+    };
+    Some((b.id, paint_y))
+}
+
+/// Paint a pinned block header at screen-y `paint_y`, pinned to the
+/// top of the scroll `viewport` (4E). Reuses
+/// [`render::paint_block_header`] on an opaque [`render::DEFAULT_BG`]
+/// strip so the content scrolling underneath is occluded, and clips to
+/// `viewport` so a header pushed up by the next block slides under the
+/// top edge instead of painting over chrome above the scroll area.
+///
+/// Split out from the pane render so the paint is snapshot-testable in
+/// isolation; the sticky-eligibility / position decision is the pure
+/// [`compute_sticky_header`].
+// Geometry (`viewport`, `paint_y`, `row_h`), chrome content (`cwd`,
+// `home`, `exit`), and the `ctx` / `pane_id` needed to spawn the `Area`
+// are all genuinely distinct inputs — same shape as the file's other
+// paint helpers.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_sticky_header(
+    ctx: &egui::Context,
+    viewport: egui::Rect,
+    paint_y: f32,
+    cwd: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+    exit: Option<i32>,
+    row_h: f32,
+    pane_id: u64,
+) {
+    let chip_h = row_h + 2.0 * render::CHIP_PAD_Y;
+    egui::Area::new(egui::Id::new(("sticky-header", pane_id)))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::pos2(viewport.left(), paint_y))
+        .show(ctx, |ui| {
+            ui.set_clip_rect(viewport);
+            let strip = egui::Rect::from_min_size(
+                egui::pos2(viewport.left(), paint_y),
+                egui::vec2(viewport.width(), chip_h),
+            );
+            ui.painter().rect_filled(strip, 0.0, render::DEFAULT_BG);
+            let _ = render::paint_block_header(ui, cwd, home, exit);
+        });
+}
+
 /// Translate a `(Key, Modifiers)` pair into an [`EditorMotion`] +
 /// "extending" flag, honouring platform conventions:
 ///
@@ -772,6 +860,10 @@ pub fn render_pane(
     // all there).
     let mut sealed_block_renders: Vec<(crate::block::BlockId, render::SealedBlockRender)> =
         Vec::new();
+    // Screen-space vertical extents of each painted block, collected
+    // top→bottom for the sticky-top-header pass (4E) after the scroll
+    // area lays out. Empty in alt-screen mode (no blocks painted).
+    let mut block_extents: Vec<BlockExtent> = Vec::new();
 
     // Phase 4D — fixed-footer Prompt block. When the tail is a
     // `Prompt` AND the editor is active, reserve a strip at the
@@ -974,6 +1066,7 @@ pub fn render_pane(
                                 + snapshot.len();
                         let sel_for_this =
                             pane_sel.as_ref().and_then(|s| s.block_range_for(*id, total_rows));
+                        let block_top = ui.next_widget_position().y;
                         let sealed_render = render::paint_sealed_block(
                             ui,
                             command,
@@ -983,6 +1076,12 @@ pub fn render_pane(
                             home,
                             *exit,
                         );
+                        block_extents.push(BlockExtent {
+                            id: *id,
+                            top: block_top,
+                            bottom: sealed_render.bounding_rect().bottom(),
+                            header_h: sealed_render.header_height,
+                        });
                         sealed_block_renders.push((*id, sealed_render));
                         // Block separator — picked via
                         // `cargo run --example pick_block_separator`
@@ -1000,11 +1099,19 @@ pub fn render_pane(
                         );
                         ui.add_space(render::BLOCK_SEPARATOR_GAP);
                     }
-                    crate::block::Block::Running { command, header, .. } => {
-                        let _ = render::paint_block_header(ui, header.cwd.as_deref(), home, None);
+                    crate::block::Block::Running { id, command, header, .. } => {
+                        let block_top = ui.next_widget_position().y;
+                        let hdr = render::paint_block_header(ui, header.cwd.as_deref(), home, None);
+                        let header_h = hdr.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
                         if !command.is_empty() {
                             let _ = render::paint_command_label(ui, command);
                         }
+                        block_extents.push(BlockExtent {
+                            id: *id,
+                            top: block_top,
+                            bottom: ui.next_widget_position().y,
+                            header_h,
+                        });
                     }
                     crate::block::Block::Prompt { .. } => {
                         // The `Prompt` block's chrome lives in
@@ -1129,8 +1236,43 @@ pub fn render_pane(
 
         (rendered, links_in_view, highlighted_link.cloned())
     });
+    let scroll_viewport = scroll_inner.inner_rect;
     let (rendered, links_in_view, highlighted_link) = scroll_inner.inner;
     let highlighted_link = highlighted_link.as_ref();
+
+    // ---- Sticky-top block header (4E) -----------------------------
+    //
+    // Once the scroll area has laid out, pin the header of the block
+    // straddling the viewport top to the top edge — until its body
+    // scrolls past, when the next block's header takes over (spec/04
+    // §"Layout: …sticky-top header"). `compute_sticky_header` is the
+    // pure decision; here we just look up the chosen block's chrome
+    // and repaint its header in a clipped foreground `Area`, over an
+    // opaque strip so the content scrolling underneath is occluded.
+    if !in_alt_screen
+        && let Some((sticky_id, paint_y)) =
+            compute_sticky_header(&block_extents, scroll_viewport.top())
+        && let Some((cwd, exit)) = slot.session.blocks().iter().find_map(|b| match b {
+            crate::block::Block::Sealed { id, header, exit, .. } if *id == sticky_id => {
+                Some((header.cwd.clone(), *exit))
+            }
+            crate::block::Block::Running { id, header, .. } if *id == sticky_id => {
+                Some((header.cwd.clone(), None))
+            }
+            _ => None,
+        })
+    {
+        paint_sticky_header(
+            ctx,
+            scroll_viewport,
+            paint_y,
+            cwd.as_deref(),
+            home,
+            exit,
+            row_h,
+            slot.session.pane_id(),
+        );
+    }
     if highlighted_link.is_some() {
         ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -2566,6 +2708,82 @@ mod tests {
             compute_footer_height(true, true, 0, true, 20.0),
             40.0 + chip_pad + FOOTER_DESCENDER_PAD
         );
+    }
+
+    // ---- compute_sticky_header (sticky-top block header, 4E) ---------
+    //
+    // spec/04 §"Layout: …sticky-top header" rule 3. Pure layout math
+    // over a synthetic block list at walked scroll positions. All
+    // coordinates are in the same screen-y space (top grows downward).
+
+    fn ext(id: u64, top: f32, bottom: f32, header_h: f32) -> BlockExtent {
+        BlockExtent { id: crate::block::BlockId(id), top, bottom, header_h }
+    }
+
+    #[test]
+    fn sticky_none_when_top_block_header_fully_visible() {
+        // Not scrolled (viewport top == first block top): the real
+        // header sits at the edge, nothing is pinned.
+        let blocks = [ext(0, 0.0, 100.0, 20.0), ext(1, 110.0, 210.0, 20.0)];
+        assert_eq!(compute_sticky_header(&blocks, 0.0), None);
+    }
+
+    #[test]
+    fn sticky_pins_straddling_block_flush_at_top() {
+        // Block 0's header scrolled above the viewport top, its body
+        // still below → pinned flush at viewport_top.
+        let blocks = [ext(0, 0.0, 100.0, 20.0), ext(1, 110.0, 210.0, 20.0)];
+        assert_eq!(compute_sticky_header(&blocks, 40.0), Some((crate::block::BlockId(0), 40.0)));
+    }
+
+    #[test]
+    fn sticky_none_in_separator_gap_between_blocks() {
+        // Viewport top in the gap (block 0 fully past, block 1 not yet
+        // reached): nothing pinned.
+        let blocks = [ext(0, 0.0, 100.0, 20.0), ext(1, 110.0, 210.0, 20.0)];
+        assert_eq!(compute_sticky_header(&blocks, 105.0), None);
+    }
+
+    #[test]
+    fn sticky_next_block_pushes_pinned_header_up() {
+        // Contiguous blocks: as block 1's top climbs toward the
+        // viewport top it shoves block 0's pinned header up.
+        let blocks = [ext(0, 0.0, 100.0, 20.0), ext(1, 100.0, 200.0, 20.0)];
+        // Far from handoff: flush.
+        assert_eq!(compute_sticky_header(&blocks, 70.0), Some((crate::block::BlockId(0), 70.0)));
+        // In the push zone (next.top - header_h = 80 < 90): pushed up.
+        assert_eq!(compute_sticky_header(&blocks, 90.0), Some((crate::block::BlockId(0), 80.0)));
+        // Just before the boundary: pushed nearly a full header.
+        assert_eq!(compute_sticky_header(&blocks, 99.0), Some((crate::block::BlockId(0), 80.0)));
+    }
+
+    #[test]
+    fn sticky_hands_off_to_next_block_past_boundary() {
+        let blocks = [ext(0, 0.0, 100.0, 20.0), ext(1, 100.0, 200.0, 20.0)];
+        assert_eq!(compute_sticky_header(&blocks, 130.0), Some((crate::block::BlockId(1), 130.0)));
+    }
+
+    #[test]
+    fn sticky_block_without_header_pins_nothing() {
+        let blocks = [ext(0, 0.0, 100.0, 0.0)];
+        assert_eq!(compute_sticky_header(&blocks, 40.0), None);
+    }
+
+    #[test]
+    fn sticky_last_block_has_no_next_to_push_it() {
+        let blocks = [ext(0, 0.0, 100.0, 20.0)];
+        assert_eq!(compute_sticky_header(&blocks, 40.0), Some((crate::block::BlockId(0), 40.0)));
+    }
+
+    #[test]
+    fn sticky_none_when_scrolled_below_all_blocks() {
+        let blocks = [ext(0, 0.0, 100.0, 20.0)];
+        assert_eq!(compute_sticky_header(&blocks, 150.0), None);
+    }
+
+    #[test]
+    fn sticky_empty_block_list_has_none() {
+        assert_eq!(compute_sticky_header(&[], 40.0), None);
     }
 
     // ---- classify_editor_motion (per-OS keybindings) -----------------

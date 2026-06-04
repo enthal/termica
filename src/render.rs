@@ -1041,6 +1041,11 @@ pub struct SealedBlockRender {
     /// Number of rows the command label occupies. Snapshot rows
     /// start at this index in the unified row space.
     pub command_lines: usize,
+    /// Painted height of the block's header chrome (cwd / exit chips),
+    /// in logical pixels. `0.0` when the block paints no header
+    /// (empty cwd and zero exit). Used by the sticky-top-header layout
+    /// (4E) to know how tall a pinned header is.
+    pub header_height: f32,
 }
 
 impl SealedBlockRender {
@@ -1077,7 +1082,8 @@ pub fn paint_sealed_block(
     // wash can extend up to the inter-block hairline above.
     let block_top_y = ui.next_widget_position().y;
 
-    let _ = paint_block_header(ui, cwd, home, exit);
+    let header = paint_block_header(ui, cwd, home, exit);
+    let header_height = header.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
 
     let cmd_lines = if command.is_empty() { 0 } else { command.split('\n').count() };
     // Split the unified selection into command and snapshot pieces.
@@ -1112,6 +1118,7 @@ pub fn paint_sealed_block(
         command: command_response,
         snapshot: snapshot_response,
         command_lines: cmd_lines,
+        header_height,
     }
 }
 

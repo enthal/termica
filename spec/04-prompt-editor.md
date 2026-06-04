@@ -446,7 +446,7 @@ Three rules govern the per-frame layout pass:
 
 3. **The top-most partially-visible block's header pins to the top edge.** If a block's body is visible but its header has scrolled above the viewport, the renderer paints that header pinned to the top edge of the scroll area for as long as the block's body intersects the viewport. Only one sticky header is shown at a time; once the body fully scrolls past, the *next* block's header takes its place. This is the same affordance iOS section headers use.
 
-The layout helper that decides which block is "sticky-eligible" and computes the inner-block scroll offset is the unit-testable boundary: pure math, no egui dependency, covered by tests that walk scroll positions through a synthetic block list.
+The layout helper that decides which block is "sticky-eligible" and computes the paint offset is the unit-testable boundary: pure math, no egui dependency, covered by tests that walk scroll positions through a synthetic block list. It ships as [`render_pane::compute_sticky_header`](../src/render_pane.rs) — given each block's screen-y extent + header height and the viewport top, it returns the block to pin and the y to paint it at (flush at the top, or pushed up by the next block during the handoff). The actual paint is [`render_pane::paint_sticky_header`](../src/render_pane.rs): an opaque strip (so content scrolling underneath is occluded) plus the reused `paint_block_header` chrome, clipped to the viewport so a pushed-up header slides under the top edge.
 
 ## Cross-block selection
 
