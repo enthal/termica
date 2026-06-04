@@ -1030,3 +1030,27 @@ fn snapshot_history_overlay_pane_scope_no_matches() {
         });
     harness.snapshot("history_overlay_pane_scope_no_matches");
 }
+
+#[test]
+fn snapshot_watermark_centered_in_narrow_pane() {
+    // Regression guard for the blank-pane watermark centering: the logo
+    // must sit in the horizontal + vertical center of the rect it is
+    // given and stay fully inside it, even in a narrow pane. The live
+    // bug centered on the pane_ui's egui_tiles-inflated `max_rect`
+    // instead of its `clip_rect`, shoving the logo right and letting
+    // the clip chop it. Alpha is bumped above the product default so
+    // the baseline is clearly reviewable by eye per the CLAUDE.md
+    // snapshot-review step.
+    use termica::watermark::{WatermarkSettings, paint};
+    let settings =
+        WatermarkSettings { enabled: true, alpha: 140, size_frac: 0.5, grayscale: false };
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(280.0, 680.0)).build_ui(move |ui| {
+            // Opaque dark fill like the terminal, then the watermark
+            // centered on the ui's clip rect (the true pane bounds).
+            let rect = ui.max_rect();
+            ui.painter().rect_filled(rect, 0.0, egui::Color32::from_gray(10));
+            paint(ui.ctx(), ui.painter(), ui.clip_rect(), settings, 1.0);
+        });
+    harness.snapshot("watermark_narrow_pane");
+}

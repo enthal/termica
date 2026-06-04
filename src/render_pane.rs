@@ -2450,6 +2450,13 @@ pub fn render_pane(
     // runs and fades back in if scrollback is cleared to blank again.
     // The animation id is pane-scoped via the surrounding `push_id`.
     // See [`crate::watermark`].
+    //
+    // Center on the pane's CLIP rect, not `max_rect`: egui_tiles can
+    // hand the pane_ui a layout rect wider than the pane (relying on
+    // the clip to keep paint inside), so centering on `max_rect` would
+    // bias the watermark rightward and let the clip chop it — the same
+    // overshoot the focused-chrome footer avoids above. `clip_rect` is
+    // the true visible pane bounds.
     let show_watermark = !in_alt_screen && !slot.session.blocks().has_sealed_blocks();
     let watermark_fade = ctx.animate_bool_with_time(
         ui.id().with("watermark-fade"),
@@ -2457,7 +2464,7 @@ pub fn render_pane(
         crate::watermark::FADE_SECS,
     );
     if watermark_fade > 0.0 {
-        crate::watermark::paint(ctx, ui.painter(), ui.max_rect(), watermark, watermark_fade);
+        crate::watermark::paint(ctx, ui.painter(), ui.clip_rect(), watermark, watermark_fade);
     }
 
     // Debug overlay: when `TERMICA_DEBUG_PANE_STATE=1` is set in
