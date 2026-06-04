@@ -51,6 +51,10 @@ pub(crate) struct TabBehavior<'a> {
     /// viewport writes into the same `Arc<Mutex<…>>` so a click
     /// in the picker updates the chrome on the next paint.
     pub(crate) chrome_variant: crate::focused_chrome::ChromeVariant,
+    /// Live-tunable blank-pane watermark appearance. Read each frame
+    /// from `TermicaApp.watermark`; the `--pick-watermark` viewport
+    /// writes into the same `Arc<Mutex<…>>`.
+    pub(crate) watermark: crate::watermark::WatermarkSettings,
 }
 
 impl<'a> Behavior<PaneId> for TabBehavior<'a> {
@@ -81,8 +85,9 @@ impl<'a> Behavior<PaneId> for TabBehavior<'a> {
         // a frame and salt accordingly.
         let modal_open = self.modal_open;
         let chrome_variant = self.chrome_variant;
+        let watermark = self.watermark;
         ui.push_id(("pane", pane_id.0), |ui| {
-            render_pane(ui, self.ctx, slot, self.home, modal_open, chrome_variant);
+            render_pane(ui, self.ctx, slot, self.home, modal_open, chrome_variant, watermark);
         });
         UiResponse::None
     }

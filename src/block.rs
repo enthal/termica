@@ -173,6 +173,15 @@ impl BlockStack {
         self.blocks.retain(|b| !matches!(b, Block::Sealed { .. }));
     }
 
+    /// True if any command has finished and been sealed into
+    /// scrollback. A freshly-spawned pane (or one cleared via
+    /// `clear_sealed`) has none — that "no scrollback blocks yet"
+    /// state is what gates the blank-pane watermark
+    /// ([`crate::watermark`]).
+    pub fn has_sealed_blocks(&self) -> bool {
+        self.blocks.iter().any(|b| matches!(b, Block::Sealed { .. }))
+    }
+
     /// Borrow the live tail block. Always present by invariant; only
     /// returns `Option` so the API stays defensive in case a future
     /// caller manages to clear the stack out from under us (it
@@ -358,6 +367,28 @@ mod tests {
         );
         assert!(stack.editor_on_tail().is_none(), "Running tail has no editor");
         assert!(stack.editor_on_tail_mut().is_none());
+    }
+
+    #[test]
+    fn has_sealed_blocks_tracks_command_lifecycle() {
+        let mut stack = fresh_stack();
+        let mut term = TerminalState::new(5, 20);
+        // Fresh pane: just the initial Prompt, nothing sealed yet.
+        assert!(!stack.has_sealed_blocks(), "fresh stack has no sealed blocks");
+
+        // Run a command to completion — seals one block.
+        stack.observe_lifecycle_event(
+            &LifecycleEvent::Preexec { command: "ls".into() },
+            &mut term,
+            1,
+        );
+        assert!(!stack.has_sealed_blocks(), "a running command is not yet sealed");
+        stack.observe_lifecycle_event(&LifecycleEvent::CommandFinished { exit: 0 }, &mut term, 2);
+        assert!(stack.has_sealed_blocks(), "finished command seals a scrollback block");
+
+        // Clearing scrollback returns to the pristine, watermark-eligible state.
+        stack.clear_sealed();
+        assert!(!stack.has_sealed_blocks(), "clear_sealed drops sealed blocks");
     }
 
     #[test]
