@@ -1193,7 +1193,8 @@ fn paint_fake_output_rows(ui: &egui::Ui, size: egui::Vec2) {
 #[test]
 fn snapshot_sticky_header_pinned_at_top() {
     // Header flush at the viewport top, occluding the output rows
-    // behind it. Non-zero exit so both the cwd and "exit 1" chips show.
+    // behind it: cwd chip + "exit 1" chip + the command label (teal)
+    // that identifies the block.
     let size = egui::Vec2::new(560.0, 220.0);
     let mut harness = Harness::builder().with_size(size).build_ui(move |ui| {
         paint_fake_output_rows(ui, size);
@@ -1206,7 +1207,7 @@ fn snapshot_sticky_header_pinned_at_top() {
             Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
             Some(std::path::Path::new("/Users/tim")),
             Some(1),
-            20.0,
+            "ls -la --color=always",
             1,
         );
     });
@@ -1214,10 +1215,33 @@ fn snapshot_sticky_header_pinned_at_top() {
 }
 
 #[test]
+fn snapshot_sticky_header_multiline_command_capped() {
+    // A multiline command shows up to 4 lines; a 6-line command is
+    // capped to 4 with a "…" truncation hint on the last shown line.
+    let size = egui::Vec2::new(560.0, 260.0);
+    let mut harness = Harness::builder().with_size(size).build_ui(move |ui| {
+        paint_fake_output_rows(ui, size);
+        let ctx = ui.ctx().clone();
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        termica::paint_sticky_header(
+            &ctx,
+            viewport,
+            0.0,
+            Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
+            Some(std::path::Path::new("/Users/tim")),
+            Some(0),
+            "for f in *.rs; do\n  echo \"$f\"\n  wc -l \"$f\"\n  head -1 \"$f\"\n  tail -1 \"$f\"\ndone",
+            1,
+        );
+    });
+    harness.snapshot("sticky_header_multiline_command_capped");
+}
+
+#[test]
 fn snapshot_sticky_header_pushed_up_clips_at_top() {
     // The next block has pushed the pinned header up: paint_y is above
-    // the viewport top, so only the header's lower part shows (clipped
-    // at the top edge), sliding off as the next header rises.
+    // the viewport top, so only the lower part shows (clipped at the
+    // top edge), sliding off as the next header rises.
     let size = egui::Vec2::new(560.0, 220.0);
     let mut harness = Harness::builder().with_size(size).build_ui(move |ui| {
         paint_fake_output_rows(ui, size);
@@ -1230,7 +1254,7 @@ fn snapshot_sticky_header_pushed_up_clips_at_top() {
             Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
             Some(std::path::Path::new("/Users/tim")),
             None,
-            20.0,
+            "cargo test --workspace",
             1,
         );
     });
