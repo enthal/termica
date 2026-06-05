@@ -88,7 +88,11 @@ pub enum Block {
         id: BlockId,
         header: BlockHeader,
         command: String,
-        started_at_frame: u64,
+        /// Wall-clock time (Unix epoch ms) the command started running
+        /// (`Preexec`). Sealed into a real `Duration` at
+        /// `CommandFinished`. Sourced from the live pane clock; tests
+        /// pass literal ms so the duration is deterministic.
+        started_at_ms: i64,
     },
     Sealed {
         id: BlockId,
@@ -124,6 +128,13 @@ impl Block {
 pub struct BlockStack {
     blocks: Vec<Block>,
     next_id: u64,
+    /// Wall-clock time (Unix epoch ms) to stamp the next observed
+    /// lifecycle event with. Set by the pane via
+    /// [`Self::set_event_clock_ms`] right before each
+    /// [`Self::observe_lifecycle_event`]; read by `start_running` /
+    /// `seal_running` to compute a command's real duration. `0` until
+    /// the pane sets it (and in duration-agnostic tests).
+    event_clock_ms: i64,
 }
 
 impl BlockStack {
@@ -131,7 +142,7 @@ impl BlockStack {
     /// with id `0`. The shell hasn't run anything yet, but the
     /// pane is conceptually "at a prompt about to be drawn."
     pub fn new(started_at_frame: u64) -> Self {
-        let mut stack = Self { blocks: Vec::with_capacity(8), next_id: 0 };
+        let mut stack = Self { blocks: Vec::with_capacity(8), next_id: 0, event_clock_ms: 0 };
         let id = stack.alloc_id();
         stack.blocks.push(Block::Prompt {
             id,
@@ -212,13 +223,24 @@ impl BlockStack {
         frame: u64,
     ) {
         match event {
-            LifecycleEvent::Preexec { command } => self.start_running(command.clone(), frame),
+            LifecycleEvent::Preexec { command } => self.start_running(command.clone()),
             LifecycleEvent::CommandFinished { exit } => self.seal_running(*exit, terminal, frame),
             LifecycleEvent::Precmd { cwd } | LifecycleEvent::Cwd { cwd } => {
                 self.update_tail_cwd(cwd.clone());
             }
             _ => {}
         }
+    }
+
+    /// Stamp the wall-clock time (Unix epoch ms) of the *next* lifecycle
+    /// event the stack will observe. The pane sets this from its clock
+    /// immediately before [`Self::observe_lifecycle_event`], so a
+    /// `Preexec` records the command's real start time and a
+    /// `CommandFinished` records its real end time — the difference is
+    /// the command's wall-clock duration. Defaults to `0`; tests that
+    /// assert on duration set it explicitly, the rest leave it.
+    pub fn set_event_clock_ms(&mut self, now_ms: i64) {
+        self.event_clock_ms = now_ms;
     }
 
     /// Update the live tail block's `BlockHeader.cwd` when the shell
@@ -242,7 +264,8 @@ impl BlockStack {
     /// context — see
     /// [spec/03 §"Nested shells"](../spec/03-shell-integration.md)),
     /// ignore: only one command can be running at a time per pane.
-    fn start_running(&mut self, command: String, frame: u64) {
+    fn start_running(&mut self, command: String) {
+        let now_ms = self.event_clock_ms;
         let Some(tail) = self.blocks.last_mut() else { return };
         if !matches!(tail, Block::Prompt { .. }) {
             // Already running, or sealed (impossible by invariant
@@ -260,7 +283,7 @@ impl BlockStack {
         // before `Preexec` arrives; for 4B with no submit wired yet,
         // any half-typed buffer is dropped — same as if the user had
         // pressed Esc and typed the command through the PTY instead.
-        *tail = Block::Running { id, header, command, started_at_frame: frame };
+        *tail = Block::Running { id, header, command, started_at_ms: now_ms };
     }
 
     /// `CommandFinished` arrived. If the tail is `Running`, snapshot
@@ -272,18 +295,20 @@ impl BlockStack {
     /// Order matters: snapshot first, then reset. Otherwise the
     /// sealed snapshot is empty.
     fn seal_running(&mut self, exit: i32, terminal: &mut TerminalState, frame: u64) {
+        let now_ms = self.event_clock_ms;
         let Some(tail) = self.blocks.last() else { return };
-        let Block::Running { id, header, command, started_at_frame } = tail else {
+        let Block::Running { id, header, command, started_at_ms } = tail else {
             return;
         };
         let id = *id;
         let header = header.clone();
         let command = command.clone();
-        let started = *started_at_frame;
+        let started_ms = *started_at_ms;
 
         let snapshot = terminal.snapshot_lines_all();
         terminal.reset_for_new_block();
-        let duration = Duration::from_secs(frame.saturating_sub(started));
+        // Real wall-clock duration; clamp negative clock skew to zero.
+        let duration = Duration::from_millis(now_ms.saturating_sub(started_ms).max(0) as u64);
 
         let sealed = Block::Sealed {
             id,
@@ -427,6 +452,7 @@ mod tests {
     fn preexec_transitions_tail_prompt_to_running() {
         let mut stack = fresh_stack();
         let mut term = TerminalState::new(5, 20);
+        stack.set_event_clock_ms(7_777);
         stack.observe_lifecycle_event(
             &LifecycleEvent::Preexec { command: "ls -la".into() },
             &mut term,
@@ -434,10 +460,10 @@ mod tests {
         );
         assert_eq!(stack.len(), 1);
         match stack.last().unwrap() {
-            Block::Running { id, command, started_at_frame, .. } => {
+            Block::Running { id, command, started_at_ms, .. } => {
                 assert_eq!(*id, BlockId(0), "id preserved across Prompt → Running");
                 assert_eq!(command, "ls -la");
-                assert_eq!(*started_at_frame, 10);
+                assert_eq!(*started_at_ms, 7_777);
             }
             other => panic!("expected Running after Preexec, got {other:?}"),
         }
@@ -478,11 +504,10 @@ mod tests {
         assert_eq!(stack.len(), 2, "sealed + new prompt");
         // First (older) is sealed.
         match stack.iter().next().unwrap() {
-            Block::Sealed { id, command, exit, duration, .. } => {
+            Block::Sealed { id, command, exit, .. } => {
                 assert_eq!(*id, BlockId(0));
                 assert_eq!(command, "echo hi");
                 assert_eq!(*exit, Some(0));
-                assert_eq!(duration.as_secs(), 10, "20 - 10 frames");
             }
             other => panic!("expected Sealed in position 0, got {other:?}"),
         }
@@ -490,6 +515,53 @@ mod tests {
         match stack.last().unwrap() {
             Block::Prompt { id, .. } => assert_eq!(*id, BlockId(1)),
             other => panic!("expected Prompt tail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seal_computes_wall_clock_duration_from_ms() {
+        // Duration is real wall-clock time (Preexec → CommandFinished),
+        // NOT a frame-counter delta. Preexec at t=1.000s, finish at
+        // t=3.500s → 2500ms, regardless of the frame numbers.
+        let mut stack = fresh_stack();
+        let mut term = TerminalState::new(5, 20);
+        stack.set_event_clock_ms(1_000);
+        stack.observe_lifecycle_event(
+            &LifecycleEvent::Preexec { command: "sleep 2.5".into() },
+            &mut term,
+            10,
+        );
+        stack.set_event_clock_ms(3_500); // 2.5s of wall-clock later
+        stack.observe_lifecycle_event(
+            &LifecycleEvent::CommandFinished { exit: 0 },
+            &mut term,
+            11, // only one frame later
+        );
+        match stack.iter().next().unwrap() {
+            Block::Sealed { duration, .. } => {
+                assert_eq!(*duration, std::time::Duration::from_millis(2_500));
+            }
+            other => panic!("expected Sealed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seal_clamps_negative_clock_skew_to_zero() {
+        // A backwards clock (finish ms < start ms) must not underflow;
+        // the duration clamps to zero.
+        let mut stack = fresh_stack();
+        let mut term = TerminalState::new(5, 20);
+        stack.set_event_clock_ms(5_000);
+        stack.observe_lifecycle_event(
+            &LifecycleEvent::Preexec { command: "x".into() },
+            &mut term,
+            10,
+        );
+        stack.set_event_clock_ms(4_000); // earlier than start — skew
+        stack.observe_lifecycle_event(&LifecycleEvent::CommandFinished { exit: 0 }, &mut term, 11);
+        match stack.iter().next().unwrap() {
+            Block::Sealed { duration, .. } => assert_eq!(*duration, std::time::Duration::ZERO),
+            other => panic!("expected Sealed, got {other:?}"),
         }
     }
 

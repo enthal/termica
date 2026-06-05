@@ -812,28 +812,47 @@ pub const CHIP_PAD_Y: f32 = 2.0;
 pub const CHIP_CORNER_RADIUS: f32 = 4.0;
 pub const CHIP_GAP: f32 = 4.0;
 
+/// Format a command's wall-clock duration for the block header, the
+/// way the spec/04 examples show it: sub-second as 3-decimal seconds
+/// (`0.034s`), under a minute as whole seconds (`11s`), then
+/// `Nm Ns` / `Nh Nm`. Pure; unit-tested.
+pub fn format_duration(d: std::time::Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1000 {
+        return format!("{:.3}s", ms as f64 / 1000.0);
+    }
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
 /// Paint the dim header line above a block as one or two rounded
 /// chips: the cwd on the left, an optional `exit N` annotation
 /// (red text) on the right. The cwd is shown with `$HOME` substituted
 /// for `~` per [`crate::home_relative_cwd`], matching the tab-title
 /// convention.
 ///
-/// The first piece of [4G](../spec/10-roadmap.md#phase-4--editor-at-prompt-block-model-pivot)
-/// block chrome. Renders only the cwd today; the git branch and
-/// dirty-summary chips called for in spec/04 §"Visual structure"
-/// live in Phase 5's async-probe surface (`termica-context`). Live
-/// duration timers for `Running` blocks also defer to that phase —
-/// the wall-clock plumbing isn't in place yet.
+/// A [4G](../spec/10-roadmap.md#phase-4--editor-at-prompt-block-model-pivot)
+/// block-chrome row of rounded chips, left→right: cwd, optional
+/// `exit N` (red), and an optional wall-clock `duration` (sealed blocks
+/// pass the final duration; running blocks pass the live elapsed time).
+/// The git branch and dirty-summary chips called for in spec/04
+/// §"Visual structure" slot in next, after cwd, in `4G-async-context`.
 ///
-/// When `cwd` is `None` *and* there's nothing to show on the right
-/// (no non-zero `exit`), nothing is painted at all — the header
-/// row is skipped entirely so the block looks identical to the
-/// pre-4G layout.
+/// When `cwd` is `None`, there's no non-zero `exit`, *and* no
+/// `duration`, nothing is painted at all — the header row is skipped
+/// entirely (no allocated rect, so egui inserts no `item_spacing` gap).
 pub fn paint_block_header(
     ui: &mut egui::Ui,
     cwd: Option<&std::path::Path>,
     home: Option<&std::path::Path>,
     exit: Option<i32>,
+    duration: Option<std::time::Duration>,
 ) -> Option<Response> {
     let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
     let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
@@ -845,8 +864,27 @@ pub fn paint_block_header(
         Some(n) if n != 0 => format!("exit {n}"),
         _ => String::new(),
     };
+    // Duration is its own chip (consistent with cwd / exit), text-only
+    // — no parens.
+    let dur_text = duration.map(format_duration).unwrap_or_default();
 
-    if cwd_text.is_empty() && !show_exit {
+    // Each present field is a chip: `text`, `width`, and text `color`.
+    // Collected left→right so the layout + paint share one source of
+    // truth (and adding the git / dirty chips in 4G-async-context is
+    // just another entry).
+    let chip_w = |text: &str| text.chars().count() as f32 * cell_w + 2.0 * CHIP_PAD_X;
+    let mut chips: Vec<(&str, f32, Color32)> = Vec::with_capacity(3);
+    if !cwd_text.is_empty() {
+        chips.push((&cwd_text, chip_w(&cwd_text), BLOCK_HEADER_FG));
+    }
+    if show_exit {
+        chips.push((&exit_text, chip_w(&exit_text), BLOCK_HEADER_EXIT_FAIL_FG));
+    }
+    if !dur_text.is_empty() {
+        chips.push((&dur_text, chip_w(&dur_text), BLOCK_HEADER_FG));
+    }
+
+    if chips.is_empty() {
         // Nothing to render. We deliberately allocate **nothing** —
         // not even a zero-sized rect — because egui inserts an
         // `item_spacing` gap after every allocated widget, and a
@@ -855,51 +893,30 @@ pub fn paint_block_header(
         return None;
     }
 
-    // Layout the row first so we know the total width to allocate.
     // Each chip is `text_width + 2 * CHIP_PAD_X` wide and
-    // `row_h + 2 * CHIP_PAD_Y` tall; chips are spaced `CHIP_GAP`
-    // apart horizontally.
-    let cwd_chip_w = if cwd_text.is_empty() {
-        0.0
-    } else {
-        cwd_text.chars().count() as f32 * cell_w + 2.0 * CHIP_PAD_X
-    };
-    let exit_chip_w =
-        if show_exit { exit_text.chars().count() as f32 * cell_w + 2.0 * CHIP_PAD_X } else { 0.0 };
-    let between_gap = if !cwd_text.is_empty() && show_exit { CHIP_GAP } else { 0.0 };
-    let total_w = cwd_chip_w + between_gap + exit_chip_w;
+    // `row_h + 2 * CHIP_PAD_Y` tall, spaced `CHIP_GAP` apart.
     let chip_h = row_h + 2.0 * CHIP_PAD_Y;
+    let total_w =
+        chips.iter().map(|c| c.1).sum::<f32>() + CHIP_GAP * chips.len().saturating_sub(1) as f32;
     let size = Vec2::new(total_w.max(cell_w), chip_h);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
 
     let radius = CHIP_CORNER_RADIUS as u8;
     let chip_stroke = egui::Stroke::new(1.0, BLOCK_HEADER_CHIP_STROKE);
-    if !cwd_text.is_empty() {
-        let chip_rect = Rect::from_min_size(rect.min, Vec2::new(cwd_chip_w, chip_h));
+    let mut x = rect.min.x;
+    for (text, w, fg) in chips {
+        let chip_rect = Rect::from_min_size(Pos2::new(x, rect.min.y), Vec2::new(w, chip_h));
         painter.rect_filled(chip_rect, radius, BLOCK_HEADER_CHIP_BG);
         painter.rect_stroke(chip_rect, radius, chip_stroke, egui::StrokeKind::Inside);
         painter.text(
             Pos2::new(chip_rect.min.x + CHIP_PAD_X, chip_rect.min.y + CHIP_PAD_Y),
             egui::Align2::LEFT_TOP,
-            &cwd_text,
+            text,
             font_id.clone(),
-            BLOCK_HEADER_FG,
+            fg,
         );
-    }
-    if show_exit {
-        let chip_x = rect.min.x + cwd_chip_w + between_gap;
-        let chip_rect =
-            Rect::from_min_size(Pos2::new(chip_x, rect.min.y), Vec2::new(exit_chip_w, chip_h));
-        painter.rect_filled(chip_rect, radius, BLOCK_HEADER_CHIP_BG);
-        painter.rect_stroke(chip_rect, radius, chip_stroke, egui::StrokeKind::Inside);
-        painter.text(
-            Pos2::new(chip_rect.min.x + CHIP_PAD_X, chip_rect.min.y + CHIP_PAD_Y),
-            egui::Align2::LEFT_TOP,
-            &exit_text,
-            font_id,
-            BLOCK_HEADER_EXIT_FAIL_FG,
-        );
+        x += w + CHIP_GAP;
     }
     Some(response)
 }
@@ -1041,6 +1058,11 @@ pub struct SealedBlockRender {
     /// Number of rows the command label occupies. Snapshot rows
     /// start at this index in the unified row space.
     pub command_lines: usize,
+    /// Painted height of the block's header chrome (cwd / exit chips),
+    /// in logical pixels. `0.0` when the block paints no header
+    /// (empty cwd and zero exit). Used by the sticky-top-header layout
+    /// (4E) to know how tall a pinned header is.
+    pub header_height: f32,
 }
 
 impl SealedBlockRender {
@@ -1056,6 +1078,7 @@ impl SealedBlockRender {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn paint_sealed_block(
     ui: &mut egui::Ui,
     command: &str,
@@ -1064,6 +1087,7 @@ pub fn paint_sealed_block(
     cwd: Option<&std::path::Path>,
     home: Option<&std::path::Path>,
     exit: Option<i32>,
+    duration: std::time::Duration,
 ) -> SealedBlockRender {
     // Reserve a backing shape index BEFORE any paint so the
     // failed-block bg wash sits underneath the chip + command +
@@ -1077,7 +1101,8 @@ pub fn paint_sealed_block(
     // wash can extend up to the inter-block hairline above.
     let block_top_y = ui.next_widget_position().y;
 
-    let _ = paint_block_header(ui, cwd, home, exit);
+    let header = paint_block_header(ui, cwd, home, exit, Some(duration));
+    let header_height = header.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
 
     let cmd_lines = if command.is_empty() { 0 } else { command.split('\n').count() };
     // Split the unified selection into command and snapshot pieces.
@@ -1112,6 +1137,7 @@ pub fn paint_sealed_block(
         command: command_response,
         snapshot: snapshot_response,
         command_lines: cmd_lines,
+        header_height,
     }
 }
 
@@ -1435,6 +1461,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- format_duration (block-header timer) -----------------------
+
+    #[test]
+    fn format_duration_subsecond_is_three_decimals() {
+        use std::time::Duration;
+        assert_eq!(format_duration(Duration::from_millis(34)), "0.034s");
+        assert_eq!(format_duration(Duration::from_millis(500)), "0.500s");
+        assert_eq!(format_duration(Duration::ZERO), "0.000s");
+        assert_eq!(format_duration(Duration::from_millis(999)), "0.999s");
+    }
+
+    #[test]
+    fn format_duration_whole_seconds_under_a_minute() {
+        use std::time::Duration;
+        assert_eq!(format_duration(Duration::from_millis(1000)), "1s");
+        assert_eq!(format_duration(Duration::from_millis(1500)), "1s"); // truncates
+        assert_eq!(format_duration(Duration::from_secs(11)), "11s");
+        assert_eq!(format_duration(Duration::from_secs(59)), "59s");
+    }
+
+    #[test]
+    fn format_duration_minutes_and_hours() {
+        use std::time::Duration;
+        assert_eq!(format_duration(Duration::from_secs(60)), "1m 0s");
+        assert_eq!(format_duration(Duration::from_secs(123)), "2m 3s");
+        assert_eq!(format_duration(Duration::from_secs(3599)), "59m 59s");
+        assert_eq!(format_duration(Duration::from_secs(3600)), "1h 0m");
+        assert_eq!(format_duration(Duration::from_secs(3661)), "1h 1m");
     }
 
     #[test]

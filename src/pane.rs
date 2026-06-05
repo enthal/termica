@@ -463,6 +463,10 @@ impl PaneSession {
                 cwd_str.as_deref(),
                 now_ms,
             );
+            // Stamp the event with the same wall-clock time used for
+            // history, so a Preexec → CommandFinished pair seals the
+            // block with its real duration (4G).
+            self.blocks.set_event_clock_ms(now_ms);
             self.blocks.observe_lifecycle_event(&event, &mut self.terminal, self.frame);
             self.controller.observe_event(event, self.frame);
             self.record_pending_transitions();

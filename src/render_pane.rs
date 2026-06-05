@@ -170,6 +170,164 @@ pub fn compute_footer_height(
     chrome_h + editor_rows as f32 * row_h + FOOTER_DESCENDER_PAD
 }
 
+/// The pinned region the sticky header shows is the block's cwd / exit
+/// chip PLUS its command label, capped at this many lines so a long
+/// multiline command can't grow the pinned strip without bound.
+pub(crate) const STICKY_MAX_CMD_LINES: usize = 4;
+
+/// Screen-space vertical extent of one block painted in the pane's
+/// scroll area, plus `sticky_h` — the height of what gets pinned when
+/// the block is sticky: its header chrome (cwd / exit chip) and its
+/// command label, the latter capped at [`STICKY_MAX_CMD_LINES`].
+/// `sticky_h == 0.0` when the block has neither a chip nor a command.
+/// Collected top→bottom during the block-paint loop and consumed by
+/// [`compute_sticky_header`]. `top`/`bottom`/`sticky_h` are all in the
+/// same screen-y space as the viewport top passed to that helper.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct BlockExtent {
+    pub id: crate::block::BlockId,
+    pub top: f32,
+    pub bottom: f32,
+    pub sticky_h: f32,
+}
+
+/// Decide which block's header pins to the viewport top (spec/04
+/// §"Layout: fixed-footer prompt, sticky-top header", rule 3) and the
+/// screen-y at which to paint it. Pure math, no egui — the spec-
+/// mandated unit-testable boundary.
+///
+/// `extents` are the blocks in top→bottom paint order; `viewport_top`
+/// is the screen-y of the scroll viewport's top edge (same space as
+/// the extents). The sticky block is the one straddling the viewport
+/// top — its header has scrolled (at least partly) above the edge
+/// while its body still extends below it. Returns `None` when the
+/// top-most visible block's header is still fully on-screen (painted
+/// normally in the scroll) or that block has nothing to pin.
+///
+/// The pinned header normally sits flush at `viewport_top`, but the
+/// next block pushes it up as it climbs toward the top (the iOS
+/// section-header handoff): the returned y can be up to `sticky_h`
+/// above `viewport_top`, at which point the next block takes over as
+/// the sticky one.
+pub(crate) fn compute_sticky_header(
+    extents: &[BlockExtent],
+    viewport_top: f32,
+) -> Option<(crate::block::BlockId, f32)> {
+    let idx = extents.iter().position(|b| b.top < viewport_top && viewport_top < b.bottom)?;
+    let b = extents[idx];
+    if b.sticky_h <= 0.0 {
+        return None;
+    }
+    let paint_y = match extents.get(idx + 1) {
+        Some(next) => viewport_top.min(next.top - b.sticky_h),
+        None => viewport_top,
+    };
+    Some((b.id, paint_y))
+}
+
+/// Height of a command label clamped to its first `max` lines, given
+/// the full label height and total line count. `0.0` for an empty
+/// command. Pure so the loop and the paint agree on the clamped
+/// height without re-measuring fonts.
+pub(crate) fn capped_command_height(full_h: f32, total_lines: usize, max: usize) -> f32 {
+    if total_lines == 0 { 0.0 } else { full_h * total_lines.min(max) as f32 / total_lines as f32 }
+}
+
+/// The first `max` lines of `command` for the pinned header, with a
+/// trailing `" …"` hint appended when the command has more lines than
+/// fit. Pure + testable; keeps the multiline cap logic out of the
+/// paint path.
+pub(crate) fn cap_command_for_sticky(command: &str, max: usize) -> String {
+    let mut lines = command.split('\n');
+    let head: Vec<&str> = lines.by_ref().take(max).collect();
+    let truncated = lines.next().is_some();
+    let mut out = head.join("\n");
+    if truncated {
+        out.push_str(" …");
+    }
+    out
+}
+
+/// Paint a pinned block header at screen-y `paint_y`, pinned to the top
+/// of the scroll `viewport` (4E): the block's cwd / exit chip and its
+/// command label (capped at [`STICKY_MAX_CMD_LINES`] lines), so the
+/// pinned strip identifies the block by the command that produced it —
+/// not just its cwd. Painted on an opaque [`render::DEFAULT_BG`] strip
+/// so the content scrolling underneath is occluded, in a foreground
+/// `Area` clipped to `viewport` so a header pushed up by the next block
+/// slides under the top edge. The command is painted non-interactively
+/// (hover sense only) so the decorative overlay never eats clicks meant
+/// for the content below.
+///
+/// Split out from the pane render so the paint is snapshot-testable in
+/// isolation; the sticky-eligibility / position decision is the pure
+/// [`compute_sticky_header`].
+// Geometry (`viewport`, `paint_y`), chrome content (`cwd`, `home`,
+// `exit`, `duration`, `command`), and the `ctx` / `pane_id` needed to
+// spawn the `Area` are all genuinely distinct inputs — same shape as
+// the file's other paint helpers.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_sticky_header(
+    ctx: &egui::Context,
+    viewport: egui::Rect,
+    paint_y: f32,
+    cwd: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+    exit: Option<i32>,
+    duration: Option<std::time::Duration>,
+    command: &str,
+    pane_id: u64,
+) {
+    egui::Area::new(egui::Id::new(("sticky-header", pane_id)))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::pos2(viewport.left(), paint_y))
+        .show(ctx, |ui| {
+            ui.set_clip_rect(viewport);
+            // Reserve the opaque strip BEHIND the chrome, then size it
+            // to the union of everything painted (chip + command).
+            let strip_idx = ui.painter().add(egui::Shape::Noop);
+            let top = ui.next_widget_position().y;
+            let _ = render::paint_block_header(ui, cwd, home, exit, duration);
+            let capped = cap_command_for_sticky(command, STICKY_MAX_CMD_LINES);
+            if !capped.is_empty() {
+                paint_command_label_static(ui, &capped);
+            }
+            let bottom = ui.next_widget_position().y;
+            let strip = egui::Rect::from_min_max(
+                egui::pos2(viewport.left(), top),
+                egui::pos2(viewport.right(), bottom),
+            );
+            ui.painter().set(strip_idx, egui::Shape::rect_filled(strip, 0.0, render::DEFAULT_BG));
+        });
+}
+
+/// Paint a (possibly multiline) command label like
+/// [`render::paint_command_label`] but with **hover** sense only —
+/// the sticky overlay is decorative and must not capture clicks /
+/// drags meant for the content scrolling underneath it. Advances the
+/// `ui` cursor so the caller's union-rect measurement includes it.
+fn paint_command_label_static(ui: &mut egui::Ui, command: &str) {
+    let font = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
+    let (cell_w, label_row_h) = ui.fonts_mut(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
+    let lines: Vec<&str> = command.split('\n').collect();
+    let cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0).max(1);
+    let size = egui::vec2(cols as f32 * cell_w, lines.len() as f32 * label_row_h);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    for (i, line) in lines.iter().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        painter.text(
+            egui::pos2(rect.min.x, rect.min.y + i as f32 * label_row_h),
+            egui::Align2::LEFT_TOP,
+            line,
+            font.clone(),
+            render::EDITOR_FG,
+        );
+    }
+}
+
 /// Translate a `(Key, Modifiers)` pair into an [`EditorMotion`] +
 /// "extending" flag, honouring platform conventions:
 ///
@@ -772,6 +930,10 @@ pub fn render_pane(
     // all there).
     let mut sealed_block_renders: Vec<(crate::block::BlockId, render::SealedBlockRender)> =
         Vec::new();
+    // Screen-space vertical extents of each painted block, collected
+    // top→bottom for the sticky-top-header pass (4E) after the scroll
+    // area lays out. Empty in alt-screen mode (no blocks painted).
+    let mut block_extents: Vec<BlockExtent> = Vec::new();
 
     // Phase 4D — fixed-footer Prompt block. When the tail is a
     // `Prompt` AND the editor is active, reserve a strip at the
@@ -968,12 +1130,21 @@ pub fn render_pane(
             // duration chips defer to Phase 5's async-probe surface.
             for block in slot.session.blocks().iter() {
                 match block {
-                    crate::block::Block::Sealed { id, command, snapshot, header, exit, .. } => {
+                    crate::block::Block::Sealed {
+                        id,
+                        command,
+                        snapshot,
+                        header,
+                        exit,
+                        duration,
+                        ..
+                    } => {
                         let total_rows =
                             (if command.is_empty() { 0 } else { command.split('\n').count() })
                                 + snapshot.len();
                         let sel_for_this =
                             pane_sel.as_ref().and_then(|s| s.block_range_for(*id, total_rows));
+                        let block_top = ui.next_widget_position().y;
                         let sealed_render = render::paint_sealed_block(
                             ui,
                             command,
@@ -982,7 +1153,21 @@ pub fn render_pane(
                             header.cwd.as_deref(),
                             home,
                             *exit,
+                            *duration,
                         );
+                        let cmd_h =
+                            sealed_render.command.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
+                        block_extents.push(BlockExtent {
+                            id: *id,
+                            top: block_top,
+                            bottom: sealed_render.bounding_rect().bottom(),
+                            sticky_h: sealed_render.header_height
+                                + capped_command_height(
+                                    cmd_h,
+                                    sealed_render.command_lines,
+                                    STICKY_MAX_CMD_LINES,
+                                ),
+                        });
                         sealed_block_renders.push((*id, sealed_render));
                         // Block separator — picked via
                         // `cargo run --example pick_block_separator`
@@ -1000,11 +1185,25 @@ pub fn render_pane(
                         );
                         ui.add_space(render::BLOCK_SEPARATOR_GAP);
                     }
-                    crate::block::Block::Running { command, header, .. } => {
-                        let _ = render::paint_block_header(ui, header.cwd.as_deref(), home, None);
-                        if !command.is_empty() {
-                            let _ = render::paint_command_label(ui, command);
-                        }
+                    crate::block::Block::Running { id, command, header, .. } => {
+                        let block_top = ui.next_widget_position().y;
+                        // Running blocks don't show a duration yet — the
+                        // live ticking timer lands in 4G slice 2.
+                        let hdr =
+                            render::paint_block_header(ui, header.cwd.as_deref(), home, None, None);
+                        let chip_h = hdr.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
+                        let cmd_resp =
+                            (!command.is_empty()).then(|| render::paint_command_label(ui, command));
+                        let cmd_lines =
+                            if command.is_empty() { 0 } else { command.split('\n').count() };
+                        let cmd_h = cmd_resp.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
+                        block_extents.push(BlockExtent {
+                            id: *id,
+                            top: block_top,
+                            bottom: ui.next_widget_position().y,
+                            sticky_h: chip_h
+                                + capped_command_height(cmd_h, cmd_lines, STICKY_MAX_CMD_LINES),
+                        });
                     }
                     crate::block::Block::Prompt { .. } => {
                         // The `Prompt` block's chrome lives in
@@ -1129,8 +1328,48 @@ pub fn render_pane(
 
         (rendered, links_in_view, highlighted_link.cloned())
     });
+    let scroll_viewport = scroll_inner.inner_rect;
     let (rendered, links_in_view, highlighted_link) = scroll_inner.inner;
     let highlighted_link = highlighted_link.as_ref();
+
+    // ---- Sticky-top block header (4E) -----------------------------
+    //
+    // Once the scroll area has laid out, pin the header of the block
+    // straddling the viewport top to the top edge — until its body
+    // scrolls past, when the next block's header takes over (spec/04
+    // §"Layout: …sticky-top header"). `compute_sticky_header` is the
+    // pure decision; here we just look up the chosen block's chrome +
+    // command and repaint them in a clipped foreground `Area`, over an
+    // opaque strip so the content scrolling underneath is occluded.
+    if !in_alt_screen
+        && let Some((sticky_id, paint_y)) =
+            compute_sticky_header(&block_extents, scroll_viewport.top())
+        && let Some((cwd, exit, duration, command)) =
+            slot.session.blocks().iter().find_map(|b| match b {
+                crate::block::Block::Sealed { id, header, exit, command, duration, .. }
+                    if *id == sticky_id =>
+                {
+                    Some((header.cwd.clone(), *exit, Some(*duration), command.clone()))
+                }
+                crate::block::Block::Running { id, header, command, .. } if *id == sticky_id => {
+                    // No live duration on running blocks yet (4G slice 2).
+                    Some((header.cwd.clone(), None, None, command.clone()))
+                }
+                _ => None,
+            })
+    {
+        paint_sticky_header(
+            ctx,
+            scroll_viewport,
+            paint_y,
+            cwd.as_deref(),
+            home,
+            exit,
+            duration,
+            &command,
+            slot.session.pane_id(),
+        );
+    }
     if highlighted_link.is_some() {
         ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -1222,7 +1461,7 @@ pub fn render_pane(
         if has_prompt_cwd
             && let Some(crate::block::Block::Prompt { header, .. }) = slot.session.blocks().last()
         {
-            let _ = render::paint_block_header(ui, header.cwd.as_deref(), home, None);
+            let _ = render::paint_block_header(ui, header.cwd.as_deref(), home, None, None);
         }
 
         // Allocate the editor strip and paint into it. The widget
@@ -2566,6 +2805,112 @@ mod tests {
             compute_footer_height(true, true, 0, true, 20.0),
             40.0 + chip_pad + FOOTER_DESCENDER_PAD
         );
+    }
+
+    // ---- compute_sticky_header (sticky-top block header, 4E) ---------
+    //
+    // spec/04 §"Layout: …sticky-top header" rule 3. Pure layout math
+    // over a synthetic block list at walked scroll positions. All
+    // coordinates are in the same screen-y space (top grows downward).
+
+    fn ext(id: u64, top: f32, bottom: f32, sticky_h: f32) -> BlockExtent {
+        BlockExtent { id: crate::block::BlockId(id), top, bottom, sticky_h }
+    }
+
+    #[test]
+    fn sticky_none_when_top_block_header_fully_visible() {
+        // Not scrolled (viewport top == first block top): the real
+        // header sits at the edge, nothing is pinned.
+        let blocks = [ext(0, 0.0, 100.0, 20.0), ext(1, 110.0, 210.0, 20.0)];
+        assert_eq!(compute_sticky_header(&blocks, 0.0), None);
+    }
+
+    #[test]
+    fn sticky_pins_straddling_block_flush_at_top() {
+        // Block 0's header scrolled above the viewport top, its body
+        // still below → pinned flush at viewport_top.
+        let blocks = [ext(0, 0.0, 100.0, 20.0), ext(1, 110.0, 210.0, 20.0)];
+        assert_eq!(compute_sticky_header(&blocks, 40.0), Some((crate::block::BlockId(0), 40.0)));
+    }
+
+    #[test]
+    fn sticky_none_in_separator_gap_between_blocks() {
+        // Viewport top in the gap (block 0 fully past, block 1 not yet
+        // reached): nothing pinned.
+        let blocks = [ext(0, 0.0, 100.0, 20.0), ext(1, 110.0, 210.0, 20.0)];
+        assert_eq!(compute_sticky_header(&blocks, 105.0), None);
+    }
+
+    #[test]
+    fn sticky_next_block_pushes_pinned_header_up() {
+        // Contiguous blocks: as block 1's top climbs toward the
+        // viewport top it shoves block 0's pinned header up.
+        let blocks = [ext(0, 0.0, 100.0, 20.0), ext(1, 100.0, 200.0, 20.0)];
+        // Far from handoff: flush.
+        assert_eq!(compute_sticky_header(&blocks, 70.0), Some((crate::block::BlockId(0), 70.0)));
+        // In the push zone (next.top - header_h = 80 < 90): pushed up.
+        assert_eq!(compute_sticky_header(&blocks, 90.0), Some((crate::block::BlockId(0), 80.0)));
+        // Just before the boundary: pushed nearly a full header.
+        assert_eq!(compute_sticky_header(&blocks, 99.0), Some((crate::block::BlockId(0), 80.0)));
+    }
+
+    #[test]
+    fn sticky_hands_off_to_next_block_past_boundary() {
+        let blocks = [ext(0, 0.0, 100.0, 20.0), ext(1, 100.0, 200.0, 20.0)];
+        assert_eq!(compute_sticky_header(&blocks, 130.0), Some((crate::block::BlockId(1), 130.0)));
+    }
+
+    #[test]
+    fn sticky_block_without_header_pins_nothing() {
+        let blocks = [ext(0, 0.0, 100.0, 0.0)];
+        assert_eq!(compute_sticky_header(&blocks, 40.0), None);
+    }
+
+    #[test]
+    fn sticky_last_block_has_no_next_to_push_it() {
+        let blocks = [ext(0, 0.0, 100.0, 20.0)];
+        assert_eq!(compute_sticky_header(&blocks, 40.0), Some((crate::block::BlockId(0), 40.0)));
+    }
+
+    #[test]
+    fn sticky_none_when_scrolled_below_all_blocks() {
+        let blocks = [ext(0, 0.0, 100.0, 20.0)];
+        assert_eq!(compute_sticky_header(&blocks, 150.0), None);
+    }
+
+    #[test]
+    fn sticky_empty_block_list_has_none() {
+        assert_eq!(compute_sticky_header(&[], 40.0), None);
+    }
+
+    #[test]
+    fn cap_command_single_line_unchanged() {
+        assert_eq!(cap_command_for_sticky("ls -la", 4), "ls -la");
+    }
+
+    #[test]
+    fn cap_command_at_limit_unchanged() {
+        assert_eq!(cap_command_for_sticky("a\nb\nc\nd", 4), "a\nb\nc\nd");
+    }
+
+    #[test]
+    fn cap_command_over_limit_truncates_with_hint() {
+        assert_eq!(cap_command_for_sticky("a\nb\nc\nd\ne", 4), "a\nb\nc\nd …");
+    }
+
+    #[test]
+    fn cap_command_empty_is_empty() {
+        assert_eq!(cap_command_for_sticky("", 4), "");
+    }
+
+    #[test]
+    fn capped_command_height_scales_to_clamped_lines() {
+        // 6 lines at full height 120 → per-line 20; clamp to 4 → 80.
+        assert_eq!(capped_command_height(120.0, 6, 4), 80.0);
+        // Under the cap: full height passes through.
+        assert_eq!(capped_command_height(60.0, 3, 4), 60.0);
+        // Empty command → 0.
+        assert_eq!(capped_command_height(0.0, 0, 4), 0.0);
     }
 
     // ---- classify_editor_motion (per-OS keybindings) -----------------
