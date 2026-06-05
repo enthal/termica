@@ -1092,10 +1092,14 @@ pub fn render_pane(
     // Live elapsed time of the running command (`None` when idle),
     // sampled once this frame for the ticking duration chip (4G).
     // While a command runs, schedule a repaint so the chip keeps
-    // counting even without input.
+    // counting even without input. Repaint fast while the chip shows
+    // tenths (< 10s → smooth tenths), then back off to ~1s once it's
+    // whole seconds — no point burning frames to redraw an unchanged
+    // `5m 0s` on a long command.
     let running_elapsed = slot.session.running_elapsed();
-    if running_elapsed.is_some() {
-        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+    if let Some(elapsed) = running_elapsed {
+        let interval = if elapsed < std::time::Duration::from_secs(10) { 100 } else { 1000 };
+        ctx.request_repaint_after(std::time::Duration::from_millis(interval));
     }
     let scroll_inner = scroll_area.show(ui, |ui| {
         // Scrollback-jump-to-top (Cmd+Option+Up / Ctrl+Alt+Up): snap
@@ -1329,6 +1333,23 @@ pub fn render_pane(
                 },
             }
         };
+
+        // Extend the running block's extent to the bottom of the live
+        // terminal output just painted (4E sticky headers). The block
+        // loop only saw the running block's header + command label;
+        // its streaming output is the live grid painted here, BELOW
+        // that. Without this the sticky header releases at the command-
+        // label bottom instead of the true content bottom, so scrolling
+        // up through a running command's output loses the pin partway
+        // — the symptom is "sticky for a bit, then scrolls past,"
+        // unlike a sealed block whose snapshot bottom is the real
+        // bottom. Only the tail can be `Running`, so its extent is the
+        // last one pushed.
+        if matches!(slot.session.blocks().last(), Some(crate::block::Block::Running { .. }))
+            && let Some(last) = block_extents.last_mut()
+        {
+            last.bottom = last.bottom.max(rendered.response.rect.bottom());
+        }
 
         // If the user just submitted a command, snap to the bottom
         // of the now-laid-out content. `scroll_to_cursor` aligns the
