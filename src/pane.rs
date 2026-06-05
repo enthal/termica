@@ -567,6 +567,15 @@ impl PaneSession {
         &self.blocks
     }
 
+    /// Live elapsed time of the currently-running command (the tail
+    /// `Running` block), or `None` when the shell is idle at a prompt.
+    /// Read each frame by the renderer to paint the ticking duration
+    /// chip; reads the wall clock here so [`BlockStack::running_elapsed_at`]
+    /// stays pure / testable.
+    pub fn running_elapsed(&self) -> Option<std::time::Duration> {
+        self.blocks.running_elapsed_at(wall_clock_ms())
+    }
+
     /// Cmd+K / Ctrl+Shift+K: drop the sealed block scrollback AND
     /// blank the live terminal grid. The shell process is
     /// untouched — it'll redraw its prompt on the next prompt

@@ -1089,6 +1089,14 @@ pub fn render_pane(
     // the wrong place.
     let scroll_area =
         if force_to_top { scroll_area.vertical_scroll_offset(0.0) } else { scroll_area };
+    // Live elapsed time of the running command (`None` when idle),
+    // sampled once this frame for the ticking duration chip (4G).
+    // While a command runs, schedule a repaint so the chip keeps
+    // counting even without input.
+    let running_elapsed = slot.session.running_elapsed();
+    if running_elapsed.is_some() {
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+    }
     let scroll_inner = scroll_area.show(ui, |ui| {
         // Scrollback-jump-to-top (Cmd+Option+Up / Ctrl+Alt+Up): snap
         // the next-widget-position (= top of content) to the TOP
@@ -1187,10 +1195,16 @@ pub fn render_pane(
                     }
                     crate::block::Block::Running { id, command, header, .. } => {
                         let block_top = ui.next_widget_position().y;
-                        // Running blocks don't show a duration yet — the
-                        // live ticking timer lands in 4G slice 2.
-                        let hdr =
-                            render::paint_block_header(ui, header.cwd.as_deref(), home, None, None);
+                        // Live ticking duration (4G-live-duration): the
+                        // running command's elapsed time, refreshed each
+                        // frame via the repaint scheduled above.
+                        let hdr = render::paint_block_header(
+                            ui,
+                            header.cwd.as_deref(),
+                            home,
+                            None,
+                            running_elapsed,
+                        );
                         let chip_h = hdr.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
                         let cmd_resp =
                             (!command.is_empty()).then(|| render::paint_command_label(ui, command));
@@ -1352,8 +1366,8 @@ pub fn render_pane(
                     Some((header.cwd.clone(), *exit, Some(*duration), command.clone()))
                 }
                 crate::block::Block::Running { id, header, command, .. } if *id == sticky_id => {
-                    // No live duration on running blocks yet (4G slice 2).
-                    Some((header.cwd.clone(), None, None, command.clone()))
+                    // The pinned running header ticks too (4G-live-duration).
+                    Some((header.cwd.clone(), None, running_elapsed, command.clone()))
                 }
                 _ => None,
             })
