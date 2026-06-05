@@ -96,7 +96,7 @@ Sub-PRs:
 
 > A "duplicate-here" pane op was originally listed alongside spawn-in-cwd in the pre-breakout Phase 2 description (see the original [#2](https://github.com/enthal/termica/issues/2) acceptance criteria). After 2B shipped, the gap between "Cmd+T" and a hypothetical "duplicate this pane" collapsed — both produce a fresh shell in the same cwd, and shells can't share runtime env across forks anyway. Dropped from the roadmap; reframing as a keyboard split shortcut (à la iTerm2 Cmd+D) is the only flavor that would still be a distinct gesture, but drag-to-split already works and a hotkey can land later as needed.
 
-### Phase 3 — Managed shell integration + mode machine
+### Phase 3 — Managed shell integration + mode machine ✅
 
 **Design pivot ([#45](https://github.com/enthal/termica/pull/45)):** the Phase 3A/3B work shipped an OSC 133 + OSC 1337-Termica marker pipeline and a four-mode `PromptController`. We pivoted in [spec/03](03-shell-integration.md) to a managed-shell-integration design: Termica controls bootstrap on every shell spawn via `ZDOTDIR` (zsh) / `--rcfile` (bash) / `--no-config --init-command` (fish), uses a DCS-JSON protocol it owns end-to-end, and ignores foreign OSC 133. The pane mode machine grows two new states (`Bootstrapping`, `Degraded` — see [05](05-pane-modes.md)). The "fenced-block dotfile installer" approach is dropped entirely.
 
@@ -115,6 +115,8 @@ Sub-PRs (reshaped):
 The strict tests-first rule from [CLAUDE.md](../CLAUDE.md) applies to **the entire Phase 3 surface area** — every commit lands with tests that failed on the pre-change tree.
 
 **Acceptance:** Termica spawns its own managed shells; DCS-JSON lifecycle messages flow end-to-end; mode transitions are observably correct including `Bootstrapping` → `RawTerminal` and `Bootstrapping` → `Degraded`; bootstrap suppression hides bootstrap noise from the user. Editor is **not** wired up yet (Phase 4).
+
+**Status:** ✅ complete — [#3](https://github.com/enthal/termica/issues/3) closed. 3A–3G all shipped; the managed-shell mode machine is the source of truth for prompt detection across zsh / bash / fish.
 
 **Known gaps tracked for later:**
 
@@ -164,23 +166,31 @@ Sub-PRs:
 
 **Acceptance:** the header replaces most of what `PS1` carried; updates feel instant; never blocks paint.
 
-### Phase 6 — History (local + global) + Ctrl+R
+### Phase 6 — History (local + global) + Ctrl+R ✅
 
-- `termica-history`: SQLite schema for `command_run` + `history_entry`; pane-local in-memory ring with disk spill.
-- Up-arrow walk; Ctrl+R popup with fuzzy match (`nucleo`).
-- Scope toggles: this pane / this project / global.
-- Cwd-biased ranking.
+- ✅ `termica-history`: SQLite schema for command runs; pane-local recall + shell-history-file replay on startup.
+- ✅ Up-arrow walk (multiline-aware, [#105](https://github.com/enthal/termica/pull/105)); Ctrl+R popup ([#96](https://github.com/enthal/termica/pull/96)).
+- ✅ Scope toggle in the Ctrl+R overlay (this pane / global).
+- ⏳ Fuzzy match via `nucleo` + cwd-biased ranking — the current matcher is a placeholder; tracked in [#119](https://github.com/enthal/termica/issues/119).
+
+Shipped under the Phase 4J slices ([#91](https://github.com/enthal/termica/pull/91)–[#97](https://github.com/enthal/termica/pull/97), [#105](https://github.com/enthal/termica/pull/105)) since the editor needed history to be useful.
 
 **Acceptance:** Ctrl+R returns relevant historical commands across panes and previous sessions in under 50 ms for a 50k-entry history.
 
-### Phase 7 — Command blocks
+**Status:** ✅ complete — [#6](https://github.com/enthal/termica/issues/6) closed. History storage, ↑/↓ recall, and the scoped Ctrl+R overlay are in daily use; `nucleo` ranking is the one remaining follow-up ([#119](https://github.com/enthal/termica/issues/119)).
 
-- `CommandRun` lifecycle wiring: open on submit / `command_start`; close on `command_end`.
-- Transcript view renders command blocks with header chrome.
-- Collapse / expand.
-- Copy command / copy output / rerun.
+### Phase 7 — Command blocks ✅
+
+- ✅ `CommandRun` lifecycle wiring: open on submit / `Preexec`; seal on `CommandFinished`.
+- ✅ Transcript renders command blocks with header chrome (cwd, exit, duration; sticky-top header).
+- ✅ Failed exits are visually distinct (red `exit N`); within- and cross-block selection + copy.
+- ⏳ Collapse / expand, copy-output / rerun, context menu — tracked in [#120](https://github.com/enthal/termica/issues/120).
+
+The foundational block model was pulled forward into Phase 4 (the block-model pivot, [#51](https://github.com/enthal/termica/pull/51)–[#116](https://github.com/enthal/termica/pull/116)); as noted above, Phase 7 is "largely subsumed by Phase 4G."
 
 **Acceptance:** the transcript becomes navigable as a sequence of command blocks. Failed exits are visually distinct. Click → collapse works.
+
+**Status:** ✅ complete — [#7](https://github.com/enthal/termica/issues/7) closed. The block model, header chrome, and selection/copy shipped under Phase 4; the remaining collapse/expand/rerun affordances are tracked in [#120](https://github.com/enthal/termica/issues/120).
 
 ### Phase 8 — In-pane search
 
