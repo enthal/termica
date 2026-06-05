@@ -42,6 +42,7 @@ TARGETS = {"hero": True, "history": False, "completion": False}
 
 WEBP_QUALITY = 80
 OG_SIZE = (1200, 630)
+OG_QUALITY = 82
 
 
 def _fit_width(img: Image.Image, target_w: int) -> Image.Image:
@@ -69,8 +70,10 @@ def emit(name: str, make_og: bool) -> bool:
 
     if make_og:
         og = _cover_crop(img, OG_SIZE)
-        og.save(OUT_DIR / "og.png", optimize=True)
-        print(f"  ✓ og.png: {OG_SIZE[0]}x{OG_SIZE[1]} (from {name})")
+        # JPEG: social cards are shown small and re-compressed by every
+        # platform, so PNG crispness is wasted bytes. ~100 KB vs ~370 KB.
+        og.save(OUT_DIR / "og.jpg", quality=OG_QUALITY, optimize=True, progressive=True)
+        print(f"  ✓ og.jpg: {OG_SIZE[0]}x{OG_SIZE[1]} (from {name})")
     return True
 
 
