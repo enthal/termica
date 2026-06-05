@@ -233,6 +233,20 @@ pub(crate) fn capped_command_height(full_h: f32, total_lines: usize, max: usize)
     if total_lines == 0 { 0.0 } else { full_h * total_lines.min(max) as f32 / total_lines as f32 }
 }
 
+/// The blank-pane watermark shows only while the pane is *pristine*:
+/// not in alt-screen, no command sealed into scrollback, and none
+/// currently running. The `tail_is_running` term is the fix for the
+/// long-running-first-command bug — without it, a running first command
+/// (nothing sealed yet) kept the watermark up behind its output until
+/// it exited. Pure; unit-tested.
+pub(crate) fn should_show_watermark(
+    in_alt_screen: bool,
+    has_sealed: bool,
+    tail_is_running: bool,
+) -> bool {
+    !in_alt_screen && !has_sealed && !tail_is_running
+}
+
 /// The first `max` lines of `command` for the pinned header, with a
 /// trailing `" …"` hint appended when the command has more lines than
 /// fit. Pure + testable; keeps the multiline cap logic out of the
@@ -1089,6 +1103,18 @@ pub fn render_pane(
     // the wrong place.
     let scroll_area =
         if force_to_top { scroll_area.vertical_scroll_offset(0.0) } else { scroll_area };
+    // Live elapsed time of the running command (`None` when idle),
+    // sampled once this frame for the ticking duration chip (4G).
+    // While a command runs, schedule a repaint so the chip keeps
+    // counting even without input. Repaint fast while the chip shows
+    // tenths (< 10s → smooth tenths), then back off to ~1s once it's
+    // whole seconds — no point burning frames to redraw an unchanged
+    // `5m 0s` on a long command.
+    let running_elapsed = slot.session.running_elapsed();
+    if let Some(elapsed) = running_elapsed {
+        let interval = if elapsed < std::time::Duration::from_secs(10) { 100 } else { 1000 };
+        ctx.request_repaint_after(std::time::Duration::from_millis(interval));
+    }
     let scroll_inner = scroll_area.show(ui, |ui| {
         // Scrollback-jump-to-top (Cmd+Option+Up / Ctrl+Alt+Up): snap
         // the next-widget-position (= top of content) to the TOP
@@ -1187,10 +1213,16 @@ pub fn render_pane(
                     }
                     crate::block::Block::Running { id, command, header, .. } => {
                         let block_top = ui.next_widget_position().y;
-                        // Running blocks don't show a duration yet — the
-                        // live ticking timer lands in 4G slice 2.
-                        let hdr =
-                            render::paint_block_header(ui, header.cwd.as_deref(), home, None, None);
+                        // Live ticking duration (4G-live-duration): the
+                        // running command's elapsed time, refreshed each
+                        // frame via the repaint scheduled above.
+                        let hdr = render::paint_block_header(
+                            ui,
+                            header.cwd.as_deref(),
+                            home,
+                            None,
+                            running_elapsed,
+                        );
                         let chip_h = hdr.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
                         let cmd_resp =
                             (!command.is_empty()).then(|| render::paint_command_label(ui, command));
@@ -1316,6 +1348,23 @@ pub fn render_pane(
             }
         };
 
+        // Extend the running block's extent to the bottom of the live
+        // terminal output just painted (4E sticky headers). The block
+        // loop only saw the running block's header + command label;
+        // its streaming output is the live grid painted here, BELOW
+        // that. Without this the sticky header releases at the command-
+        // label bottom instead of the true content bottom, so scrolling
+        // up through a running command's output loses the pin partway
+        // — the symptom is "sticky for a bit, then scrolls past,"
+        // unlike a sealed block whose snapshot bottom is the real
+        // bottom. Only the tail can be `Running`, so its extent is the
+        // last one pushed.
+        if matches!(slot.session.blocks().last(), Some(crate::block::Block::Running { .. }))
+            && let Some(last) = block_extents.last_mut()
+        {
+            last.bottom = last.bottom.max(rendered.response.rect.bottom());
+        }
+
         // If the user just submitted a command, snap to the bottom
         // of the now-laid-out content. `scroll_to_cursor` aligns the
         // *next* widget position (which is past everything we've
@@ -1352,8 +1401,8 @@ pub fn render_pane(
                     Some((header.cwd.clone(), *exit, Some(*duration), command.clone()))
                 }
                 crate::block::Block::Running { id, header, command, .. } if *id == sticky_id => {
-                    // No live duration on running blocks yet (4G slice 2).
-                    Some((header.cwd.clone(), None, None, command.clone()))
+                    // The pinned running header ticks too (4G-live-duration).
+                    Some((header.cwd.clone(), None, running_elapsed, command.clone()))
                 }
                 _ => None,
             })
@@ -2686,9 +2735,12 @@ pub fn render_pane(
     // ---- blank-pane watermark overlay ---------------------------
     //
     // Painted last, on top of the terminal's opaque fill, so the faint
-    // app icon shows through. Shown while the pane is *pristine* — no
-    // command has sealed into scrollback yet (`has_sealed_blocks`) —
-    // and not in alt-screen (vim/less/etc. own the whole grid). Drawn
+    // app icon shows through. Shown only while the pane is *pristine*
+    // (see `should_show_watermark`): nothing sealed into scrollback,
+    // nothing currently running, and not in alt-screen (vim/less/etc.
+    // own the whole grid). The running check matters — a long-running
+    // FIRST command hasn't sealed yet, so without it the watermark
+    // lingered behind the command's output until it exited. Drawn
     // in the base layer after all content, so Area-based popups (the
     // completion popup) and modals still render above it.
     //
@@ -2705,7 +2757,13 @@ pub fn render_pane(
     // bias the watermark rightward and let the clip chop it — the same
     // overshoot the focused-chrome footer avoids above. `clip_rect` is
     // the true visible pane bounds.
-    let show_watermark = !in_alt_screen && !slot.session.blocks().has_sealed_blocks();
+    let tail_is_running =
+        matches!(slot.session.blocks().last(), Some(crate::block::Block::Running { .. }));
+    let show_watermark = should_show_watermark(
+        in_alt_screen,
+        slot.session.blocks().has_sealed_blocks(),
+        tail_is_running,
+    );
     let watermark_fade = ctx.animate_bool_with_time(
         ui.id().with("watermark-fade"),
         show_watermark,
@@ -2911,6 +2969,23 @@ mod tests {
         assert_eq!(capped_command_height(60.0, 3, 4), 60.0);
         // Empty command → 0.
         assert_eq!(capped_command_height(0.0, 0, 4), 0.0);
+    }
+
+    // ---- should_show_watermark (blank-pane gate) --------------------
+
+    #[test]
+    fn watermark_shows_only_on_a_pristine_idle_pane() {
+        // pristine = not alt-screen, nothing sealed, nothing running.
+        assert!(should_show_watermark(false, false, false));
+        // A running FIRST command (nothing sealed yet) hides it — the
+        // reported bug: it used to persist until the command exited.
+        assert!(!should_show_watermark(false, false, true));
+        // Sealed scrollback hides it.
+        assert!(!should_show_watermark(false, true, false));
+        // Alt-screen hides it (vim/less own the grid).
+        assert!(!should_show_watermark(true, false, false));
+        // Any combination of "has content" reasons keeps it hidden.
+        assert!(!should_show_watermark(true, true, true));
     }
 
     // ---- classify_editor_motion (per-OS keybindings) -----------------

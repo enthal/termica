@@ -243,6 +243,20 @@ impl BlockStack {
         self.event_clock_ms = now_ms;
     }
 
+    /// Live elapsed time of the currently-`Running` command, measured
+    /// against the wall-clock `now_ms` the caller supplies. `None` when
+    /// the tail is a `Prompt` (nothing running). Clamps backwards clock
+    /// skew to zero. Pure (time is a parameter) so the live-timer logic
+    /// is deterministic in tests; the renderer passes `wall_clock_ms()`.
+    pub fn running_elapsed_at(&self, now_ms: i64) -> Option<Duration> {
+        match self.blocks.last() {
+            Some(Block::Running { started_at_ms, .. }) => {
+                Some(Duration::from_millis(now_ms.saturating_sub(*started_at_ms).max(0) as u64))
+            }
+            _ => None,
+        }
+    }
+
     /// Update the live tail block's `BlockHeader.cwd` when the shell
     /// reports a new working directory.
     ///
@@ -543,6 +557,29 @@ mod tests {
             }
             other => panic!("expected Sealed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn running_elapsed_is_live_for_running_tail_and_none_otherwise() {
+        let mut stack = fresh_stack();
+        let mut term = TerminalState::new(5, 20);
+        // Fresh Prompt tail: nothing running.
+        assert_eq!(stack.running_elapsed_at(9_999), None);
+        // Start a command at t=1.000s.
+        stack.set_event_clock_ms(1_000);
+        stack.observe_lifecycle_event(
+            &LifecycleEvent::Preexec { command: "sleep 5".into() },
+            &mut term,
+            10,
+        );
+        // Live elapsed = now - started.
+        assert_eq!(stack.running_elapsed_at(3_500), Some(Duration::from_millis(2_500)));
+        // Clock skew clamps to zero.
+        assert_eq!(stack.running_elapsed_at(500), Some(Duration::ZERO));
+        // After sealing, the tail is a Prompt again → no live elapsed.
+        stack.set_event_clock_ms(4_000);
+        stack.observe_lifecycle_event(&LifecycleEvent::CommandFinished { exit: 0 }, &mut term, 11);
+        assert_eq!(stack.running_elapsed_at(9_999), None);
     }
 
     #[test]
