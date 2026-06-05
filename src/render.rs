@@ -812,14 +812,23 @@ pub const CHIP_PAD_Y: f32 = 2.0;
 pub const CHIP_CORNER_RADIUS: f32 = 4.0;
 pub const CHIP_GAP: f32 = 4.0;
 
-/// Format a command's wall-clock duration for the block header, the
-/// way the spec/04 examples show it: sub-second as 3-decimal seconds
-/// (`0.034s`), under a minute as whole seconds (`11s`), then
-/// `Nm Ns` / `Nh Nm`. Pure; unit-tested.
+/// Format a command's wall-clock duration for the block header, kept
+/// to roughly **2–3 significant figures** so the timer stays
+/// informative across scales:
+/// - `< 1s` → millisecond precision (`0.034s`, `0.500s`);
+/// - `1s ..< 10s` → tenths (`2.1s`) — whole seconds would drop a
+///   significant figure here;
+/// - `10s ..< 60s` → whole seconds (`11s`, `59s` — already 2 figures);
+/// - then `Nm Ns` / `Nh Nm`.
+///
+/// Pure; unit-tested.
 pub fn format_duration(d: std::time::Duration) -> String {
-    let ms = d.as_millis();
-    if ms < 1000 {
-        return format!("{:.3}s", ms as f64 / 1000.0);
+    let secs_f = d.as_secs_f64();
+    if secs_f < 1.0 {
+        return format!("{secs_f:.3}s"); // 0.034s
+    }
+    if secs_f < 10.0 {
+        return format!("{secs_f:.1}s"); // 2.1s
     }
     let secs = d.as_secs();
     if secs < 60 {
@@ -1475,10 +1484,20 @@ mod tests {
     }
 
     #[test]
-    fn format_duration_whole_seconds_under_a_minute() {
+    fn format_duration_one_to_ten_seconds_shows_tenths() {
         use std::time::Duration;
-        assert_eq!(format_duration(Duration::from_millis(1000)), "1s");
-        assert_eq!(format_duration(Duration::from_millis(1500)), "1s"); // truncates
+        // Tenths keep a second significant figure that whole seconds
+        // would drop (`2s` → `2.1s`).
+        assert_eq!(format_duration(Duration::from_millis(1000)), "1.0s");
+        assert_eq!(format_duration(Duration::from_millis(1500)), "1.5s");
+        assert_eq!(format_duration(Duration::from_millis(2100)), "2.1s");
+        assert_eq!(format_duration(Duration::from_millis(9900)), "9.9s");
+    }
+
+    #[test]
+    fn format_duration_ten_seconds_and_up_is_whole_seconds() {
+        use std::time::Duration;
+        assert_eq!(format_duration(Duration::from_secs(10)), "10s");
         assert_eq!(format_duration(Duration::from_secs(11)), "11s");
         assert_eq!(format_duration(Duration::from_secs(59)), "59s");
     }
