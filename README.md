@@ -17,7 +17,7 @@ A real, native terminal emulator in Rust — vim, ssh, htop, tmux all behave exa
 </div>
 
 <p align="center">
-  <img src="site/src/img/hero.png" alt="Termica running three panes: a stack of command blocks with cwd, exit-code and duration chips and a syntax-highlighted prompt; bat viewing Rust source; and htop running full-width." width="900" />
+  <img src="site/src/img/hero@2x.webp" alt="Termica running three panes: a stack of command blocks with cwd, exit-code and duration chips and a syntax-highlighted prompt; bat viewing Rust source; and htop running full-width." width="900" />
 </p>
 
 ---

@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
-"""Turn raw homepage captures into the web variants the page references.
+"""Turn raw homepage captures into the small WebP variants the page serves.
 
-Drop full-resolution (2x / retina) PNG captures into ``site/media-src/``:
+Drop full-resolution (retina) PNG captures into ``site/media-src/``:
 
     site/media-src/hero.png         the 3-pane workspace shot
-    site/media-src/history.png      the Ctrl+R overlay
-    site/media-src/completion.png   the Tab popup
+    site/media-src/history.png      the Ctrl+R overlay   (future)
+    site/media-src/completion.png   the Tab popup        (future)
 
 then run this script (no args). For each one it writes, into ``site/src/img/``:
 
-    <name>@2x.png   optimized full-res          <name>@2x.webp
-    <name>.png      half-size (1x)              <name>.webp
+    <name>.webp     1x, capped at DISPLAY_W px wide
+    <name>@2x.webp  2x, capped at DISPLAY_W*2 px wide
 
-and, from the hero, a 1200x630 ``og.png`` social card. Missing inputs are
-skipped with a warning, so you can drop them in one at a time.
+and, from the hero, a 1200x630 ``og.png`` social card.
 
-Requires Pillow with WebP support (already present on this machine).
+We ship WebP only — it's universally supported and roughly a third the size
+of PNG for these screenshots. The page never references a PNG fallback, and
+the raw originals are NOT committed (see site/media-src/.gitignore); they are
+the source of truth on disk and can be re-captured. Missing inputs are
+skipped, so you can drop them in one at a time.
+
+Requires Pillow with WebP support.
 """
 
 from pathlib import Path
@@ -27,11 +32,24 @@ HERE = Path(__file__).resolve().parent
 SRC_DIR = HERE.parent / "media-src"
 OUT_DIR = HERE.parent / "src" / "img"
 
+# The hero renders at most ~960px wide (.shot max-width: 60rem). 1000px gives a
+# little headroom for 1x; @2x is double that for retina. Anything larger is
+# bytes the browser throws away.
+DISPLAY_W = 1000
+
 # name -> whether to also emit the OG card from it
 TARGETS = {"hero": True, "history": False, "completion": False}
 
-WEBP_QUALITY = 82
+WEBP_QUALITY = 80
 OG_SIZE = (1200, 630)
+
+
+def _fit_width(img: Image.Image, target_w: int) -> Image.Image:
+    """Downscale to target_w wide (never upscale)."""
+    w, h = img.size
+    if w <= target_w:
+        return img
+    return img.resize((target_w, round(h * target_w / w)), Image.LANCZOS)
 
 
 def emit(name: str, make_og: bool) -> bool:
@@ -41,20 +59,16 @@ def emit(name: str, make_og: bool) -> bool:
         return False
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    img = Image.open(src).convert("RGBA")
-    w, h = img.size
+    img = Image.open(src).convert("RGB")
 
-    # 2x = the source as-is; 1x = half (rounded), never upscaled.
-    one = img.resize((max(1, w // 2), max(1, h // 2)), Image.LANCZOS)
-
-    img.save(OUT_DIR / f"{name}@2x.png", optimize=True)
-    one.save(OUT_DIR / f"{name}.png", optimize=True)
-    img.save(OUT_DIR / f"{name}@2x.webp", quality=WEBP_QUALITY, method=6)
+    one = _fit_width(img, DISPLAY_W)
+    two = _fit_width(img, DISPLAY_W * 2)
     one.save(OUT_DIR / f"{name}.webp", quality=WEBP_QUALITY, method=6)
-    print(f"  ✓ {name}: {w}x{h} -> @2x + 1x ({w//2}x{h//2}), png + webp")
+    two.save(OUT_DIR / f"{name}@2x.webp", quality=WEBP_QUALITY, method=6)
+    print(f"  ✓ {name}: 1x {one.size[0]}x{one.size[1]} + 2x {two.size[0]}x{two.size[1]} (webp)")
 
     if make_og:
-        og = _cover_crop(img.convert("RGB"), OG_SIZE)
+        og = _cover_crop(img, OG_SIZE)
         og.save(OUT_DIR / "og.png", optimize=True)
         print(f"  ✓ og.png: {OG_SIZE[0]}x{OG_SIZE[1]} (from {name})")
     return True
