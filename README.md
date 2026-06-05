@@ -1,100 +1,153 @@
+<div align="center">
+
+<img src="assets/app_icon.png" alt="Termica" width="120" height="120" />
+
 # Termica
 
-> **🚧 Status: WIP — Phase 2 complete; Phase 3 (markers + mode machine) is next.** Phase 1 shipped a single PTY-backed terminal pane that runs `vim`, `less`, `htop`, `fzf`, `ssh` interactively, with mouse selection / clipboard, clickable URLs and on-disk paths, and a VT golden suite locking in escape-sequence parsing. Phase 2 added the multi-pane workspace: an `egui_tiles::Tree<PaneId>` of tabs and drag-splits, per-tab keyboard focus with a blue-underline focused-tab indicator, Cmd/Ctrl+Shift shortcuts for new / close / next / prev tab and Quit, modal confirmation when closing a tab or quitting with a program still running, a custom macOS menubar that routes Quit through the same modal, spawn-in-cwd from the active sibling pane, full-cwd tab titles with `~` substitution and 25-char truncation, refocus-on-close via a focus history, and `egui_kittest` snapshots for split layouts. Phase 3 is next: markers + mode machine ([#3](https://github.com/enthal/termica/issues/3)) — the load-bearing safety layer. Watch this banner — it tracks the actual phase as work lands.
+**A modern interface for the shell you already use.**
 
-Termica is a native terminal workspace built with Rust and [egui](https://github.com/emilk/egui). It combines a real terminal emulator with an editor-driven shell experience, persistent command history, searchable transcripts, structured command execution, and modern pane-based workflows.
+A real, native terminal emulator in Rust — vim, ssh, htop, tmux all behave exactly as they should — with an editor-driven prompt, structured command history, and a tab-and-split workspace layered on top.
 
-![Rust](https://img.shields.io/badge/Rust-2024_edition-orange) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue)](LICENSE-MIT)
+[![Rust](https://img.shields.io/badge/Rust-2024_edition-orange)](rust-toolchain.toml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue)](#license)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-informational)](#platform-support)
 
-## North star
+[termica.io](https://termica.io) · [Spec](SPEC.md) · [Roadmap](https://github.com/enthal/termica/issues)
 
-Three properties drive every design choice:
+</div>
 
-1. **Terminal correctness first.** vim, htop, less, fzf, ssh, tmux behave exactly like they do in any modern terminal. The editor experience is a layer on top of a boring, correct terminal — never the other way around.
-2. **Mode safety is the product.** The pane-mode state machine ([spec/05-pane-modes.md](spec/05-pane-modes.md)) is what makes editor-driven prompt editing safe to ship. Default to raw terminal whenever there's any ambiguity. A wrong-mode dropped keystroke is a corruption-class bug.
-3. **No silent data loss.** What you typed, what the shell ran, the exit status, the transcript — all persist across crashes.
+<!-- TODO: drop a hero screenshot here once captured, e.g. ![Termica](docs/screenshot.png) -->
 
-## What it is
+---
 
-- A real PTY-backed terminal emulator with [alacritty_terminal](https://crates.io/crates/alacritty_terminal) as the state engine, painted into [egui](https://github.com/emilk/egui) with a custom cell-grid renderer.
-- A workspace of tabs and splits powered by [egui_tiles](https://github.com/rerun-io/egui_tiles), each pane a real PTY session.
-- An **editor-driven prompt**: at a known shell prompt (detected via OSC 133 + Termica-private markers), the shell line editor is replaced by a native egui editor with click-to-place cursor, drag selection, multiline editing, undo/redo, history search, and syntax highlighting. Enter sends the final command to the PTY.
-- A **structured command lifecycle**: every executed command becomes a record with cwd, exit status, duration, and an output range — collapsible, copyable, searchable, rerunnable.
-- Pane-local and global **command history** backed by SQLite, with fuzzy search across scopes.
-- Persistent transcripts: large scrollbacks spill to disk; sessions restore on restart (as transcripts — live PTYs do not survive a restart in v1).
-- Bash and zsh **shell integration** installed by one command.
+## What is Termica?
 
-## What it isn't (yet)
+Termica is a terminal emulator that doesn't make you choose between *correct* and *modern*. Underneath, it's a real PTY-backed terminal built on [alacritty_terminal](https://crates.io/crates/alacritty_terminal) — every full-screen program you rely on (vim, less, htop, fzf, ssh, tmux) runs exactly as it does in any other terminal. On top of that, when you're sitting at a shell prompt, Termica quietly upgrades the experience: the line you're typing becomes a real text editor, your commands and their output are kept as structured blocks, and your history is searchable across sessions.
 
-- A shell. Termica embeds your existing `bash` or `zsh`.
-- A terminal multiplexer. tmux still works inside Termica; we don't replace it.
-- A Windows terminal. macOS and Linux first; Windows is later or never.
-- A REPL-aware editor. `psql` / `python` / `node` get raw-terminal behavior (good enough). Deep REPL integrations are out of scope for v1.
-- A shell completion reimplementation. v1 ships local completion (paths, history, PATH executables); deep zsh/bash completion bridges are post-MVP.
+It embeds your existing `zsh`, `bash`, or `fish` — Termica is not a new shell, and it isn't trying to replace tmux. It's a better front-end for the shell you already use.
 
-See [spec/00-overview.md](spec/00-overview.md) for the full in-scope / out-of-scope breakdown.
+### Three principles drive every decision
 
-## Architecture in one paragraph
+1. **Terminal correctness first.** The editor experience is a layer on top of a boring, correct terminal — never the other way around. A program that misbehaves in Termica but works in your old terminal is a bug we treat as critical.
+2. **Mode safety is the product.** A state machine decides, per keystroke, whether you're at a prompt or inside a full-screen program, and defaults to raw-terminal behavior whenever there's any ambiguity. A keystroke delivered to the wrong place is a corruption-class bug.
+3. **No silent data loss.** What you typed, what the shell ran, and the exit status survive across restarts.
 
-Three layers, sharply separated. The **terminal layer** is `alacritty_terminal` driving grid state from PTY bytes, painted to egui through a custom cell renderer. The **structured-shell layer** consumes a stream of OSC markers emitted by an installable bash/zsh integration script and drives a pane-mode state machine (`RawTerminal` / `ShellPromptEditor` / `AlternateScreen` / `Dead`); a default of `RawTerminal` is the safety invariant. The **workspace layer** owns tabs, splits, the editor, the status header, history, search, and persistence on top. Full diagrams and component tables in [spec/01-architecture.md](spec/01-architecture.md).
+## Features
 
-## Reading order
+- **A real terminal.** Full VT/ANSI emulation, alternate-screen apps, mouse reporting, bracketed paste, true color. vim/htop/less/fzf/ssh/tmux just work.
+- **Editor-driven prompt.** At a known shell prompt, the line editor becomes a native editor: click to place the cursor, drag to select, multiline editing, undo/redo, and shell syntax highlighting. Press Enter to send the command.
+- **Structured command blocks.** Each command and its output are sealed into a block you can select across, copy, and read back with its exit status.
+- **Command history that remembers.** Backed by SQLite and seeded from your existing shell history. Walk it with ↑/↓ in the prompt, or open a fuzzy-search overlay with Ctrl+R, scoped to the current pane or everywhere.
+- **Tab completion.** A completion popup sourced from filesystem paths, command history, and executables on your `PATH`.
+- **Tabs and splits.** A workspace of tabs and drag-to-split panes, each a real PTY session, with per-pane keyboard focus.
+- **Clickable links and paths.** URLs and on-disk file paths in output are detected and openable on Cmd/Ctrl-hover.
+- **Automatic shell integration.** zsh, bash, and fish are detected and wired up on launch — no dotfile edits required (see [below](#shell-integration)).
+- **Native and fast.** Built on [egui](https://github.com/emilk/egui) with a custom cell-grid renderer. No Electron, no web view.
 
-The full spec index is in [SPEC.md](SPEC.md). If you read three documents:
+## Status
 
-1. [01 — Architecture](spec/01-architecture.md) — the spine.
-2. [05 — Pane modes](spec/05-pane-modes.md) — the load-bearing safety invariant.
-3. [09 — Testing](spec/09-testing.md) — how we know it works.
+Termica is in **active development and pre-1.0**. The core terminal, the tab/split workspace, the prompt-editor mode machine, command history, and tab completion are all working day-to-day, but the format and behavior may still change and there are rough edges. There are **no prebuilt binaries yet** — for now you build from source (it's one `cargo` command). Follow the [issue tracker](https://github.com/enthal/termica/issues) for the roadmap.
+
+## Platform support
+
+macOS and Linux. Windows is not supported (and is not currently planned).
 
 ## Getting started
 
-### Toolchain
+### 1. Install Rust
 
-Termica builds on stable Rust **1.95** or newer, pinned in [rust-toolchain.toml](rust-toolchain.toml). If you don't already have Rust, install it via [rustup](https://rustup.rs/):
+Termica builds on stable Rust **1.95+** (pinned in [rust-toolchain.toml](rust-toolchain.toml)). If you don't have Rust:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-rustup component add rustfmt clippy
 ```
 
-### Clone and build
+### 2. Build and run
 
 ```sh
 git clone https://github.com/enthal/termica
 cd termica
-cargo build
+cargo run --release
 ```
 
-Today this builds the placeholder binary, which prints a pre-implementation notice and exits. Real entry points arrive with Phase 1.
-
-### Run the tests
+That launches Termica with a fresh pane running your default shell. To install the binary onto your `PATH`:
 
 ```sh
-cargo test
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all -- --check
+cargo install --path .
+termica
 ```
 
-### Install git hooks (recommended)
+### Shell integration
 
-A pre-commit hook runs fmt + clippy locally — but deliberately not `cargo test`. The project follows a tests-first discipline (see [CLAUDE.md](CLAUDE.md)), which requires committing a failing test before the implementation that makes it pass; running tests in pre-commit would block that workflow. CI runs the full test suite and gates merge. Install the hook once per checkout:
+On launch, Termica spawns a *managed* copy of your shell: it sources your real dotfiles (`.zshrc` / `.bashrc` / fish config) and then installs the lifecycle hooks that power prompt detection, command blocks, and history capture. You don't have to edit any config files.
+
+To opt out and run a plain shell with normal rc-file processing:
+
+```sh
+TERMICA_NO_SHELL_INTEGRATION=1 termica
+```
+
+With integration disabled, Termica is still a fully functional terminal — the editor-driven prompt features are simply unavailable.
+
+## Keyboard shortcuts
+
+Shortcuts use **Cmd** on macOS and **Ctrl+Shift** on Linux.
+
+| Action | macOS | Linux |
+| --- | --- | --- |
+| New tab | Cmd+T | Ctrl+Shift+T |
+| Close tab | Cmd+W | Ctrl+Shift+W |
+| Next / previous tab | Cmd+Shift+] / [ | Ctrl+Shift+] / [ |
+| Clear scrollback | Cmd+K | Ctrl+Shift+K |
+| Scroll through scrollback | Cmd+Option+↑ / ↓ | Ctrl+Alt+↑ / ↓ |
+| Quit | Cmd+Q | Ctrl+Shift+Q |
+
+At the prompt:
+
+| Action | Key |
+| --- | --- |
+| Recall previous / next command | ↑ / ↓ |
+| Fuzzy-search history | Ctrl+R |
+| Tab completion | Tab |
+
+## How it works
+
+Three sharply separated layers:
+
+- **Terminal layer** — `alacritty_terminal` drives grid state from PTY bytes, painted to egui through a custom cell renderer. We never parse VT bytes ourselves.
+- **Structured-shell layer** — an installable shell integration emits OSC markers; a pane-mode state machine (`RawTerminal` / `ShellPromptEditor` / `AlternateScreen` / `Dead`) consumes them and decides where each keystroke goes. Defaulting to `RawTerminal` is the safety invariant.
+- **Workspace layer** — tabs, splits, the prompt editor, the status header, history, search, and persistence on top.
+
+The full design lives in [SPEC.md](SPEC.md) and [spec/](spec/). The three documents worth reading first: [01 — Architecture](spec/01-architecture.md), [05 — Pane modes](spec/05-pane-modes.md), and [09 — Testing](spec/09-testing.md).
+
+## Contributing
+
+Contributions are welcome. Before opening a PR, please read [CLAUDE.md](CLAUDE.md) for the working agreement — the short version:
+
+- **The spec is the source of truth.** Any normative change ships with its spec update in the same commit.
+- **Tests-first for the load-bearing layers** (terminal engine, mode machine, marker parser, prompt-submission path, persistence); same-commit tests everywhere else.
+- All changes land via a feature branch → PR → squash merge.
+
+Local checks before committing:
+
+```sh
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+A pre-commit hook that runs fmt + clippy is available — install it once per checkout:
 
 ```sh
 scripts/install-git-hooks.sh
 ```
 
-The installer symlinks from [scripts/git-hooks/](scripts/git-hooks/) into `.git/hooks/`, so edits to a hook take effect immediately. To bypass on a specific commit (rare, discouraged): `git commit --no-verify`. [CLAUDE.md](CLAUDE.md) explicitly forbids routine bypass.
-
-## Working in this repo
-
-See [CLAUDE.md](CLAUDE.md) for the working agreement — most importantly: **the spec is the source of truth**, the testing rule is hybrid (strict for the engine, mode machine, marker parser, prompt path, and persistence; pragmatic for tile and theme chrome), all changes after commit zero land via a feature branch → PR → squash merge, and every normative spec change ships with the code change in the same commit.
-
 ## License
 
 Dual-licensed under either of:
 
-- Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
 
 at your option. This matches the standard Rust ecosystem licensing.
 

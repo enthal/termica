@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Termica — a native terminal workspace</title>
+  <meta name="description" content="Termica is a modern interface for the shell you already use — a real, native terminal in Rust, with vim, ssh and tmux working exactly as they should." />
+
+  <link rel="icon" href="/favicon.ico" sizes="any" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+  <meta name="theme-color" content="#03070f" />
+
+  <!-- Open Graph / social -->
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="Termica — a native terminal workspace" />
+  <meta property="og:description" content="A modern interface for the shell you already use. A real, native terminal. Rust · egui." />
+  <meta property="og:url" content="https://termica.io/" />
+  <meta property="og:image" content="https://termica.io/icon.png" />
+  <meta name="twitter:card" content="summary" />
+
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="glow" aria-hidden="true"></div>
+
+  <main class="hero">
+    <img class="logo" src="/icon.png" width="160" height="160"
+         alt="Termica icon — a neon T over a terminal prompt" />
+
+    <h1 class="wordmark">Termica</h1>
+
+    <p class="tagline">
+      A modern interface for the shell you already use.
+    </p>
+
+    <p class="prompt" aria-hidden="true">
+      <span class="caret">&gt;_</span> <span class="typed">cargo run</span>
+    </p>
+
+    <div class="actions">
+      <a class="btn btn-primary" href="https://github.com/enthal/termica">
+        View on GitHub
+      </a>
+    </div>
+
+    <p class="meta muted">Built in Rust with egui · Open source</p>
+  </main>
+
+  <footer class="footer muted">
+    &copy; <span id="year">2026</span> Termica
+  </footer>
+
+  <script>
+    document.getElementById('year').textContent = new Date().getFullYear();
+  </script>
+</body>
+</html>
