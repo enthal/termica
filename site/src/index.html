@@ -36,77 +36,23 @@
     <p class="tagline">
       A modern interface for the shell you already use.
     </p>
-
-    <p class="prompt" aria-hidden="true">
-      <span class="caret">&gt;_</span> <span class="typed">cargo run</span>
-    </p>
-
-    <div class="actions">
-      <a class="btn btn-primary" href="https://github.com/enthal/termica">
-        View on GitHub
-      </a>
-    </div>
-
-    <p class="meta muted">Built in Rust with egui · Open source</p>
   </header>
 
-  <!-- Hero screenshot: the workspace — block model, alt-screen, live output -->
   <figure class="shot">
     <picture>
       <source type="image/webp" srcset="/img/hero.webp 1x, /img/hero@2x.webp 2x" />
       <img src="/img/hero.png" srcset="/img/hero@2x.png 2x"
            width="1840" height="1191" decoding="async"
-           alt="Termica with three panes: a stack of command blocks with cwd, exit-code and duration chips and a syntax-highlighted prompt; bat viewing Rust source; and htop running full-width." />
+           alt="Termica running three panes: a stack of command blocks with cwd, exit-code and duration chips and a syntax-highlighted prompt; bat viewing Rust source; and htop running full-width." />
     </picture>
-    <figcaption class="muted">
-      One window: sealed command blocks with <span class="hl-cyan">cwd</span> ·
-      <span class="hl-red">exit</span> · duration chips, a real alt-screen TUI,
-      and live output — every pane a real PTY.
-    </figcaption>
   </figure>
 
-  <main class="features">
-    <section class="feature">
-      <div class="feature-text">
-        <h2>Find anything you've ever run</h2>
-        <p>
-          Press <kbd>Ctrl</kbd>+<kbd>R</kbd> for a fuzzy search across your whole
-          history — this pane or everywhere. Matches highlight as you type, and
-          your history follows you across sessions.
-        </p>
-      </div>
-      <figure class="feature-shot">
-        <picture>
-          <source type="image/webp" srcset="/img/history.webp 1x, /img/history@2x.webp 2x" />
-          <img src="/img/history.png" srcset="/img/history@2x.png 2x"
-               loading="lazy" decoding="async"
-               onerror="this.closest('.feature').hidden = true"
-               alt="Termica's Ctrl+R history overlay: a query box over a list of past commands with the matched substrings highlighted and a scope label." />
-        </picture>
-      </figure>
-    </section>
-
-    <section class="feature feature-reverse">
-      <div class="feature-text">
-        <h2>Tab, and go</h2>
-        <p>
-          Completion that knows where things come from — filesystem paths,
-          executables on your <code>$PATH</code>, and your command history — each
-          labeled at a glance. Navigate with the arrow keys, accept with
-          <kbd>Tab</kbd>.
-        </p>
-      </div>
-      <figure class="feature-shot">
-        <picture>
-          <source type="image/webp" srcset="/img/completion.webp 1x, /img/completion@2x.webp 2x" />
-          <img src="/img/completion.png" srcset="/img/completion@2x.png 2x"
-               loading="lazy" decoding="async"
-               onerror="this.closest('.feature').hidden = true"
-               alt="Termica's tab-completion popup showing candidate commands, each tagged with its source: $PATH or history." />
-        </picture>
-      </figure>
-    </section>
-  </main>
+  <div class="cta">
+    <a class="btn btn-primary" href="https://github.com/enthal/termica">
+      View on GitHub
+    </a>
+    <p class="meta muted">Built in Rust with egui · Open source</p>
+  </div>
 
   <footer class="footer muted">
     <a class="footer-link" href="https://github.com/enthal/termica">GitHub</a>
