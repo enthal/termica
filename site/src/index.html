@@ -80,6 +80,7 @@
           <source type="image/webp" srcset="/img/history.webp 1x, /img/history@2x.webp 2x" />
           <img src="/img/history.png" srcset="/img/history@2x.png 2x"
                loading="lazy" decoding="async"
+               onerror="this.closest('.feature').hidden = true"
                alt="Termica's Ctrl+R history overlay: a query box over a list of past commands with the matched substrings highlighted and a scope label." />
         </picture>
       </figure>
@@ -100,6 +101,7 @@
           <source type="image/webp" srcset="/img/completion.webp 1x, /img/completion@2x.webp 2x" />
           <img src="/img/completion.png" srcset="/img/completion@2x.png 2x"
                loading="lazy" decoding="async"
+               onerror="this.closest('.feature').hidden = true"
                alt="Termica's tab-completion popup showing candidate commands, each tagged with its source: $PATH or history." />
         </picture>
       </figure>
