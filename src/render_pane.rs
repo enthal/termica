@@ -233,6 +233,20 @@ pub(crate) fn capped_command_height(full_h: f32, total_lines: usize, max: usize)
     if total_lines == 0 { 0.0 } else { full_h * total_lines.min(max) as f32 / total_lines as f32 }
 }
 
+/// The blank-pane watermark shows only while the pane is *pristine*:
+/// not in alt-screen, no command sealed into scrollback, and none
+/// currently running. The `tail_is_running` term is the fix for the
+/// long-running-first-command bug — without it, a running first command
+/// (nothing sealed yet) kept the watermark up behind its output until
+/// it exited. Pure; unit-tested.
+pub(crate) fn should_show_watermark(
+    in_alt_screen: bool,
+    has_sealed: bool,
+    tail_is_running: bool,
+) -> bool {
+    !in_alt_screen && !has_sealed && !tail_is_running
+}
+
 /// The first `max` lines of `command` for the pinned header, with a
 /// trailing `" …"` hint appended when the command has more lines than
 /// fit. Pure + testable; keeps the multiline cap logic out of the
@@ -2721,9 +2735,12 @@ pub fn render_pane(
     // ---- blank-pane watermark overlay ---------------------------
     //
     // Painted last, on top of the terminal's opaque fill, so the faint
-    // app icon shows through. Shown while the pane is *pristine* — no
-    // command has sealed into scrollback yet (`has_sealed_blocks`) —
-    // and not in alt-screen (vim/less/etc. own the whole grid). Drawn
+    // app icon shows through. Shown only while the pane is *pristine*
+    // (see `should_show_watermark`): nothing sealed into scrollback,
+    // nothing currently running, and not in alt-screen (vim/less/etc.
+    // own the whole grid). The running check matters — a long-running
+    // FIRST command hasn't sealed yet, so without it the watermark
+    // lingered behind the command's output until it exited. Drawn
     // in the base layer after all content, so Area-based popups (the
     // completion popup) and modals still render above it.
     //
@@ -2740,7 +2757,13 @@ pub fn render_pane(
     // bias the watermark rightward and let the clip chop it — the same
     // overshoot the focused-chrome footer avoids above. `clip_rect` is
     // the true visible pane bounds.
-    let show_watermark = !in_alt_screen && !slot.session.blocks().has_sealed_blocks();
+    let tail_is_running =
+        matches!(slot.session.blocks().last(), Some(crate::block::Block::Running { .. }));
+    let show_watermark = should_show_watermark(
+        in_alt_screen,
+        slot.session.blocks().has_sealed_blocks(),
+        tail_is_running,
+    );
     let watermark_fade = ctx.animate_bool_with_time(
         ui.id().with("watermark-fade"),
         show_watermark,
@@ -2946,6 +2969,23 @@ mod tests {
         assert_eq!(capped_command_height(60.0, 3, 4), 60.0);
         // Empty command → 0.
         assert_eq!(capped_command_height(0.0, 0, 4), 0.0);
+    }
+
+    // ---- should_show_watermark (blank-pane gate) --------------------
+
+    #[test]
+    fn watermark_shows_only_on_a_pristine_idle_pane() {
+        // pristine = not alt-screen, nothing sealed, nothing running.
+        assert!(should_show_watermark(false, false, false));
+        // A running FIRST command (nothing sealed yet) hides it — the
+        // reported bug: it used to persist until the command exited.
+        assert!(!should_show_watermark(false, false, true));
+        // Sealed scrollback hides it.
+        assert!(!should_show_watermark(false, true, false));
+        // Alt-screen hides it (vim/less own the grid).
+        assert!(!should_show_watermark(true, false, false));
+        // Any combination of "has content" reasons keeps it hidden.
+        assert!(!should_show_watermark(true, true, true));
     }
 
     // ---- classify_editor_motion (per-OS keybindings) -----------------
