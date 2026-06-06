@@ -185,6 +185,19 @@ pub fn color_for_token_kind(kind: crate::shell_syntax::TokenKind) -> Color32 {
 /// in a long transcript. Theme polish lands in Phase 10.
 pub const BLOCK_HEADER_EXIT_FAIL_FG: Color32 = Color32::from_rgb(0xe0, 0x70, 0x70);
 
+/// Foreground for the dirty-working-tree chip (4G-async-context). Amber:
+/// not an error (a dirty tree is normal mid-work), but warmer than the
+/// dim grey of the cwd / branch chips so uncommitted changes catch the
+/// eye. Branch + ahead/behind chips stay [`BLOCK_HEADER_FG`].
+pub const BLOCK_HEADER_DIRTY_FG: Color32 = Color32::from_rgb(0xe0, 0xb8, 0x6e);
+
+/// Foregrounds for the `PR #NN` chip (4G-async-context), colored by the
+/// PR's rolled-up CI status: green passing, yellow pending, red failing.
+/// A PR with no checks falls back to [`BLOCK_HEADER_FG`].
+pub const PR_CHIP_PASS_FG: Color32 = Color32::from_rgb(0x6e, 0xc8, 0x7a);
+pub const PR_CHIP_PENDING_FG: Color32 = Color32::from_rgb(0xe0, 0xc0, 0x4e);
+pub const PR_CHIP_FAIL_FG: Color32 = Color32::from_rgb(0xe0, 0x70, 0x70);
+
 /// Result of one paint pass over the terminal grid.
 ///
 /// The caller (the eframe app) uses this to do hit-testing for the
@@ -911,12 +924,15 @@ pub fn format_duration(d: std::time::Duration) -> String {
 /// When `cwd` is `None`, there's no non-zero `exit`, *and* no
 /// `duration`, nothing is painted at all — the header row is skipped
 /// entirely (no allocated rect, so egui inserts no `item_spacing` gap).
+#[allow(clippy::too_many_arguments)]
 pub fn paint_block_header(
     ui: &mut egui::Ui,
     cwd: Option<&std::path::Path>,
     home: Option<&std::path::Path>,
     exit: Option<i32>,
     duration: Option<std::time::Duration>,
+    git: Option<&crate::git_context::GitContext>,
+    pr: Option<&crate::pr_context::PrContext>,
 ) -> Option<Response> {
     let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
     let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
@@ -932,14 +948,45 @@ pub fn paint_block_header(
     // — no parens.
     let dur_text = duration.map(format_duration).unwrap_or_default();
 
+    // 4G-async-context git chips, slotting in after cwd: the branch name,
+    // an optional ahead/behind chip, and an optional dirty chip. The
+    // label strings are built by the pure helpers on `GitContext` (so
+    // they're unit-tested without egui); `None` for any of them means
+    // "skip that chip".
+    let branch_text = git.and_then(|g| g.branch.clone()).unwrap_or_default();
+    let sync_text = git.and_then(|g| g.sync_label()).unwrap_or_default();
+    let dirty_text = git.and_then(|g| g.dirty_label()).unwrap_or_default();
+
+    // 4G-async-context PR chip, after the git chips: `PR #NN` colored by
+    // the rolled-up CI status. Empty (no chip) when there's no open PR.
+    let pr_text = pr.map(|p| format!("PR #{}", p.number)).unwrap_or_default();
+    let pr_color = match pr.map(|p| p.ci) {
+        Some(crate::pr_context::CiStatus::Passing) => PR_CHIP_PASS_FG,
+        Some(crate::pr_context::CiStatus::Pending) => PR_CHIP_PENDING_FG,
+        Some(crate::pr_context::CiStatus::Failing) => PR_CHIP_FAIL_FG,
+        // No checks (or no PR — `pr_text` empty, chip skipped): neutral.
+        _ => BLOCK_HEADER_FG,
+    };
+
     // Each present field is a chip: `text`, `width`, and text `color`.
     // Collected left→right so the layout + paint share one source of
-    // truth (and adding the git / dirty chips in 4G-async-context is
-    // just another entry).
+    // truth.
     let chip_w = |text: &str| text.chars().count() as f32 * cell_w + 2.0 * CHIP_PAD_X;
-    let mut chips: Vec<(&str, f32, Color32)> = Vec::with_capacity(3);
+    let mut chips: Vec<(&str, f32, Color32)> = Vec::with_capacity(6);
     if !cwd_text.is_empty() {
         chips.push((&cwd_text, chip_w(&cwd_text), BLOCK_HEADER_FG));
+    }
+    if !branch_text.is_empty() {
+        chips.push((&branch_text, chip_w(&branch_text), BLOCK_HEADER_FG));
+    }
+    if !sync_text.is_empty() {
+        chips.push((&sync_text, chip_w(&sync_text), BLOCK_HEADER_FG));
+    }
+    if !dirty_text.is_empty() {
+        chips.push((&dirty_text, chip_w(&dirty_text), BLOCK_HEADER_DIRTY_FG));
+    }
+    if !pr_text.is_empty() {
+        chips.push((&pr_text, chip_w(&pr_text), pr_color));
     }
     if show_exit {
         chips.push((&exit_text, chip_w(&exit_text), BLOCK_HEADER_EXIT_FAIL_FG));
@@ -1152,6 +1199,7 @@ pub fn paint_sealed_block(
     home: Option<&std::path::Path>,
     exit: Option<i32>,
     duration: std::time::Duration,
+    git: Option<&crate::git_context::GitContext>,
 ) -> SealedBlockRender {
     // Reserve a backing shape index BEFORE any paint so the
     // failed-block bg wash sits underneath the chip + command +
@@ -1165,7 +1213,12 @@ pub fn paint_sealed_block(
     // wash can extend up to the inter-block hairline above.
     let block_top_y = ui.next_widget_position().y;
 
-    let header = paint_block_header(ui, cwd, home, exit, Some(duration));
+    // Sealed blocks show the git context **captured at command-start**
+    // (4G-async-context) — the branch / dirty the command actually ran
+    // under, frozen as history. NOT the pane's current git, which would
+    // be anachronistic on scroll-back. No PR chip: a finished command's
+    // CI status is meaningless (you want current), so PR is prompt-only.
+    let header = paint_block_header(ui, cwd, home, exit, Some(duration), git, None);
     let header_height = header.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
 
     let cmd_lines = if command.is_empty() { 0 } else { command.split('\n').count() };

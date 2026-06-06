@@ -22,11 +22,15 @@ use alacritty_terminal::index::Point;
 
 use crate::block::{Block, BlockStack};
 use crate::events::EventRecorder;
+use crate::gh_probe::GhProbe;
+use crate::git_context::GitContext;
+use crate::git_probe::GitProbe;
 use crate::history::{
     CaptureState, HistoryContext, RecallOutcome, RecallState, Scope, capture_on_event,
 };
 use crate::integration::{ManagedSpawn, ShellSpec, managed_spawn_for, new_session_id};
 use crate::pane_selection::{PaneCursor, PaneSelection};
+use crate::pr_context::PrContext;
 use crate::pty::{PtyConfig, PtyError, PtySession};
 use crate::selection::{self, Selection, SelectionMode};
 use crate::shell::{PaneMode, PromptController};
@@ -155,6 +159,27 @@ pub struct PaneSession {
     /// walk (saved buffer + cached entries + cursor) and is reset
     /// on the first non-recall edit. See [`crate::history::recall`].
     recall: RecallState,
+    /// 4G-async-context: off-thread git probe for the pane's cwd. Fed a
+    /// directory whenever the cwd changes or a command finishes; its
+    /// result populates [`Self::git_context`]. Dropped (and so torn
+    /// down) with the pane.
+    git_probe: GitProbe,
+    /// Latest parsed git context for the pane's cwd, or `None` outside a
+    /// repo / before the first probe returns. Drives the branch / dirty
+    /// chips on the live prompt + running block headers.
+    git_context: Option<GitContext>,
+    /// 4G-async-context: off-thread GitHub PR probe (`gh pr view`). Fed
+    /// the cwd when the cwd or the branch changes; its result populates
+    /// [`Self::pr_context`]. Dropped (torn down) with the pane.
+    gh_probe: GhProbe,
+    /// Latest parsed PR context for the pane's branch, or `None` when the
+    /// branch has no open PR / before the first probe returns. Drives the
+    /// PR chip on the live prompt header.
+    pr_context: Option<PrContext>,
+    /// Last git branch seen from [`Self::git_context`], to detect a
+    /// branch change (e.g. `git checkout`) and re-probe the PR even when
+    /// the cwd is unchanged.
+    last_git_branch: Option<String>,
 }
 
 impl PaneSession {
@@ -222,6 +247,11 @@ impl PaneSession {
             history: None,
             capture_state: CaptureState::default(),
             recall: RecallState::default(),
+            git_probe: GitProbe::spawn(),
+            git_context: None,
+            gh_probe: GhProbe::spawn(),
+            pr_context: None,
+            last_git_branch: None,
         })
     }
 
@@ -366,9 +396,16 @@ impl PaneSession {
         // per spec/03. The block stack reads the terminal snapshot
         // at seal time, so it must run AFTER the bytes that produced
         // this event have been fed into the grid (they were, above).
+        // 4G-async-context: a command finishing this frame is a forced
+        // re-probe trigger — the working tree may now be dirty even
+        // though the cwd is unchanged.
+        let mut command_finished = false;
         for event in self.terminal.drain_lifecycle_events() {
             if let Some(rec) = self.recorder.as_ref() {
                 rec.record_lifecycle(self.pane_id, &event);
+            }
+            if matches!(event, crate::markers::LifecycleEvent::CommandFinished { .. }) {
+                command_finished = true;
             }
             // Multi-line continuation: if the shell's parser saw an
             // incomplete command after submit and emitted `PS2` (as
@@ -467,6 +504,12 @@ impl PaneSession {
             // history, so a Preexec → CommandFinished pair seals the
             // block with its real duration (4G).
             self.blocks.set_event_clock_ms(now_ms);
+            // Freeze the current git context into the block if this event
+            // starts a command (`Preexec`), so a sealed block shows the
+            // branch / dirty it ran under (4G-async-context). `git_context`
+            // here is last frame's probe result — the state just before
+            // the command ran, which is exactly what we want.
+            self.blocks.set_current_git(self.git_context.clone());
             self.blocks.observe_lifecycle_event(&event, &mut self.terminal, self.frame);
             self.controller.observe_event(event, self.frame);
             self.record_pending_transitions();
@@ -480,6 +523,35 @@ impl PaneSession {
             self.controller.observe_alt_screen(alt, self.frame);
             self.last_alt_screen = alt;
             self.record_pending_transitions();
+        }
+
+        // 4G-async-context: drive the off-thread git probe. Request a
+        // fresh probe when the cwd changed (the probe dedups internally)
+        // or a command just finished (forced — same cwd, newly dirty),
+        // then fold in whatever the worker has finished. Both are
+        // non-blocking; the chips update on a later frame when the
+        // result lands (idle frames repaint every ~300 ms — see
+        // `app::update`).
+        if let Some(cwd) = self.current_cwd() {
+            self.git_probe.request(&cwd, command_finished);
+        }
+        if let Some(result) = self.git_probe.poll() {
+            self.git_context = result.context;
+        }
+
+        // 4G-async-context: drive the off-thread GitHub PR probe. `gh` is
+        // slow + networked, so we re-probe only on cwd change (dedup'd by
+        // the probe) or a branch change — a `git checkout` keeps the cwd
+        // but swaps the PR. The probe self-refreshes while CI is pending,
+        // so a chip watching CI go green updates without our help.
+        if let Some(cwd) = self.current_cwd() {
+            let branch = self.git_context.as_ref().and_then(|g| g.branch.clone());
+            let branch_changed = branch != self.last_git_branch;
+            self.last_git_branch = branch;
+            self.gh_probe.request(&cwd, branch_changed);
+        }
+        if let Some(result) = self.gh_probe.poll() {
+            self.pr_context = result.pr;
         }
 
         // PTY exit is observed via `self.exited` (latched above)
@@ -530,15 +602,37 @@ impl PaneSession {
             alt_screen: self.terminal.is_alternate_screen(),
             rows: grid.screen_lines() as u16,
             cols: grid.columns() as u16,
-            cwd: self
-                .controller
-                .cwd()
-                .map(|p| p.to_path_buf())
-                .or_else(|| self.terminal.cwd().map(|p| p.to_path_buf())),
+            cwd: self.current_cwd(),
             screen_text: self.terminal.screen_text(),
             mode: Some(mode),
             is_bootstrapping: mode == PaneMode::Bootstrapping,
         }
+    }
+
+    /// The pane's current working directory: the controller's cwd
+    /// (OSC 7 / DCS-JSON `Precmd`) if known, else the terminal's. The
+    /// view snapshot and the git probe both resolve cwd this way.
+    fn current_cwd(&self) -> Option<std::path::PathBuf> {
+        self.controller
+            .cwd()
+            .map(|p| p.to_path_buf())
+            .or_else(|| self.terminal.cwd().map(|p| p.to_path_buf()))
+    }
+
+    /// Latest parsed git context for the pane's cwd, or `None` outside a
+    /// repo / before the first async probe returns. The renderer reads
+    /// this for the live prompt + running block-header branch/dirty
+    /// chips (4G-async-context).
+    pub fn git_context(&self) -> Option<&GitContext> {
+        self.git_context.as_ref()
+    }
+
+    /// Latest GitHub PR context for the pane's branch, or `None` when the
+    /// branch has no open PR / before the first probe returns. The
+    /// renderer reads this for the live prompt header's PR chip
+    /// (4G-async-context).
+    pub fn pr_context(&self) -> Option<&PrContext> {
+        self.pr_context.as_ref()
     }
 
     /// Current pane mode per the `PromptController`. Reflects the

@@ -1,0 +1,3 @@
+# Raw capture originals — source of truth on disk, regenerated into ../src/img/.
+# Do not commit (large). Keep this file and the README.
+*.png
