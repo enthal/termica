@@ -1121,6 +1121,7 @@ pub fn paint_sealed_block(
     home: Option<&std::path::Path>,
     exit: Option<i32>,
     duration: std::time::Duration,
+    git: Option<&crate::git_context::GitContext>,
 ) -> SealedBlockRender {
     // Reserve a backing shape index BEFORE any paint so the
     // failed-block bg wash sits underneath the chip + command +
@@ -1134,11 +1135,11 @@ pub fn paint_sealed_block(
     // wash can extend up to the inter-block hairline above.
     let block_top_y = ui.next_widget_position().y;
 
-    // Sealed blocks are historical — they show the cwd / exit / duration
-    // captured at seal time, but NOT the current git context (that would
-    // be anachronistic). Git chips appear only on the live prompt /
-    // running headers. So: `None` here.
-    let header = paint_block_header(ui, cwd, home, exit, Some(duration), None);
+    // Sealed blocks show the git context **captured at command-start**
+    // (4G-async-context) — the branch / dirty the command actually ran
+    // under, frozen as history. NOT the pane's current git, which would
+    // be anachronistic on scroll-back.
+    let header = paint_block_header(ui, cwd, home, exit, Some(duration), git);
     let header_height = header.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
 
     let cmd_lines = if command.is_empty() { 0 } else { command.split('\n').count() };

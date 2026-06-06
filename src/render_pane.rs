@@ -1186,6 +1186,7 @@ pub fn render_pane(
                             home,
                             *exit,
                             *duration,
+                            header.git.as_ref(),
                         );
                         let cmd_h =
                             sealed_render.command.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
@@ -1222,13 +1223,16 @@ pub fn render_pane(
                         // Live ticking duration (4G-live-duration): the
                         // running command's elapsed time, refreshed each
                         // frame via the repaint scheduled above.
+                        // Running shows the git context captured at
+                        // command-start (frozen like its cwd / duration),
+                        // not the pane's live git — 4G-async-context.
                         let hdr = render::paint_block_header(
                             ui,
                             header.cwd.as_deref(),
                             home,
                             None,
                             running_elapsed,
-                            git_ctx.as_ref(),
+                            header.git.as_ref(),
                         );
                         let chip_h = hdr.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
                         let cmd_resp =
@@ -1405,19 +1409,25 @@ pub fn render_pane(
                 crate::block::Block::Sealed { id, header, exit, command, duration, .. }
                     if *id == sticky_id =>
                 {
-                    // Sealed: historical, so no git chips (mirrors the
-                    // inline sealed header).
-                    Some((header.cwd.clone(), *exit, Some(*duration), None, command.clone()))
+                    // Mirrors the inline sealed header: git captured at
+                    // command-start (4G-async-context).
+                    Some((
+                        header.cwd.clone(),
+                        *exit,
+                        Some(*duration),
+                        header.git.clone(),
+                        command.clone(),
+                    ))
                 }
                 crate::block::Block::Running { id, header, command, .. } if *id == sticky_id => {
                     // The pinned running header ticks too (4G-live-duration)
-                    // and shows the live git context (4G-async-context),
-                    // matching its inline counterpart.
+                    // and shows the git captured at command-start
+                    // (4G-async-context), matching its inline counterpart.
                     Some((
                         header.cwd.clone(),
                         None,
                         running_elapsed,
-                        git_ctx.clone(),
+                        header.git.clone(),
                         command.clone(),
                     ))
                 }

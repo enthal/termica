@@ -380,16 +380,10 @@ pub enum Block {
 }
 
 pub struct BlockHeader {
-    cwd: PathBuf,
+    cwd: Option<PathBuf>,
+    git: Option<GitContext>,        // captured at command-start; None on a live Prompt
 }
-```
 
-**Git context is pane-current, not per-block.** Earlier drafts hung
-`git_branch` / `git_dirty` on each block's `BlockHeader`. In
-`4G-async-context` they moved up to the `PaneSession`, as a single
-live `Option<GitContext>` refreshed off-thread by a [`GitProbe`](../src/git_probe.rs):
-
-```rust
 pub struct GitContext {
     pub branch: Option<String>,     // None on a detached HEAD
     pub ahead: u32,                 // vs upstream (0 if none / in sync)
@@ -404,17 +398,28 @@ pub struct DirtySummary {
 }
 ```
 
-The reason is correctness, not convenience: git state describes the
-working tree **now**. Stamping it onto a sealed block would make a
-historical block claim a branch / dirtiness it never had when it ran —
-anachronistic and misleading on scroll-back. So the git chips render
-**only on the live prompt and running headers** (and the sticky header
-when it's pinning the running block); sealed blocks show cwd / exit /
-duration only. The probe runs `git status --porcelain=v2 --branch` +
+**Git context: live on the prompt, captured-at-run-time on
+running / sealed blocks.** The `PaneSession` holds the pane's *current*
+`Option<GitContext>`, refreshed off-thread by a [`GitProbe`](../src/git_probe.rs).
+Two surfaces consume it:
+
+- The **live `Prompt` header** reads the pane's current git directly, so
+  it updates as you `cd` / dirty the tree. The block's own `header.git`
+  stays `None` here.
+- At **`Preexec`** the pane stamps its current git into the new
+  `Running` block's `header.git` (alongside the start-time cwd and
+  clock), and the seal carries it into `Sealed`. So a running / sealed
+  block shows the branch / dirtiness the command **actually ran under**,
+  frozen as history — not whatever is current now (which would be
+  anachronistic on scroll-back). This mirrors how `cwd` and `duration`
+  lock at command-start.
+
+The probe runs `git status --porcelain=v2 --branch` +
 `git diff HEAD --numstat` for the pane's cwd on a background thread,
 re-triggered when the cwd changes or a command finishes, debounced and
 cancelled on pane teardown (per [01](01-architecture.md) "Do not block
-the UI on probes"). Parsing is pure ([`src/git_context.rs`](../src/git_context.rs)).
+the UI on probes"). Parsing is pure ([`src/git_context.rs`](../src/git_context.rs));
+the capture is in `BlockStack::start_running` (unit-tested).
 
 A `PaneSession` owns `Vec<Block>` plus an `active: Option<BlockId>` pointing at the live one (always the last; `None` very briefly between command_finished and the next precmd).
 
@@ -422,28 +427,28 @@ A `PaneSession` owns `Vec<Block>` plus an `active: Option<BlockId>` pointing at 
 
 Each block paints differently per state:
 
-Each chip is a rounded pill; `[…]` below stands in for one. Sealed
-blocks carry only cwd / exit / duration (no git — see above). The live
-prompt + running headers add the git chips after cwd: branch, an
-optional `ahead N behind N` chip, then an amber dirty chip
-(`N files +A -R`, files-only when the dirt is untracked).
+Each chip is a rounded pill; `[…]` below stands in for one. The git
+chips slot in after cwd: branch, an optional `ahead N behind N` chip,
+then an amber dirty chip (`N files +A -R`, files-only when the dirt is
+untracked). Sealed / running show the git **captured at command-start**;
+the prompt shows **live** current git.
 
 ```
 ┌─────────────────────────── Sealed ─────────────────────────────┐
-│ [~/git/enthal/termica] [0.034s]                                │  ← dim header chips
+│ [~/git/enthal/termica] [main] [1 file +3 -0] [0.034s]          │  ← header chips, git frozen at run-time
 │ git status                                                     │  ← bold command
 │ On branch main                                                 │  ← frozen output
 │ Your branch is up to date with 'origin/main'.                  │
 └────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────── Running ────────────────────────────┐
-│ [~/git/enthal/termica] [main] [3 files +120 -8] [11s]          │  ← live git + duration chips
+│ [~/git/enthal/termica] [main] [3 files +120 -8] [11s]          │  ← git frozen at start; live duration
 │ while true; do sleep 1; date; done                             │  ← bold command, frozen
 │ Tue May 26 10:07:52 PDT 2026                                   │  ← live output
 │ Tue May 26 10:07:53 PDT 2026                                   │
 │ ▌                                                              │  ← running-cursor glyph
 └────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────── Prompt ─────────────────────────────┐  ← glued to viewport bottom
-│ [~/git/enthal/termica] [main] [3 files +120 -8]                │  ← decoration chips
+│ [~/git/enthal/termica] [main] [3 files +120 -8]                │  ← live git chips (update as you cd / edit)
 │ ❯ git status_                                                  │  ← editor (multiline expands here)
 └────────────────────────────────────────────────────────────────┘
 ```
