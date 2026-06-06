@@ -220,6 +220,60 @@ pub struct TerminalRender {
 /// `selection`, if `Some`, is painted as a semi-transparent overlay
 /// over the cells covered by the selection range. The hit-testing /
 /// drag tracking lives in the caller — this function only renders.
+/// Number of screen rows to paint below the scrollback history in the
+/// `include_history` (running-command, non-alt-screen) path.
+///
+/// The path paints all of scrollback plus the live screen, but must
+/// NOT paint the blank rows below the visible content — that draws a
+/// panel-sized `DEFAULT_BG` void in a tall pane (the bug the original
+/// `cursor_row + 1` clamp fixed). The subtlety: streaming output
+/// (`cat`, `make`) parks the cursor on the last *written* row, so the
+/// cursor IS the content bottom — but a primary-screen TUI like Claude
+/// Code parks its cursor *inside* an input box and draws its footer
+/// (input border, status line) on rows BELOW the cursor. Clamping to
+/// the cursor alone eats those rows ("the bottom couple of lines are
+/// always missing"). So the content bottom is the lower-most of the
+/// cursor row and the last row that actually has content; we paint
+/// through it, then clamp to the real screen height.
+fn painted_screen_rows(
+    cursor_row: usize,
+    last_content_row: Option<usize>,
+    screen_lines: usize,
+) -> usize {
+    let bottom = cursor_row.max(last_content_row.unwrap_or(0));
+    (bottom + 1).min(screen_lines)
+}
+
+/// Viewport row index (0-based) of the last screen row that paints
+/// anything — a non-space glyph or a non-default background — or
+/// `None` when the whole screen is blank. Uses the same
+/// content-vs-blank test as the per-cell paint loop ([`cell_colors`])
+/// so the painted region and this extent never disagree. Scans
+/// bottom-up and returns on the first hit, so the common case
+/// (content near the bottom) is cheap; cost is bounded by the
+/// viewport, never the scrollback depth.
+fn last_nonempty_screen_row(grid: &Grid<Cell>) -> Option<usize> {
+    let screen_lines = grid.screen_lines();
+    let cols = grid.columns();
+    for row in (0..screen_lines).rev() {
+        for col in 0..cols {
+            if cell_has_content(&grid[Line(row as i32)][Column(col)]) {
+                return Some(row);
+            }
+        }
+    }
+    None
+}
+
+/// Whether a cell paints anything: a solid background, or a visible
+/// non-space glyph. Mirrors what the per-cell paint loop actually
+/// draws (see [`cell_colors`]) so [`last_nonempty_screen_row`] never
+/// disagrees with the painter about where content ends.
+fn cell_has_content(cell: &Cell) -> bool {
+    let (_, bg, paint_glyph) = cell_colors(cell);
+    bg.is_some() || (paint_glyph && cell.c != ' ')
+}
+
 pub fn paint_terminal(
     ui: &mut egui::Ui,
     term: &TerminalState,
@@ -247,15 +301,16 @@ pub fn paint_terminal(
     // would draw `screen_lines - cursor_row - 1` rows of pure
     // `DEFAULT_BG` below the visible output: the panel-sized black
     // void users reported the moment a long-running command kicked
-    // off in a tall pane. Clamp to `history_size + cursor_row + 1`
-    // so the painted area tracks the actual content height; when
-    // output overflows the screen the cursor sits at the last
-    // row and this collapses back to `history_size + screen_lines`
-    // (the pre-clamp behaviour). Alt-screen / no-history paths
-    // keep painting the full screen (a TUI owns its viewport).
+    // off in a tall pane. We clamp the painted area to the actual
+    // content height (see [`painted_screen_rows`]); when output
+    // overflows the screen this collapses back to
+    // `history_size + screen_lines` (the pre-clamp behaviour).
+    // Alt-screen / no-history paths keep painting the full screen
+    // (a TUI owns its viewport).
     let rows = if include_history {
         let cursor_row = grid.cursor.point.line.0.max(0) as usize;
-        history_size + (cursor_row + 1).min(screen_lines)
+        let last_content_row = last_nonempty_screen_row(grid);
+        history_size + painted_screen_rows(cursor_row, last_content_row, screen_lines)
     } else {
         screen_lines
     };
@@ -1455,6 +1510,61 @@ mod tests {
     //! by snapshot tests in `tests/snapshots.rs`.
 
     use super::*;
+
+    // ---- painted_screen_rows (running-command paint extent) ---------
+
+    #[test]
+    fn painted_rows_streaming_stops_at_cursor_no_void() {
+        // Streaming output (`cat`, `make`) parks the cursor on the last
+        // written row, which is also the last content row. We paint
+        // through it and NOT the blank rows below (the black-void bug).
+        assert_eq!(painted_screen_rows(4, Some(4), 50), 5);
+    }
+
+    #[test]
+    fn painted_rows_includes_content_below_cursor() {
+        // A primary-screen TUI (Claude Code) parks the cursor inside its
+        // input box (row 10) and draws its footer — input border, status
+        // line — on rows below it (last content row 13). The cursor-only
+        // clamp would yield 11, eating rows 11..=13 ("the bottom couple
+        // of lines are always missing"). We must paint through 13.
+        assert_eq!(painted_screen_rows(10, Some(13), 50), 14);
+    }
+
+    #[test]
+    fn painted_rows_clamp_to_screen_height() {
+        // Content fills the whole screen: collapses to screen_lines.
+        assert_eq!(painted_screen_rows(49, Some(49), 50), 50);
+        // Never exceeds the screen even if both inputs are at the edge.
+        assert_eq!(painted_screen_rows(49, Some(49), 50), 50);
+    }
+
+    #[test]
+    fn painted_rows_empty_screen_paints_one_row() {
+        assert_eq!(painted_screen_rows(0, None, 50), 1);
+    }
+
+    // ---- last_nonempty_screen_row (content extent from a real grid) --
+
+    #[test]
+    fn last_nonempty_row_tracks_content_below_cursor() {
+        // Print three lines, then move the cursor back to the top
+        // (CUP / ESC[H) — exactly what a TUI does to repaint or to park
+        // the caret in an input field above its own footer. The cursor
+        // is now on row 0, but content lives down through row 2; the
+        // content extent must follow the content, not the cursor.
+        let mut term = crate::terminal::TerminalState::new(10, 20);
+        term.feed(b"line0\r\nline1\r\nline2\x1b[H");
+        let cursor_row = term.grid().cursor.point.line.0.max(0) as usize;
+        assert_eq!(cursor_row, 0, "cursor parked back at top");
+        assert_eq!(last_nonempty_screen_row(term.grid()), Some(2));
+    }
+
+    #[test]
+    fn last_nonempty_row_blank_screen_is_none() {
+        let term = crate::terminal::TerminalState::new(10, 20);
+        assert_eq!(last_nonempty_screen_row(term.grid()), None);
+    }
 
     /// 2×2×2 truth table for the caret-visibility rule. Spec/04
     /// says the caret is shown iff `mode_is_editor && pane_has_focus

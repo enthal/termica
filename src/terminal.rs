@@ -1025,6 +1025,90 @@ mod tests {
         assert_eq!(state.osc_title(), None);
     }
 
+    /// Flatten the full scrollback + screen snapshot to one trimmed
+    /// String per row, for content-counting assertions.
+    fn snapshot_row_texts(state: &TerminalState) -> Vec<String> {
+        state
+            .snapshot_lines_all()
+            .iter()
+            .map(|l| l.cells.iter().map(|c| c.c).collect::<String>().trim_end().to_string())
+            .collect()
+    }
+
+    /// Characterizes the engine's resize behaviour for the "banner
+    /// renders twice on resize" bug (Claude Code, a primary-screen TUI).
+    ///
+    /// This test pins down where the duplication does NOT live: a bare
+    /// grid resize — even one that grows rows while content sits in
+    /// scrollback — never duplicates that content. alacritty preserves
+    /// each line exactly once across the resize. So our resize plumbing
+    /// (`TerminalState::resize` → `Term::resize`) is not the culprit;
+    /// the real duplication comes from the application re-emitting its
+    /// full frame on SIGWINCH while the scrolled-out top of the prior
+    /// frame is frozen in scrollback and unreachable by the relative
+    /// cursor moves the app uses to erase. Reproducing THAT needs a
+    /// recorded PTY byte stream of the app's repaint (a VT golden), and
+    /// the fix is a design question (give such apps a managed viewport),
+    /// not a resize-path bug. Guards against a regression where our own
+    /// resize starts duplicating.
+    #[test]
+    fn bare_resize_does_not_duplicate_scrollback_content() {
+        let mut state = TerminalState::new(5, 20);
+        // BANNER then enough lines to push it into scrollback.
+        state.feed(b"BANNER\r\nl1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6");
+        let before = snapshot_row_texts(&state);
+        assert_eq!(
+            before.iter().filter(|t| *t == "BANNER").count(),
+            1,
+            "precondition: BANNER present exactly once before resize: {before:?}"
+        );
+
+        // Grow rows (the SIGWINCH-taller case) — and separately a
+        // width change that triggers reflow.
+        state.resize(10, 20);
+        state.resize(10, 40);
+
+        let after = snapshot_row_texts(&state);
+        assert_eq!(
+            after.iter().filter(|t| *t == "BANNER").count(),
+            1,
+            "resize must not duplicate scrollback content: {after:?}"
+        );
+    }
+
+    /// Documents the mechanism behind the "intro banner renders twice
+    /// on resize" report (Claude Code, a primary-screen TUI). It is
+    /// `#[ignore]`d because it asserts the *desired* behaviour, which
+    /// the current renderer does not yet provide — a ready-made failing
+    /// test for whoever fixes it, not a lock-in of the bug.
+    ///
+    /// Repro: an app writes a frame taller than the screen (so its top
+    /// scrolls into history), then repaints in place with `ESC[H`
+    /// (home) + `ESC[J` (erase-below) + rewrite — exactly what a
+    /// resize-triggered redraw does. `ESC[H`/`ESC[J` reach only the
+    /// active screen, never scrollback, so the scrolled-out top line is
+    /// orphaned in history while the rewrite re-emits it. Every
+    /// terminal leaves that orphan in scrollback; the Termica-specific
+    /// symptom is that the running-command paint shows history inline,
+    /// contiguous with the live screen, so the orphan and the rewrite
+    /// appear as a visible duplicate. The fix is a rendering-model
+    /// decision (give in-place-repainting primary-screen apps a managed
+    /// viewport, like alt-screen), tracked separately.
+    #[test]
+    #[ignore = "open bug: in-place-repaint apps duplicate scrolled-out content in inline history"]
+    fn app_repaint_across_scroll_should_not_duplicate() {
+        let mut state = TerminalState::new(5, 20);
+        state.feed(b"BANNER\r\nA\r\nB\r\nC\r\nD\r\nE");
+        state.feed(b"\x1b[H\x1b[J");
+        state.feed(b"BANNER\r\nA\r\nB\r\nC\r\nD\r\nE");
+        let after = snapshot_row_texts(&state);
+        assert_eq!(
+            after.iter().filter(|t| *t == "BANNER").count(),
+            1,
+            "in-place repaint must not leave a duplicated banner in inline history: {after:?}"
+        );
+    }
+
     #[test]
     fn clear_all_moves_cursor_to_origin() {
         let mut state = TerminalState::new(5, 20);
