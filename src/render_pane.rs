@@ -302,7 +302,9 @@ pub fn paint_sticky_header(
             // to the union of everything painted (chip + command).
             let strip_idx = ui.painter().add(egui::Shape::Noop);
             let top = ui.next_widget_position().y;
-            let _ = render::paint_block_header(ui, cwd, home, exit, duration, git);
+            // Sticky pins a running / sealed block — no PR chip (it's a
+            // live-prompt-only affordance).
+            let _ = render::paint_block_header(ui, cwd, home, exit, duration, git, None);
             let capped = cap_command_for_sticky(command, STICKY_MAX_CMD_LINES);
             if !capped.is_empty() {
                 paint_command_label_static(ui, &capped);
@@ -1116,11 +1118,13 @@ pub fn render_pane(
         let interval = if elapsed < std::time::Duration::from_secs(10) { 100 } else { 1000 };
         ctx.request_repaint_after(std::time::Duration::from_millis(interval));
     }
-    // 4G-async-context: snapshot the pane's live git context once this
-    // frame. Cloned (cheap — one `String` + small counts) so the chips
-    // can be painted on the live prompt / running headers below without
-    // re-borrowing `slot.session` while its blocks are borrowed.
+    // 4G-async-context: snapshot the pane's live git + PR context once
+    // this frame. Cloned (cheap — small structs) so the chips can be
+    // painted on the live prompt header below without re-borrowing
+    // `slot.session` while its blocks are borrowed. `git_ctx` also feeds
+    // the live prompt header; running / sealed read their captured copy.
     let git_ctx = slot.session.git_context().cloned();
+    let pr_ctx = slot.session.pr_context().copied();
     let scroll_inner = scroll_area.show(ui, |ui| {
         // Scrollback-jump-to-top (Cmd+Option+Up / Ctrl+Alt+Up): snap
         // the next-widget-position (= top of content) to the TOP
@@ -1233,6 +1237,7 @@ pub fn render_pane(
                             None,
                             running_elapsed,
                             header.git.as_ref(),
+                            None,
                         );
                         let chip_h = hdr.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
                         let cmd_resp =
@@ -1538,6 +1543,8 @@ pub fn render_pane(
         if has_prompt_cwd
             && let Some(crate::block::Block::Prompt { header, .. }) = slot.session.blocks().last()
         {
+            // The live prompt shows current git + the PR chip (number +
+            // live CI color) — the "now, about to act" state.
             let _ = render::paint_block_header(
                 ui,
                 header.cwd.as_deref(),
@@ -1545,6 +1552,7 @@ pub fn render_pane(
                 None,
                 None,
                 git_ctx.as_ref(),
+                pr_ctx.as_ref(),
             );
         }
 

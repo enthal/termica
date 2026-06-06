@@ -22,6 +22,7 @@ use alacritty_terminal::index::Point;
 
 use crate::block::{Block, BlockStack};
 use crate::events::EventRecorder;
+use crate::gh_probe::GhProbe;
 use crate::git_context::GitContext;
 use crate::git_probe::GitProbe;
 use crate::history::{
@@ -29,6 +30,7 @@ use crate::history::{
 };
 use crate::integration::{ManagedSpawn, ShellSpec, managed_spawn_for, new_session_id};
 use crate::pane_selection::{PaneCursor, PaneSelection};
+use crate::pr_context::PrContext;
 use crate::pty::{PtyConfig, PtyError, PtySession};
 use crate::selection::{self, Selection, SelectionMode};
 use crate::shell::{PaneMode, PromptController};
@@ -166,6 +168,18 @@ pub struct PaneSession {
     /// repo / before the first probe returns. Drives the branch / dirty
     /// chips on the live prompt + running block headers.
     git_context: Option<GitContext>,
+    /// 4G-async-context: off-thread GitHub PR probe (`gh pr view`). Fed
+    /// the cwd when the cwd or the branch changes; its result populates
+    /// [`Self::pr_context`]. Dropped (torn down) with the pane.
+    gh_probe: GhProbe,
+    /// Latest parsed PR context for the pane's branch, or `None` when the
+    /// branch has no open PR / before the first probe returns. Drives the
+    /// PR chip on the live prompt header.
+    pr_context: Option<PrContext>,
+    /// Last git branch seen from [`Self::git_context`], to detect a
+    /// branch change (e.g. `git checkout`) and re-probe the PR even when
+    /// the cwd is unchanged.
+    last_git_branch: Option<String>,
 }
 
 impl PaneSession {
@@ -235,6 +249,9 @@ impl PaneSession {
             recall: RecallState::default(),
             git_probe: GitProbe::spawn(),
             git_context: None,
+            gh_probe: GhProbe::spawn(),
+            pr_context: None,
+            last_git_branch: None,
         })
     }
 
@@ -522,6 +539,21 @@ impl PaneSession {
             self.git_context = result.context;
         }
 
+        // 4G-async-context: drive the off-thread GitHub PR probe. `gh` is
+        // slow + networked, so we re-probe only on cwd change (dedup'd by
+        // the probe) or a branch change — a `git checkout` keeps the cwd
+        // but swaps the PR. The probe self-refreshes while CI is pending,
+        // so a chip watching CI go green updates without our help.
+        if let Some(cwd) = self.current_cwd() {
+            let branch = self.git_context.as_ref().and_then(|g| g.branch.clone());
+            let branch_changed = branch != self.last_git_branch;
+            self.last_git_branch = branch;
+            self.gh_probe.request(&cwd, branch_changed);
+        }
+        if let Some(result) = self.gh_probe.poll() {
+            self.pr_context = result.pr;
+        }
+
         // PTY exit is observed via `self.exited` (latched above)
         // rather than as a one-shot signal here — the parent app
         // already polls `is_exited` per frame to route pane close,
@@ -593,6 +625,14 @@ impl PaneSession {
     /// chips (4G-async-context).
     pub fn git_context(&self) -> Option<&GitContext> {
         self.git_context.as_ref()
+    }
+
+    /// Latest GitHub PR context for the pane's branch, or `None` when the
+    /// branch has no open PR / before the first probe returns. The
+    /// renderer reads this for the live prompt header's PR chip
+    /// (4G-async-context).
+    pub fn pr_context(&self) -> Option<&PrContext> {
+        self.pr_context.as_ref()
     }
 
     /// Current pane mode per the `PromptController`. Reflects the
