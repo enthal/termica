@@ -56,6 +56,36 @@ impl GitContext {
         self.dirty.lines_removed = lines_removed;
         self
     }
+
+    /// Chip text for the upstream relationship, or `None` when in sync
+    /// (or there's no upstream — both counts zero). Words, not glyphs,
+    /// so the no-Unicode-icon rule holds and `+`/`-` stay reserved for
+    /// the dirty chip's line counts: `ahead 2`, `behind 1`, or
+    /// `ahead 2 behind 1`.
+    pub fn sync_label(&self) -> Option<String> {
+        match (self.ahead, self.behind) {
+            (0, 0) => None,
+            (a, 0) => Some(format!("ahead {a}")),
+            (0, b) => Some(format!("behind {b}")),
+            (a, b) => Some(format!("ahead {a} behind {b}")),
+        }
+    }
+
+    /// Chip text for the working-tree dirtiness, or `None` when clean.
+    /// `{n} file[s]`, plus ` +{added} -{removed}` when there are tracked
+    /// line changes (untracked-only dirt shows just the file count).
+    pub fn dirty_label(&self) -> Option<String> {
+        if self.dirty.is_clean() {
+            return None;
+        }
+        let DirtySummary { files_changed, lines_added, lines_removed } = self.dirty;
+        let noun = if files_changed == 1 { "file" } else { "files" };
+        let mut label = format!("{files_changed} {noun}");
+        if lines_added > 0 || lines_removed > 0 {
+            label.push_str(&format!(" +{lines_added} -{lines_removed}"));
+        }
+        Some(label)
+    }
 }
 
 /// Parse `git status --porcelain=v2 --branch` stdout into a
@@ -213,5 +243,38 @@ mod tests {
         assert!(DirtySummary::default().is_clean());
         assert!(!DirtySummary { files_changed: 1, ..Default::default() }.is_clean());
         assert!(!DirtySummary { lines_added: 1, ..Default::default() }.is_clean());
+    }
+
+    #[test]
+    fn sync_label_words_by_relationship() {
+        let mk = |ahead, behind| GitContext { ahead, behind, ..Default::default() };
+        assert_eq!(mk(0, 0).sync_label(), None);
+        assert_eq!(mk(2, 0).sync_label().as_deref(), Some("ahead 2"));
+        assert_eq!(mk(0, 1).sync_label().as_deref(), Some("behind 1"));
+        assert_eq!(mk(2, 1).sync_label().as_deref(), Some("ahead 2 behind 1"));
+    }
+
+    #[test]
+    fn dirty_label_clean_is_none() {
+        assert_eq!(GitContext::default().dirty_label(), None);
+    }
+
+    #[test]
+    fn dirty_label_files_and_lines() {
+        let ctx = GitContext {
+            dirty: DirtySummary { files_changed: 3, lines_added: 120, lines_removed: 8 },
+            ..Default::default()
+        };
+        assert_eq!(ctx.dirty_label().as_deref(), Some("3 files +120 -8"));
+    }
+
+    #[test]
+    fn dirty_label_untracked_only_omits_lines() {
+        // One untracked file: counted, but no diff line counts.
+        let ctx = GitContext {
+            dirty: DirtySummary { files_changed: 1, lines_added: 0, lines_removed: 0 },
+            ..Default::default()
+        };
+        assert_eq!(ctx.dirty_label().as_deref(), Some("1 file"));
     }
 }

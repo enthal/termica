@@ -185,6 +185,12 @@ pub fn color_for_token_kind(kind: crate::shell_syntax::TokenKind) -> Color32 {
 /// in a long transcript. Theme polish lands in Phase 10.
 pub const BLOCK_HEADER_EXIT_FAIL_FG: Color32 = Color32::from_rgb(0xe0, 0x70, 0x70);
 
+/// Foreground for the dirty-working-tree chip (4G-async-context). Amber:
+/// not an error (a dirty tree is normal mid-work), but warmer than the
+/// dim grey of the cwd / branch chips so uncommitted changes catch the
+/// eye. Branch + ahead/behind chips stay [`BLOCK_HEADER_FG`].
+pub const BLOCK_HEADER_DIRTY_FG: Color32 = Color32::from_rgb(0xe0, 0xb8, 0x6e);
+
 /// Result of one paint pass over the terminal grid.
 ///
 /// The caller (the eframe app) uses this to do hit-testing for the
@@ -862,6 +868,7 @@ pub fn paint_block_header(
     home: Option<&std::path::Path>,
     exit: Option<i32>,
     duration: Option<std::time::Duration>,
+    git: Option<&crate::git_context::GitContext>,
 ) -> Option<Response> {
     let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
     let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
@@ -877,14 +884,31 @@ pub fn paint_block_header(
     // — no parens.
     let dur_text = duration.map(format_duration).unwrap_or_default();
 
+    // 4G-async-context git chips, slotting in after cwd: the branch name,
+    // an optional ahead/behind chip, and an optional dirty chip. The
+    // label strings are built by the pure helpers on `GitContext` (so
+    // they're unit-tested without egui); `None` for any of them means
+    // "skip that chip".
+    let branch_text = git.and_then(|g| g.branch.clone()).unwrap_or_default();
+    let sync_text = git.and_then(|g| g.sync_label()).unwrap_or_default();
+    let dirty_text = git.and_then(|g| g.dirty_label()).unwrap_or_default();
+
     // Each present field is a chip: `text`, `width`, and text `color`.
     // Collected left→right so the layout + paint share one source of
-    // truth (and adding the git / dirty chips in 4G-async-context is
-    // just another entry).
+    // truth.
     let chip_w = |text: &str| text.chars().count() as f32 * cell_w + 2.0 * CHIP_PAD_X;
-    let mut chips: Vec<(&str, f32, Color32)> = Vec::with_capacity(3);
+    let mut chips: Vec<(&str, f32, Color32)> = Vec::with_capacity(6);
     if !cwd_text.is_empty() {
         chips.push((&cwd_text, chip_w(&cwd_text), BLOCK_HEADER_FG));
+    }
+    if !branch_text.is_empty() {
+        chips.push((&branch_text, chip_w(&branch_text), BLOCK_HEADER_FG));
+    }
+    if !sync_text.is_empty() {
+        chips.push((&sync_text, chip_w(&sync_text), BLOCK_HEADER_FG));
+    }
+    if !dirty_text.is_empty() {
+        chips.push((&dirty_text, chip_w(&dirty_text), BLOCK_HEADER_DIRTY_FG));
     }
     if show_exit {
         chips.push((&exit_text, chip_w(&exit_text), BLOCK_HEADER_EXIT_FAIL_FG));
@@ -1110,7 +1134,11 @@ pub fn paint_sealed_block(
     // wash can extend up to the inter-block hairline above.
     let block_top_y = ui.next_widget_position().y;
 
-    let header = paint_block_header(ui, cwd, home, exit, Some(duration));
+    // Sealed blocks are historical — they show the cwd / exit / duration
+    // captured at seal time, but NOT the current git context (that would
+    // be anachronistic). Git chips appear only on the live prompt /
+    // running headers. So: `None` here.
+    let header = paint_block_header(ui, cwd, home, exit, Some(duration), None);
     let header_height = header.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
 
     let cmd_lines = if command.is_empty() { 0 } else { command.split('\n').count() };

@@ -36,6 +36,7 @@ pub mod echo_suppress;
 pub mod events;
 pub mod focused_chrome;
 pub mod git_context;
+pub mod git_probe;
 pub mod history;
 pub mod history_overlay;
 pub mod input;
