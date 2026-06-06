@@ -191,6 +191,13 @@ pub const BLOCK_HEADER_EXIT_FAIL_FG: Color32 = Color32::from_rgb(0xe0, 0x70, 0x7
 /// eye. Branch + ahead/behind chips stay [`BLOCK_HEADER_FG`].
 pub const BLOCK_HEADER_DIRTY_FG: Color32 = Color32::from_rgb(0xe0, 0xb8, 0x6e);
 
+/// Foregrounds for the `PR #NN` chip (4G-async-context), colored by the
+/// PR's rolled-up CI status: green passing, yellow pending, red failing.
+/// A PR with no checks falls back to [`BLOCK_HEADER_FG`].
+pub const PR_CHIP_PASS_FG: Color32 = Color32::from_rgb(0x6e, 0xc8, 0x7a);
+pub const PR_CHIP_PENDING_FG: Color32 = Color32::from_rgb(0xe0, 0xc0, 0x4e);
+pub const PR_CHIP_FAIL_FG: Color32 = Color32::from_rgb(0xe0, 0x70, 0x70);
+
 /// Result of one paint pass over the terminal grid.
 ///
 /// The caller (the eframe app) uses this to do hit-testing for the
@@ -862,6 +869,7 @@ pub fn format_duration(d: std::time::Duration) -> String {
 /// When `cwd` is `None`, there's no non-zero `exit`, *and* no
 /// `duration`, nothing is painted at all — the header row is skipped
 /// entirely (no allocated rect, so egui inserts no `item_spacing` gap).
+#[allow(clippy::too_many_arguments)]
 pub fn paint_block_header(
     ui: &mut egui::Ui,
     cwd: Option<&std::path::Path>,
@@ -869,6 +877,7 @@ pub fn paint_block_header(
     exit: Option<i32>,
     duration: Option<std::time::Duration>,
     git: Option<&crate::git_context::GitContext>,
+    pr: Option<&crate::pr_context::PrContext>,
 ) -> Option<Response> {
     let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
     let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
@@ -893,6 +902,17 @@ pub fn paint_block_header(
     let sync_text = git.and_then(|g| g.sync_label()).unwrap_or_default();
     let dirty_text = git.and_then(|g| g.dirty_label()).unwrap_or_default();
 
+    // 4G-async-context PR chip, after the git chips: `PR #NN` colored by
+    // the rolled-up CI status. Empty (no chip) when there's no open PR.
+    let pr_text = pr.map(|p| format!("PR #{}", p.number)).unwrap_or_default();
+    let pr_color = match pr.map(|p| p.ci) {
+        Some(crate::pr_context::CiStatus::Passing) => PR_CHIP_PASS_FG,
+        Some(crate::pr_context::CiStatus::Pending) => PR_CHIP_PENDING_FG,
+        Some(crate::pr_context::CiStatus::Failing) => PR_CHIP_FAIL_FG,
+        // No checks (or no PR — `pr_text` empty, chip skipped): neutral.
+        _ => BLOCK_HEADER_FG,
+    };
+
     // Each present field is a chip: `text`, `width`, and text `color`.
     // Collected left→right so the layout + paint share one source of
     // truth.
@@ -909,6 +929,9 @@ pub fn paint_block_header(
     }
     if !dirty_text.is_empty() {
         chips.push((&dirty_text, chip_w(&dirty_text), BLOCK_HEADER_DIRTY_FG));
+    }
+    if !pr_text.is_empty() {
+        chips.push((&pr_text, chip_w(&pr_text), pr_color));
     }
     if show_exit {
         chips.push((&exit_text, chip_w(&exit_text), BLOCK_HEADER_EXIT_FAIL_FG));
@@ -1138,8 +1161,9 @@ pub fn paint_sealed_block(
     // Sealed blocks show the git context **captured at command-start**
     // (4G-async-context) — the branch / dirty the command actually ran
     // under, frozen as history. NOT the pane's current git, which would
-    // be anachronistic on scroll-back.
-    let header = paint_block_header(ui, cwd, home, exit, Some(duration), git);
+    // be anachronistic on scroll-back. No PR chip: a finished command's
+    // CI status is meaningless (you want current), so PR is prompt-only.
+    let header = paint_block_header(ui, cwd, home, exit, Some(duration), git, None);
     let header_height = header.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
 
     let cmd_lines = if command.is_empty() { 0 } else { command.split('\n').count() };

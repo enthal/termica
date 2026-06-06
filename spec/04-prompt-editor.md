@@ -431,7 +431,13 @@ Each chip is a rounded pill; `[…]` below stands in for one. The git
 chips slot in after cwd: branch, an optional `ahead N behind N` chip,
 then an amber dirty chip (`N files +A -R`, files-only when the dirt is
 untracked). Sealed / running show the git **captured at command-start**;
-the prompt shows **live** current git.
+the prompt shows **live** current git. After the git chips, the **live
+prompt only** adds a `PR #NN` chip for the branch's open GitHub PR,
+colored by its rolled-up CI status (green passing / yellow pending /
+red failing) — sourced from an async [`GhProbe`](../src/gh_probe.rs)
+(`gh pr view`). It's prompt-only because a finished command's CI status
+is meaningless on scroll-back; you want *current* CI, where you're about
+to act.
 
 ```
 ┌─────────────────────────── Sealed ─────────────────────────────┐
@@ -448,7 +454,7 @@ the prompt shows **live** current git.
 │ ▌                                                              │  ← running-cursor glyph
 └────────────────────────────────────────────────────────────────┘
 ┌─────────────────────────── Prompt ─────────────────────────────┐  ← glued to viewport bottom
-│ [~/git/enthal/termica] [main] [3 files +120 -8]                │  ← live git chips (update as you cd / edit)
+│ [~/git/enthal/termica] [main] [3 files +120 -8] [PR #124]      │  ← live git + PR chips (PR colored by CI)
 │ ❯ git status_                                                  │  ← editor (multiline expands here)
 └────────────────────────────────────────────────────────────────┘
 ```

@@ -734,6 +734,7 @@ fn snapshot_paint_block_header_cwd_only() {
                 None,
                 None,
                 None,
+                None,
             );
         });
     harness.snapshot("paint_block_header_cwd_only");
@@ -750,6 +751,7 @@ fn snapshot_paint_block_header_zero_exit_hides_exit_chip() {
                 Some(cwd.as_path()),
                 Some(home.as_path()),
                 Some(0),
+                None,
                 None,
                 None,
             );
@@ -772,6 +774,7 @@ fn snapshot_paint_block_header_substitutes_home_with_tilde() {
                 None,
                 None,
                 None,
+                None,
             );
         });
     harness.snapshot("paint_block_header_tilde_substitution");
@@ -788,6 +791,7 @@ fn snapshot_paint_block_header_nonzero_exit_shows_red_annotation() {
                 Some(cwd.as_path()),
                 Some(home.as_path()),
                 Some(127),
+                None,
                 None,
                 None,
             );
@@ -809,6 +813,7 @@ fn snapshot_paint_block_header_with_duration() {
                 Some(home.as_path()),
                 Some(1),
                 Some(std::time::Duration::from_secs(125)),
+                None,
                 None,
             );
         });
@@ -832,6 +837,7 @@ fn snapshot_paint_block_header_with_git_branch_clean() {
                 None,
                 None,
                 Some(&git),
+                None,
             );
         });
     harness.snapshot("paint_block_header_git_branch_clean");
@@ -863,9 +869,67 @@ fn snapshot_paint_block_header_with_git_dirty_and_sync() {
                 None,
                 None,
                 Some(&git),
+                None,
             );
         });
     harness.snapshot("paint_block_header_git_dirty_and_sync");
+}
+
+#[test]
+fn snapshot_paint_block_header_with_pr_chip_pending() {
+    // 4G-async-context PR chip: the live prompt header shows cwd, branch,
+    // dirty, then a `PR #NN` chip colored by CI status (here yellow =
+    // pending). This is the prompt-only "now, about to act" surface.
+    let cwd = std::path::PathBuf::from("/Users/tim/git/enthal/termica");
+    let home = std::path::PathBuf::from("/Users/tim");
+    let git = termica::git_context::GitContext {
+        branch: Some("feat/pr-status-chip".to_string()),
+        dirty: termica::git_context::DirtySummary {
+            files_changed: 1,
+            lines_added: 8,
+            lines_removed: 0,
+        },
+        ..Default::default()
+    };
+    let pr =
+        termica::pr_context::PrContext { number: 127, ci: termica::pr_context::CiStatus::Pending };
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(760.0, 40.0)).build_ui(move |ui| {
+            let _ = render::paint_block_header(
+                ui,
+                Some(cwd.as_path()),
+                Some(home.as_path()),
+                None,
+                None,
+                Some(&git),
+                Some(&pr),
+            );
+        });
+    harness.snapshot("paint_block_header_pr_chip_pending");
+}
+
+#[test]
+fn snapshot_paint_block_header_with_pr_chip_passing() {
+    // Same surface, CI passing (green chip), clean tree.
+    let cwd = std::path::PathBuf::from("/Users/tim/git/enthal/termica");
+    let home = std::path::PathBuf::from("/Users/tim");
+    let git =
+        termica::git_context::GitContext { branch: Some("main".to_string()), ..Default::default() };
+    let pr =
+        termica::pr_context::PrContext { number: 124, ci: termica::pr_context::CiStatus::Passing };
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(760.0, 40.0)).build_ui(move |ui| {
+            let _ = render::paint_block_header(
+                ui,
+                Some(cwd.as_path()),
+                Some(home.as_path()),
+                None,
+                None,
+                Some(&git),
+                Some(&pr),
+            );
+        });
+    harness.snapshot("paint_block_header_pr_chip_passing");
 }
 
 #[test]
