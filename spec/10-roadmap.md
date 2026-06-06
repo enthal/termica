@@ -96,7 +96,7 @@ Sub-PRs:
 
 > A "duplicate-here" pane op was originally listed alongside spawn-in-cwd in the pre-breakout Phase 2 description (see the original [#2](https://github.com/enthal/termica/issues/2) acceptance criteria). After 2B shipped, the gap between "Cmd+T" and a hypothetical "duplicate this pane" collapsed — both produce a fresh shell in the same cwd, and shells can't share runtime env across forks anyway. Dropped from the roadmap; reframing as a keyboard split shortcut (à la iTerm2 Cmd+D) is the only flavor that would still be a distinct gesture, but drag-to-split already works and a hotkey can land later as needed.
 
-### Phase 3 — Managed shell integration + mode machine
+### Phase 3 — Managed shell integration + mode machine ✅
 
 **Design pivot ([#45](https://github.com/enthal/termica/pull/45)):** the Phase 3A/3B work shipped an OSC 133 + OSC 1337-Termica marker pipeline and a four-mode `PromptController`. We pivoted in [spec/03](03-shell-integration.md) to a managed-shell-integration design: Termica controls bootstrap on every shell spawn via `ZDOTDIR` (zsh) / `--rcfile` (bash) / `--no-config --init-command` (fish), uses a DCS-JSON protocol it owns end-to-end, and ignores foreign OSC 133. The pane mode machine grows two new states (`Bootstrapping`, `Degraded` — see [05](05-pane-modes.md)). The "fenced-block dotfile installer" approach is dropped entirely.
 
@@ -115,6 +115,8 @@ Sub-PRs (reshaped):
 The strict tests-first rule from [CLAUDE.md](../CLAUDE.md) applies to **the entire Phase 3 surface area** — every commit lands with tests that failed on the pre-change tree.
 
 **Acceptance:** Termica spawns its own managed shells; DCS-JSON lifecycle messages flow end-to-end; mode transitions are observably correct including `Bootstrapping` → `RawTerminal` and `Bootstrapping` → `Degraded`; bootstrap suppression hides bootstrap noise from the user. Editor is **not** wired up yet (Phase 4).
+
+**Status:** ✅ complete — [#3](https://github.com/enthal/termica/issues/3) closed. 3A–3G all shipped; the managed-shell mode machine is the source of truth for prompt detection across zsh / bash / fish.
 
 **Known gaps tracked for later:**
 
@@ -144,7 +146,10 @@ Sub-PRs:
     - ✅ **4G-cwd-and-exit — dim cwd header + exit annotation** (this PR). `BlockHeader.cwd` is populated from `LifecycleEvent::Precmd` / `LifecycleEvent::Cwd` and inherits through `Preexec` → `Running` → `CommandFinished` (the `Running` header is locked at start-time even if the program re-emits `Cwd` mid-execution). `render::paint_block_header` paints a dim cwd line above each block and a red `exit N` annotation for sealed blocks with non-zero exit.
     - ✅ **4G-duration — wall-clock command duration (sealed blocks).** Replaces the frame-counter placeholder with a real `Duration`: the pane stamps each lifecycle event with `wall_clock_ms()` (`BlockStack::set_event_clock_ms`), so a `Preexec` → `CommandFinished` pair seals the block with its true elapsed time (`Block::Running.started_at_ms`, clamped against clock skew). `render::format_duration` renders it as its own chip (`0.034s` / `11s` / `2m 3s` / `1h 2m`) on the header row, after the cwd / exit chips — `paint_block_header` lays the row out as a uniform left→right chip list so the git / dirty chips slot in next. Pure timing math is unit-tested with literal ms; the formatter and header are snapshot-tested.
     - ✅ **4G-live-duration — ticking timer for `Running` blocks.** The running block's header (and its sticky-pinned copy) shows elapsed time live: `BlockStack::running_elapsed_at(now_ms)` (pure, unit-tested) computes `now - started_at_ms`, surfaced as `PaneSession::running_elapsed()` reading `wall_clock_ms()`; the renderer samples it once per frame and schedules a 500 ms `request_repaint_after` while a command runs so the chip keeps counting without input.
-    - ⏳ **4G-async-context — git branch + dirty chips.** Async-probe surface per spec/00 §"Do not block the UI on probes"; co-locates with Phase 5's `termica-context` work since the same probes power both surfaces.
+    - ⏳ **4G-async-context — git branch + dirty chips.** Async-probe surface per spec/00 §"Do not block the UI on probes"; co-locates with Phase 5's `termica-context` work since the same probes power both surfaces. Sliced:
+        - ✅ **PR 1 — pure git-status parser** ([#123](https://github.com/enthal/termica/pull/123)). [`src/git_context.rs`](../src/git_context.rs): `GitContext` / `DirtySummary` types + `parse_status_v2` (porcelain v2 → branch / ahead-behind / changed-file count) + `parse_numstat` (diff line counts). No process spawning, no UI — pure parsing, unit-tested without a repo.
+        - ✅ **PR 2 — async probe + chips.** [`src/git_probe.rs`](../src/git_probe.rs): a per-pane `GitProbe` background thread runs `git status` + `git diff HEAD --numstat` for the pane's cwd off the UI thread, debounced (coalesced + cwd-dedup) and re-triggered on cwd change / command finish, cancelled on pane teardown (drop the request `Sender` → worker exits). `PaneSession` caches the latest `GitContext`; `render::paint_block_header` renders the branch / `ahead N behind N` / amber dirty (`N files +A -R`) chips after the cwd chip. Label strings are pure helpers on `GitContext` (unit-tested); chips are snapshot-tested.
+        - ✅ **PR 3 — capture git at run-time.** `BlockHeader` gains `git: Option<GitContext>`; `BlockStack::set_current_git` + `start_running` freeze the pane's current git into the block at `Preexec`, so running / sealed blocks show the branch / dirtiness the command **actually ran under** (frozen as history, like cwd / duration) while the live `Prompt` header still reads current git. Corrects PR 2's interim "live-only, never on sealed" rendering. Capture is unit-tested (strict-layer block lifecycle); sealed-with-git is snapshot-tested.
 - ✅ **4H — Local syntax highlighting** (in-house tokenizer per [04 §"Syntax highlighting"](04-prompt-editor.md#syntax-highlighting)). New [`src/shell_syntax.rs`](../src/shell_syntax.rs) emits `Token { kind, range }` for command (first word in each pipeline scope), strings (single + double, with `$var` splitting double-quoted runs), variables (`$NAME` / `${expr}`), pipes / redirects / `;` / `&&` / `||`, flags (`-x`, `--long=value`), comments (`#` to end-of-line at token boundary), and `Word` for everything else. `paint_prompt_editor_at` walks the token list per row and paints each token in its kind's colour; the editor's `EDITOR_FG` is the `Word` default. Subshells (`$(…)`, backticks) and proper here-doc parsing defer to a follow-up.
 - ✅ **4I — Local completion (Tab)** ([#107](https://github.com/enthal/termica/pull/107)). Path + history + `$PATH` per [04 §"Tab handling"](04-prompt-editor.md#tab-handling): the local popup with the three sources, smart-Tab extension, and live filtering. (CLI-native drivers + per-pane shell sidecars are the separate "Tab completion engine" item below.)
 - ✅ **4J — History walk (Up/Down) + Ctrl+R popup** ([Ctrl+R overlay #96](https://github.com/enthal/termica/pull/96); [multiline-aware Up/Down #105](https://github.com/enthal/termica/pull/105)).
@@ -164,23 +169,31 @@ Sub-PRs:
 
 **Acceptance:** the header replaces most of what `PS1` carried; updates feel instant; never blocks paint.
 
-### Phase 6 — History (local + global) + Ctrl+R
+### Phase 6 — History (local + global) + Ctrl+R ✅
 
-- `termica-history`: SQLite schema for `command_run` + `history_entry`; pane-local in-memory ring with disk spill.
-- Up-arrow walk; Ctrl+R popup with fuzzy match (`nucleo`).
-- Scope toggles: this pane / this project / global.
-- Cwd-biased ranking.
+- ✅ `termica-history`: SQLite schema for command runs; pane-local recall + shell-history-file replay on startup.
+- ✅ Up-arrow walk (multiline-aware, [#105](https://github.com/enthal/termica/pull/105)); Ctrl+R popup ([#96](https://github.com/enthal/termica/pull/96)).
+- ✅ Scope toggle in the Ctrl+R overlay (this pane / global).
+- ⏳ Fuzzy match via `nucleo` + cwd-biased ranking — the current matcher is a placeholder; tracked in [#119](https://github.com/enthal/termica/issues/119).
+
+Shipped under the Phase 4J slices ([#91](https://github.com/enthal/termica/pull/91)–[#97](https://github.com/enthal/termica/pull/97), [#105](https://github.com/enthal/termica/pull/105)) since the editor needed history to be useful.
 
 **Acceptance:** Ctrl+R returns relevant historical commands across panes and previous sessions in under 50 ms for a 50k-entry history.
 
-### Phase 7 — Command blocks
+**Status:** ✅ complete — [#6](https://github.com/enthal/termica/issues/6) closed. History storage, ↑/↓ recall, and the scoped Ctrl+R overlay are in daily use; `nucleo` ranking is the one remaining follow-up ([#119](https://github.com/enthal/termica/issues/119)).
 
-- `CommandRun` lifecycle wiring: open on submit / `command_start`; close on `command_end`.
-- Transcript view renders command blocks with header chrome.
-- Collapse / expand.
-- Copy command / copy output / rerun.
+### Phase 7 — Command blocks ✅
+
+- ✅ `CommandRun` lifecycle wiring: open on submit / `Preexec`; seal on `CommandFinished`.
+- ✅ Transcript renders command blocks with header chrome (cwd, exit, duration; sticky-top header).
+- ✅ Failed exits are visually distinct (red `exit N`); within- and cross-block selection + copy.
+- ⏳ Collapse / expand, copy-output / rerun, context menu — tracked in [#120](https://github.com/enthal/termica/issues/120).
+
+The foundational block model was pulled forward into Phase 4 (the block-model pivot, [#51](https://github.com/enthal/termica/pull/51)–[#116](https://github.com/enthal/termica/pull/116)); as noted above, Phase 7 is "largely subsumed by Phase 4G."
 
 **Acceptance:** the transcript becomes navigable as a sequence of command blocks. Failed exits are visually distinct. Click → collapse works.
+
+**Status:** ✅ complete — [#7](https://github.com/enthal/termica/issues/7) closed. The block model, header chrome, and selection/copy shipped under Phase 4; the remaining collapse/expand/rerun affordances are tracked in [#120](https://github.com/enthal/termica/issues/120).
 
 ### Phase 8 — In-pane search
 

@@ -289,6 +289,7 @@ pub fn paint_sticky_header(
     home: Option<&std::path::Path>,
     exit: Option<i32>,
     duration: Option<std::time::Duration>,
+    git: Option<&crate::git_context::GitContext>,
     command: &str,
     pane_id: u64,
 ) {
@@ -301,7 +302,7 @@ pub fn paint_sticky_header(
             // to the union of everything painted (chip + command).
             let strip_idx = ui.painter().add(egui::Shape::Noop);
             let top = ui.next_widget_position().y;
-            let _ = render::paint_block_header(ui, cwd, home, exit, duration);
+            let _ = render::paint_block_header(ui, cwd, home, exit, duration, git);
             let capped = cap_command_for_sticky(command, STICKY_MAX_CMD_LINES);
             if !capped.is_empty() {
                 paint_command_label_static(ui, &capped);
@@ -1115,6 +1116,11 @@ pub fn render_pane(
         let interval = if elapsed < std::time::Duration::from_secs(10) { 100 } else { 1000 };
         ctx.request_repaint_after(std::time::Duration::from_millis(interval));
     }
+    // 4G-async-context: snapshot the pane's live git context once this
+    // frame. Cloned (cheap — one `String` + small counts) so the chips
+    // can be painted on the live prompt / running headers below without
+    // re-borrowing `slot.session` while its blocks are borrowed.
+    let git_ctx = slot.session.git_context().cloned();
     let scroll_inner = scroll_area.show(ui, |ui| {
         // Scrollback-jump-to-top (Cmd+Option+Up / Ctrl+Alt+Up): snap
         // the next-widget-position (= top of content) to the TOP
@@ -1180,6 +1186,7 @@ pub fn render_pane(
                             home,
                             *exit,
                             *duration,
+                            header.git.as_ref(),
                         );
                         let cmd_h =
                             sealed_render.command.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
@@ -1216,12 +1223,16 @@ pub fn render_pane(
                         // Live ticking duration (4G-live-duration): the
                         // running command's elapsed time, refreshed each
                         // frame via the repaint scheduled above.
+                        // Running shows the git context captured at
+                        // command-start (frozen like its cwd / duration),
+                        // not the pane's live git — 4G-async-context.
                         let hdr = render::paint_block_header(
                             ui,
                             header.cwd.as_deref(),
                             home,
                             None,
                             running_elapsed,
+                            header.git.as_ref(),
                         );
                         let chip_h = hdr.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
                         let cmd_resp =
@@ -1393,16 +1404,32 @@ pub fn render_pane(
     if !in_alt_screen
         && let Some((sticky_id, paint_y)) =
             compute_sticky_header(&block_extents, scroll_viewport.top())
-        && let Some((cwd, exit, duration, command)) =
+        && let Some((cwd, exit, duration, git, command)) =
             slot.session.blocks().iter().find_map(|b| match b {
                 crate::block::Block::Sealed { id, header, exit, command, duration, .. }
                     if *id == sticky_id =>
                 {
-                    Some((header.cwd.clone(), *exit, Some(*duration), command.clone()))
+                    // Mirrors the inline sealed header: git captured at
+                    // command-start (4G-async-context).
+                    Some((
+                        header.cwd.clone(),
+                        *exit,
+                        Some(*duration),
+                        header.git.clone(),
+                        command.clone(),
+                    ))
                 }
                 crate::block::Block::Running { id, header, command, .. } if *id == sticky_id => {
-                    // The pinned running header ticks too (4G-live-duration).
-                    Some((header.cwd.clone(), None, running_elapsed, command.clone()))
+                    // The pinned running header ticks too (4G-live-duration)
+                    // and shows the git captured at command-start
+                    // (4G-async-context), matching its inline counterpart.
+                    Some((
+                        header.cwd.clone(),
+                        None,
+                        running_elapsed,
+                        header.git.clone(),
+                        command.clone(),
+                    ))
                 }
                 _ => None,
             })
@@ -1415,6 +1442,7 @@ pub fn render_pane(
             home,
             exit,
             duration,
+            git.as_ref(),
             &command,
             slot.session.pane_id(),
         );
@@ -1510,7 +1538,14 @@ pub fn render_pane(
         if has_prompt_cwd
             && let Some(crate::block::Block::Prompt { header, .. }) = slot.session.blocks().last()
         {
-            let _ = render::paint_block_header(ui, header.cwd.as_deref(), home, None, None);
+            let _ = render::paint_block_header(
+                ui,
+                header.cwd.as_deref(),
+                home,
+                None,
+                None,
+                git_ctx.as_ref(),
+            );
         }
 
         // Allocate the editor strip and paint into it. The widget
