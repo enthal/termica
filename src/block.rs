@@ -49,11 +49,15 @@ use crate::terminal::{StyledLine, TerminalState};
 pub struct BlockId(pub u64);
 
 /// Information about the shell environment at the moment a block
-/// begins. Phase 4A populates only `cwd`; git branch / dirty
-/// summary land in [4G](../spec/10-roadmap.md).
+/// begins: the cwd, and (4G-async-context) the git context **captured
+/// at command-start**. `git` is `None` on the live `Prompt` block —
+/// the prompt header reads the pane's *current* git live instead — and
+/// is stamped in at `Preexec` so `Running` / `Sealed` blocks show the
+/// branch / dirtiness the command actually ran under, frozen as history.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BlockHeader {
     pub cwd: Option<PathBuf>,
+    pub git: Option<crate::git_context::GitContext>,
 }
 
 /// One block in the per-pane stack. The variants encode the three
@@ -135,6 +139,13 @@ pub struct BlockStack {
     /// `seal_running` to compute a command's real duration. `0` until
     /// the pane sets it (and in duration-agnostic tests).
     event_clock_ms: i64,
+    /// The pane's current git context, stamped into a block's header at
+    /// `Preexec` so `Running` / `Sealed` blocks freeze the git state the
+    /// command ran under (4G-async-context). Set by the pane via
+    /// [`Self::set_current_git`] right before
+    /// [`Self::observe_lifecycle_event`]; `None` outside a repo / before
+    /// the first probe returns (and in git-agnostic tests).
+    current_git: Option<crate::git_context::GitContext>,
 }
 
 impl BlockStack {
@@ -142,7 +153,12 @@ impl BlockStack {
     /// with id `0`. The shell hasn't run anything yet, but the
     /// pane is conceptually "at a prompt about to be drawn."
     pub fn new(started_at_frame: u64) -> Self {
-        let mut stack = Self { blocks: Vec::with_capacity(8), next_id: 0, event_clock_ms: 0 };
+        let mut stack = Self {
+            blocks: Vec::with_capacity(8),
+            next_id: 0,
+            event_clock_ms: 0,
+            current_git: None,
+        };
         let id = stack.alloc_id();
         stack.blocks.push(Block::Prompt {
             id,
@@ -243,6 +259,17 @@ impl BlockStack {
         self.event_clock_ms = now_ms;
     }
 
+    /// Stamp the pane's current git context to freeze into the *next*
+    /// block that starts running. The pane sets this from its async
+    /// probe immediately before [`Self::observe_lifecycle_event`], so a
+    /// `Preexec` captures the branch / dirty state the command ran under
+    /// (4G-async-context). `Running` / `Sealed` headers keep that frozen
+    /// copy; the live `Prompt` header is unaffected (it reads the pane's
+    /// current git directly). Defaults to `None`.
+    pub fn set_current_git(&mut self, git: Option<crate::git_context::GitContext>) {
+        self.current_git = git;
+    }
+
     /// Live elapsed time of the currently-`Running` command, measured
     /// against the wall-clock `now_ms` the caller supplies. `None` when
     /// the tail is a `Prompt` (nothing running). Clamps backwards clock
@@ -288,10 +315,15 @@ impl BlockStack {
             // a block boundary than corrupt the stack.
             return;
         }
-        let (id, header) = match tail {
+        let (id, mut header) = match tail {
             Block::Prompt { id, header, .. } => (*id, header.clone()),
             _ => unreachable!(),
         };
+        // Freeze the git state the command runs under into the block
+        // header (4G-async-context). The `Prompt` header's own `git` is
+        // always `None` (the live prompt reads current git separately);
+        // the captured value comes from the pane's current probe result.
+        header.git = self.current_git.clone();
         // The editor's content is implicitly discarded here. In
         // Phase 4C, `submit_command` will have moved the text out
         // before `Preexec` arrives; for 4B with no submit wired yet,
@@ -554,6 +586,51 @@ mod tests {
         match stack.iter().next().unwrap() {
             Block::Sealed { duration, .. } => {
                 assert_eq!(*duration, std::time::Duration::from_millis(2_500));
+            }
+            other => panic!("expected Sealed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preexec_captures_current_git_into_running_and_seal_retains_it() {
+        // 4G capture-at-run-time: the git context current when the
+        // command starts (`Preexec`) is frozen into the block header and
+        // survives the seal, so a sealed block shows the branch / dirty
+        // it actually ran under — not whatever is current later.
+        let mut stack = fresh_stack();
+        let mut term = TerminalState::new(5, 20);
+        let git = crate::git_context::GitContext {
+            branch: Some("feat/x".into()),
+            ahead: 1,
+            behind: 0,
+            dirty: crate::git_context::DirtySummary {
+                files_changed: 2,
+                lines_added: 5,
+                lines_removed: 1,
+            },
+        };
+        stack.set_current_git(Some(git.clone()));
+        stack.observe_lifecycle_event(
+            &LifecycleEvent::Preexec { command: "cargo build".into() },
+            &mut term,
+            10,
+        );
+        match stack.last().unwrap() {
+            Block::Running { header, .. } => {
+                assert_eq!(header.git.as_ref(), Some(&git), "Running captures git at Preexec");
+            }
+            other => panic!("expected Running, got {other:?}"),
+        }
+        // Change the current git AFTER the command started — the running
+        // block must not pick it up (it's frozen at start).
+        stack.set_current_git(Some(crate::git_context::GitContext {
+            branch: Some("main".into()),
+            ..Default::default()
+        }));
+        stack.observe_lifecycle_event(&LifecycleEvent::CommandFinished { exit: 0 }, &mut term, 20);
+        match stack.iter().next().unwrap() {
+            Block::Sealed { header, .. } => {
+                assert_eq!(header.git.as_ref(), Some(&git), "Sealed retains the run-time git");
             }
             other => panic!("expected Sealed, got {other:?}"),
         }

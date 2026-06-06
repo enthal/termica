@@ -487,6 +487,12 @@ impl PaneSession {
             // history, so a Preexec → CommandFinished pair seals the
             // block with its real duration (4G).
             self.blocks.set_event_clock_ms(now_ms);
+            // Freeze the current git context into the block if this event
+            // starts a command (`Preexec`), so a sealed block shows the
+            // branch / dirty it ran under (4G-async-context). `git_context`
+            // here is last frame's probe result — the state just before
+            // the command ran, which is exactly what we want.
+            self.blocks.set_current_git(self.git_context.clone());
             self.blocks.observe_lifecycle_event(&event, &mut self.terminal, self.frame);
             self.controller.observe_event(event, self.frame);
             self.record_pending_transitions();
