@@ -99,6 +99,8 @@ When the cwd collapses to bare `~` (the default startup cwd, so the worst case i
 
 Rule: titles are space-padded to **`MIN_TAB_TITLE_CHARS = 7` characters** before being handed to `egui_tiles`. egui_tiles has no min-tab-width knob; widening via the title string is the cleanest cross-Behavior approach. Padding is split symmetrically with the extra character going to the right when the shortfall is odd (matches egui_tiles' `LEFT_CENTER` paint origin so the text stays visually centered). The constant was picked via `cargo run --example pick_tab_min_width` (variant `3x` ≈ 48 px, 3× the natural `~` width). Implemented as a pure `pad_to_min_chars` helper in [`src/behavior.rs`](../src/behavior.rs) with strict-layer tests.
 
+Max width before truncation depends on the title source: a cwd-/program-derived title elides at `MAX_TAB_TITLE_CHARS = 25`, but an **OSC-set title earns `MAX_TAB_TITLE_CHARS_OSC = 50` (2×)** — an app that named its own tab (e.g. Claude Code's per-topic title) chose something more specific than a path and is worth the room. The **window title** (set via `window_title_for_with_osc`) is not truncated for layout at all — the window manager elides it as the title bar narrows — only a generous `MAX_WINDOW_TITLE_CHARS = 256` safety cap applies. Truncation keeps the string's *tail* with a `..` prefix.
+
 ## Active pane / focus
 
 Exactly one pane is "active" per workspace. Focus follows mouse click or keyboard navigation; egui's focus system drives it. The active pane:
