@@ -905,7 +905,7 @@ impl eframe::App for TermicaApp {
                 let osc = slot.session.terminal().osc_title();
                 let cwd = slot.session.terminal().cwd();
                 let running = crate::behavior::running_command_for(Some(slot));
-                Some(crate::tab_title::tab_title_for_with_osc(
+                Some(crate::tab_title::window_title_for_with_osc(
                     id,
                     osc.as_deref(),
                     cwd,
