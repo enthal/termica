@@ -86,7 +86,16 @@ A "duplicate shell" sets `cwd` but does **not** copy scrollback or transcript. E
 
 ### Tab title and minimum width
 
-Tab titles default to the home-relative cwd (`~/git/enthal/termica`, `~/projects/foo`, …) and are tracked in [`src/tab_title.rs`](../src/tab_title.rs). When the cwd collapses to bare `~` (the default startup cwd, so the worst case is also the first thing the user sees), the natural-width tab is ~16 px — barely clickable.
+Tab titles are tracked in [`src/tab_title.rs`](../src/tab_title.rs). The title is the most-informative thing the pane knows, chosen in this order:
+
+1. **OSC 0 / 2 title**, if non-empty — what every standard terminal shows, and the only channel an app has to name its own tab. A primary-screen TUI like Claude Code sets a descriptive title (`Introduce Claude Code capabilities`); honouring it is "terminal correctness comes first". Cooperating shells keep it fresh (`preexec` → command, `precmd` → cwd).
+2. **Running foreground program** (first whitespace-separated token, e.g. `less`, `vim`, `htop`) — a fallback *enhancement* for the bare-shell case where nothing set an OSC title. It does **not** override an OSC title.
+3. **Home-relative cwd** (`~/git/enthal/termica`, `~/projects/foo`, …).
+4. **`pane <n>`** — final fallback.
+
+Trade-off of OSC-first: a shell that titles the prompt with the cwd but doesn't update on command-run, paired with a command that sets no title, shows the stale title rather than the program name. That matches every other terminal (none have a program-name notion); the running-program rule is Termica's own embellishment, kept as a fallback only.
+
+When the cwd collapses to bare `~` (the default startup cwd, so the worst case is also the first thing the user sees), the natural-width tab is ~16 px — barely clickable.
 
 Rule: titles are space-padded to **`MIN_TAB_TITLE_CHARS = 7` characters** before being handed to `egui_tiles`. egui_tiles has no min-tab-width knob; widening via the title string is the cleanest cross-Behavior approach. Padding is split symmetrically with the extra character going to the right when the shortfall is odd (matches egui_tiles' `LEFT_CENTER` paint origin so the text stays visually centered). The constant was picked via `cargo run --example pick_tab_min_width` (variant `3x` ≈ 48 px, 3× the natural `~` width). Implemented as a pure `pad_to_min_chars` helper in [`src/behavior.rs`](../src/behavior.rs) with strict-layer tests.
 

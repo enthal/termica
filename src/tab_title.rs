@@ -46,14 +46,29 @@ pub fn tab_title_for(pane_id: PaneId, cwd: Option<&Path>, home: Option<&Path>) -
 /// Variant of [`tab_title_for`] that picks the most-informative
 /// title given everything the pane knows:
 ///
-/// 1. **Running program** (e.g. `less`, `vim`, `htop`) — when
-///    `running_program` is `Some`, take the first whitespace-
-///    separated token. This is what surfaces in the tab AND the
-///    window title while an alt-screen or long-running program
-///    has the foreground; `less ~/big.log` ⇒ tab shows `less`.
-/// 2. **Shell-set OSC 0 / 2** title — if non-empty, used as-is.
+/// 1. **OSC 0 / 2 title** — if non-empty, used as-is. This is what
+///    every standard terminal (xterm, iTerm, …) shows, and it's the
+///    only channel an application has to name its own tab. A
+///    primary-screen TUI like Claude Code sets a descriptive title
+///    (`Introduce Claude Code capabilities`); honouring it is
+///    "terminal correctness comes first". Shells that follow the
+///    common convention also keep this fresh — `preexec` sets it to
+///    the running command, `precmd` back to the cwd — so `less`
+///    surfaces here too when the shell cooperates.
+/// 2. **Running program** (e.g. `less`, `vim`, `htop`) — fallback
+///    *enhancement* for the bare-shell case where nothing set an OSC
+///    title: take the first whitespace-separated token of the
+///    foreground command so `less ~/big.log` ⇒ `less`.
 /// 3. **cwd-derived** — `~/git/enthal/termica` style.
 /// 4. **`pane <n>`** — final fallback when none of the above is known.
+///
+/// Trade-off of OSC-first: a shell that sets the title to the cwd at
+/// the prompt but does *not* update it when a command runs, paired
+/// with a command that sets no title of its own, will show that stale
+/// title rather than the program name. That matches how every other
+/// terminal behaves (they have no program-name notion at all), and the
+/// running-program rule was Termica's own embellishment — so we keep it
+/// only as a fallback, not an override.
 ///
 /// The same truncation rule applies to whichever title wins.
 pub fn tab_title_for_with_osc(
@@ -63,15 +78,15 @@ pub fn tab_title_for_with_osc(
     home: Option<&Path>,
     running_program: Option<&str>,
 ) -> String {
-    if let Some(p) = running_program
-        && let Some(word) = first_word(p)
-    {
-        return truncate_tab_title(word);
-    }
     if let Some(t) = osc_title
         && !t.trim().is_empty()
     {
         return truncate_tab_title(t);
+    }
+    if let Some(p) = running_program
+        && let Some(word) = first_word(p)
+    {
+        return truncate_tab_title(word);
     }
     let Some(c) = cwd else {
         return format!("pane {}", pane_id.0);
@@ -195,17 +210,38 @@ mod tests {
     }
 
     #[test]
-    fn tab_title_running_program_overrides_cwd_and_osc() {
+    fn tab_title_osc_title_beats_running_program() {
+        // An app-set OSC title wins over the foreground program name.
+        // This is the Claude Code case: `claude` is the running program,
+        // but it sets a descriptive OSC title that should surface — the
+        // way every standard terminal behaves.
         let cwd = PathBuf::from("/Users/tim/git/enthal/termica");
         let home = PathBuf::from("/Users/tim");
-        // While `less ~/big.log` is running, the tab reads `less`.
         assert_eq!(
             tab_title_for_with_osc(
                 PaneId(0),
-                Some("shell-set-title"),
+                Some("Introduce Claude"),
                 Some(&cwd),
                 Some(&home),
-                Some("less ~/big.log"),
+                Some("claude"),
+            ),
+            "Introduce Claude"
+        );
+    }
+
+    #[test]
+    fn tab_title_running_program_is_fallback_when_no_osc() {
+        let cwd = PathBuf::from("/Users/tim/git/enthal/termica");
+        let home = PathBuf::from("/Users/tim");
+        // No OSC title (bare shell): the foreground command names the
+        // tab. `less ~/big.log` ⇒ `less`.
+        assert_eq!(
+            tab_title_for_with_osc(
+                PaneId(0),
+                None,
+                Some(&cwd),
+                Some(&home),
+                Some("less ~/big.log")
             ),
             "less"
         );
@@ -220,7 +256,12 @@ mod tests {
             ),
             "vim"
         );
-        // Empty / whitespace running program falls through.
+        // Blank OSC title also falls through to the program name.
+        assert_eq!(
+            tab_title_for_with_osc(PaneId(0), Some("  "), Some(&cwd), Some(&home), Some("htop")),
+            "htop"
+        );
+        // Empty / whitespace running program AND no OSC ⇒ cwd.
         assert_eq!(
             tab_title_for_with_osc(PaneId(0), None, Some(&cwd), Some(&home), Some("")),
             "~/git/enthal/termica"
