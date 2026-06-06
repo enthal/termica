@@ -69,6 +69,45 @@ pub const CURSOR_UNFOCUSED_COLOR: Color32 =
 /// swallow dark text.
 pub const SELECTION_COLOR: Color32 = Color32::from_rgba_premultiplied(0x3a, 0x60, 0xa0, 0x80);
 
+/// Find-overlay highlight for a non-current match (Phase 8). Warm,
+/// translucent amber painted *over* the glyphs (highlighter-pen style)
+/// so the underlying text still reads through. Premultiplied so the
+/// alpha is baked into the channels.
+pub const FIND_MATCH_COLOR: Color32 = Color32::from_rgba_premultiplied(0x6e, 0x57, 0x12, 0xb0);
+
+/// Find-overlay highlight for the **current** match — brighter and
+/// more opaque so the one match `Prev`/`Next` and scroll-to track
+/// stands out from the rest.
+pub const FIND_CURRENT_MATCH_COLOR: Color32 =
+    Color32::from_rgba_premultiplied(0xd0, 0xa0, 0x18, 0xe0);
+
+/// Paint find-match highlight rectangles over a block of monospaced
+/// text. `origin` is the top-left of row 0, column 0 (the painted
+/// rect's `min` of the command label or snapshot). Each entry is
+/// `(row, col_start, col_end, is_current)` in char/cell coordinates;
+/// the current match gets [`FIND_CURRENT_MATCH_COLOR`], the rest
+/// [`FIND_MATCH_COLOR`]. Painted over the glyphs, so the translucent
+/// fill reads as a highlighter pass rather than a block-out.
+pub fn paint_match_highlights(
+    painter: &egui::Painter,
+    origin: Pos2,
+    cell_w: f32,
+    row_h: f32,
+    ranges: &[(usize, usize, usize, bool)],
+) {
+    for &(row, col_start, col_end, is_current) in ranges {
+        if col_end <= col_start {
+            continue;
+        }
+        let x0 = origin.x + col_start as f32 * cell_w;
+        let x1 = origin.x + col_end as f32 * cell_w;
+        let y0 = origin.y + row as f32 * row_h;
+        let rect = Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y0 + row_h));
+        let color = if is_current { FIND_CURRENT_MATCH_COLOR } else { FIND_MATCH_COLOR };
+        painter.rect_filled(rect, 0.0, color);
+    }
+}
+
 /// Color of the underline drawn beneath a Cmd/Ctrl-hovered URL.
 /// Same colour family as the selection overlay so the two feel like
 /// siblings in the UI, but fully opaque so a thin underline is

@@ -191,6 +191,17 @@ pub(crate) struct BlockExtent {
     pub sticky_h: f32,
 }
 
+/// Phase 8 — find-match highlight rectangles for one sealed block,
+/// split by which painted widget they sit on. Each tuple is
+/// `(row, col_start, col_end, is_current)` in char/cell coordinates;
+/// `render::paint_match_highlights` turns them into rects relative to
+/// the command-label / snapshot origin.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct FindBlockHighlights {
+    pub command: Vec<(usize, usize, usize, bool)>,
+    pub output: Vec<(usize, usize, usize, bool)>,
+}
+
 /// Decide which block's header pins to the viewport top (spec/04
 /// §"Layout: fixed-footer prompt, sticky-top header", rule 3) and the
 /// screen-y at which to paint it. Pure math, no egui — the spec-
@@ -1075,6 +1086,42 @@ pub fn render_pane(
     }
     let force_to_bottom = one_shot_bottom || multi_frame_bottom;
     let force_to_top = std::mem::take(&mut slot.ui.scroll_to_top_pending);
+
+    // ---- Phase 8 in-pane find: recompute + highlight map ----------
+    //
+    // The find overlay searches THIS pane's sealed blocks. Recompute
+    // the match list against the current query / toggles each frame
+    // (the overlay clears its matches on an empty query, so this is a
+    // no-op while the field is blank), then build an owned per-block
+    // highlight map + a clone of the selected match BEFORE the scroll
+    // closure borrows `slot` mutably — the closure paints from these.
+    // Disabled in alt-screen mode (no transcript blocks are painted).
+    let do_find_scroll = std::mem::take(&mut slot.ui.find_scroll_pending);
+    let mut find_hl_by_block: std::collections::HashMap<
+        crate::block::BlockId,
+        FindBlockHighlights,
+    > = std::collections::HashMap::new();
+    let mut find_selected_match: Option<crate::find::SearchMatch> = None;
+    if slot.ui.find_overlay.is_some() && !in_alt_screen {
+        let lines = crate::find::collect_searchable_lines(slot.session.blocks());
+        if let Some(fo) = slot.ui.find_overlay.as_mut() {
+            fo.recompute(&lines);
+            find_selected_match = fo.selected_match().cloned();
+            for (i, m) in fo.matches.iter().enumerate() {
+                let entry = find_hl_by_block.entry(m.block_id).or_default();
+                let tuple = (m.row, m.col_start, m.col_end, i == fo.selected);
+                match m.kind {
+                    crate::find::LineKind::Command => entry.command.push(tuple),
+                    crate::find::LineKind::Output => entry.output.push(tuple),
+                }
+            }
+        }
+        // Keep matches / highlights converging while the field has focus.
+        ctx.request_repaint();
+    }
+    // A pending scroll-to-match must win over `stick_to_bottom`, which
+    // would otherwise re-pin the user to the live tail every frame.
+    let find_scrolling = do_find_scroll && find_selected_match.is_some();
     // `stick_to_bottom` re-snaps the offset to max every frame the
     // user is at the bottom — which fights any top-snap attempt
     // and silently swallows a Cmd+Option+Up jump while the user is
@@ -1093,7 +1140,7 @@ pub fn render_pane(
     //  `force_to_bottom` comment below.
     let scroll_area = egui::ScrollArea::vertical()
         .id_salt(("pane-blocks", slot.session.pane_id()))
-        .stick_to_bottom(!force_to_top)
+        .stick_to_bottom(!force_to_top && !find_scrolling)
         .auto_shrink([false, false])
         .max_height(scroll_max_h);
     // `force_to_top` uses a direct offset override (0.0) because
@@ -1259,6 +1306,52 @@ pub fn render_pane(
                         // (Phase 4D); the editor itself paints
                         // there too. Nothing to draw here.
                     }
+                }
+            }
+
+            // ---- Phase 8 find highlights + scroll-to-match --------
+            //
+            // Paint translucent amber over every match in this pane's
+            // sealed blocks (current match brighter), then bring the
+            // current match into view. Both run here, after the block
+            // loop, because they need the per-block painted rects
+            // (`sealed_block_renders`) which only exist post-paint.
+            if !find_hl_by_block.is_empty() {
+                for (id, sr) in &sealed_block_renders {
+                    let Some(hl) = find_hl_by_block.get(id) else { continue };
+                    if let Some(cmd) = &sr.command {
+                        render::paint_match_highlights(
+                            ui.painter(),
+                            cmd.rect.min,
+                            cell_w,
+                            row_h,
+                            &hl.command,
+                        );
+                    }
+                    render::paint_match_highlights(
+                        ui.painter(),
+                        sr.snapshot.rect.min,
+                        cell_w,
+                        row_h,
+                        &hl.output,
+                    );
+                }
+            }
+            if find_scrolling
+                && let Some(m) = &find_selected_match
+                && let Some((_, sr)) = sealed_block_renders.iter().find(|(id, _)| *id == m.block_id)
+            {
+                let origin = match m.kind {
+                    crate::find::LineKind::Command => sr.command.as_ref().map(|r| r.rect.min),
+                    crate::find::LineKind::Output => Some(sr.snapshot.rect.min),
+                };
+                if let Some(o) = origin {
+                    let y = o.y + m.row as f32 * row_h;
+                    let rect = egui::Rect::from_min_max(
+                        egui::pos2(o.x + m.col_start as f32 * cell_w, y),
+                        egui::pos2(o.x + m.col_end as f32 * cell_w, y + row_h),
+                    );
+                    ui.scroll_to_rect(rect, Some(egui::Align::Center));
                 }
             }
         } // end of `if !in_alt_screen { ... }`
@@ -2506,6 +2599,12 @@ pub fn render_pane(
             if slot.ui.history_overlay.is_some() {
                 continue;
             }
+            // Same modality for the Phase 8 find overlay: while it's
+            // open its `TextEdit` + `ctx.input` navigation checks own
+            // the keyboard; skip the editor / PTY paths so nothing leaks.
+            if slot.ui.find_overlay.is_some() {
+                continue;
+            }
             // ---- Tab completion popup interception -----------------
             //
             // If the completion popup is open, navigation keys
@@ -2772,6 +2871,22 @@ pub fn render_pane(
                     overlay.rerank(cwd.as_deref());
                 }
             }
+        }
+    }
+
+    // Phase 8: paint the find overlay on top of everything, and apply
+    // its outcome. Like the Ctrl+R overlay, the event loop above
+    // blocked the editor / PTY paths while it's open. A selection /
+    // query change schedules a scroll-to-match for the next frame
+    // (the match rects only exist after the scroll area lays out).
+    if slot.ui.find_overlay.is_some() {
+        let pane_rect = ui.max_rect();
+        let outcome = crate::find::paint(ui, slot, pane_rect);
+        if outcome.close {
+            slot.ui.find_overlay = None;
+            slot.ui.needs_focus = true;
+        } else if outcome.scroll_to_selected {
+            slot.ui.find_scroll_pending = true;
         }
     }
 

@@ -34,6 +34,7 @@ pub mod block_selection;
 pub mod completion;
 pub mod echo_suppress;
 pub mod events;
+pub mod find;
 pub mod focused_chrome;
 pub mod gh_probe;
 pub mod git_context;

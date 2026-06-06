@@ -1526,3 +1526,106 @@ fn snapshot_watermark_centered_in_narrow_pane() {
         });
     harness.snapshot("watermark_narrow_pane");
 }
+
+// ---- Phase 8: in-pane find overlay + match highlights --------------------
+
+/// Build a synthetic [`termica::find::FindOverlay`] with a fixed query,
+/// toggles, and a given number of matches so the count chip ("N of M")
+/// renders deterministically without a real block stack.
+fn find_overlay(
+    query: &str,
+    n_matches: usize,
+    selected: usize,
+    case_sensitive: bool,
+    regex: bool,
+    filter: termica::find::SearchFilter,
+) -> termica::find::FindOverlay {
+    use termica::block::BlockId;
+    use termica::find::{FindOverlay, LineKind, SearchMatch};
+    let mut o = FindOverlay::open(vec![]);
+    o.query = query.to_string();
+    o.case_sensitive = case_sensitive;
+    o.regex = regex;
+    o.filter = filter;
+    o.selected = selected;
+    o.matches = (0..n_matches)
+        .map(|i| SearchMatch {
+            block_id: BlockId(0),
+            kind: LineKind::Output,
+            row: i,
+            col_start: 0,
+            col_end: query.chars().count(),
+        })
+        .collect();
+    o
+}
+
+#[test]
+fn snapshot_find_overlay_with_matches() {
+    let mut overlay = find_overlay("error", 14, 2, false, false, termica::find::SearchFilter::Both);
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(900.0, 200.0)).build_ui(move |ui| {
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 200.0));
+            let _ = termica::find::paint_overlay(ui, &mut overlay, 1, rect);
+        });
+    harness.snapshot("find_overlay_with_matches");
+}
+
+#[test]
+fn snapshot_find_overlay_commands_filter_case_sensitive() {
+    // `Commands` filter + `Aa` (match case) both engaged so the toggle
+    // chips show their active state.
+    let mut overlay =
+        find_overlay("Cargo", 3, 0, true, false, termica::find::SearchFilter::CommandOnly);
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(900.0, 200.0)).build_ui(move |ui| {
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 200.0));
+            let _ = termica::find::paint_overlay(ui, &mut overlay, 1, rect);
+        });
+    harness.snapshot("find_overlay_commands_filter_case_sensitive");
+}
+
+#[test]
+fn snapshot_find_overlay_regex_error() {
+    let mut overlay =
+        find_overlay("(unclosed", 0, 0, false, true, termica::find::SearchFilter::Both);
+    overlay.regex_error = true;
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(900.0, 200.0)).build_ui(move |ui| {
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 200.0));
+            let _ = termica::find::paint_overlay(ui, &mut overlay, 1, rect);
+        });
+    harness.snapshot("find_overlay_regex_error");
+}
+
+#[test]
+fn snapshot_find_overlay_history_dropdown() {
+    let mut overlay = find_overlay("err", 5, 0, false, false, termica::find::SearchFilter::Both);
+    overlay.history = vec!["error".to_string(), "cargo test".to_string(), "TODO".to_string()];
+    overlay.dropdown_open = true;
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(900.0, 360.0)).build_ui(move |ui| {
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 360.0));
+            let _ = termica::find::paint_overlay(ui, &mut overlay, 1, rect);
+        });
+    harness.snapshot("find_overlay_history_dropdown");
+}
+
+#[test]
+fn snapshot_find_match_highlights_over_snapshot() {
+    // Paint a sealed snapshot, then lay find highlights over it: two
+    // plain matches + one "current" match (brighter), to lock in the
+    // highlighter-over-glyphs look.
+    let lines = sealed_snapshot(4, 40, b"error: build failed\r\nwarning: error here\r\nall good");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 180.0)).build_ui(move |ui| {
+            let resp = render::paint_styled_lines(ui, &lines, None);
+            let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
+            let (cell_w, row_h) =
+                ui.fonts_mut(|f| (f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
+            // "error" at row0 col0 (current), row1 col9, and "all" row2.
+            let ranges = [(0usize, 0usize, 5usize, true), (1, 9, 14, false), (2, 0, 3, false)];
+            render::paint_match_highlights(ui.painter(), resp.rect.min, cell_w, row_h, &ranges);
+        });
+    harness.snapshot("find_match_highlights");
+}

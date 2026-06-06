@@ -284,25 +284,43 @@ pub struct SearchResult {
 
 ### Default + scope-switcher UX
 
-- `Cmd/Ctrl+F` opens the overlay with `scope = CurrentTab`. This is
-  what users expect from "find in this terminal" — every block they
-  can see by switching splits / tabs-within-the-current-tab is in
-  range, but unrelated tabs aren't.
-- The overlay has a scope chip (e.g. `[Tab]`) the user can click to
-  cycle through `SelectedBlocks` → `LastBlock` → `CurrentTab` →
-  `AllTabsInWindow` → `AllWindows`. `Global` is hidden until the
-  global index ships.
-- Modes (`Literal` / `CaseInsensitive` / `Regex` / `Fuzzy`) and
-  filters (`Both` / `CommandOnly` / `OutputOnly`) are independent
-  toggles in the overlay.
+- `Cmd/Ctrl+F` opens the overlay. The eventual default is
+  `scope = CurrentTab` — every block the user can reach by switching
+  splits / tabs-within-the-current-tab — but **Phase 8 shipped a
+  focused-pane scope only** (see "v1 scopes" below); the cross-pane
+  scope chip is deferred.
+- The overlay will gain a scope chip (e.g. `[Tab]`) to cycle through
+  `SelectedBlocks` → `LastBlock` → `CurrentTab` → `AllTabsInWindow` →
+  `AllWindows`. `Global` is hidden until the global index ships.
+- `Aa` (match case) and `.*` (regex) are independent toggles; together
+  they cover the `Literal` / `CaseInsensitive` / `Regex` modes (regex
+  itself honours the `Aa` toggle). The `Both` / `CommandOnly` /
+  `OutputOnly` filter is a single chip cycling **All → Commands →
+  Outputs**.
+- **Find-query history (Phase 8, Termica addition).** While the query
+  field has the caret, `↑` / `↓` walk previously-submitted searches; a
+  `▾` button opens a dropdown of recent queries to click. The list is
+  per-pane and in-memory for the session (a future PR can promote it to
+  app-wide / SQLite-persisted alongside command history).
 
-Search engine: literal + case-insensitive in v1 (Phase 8). Regex via
-`regex`; fuzzy via `nucleo`. Tantivy for global persisted output
-search is post-MVP.
+Search engine: literal + case-insensitive + regex all ship in v1
+(Phase 8) — regex via the `regex` crate, literal / case-insensitive via
+an in-house char-column scanner (so highlight columns line up with the
+cell grid). Fuzzy via `nucleo` and Tantivy for global persisted output
+search remain post-MVP.
 
 ### v1 scopes (shipping)
 
-- `SelectedBlocks` / `LastBlock` / `CurrentTab` — **Phase 8 deliverable.**
+- **`FocusedPane`** — Phase 8 shipped search over the focused pane's
+  **sealed** blocks (command lines + frozen output snapshots). The live
+  `Prompt` / `Running` tail is excluded (its output isn't frozen yet).
+- `LastBlock` / `CurrentTab` / `SelectedBlocks` — **deferred.**
+  `CurrentTab` needs the cross-pane match-navigation UX design pass;
+  `SelectedBlocks` additionally needs block-object selection
+  ([#120](https://github.com/enthal/termica/issues/120)). The
+  `SearchScope` enum above is the forward design; the focused-pane v1
+  implements an implicit scope and grows the chip later without a
+  rethink.
 - `CommandHistoryOnly` is *not* a scope of `find`; that's the
   `Ctrl+R` popup, which is its own UI and ships in Phase 6.
 
@@ -315,21 +333,27 @@ search is post-MVP.
 - `Global` — across all persisted sessions, including ones that
   aren't currently open. Tantivy-indexed.
 
-Search engine: literal + case-insensitive in v1 (Phase 8). Regex via `regex`; fuzzy via `nucleo`. Tantivy for global persisted output search is post-MVP.
-
 ## Result navigation
 
-In-pane search opens a small overlay at the top of the pane:
+In-pane search opens a small overlay bar at the top of the pane:
 
 ```
 ┌─ find ─────────────────────────────────────────────────────────────┐
-│ "error" · 3 of 14 · [Aa] [.*] [⇡] [⇣] [Esc]                        │
+│ find [ error        ▾] 3 of 14  Aa  .*  All  Prev  Next  Done       │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-- ⇡ / ⇣ jump to previous / next match, scrolling the transcript.
-- Match highlights paint as overlays in the cell renderer.
-- Esc dismisses.
+- **Prev / Next** (or **Enter** / **Shift+Enter**) jump to the
+  previous / next match, scrolling the transcript so the current match
+  is centered. The count (`3 of 14`) updates live.
+- Match highlights paint as overlays in the cell renderer: all matches
+  in translucent amber, the current match brighter.
+- `Aa` toggles match-case; `.*` toggles regex (a bad pattern shows
+  `(bad regex)` instead of a count). The filter chip cycles
+  **All → Commands → Outputs**.
+- `↑` / `↓` walk the find-query history; `▾` opens the recent-query
+  dropdown.
+- **Esc** or **Done** dismisses.
 
 ## What's deliberately not in v1
 

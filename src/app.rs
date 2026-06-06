@@ -366,6 +366,23 @@ impl TermicaApp {
                     slot.ui.scroll_to_bottom_pending = true;
                 }
             }
+            PaneAction::OpenFind => {
+                // Cmd+F / Ctrl+Shift+F: open the in-pane find overlay
+                // (Phase 8). Skip it in alt-screen mode — a full-screen
+                // program (vim/less/htop) owns the viewport and there's
+                // no scrollback transcript to search. Reopening carries
+                // this pane's prior query history forward, and closes
+                // the Ctrl+R overlay so the two never fight for focus.
+                if let Some(slot) = self.panes.get_mut(&pane_id)
+                    && !slot.session.terminal().is_alternate_screen()
+                {
+                    slot.ui.history_overlay = None;
+                    let history =
+                        slot.ui.find_overlay.take().map(|o| o.history).unwrap_or_default();
+                    slot.ui.find_overlay = Some(crate::find::FindOverlay::open(history));
+                    slot.ui.needs_focus = true;
+                }
+            }
         }
     }
 
