@@ -34,7 +34,7 @@ jobs:
             formats: dmg
           - os: ubuntu-22.04
             label: linux-x64
-            formats: deb appimage
+            formats: deb,appimage # comma-separated: space-separated reads the 2nd as a subcommand
     steps:
       - uses: actions/checkout@v4
 
