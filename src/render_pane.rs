@@ -377,7 +377,10 @@ pub fn paint_sticky_header(
             // Sticky pins a running / sealed block — no PR chip (it's a
             // live-prompt-only affordance). `faded` matches the pinned
             // block (sealed → muted, running → vivid).
-            let _ = render::paint_block_header(ui, cwd, home, exit, duration, git, None, faded);
+            let _ = render::paint_block_header(
+                ui,
+                render::BlockHeader { cwd, home, exit, duration, git, faded, ..Default::default() },
+            );
             let capped = cap_command_for_sticky(command, STICKY_MAX_CMD_LINES);
             // Interactive (not hover-only) so the foreground overlay
             // captures the press instead of leaking it to the output
@@ -1366,11 +1369,14 @@ pub fn render_pane(
                             command,
                             snapshot,
                             sel_for_this,
-                            header.cwd.as_deref(),
-                            home,
-                            *exit,
-                            *duration,
-                            header.git.as_ref(),
+                            render::BlockHeader {
+                                cwd: header.cwd.as_deref(),
+                                home,
+                                exit: *exit,
+                                duration: Some(*duration),
+                                git: header.git.as_ref(),
+                                ..Default::default()
+                            },
                         );
                         let cmd_h =
                             sealed_render.command.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
@@ -1412,13 +1418,13 @@ pub fn render_pane(
                         // not the pane's live git — 4G-async-context.
                         let hdr = render::paint_block_header(
                             ui,
-                            header.cwd.as_deref(),
-                            home,
-                            None,
-                            running_elapsed,
-                            header.git.as_ref(),
-                            None,
-                            false,
+                            render::BlockHeader {
+                                cwd: header.cwd.as_deref(),
+                                home,
+                                duration: running_elapsed,
+                                git: header.git.as_ref(),
+                                ..Default::default()
+                            },
                         );
                         let chip_h = hdr.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
                         let cmd_resp =
@@ -1832,13 +1838,13 @@ pub fn render_pane(
             // faded).
             let _ = render::paint_block_header(
                 ui,
-                header.cwd.as_deref(),
-                home,
-                None,
-                None,
-                git_ctx.as_ref(),
-                pr_ctx.as_ref(),
-                false,
+                render::BlockHeader {
+                    cwd: header.cwd.as_deref(),
+                    home,
+                    git: git_ctx.as_ref(),
+                    pr: pr_ctx.as_ref(),
+                    ..Default::default()
+                },
             );
         }
 
