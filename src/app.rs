@@ -110,6 +110,15 @@ pub struct TermicaApp {
     /// menubar (and, in the future, any other surface that wants
     /// to open it). Closed by Esc / backdrop / OK button.
     about_open: bool,
+    /// One-shot guard for pinning the *native window* appearance to
+    /// dark. egui's `set_theme(Dark)` only colors the egui content; the
+    /// OS window chrome (the macOS title bar) follows the system theme
+    /// until we tell winit otherwise. We send the `SetTheme(Dark)`
+    /// viewport command once on the first `update` (when the window
+    /// definitely exists), then latch this so we don't re-send it every
+    /// frame. Dark-only is the product — see the `set_theme` call in
+    /// [`crate::run`].
+    native_dark_theme_applied: bool,
     /// Diagnostic event sink shared across all panes in this
     /// process. `Some` when `TERMICA_DUMP_EVENTS=<path>` was set at
     /// startup; passed to each [`PaneSession`] on spawn. `None`
@@ -195,6 +204,7 @@ impl TermicaApp {
             prev_active_panes: HashSet::new(),
             focus_history: Vec::new(),
             quit_requested: false,
+            native_dark_theme_applied: false,
             pending_close_confirm: None,
             quit_confirm_started_at: None,
             should_quit: false,
@@ -474,6 +484,18 @@ impl Default for TermicaApp {
 
 impl eframe::App for TermicaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Pin the *native* window chrome to dark, once. `set_theme(Dark)`
+        // in `run()` only themes the egui content — the macOS title bar
+        // (and Windows/Linux client-side decorations) follow the system
+        // theme until winit is told otherwise, which is why a light-mode
+        // Mac shows a white title bar above our black grid. This maps to
+        // winit's `Window::set_theme(Dark)` (→ dark `NSAppearance`).
+        // Latched so it isn't re-sent every frame.
+        if !self.native_dark_theme_applied {
+            ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
+            self.native_dark_theme_applied = true;
+        }
+
         // Drain every pane up front so this frame decides the next
         // repaint cadence from actual activity. Drained panes also
         // reset their `slot.ui.focused` mirror.
@@ -923,7 +945,7 @@ impl eframe::App for TermicaApp {
                 let osc = slot.session.terminal().osc_title();
                 let cwd = slot.session.terminal().cwd();
                 let running = crate::behavior::running_command_for(Some(slot));
-                Some(crate::tab_title::tab_title_for_with_osc(
+                Some(crate::tab_title::window_title_for_with_osc(
                     id,
                     osc.as_deref(),
                     cwd,

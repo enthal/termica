@@ -224,10 +224,15 @@ pub fn color_for_token_kind(kind: crate::shell_syntax::TokenKind) -> Color32 {
 /// in a long transcript. Theme polish lands in Phase 10.
 pub const BLOCK_HEADER_EXIT_FAIL_FG: Color32 = Color32::from_rgb(0xe0, 0x70, 0x70);
 
+/// Foreground for the git branch chip (4G-async-context). A soft green —
+/// the branch is the headline of the git chips, so it reads as "you're
+/// here" without the alarm of the red exit / dirty colors. ahead/behind
+/// stays the dim [`BLOCK_HEADER_FG`].
+pub const BLOCK_HEADER_BRANCH_FG: Color32 = Color32::from_rgb(0x86, 0xc8, 0x88);
+
 /// Foreground for the dirty-working-tree chip (4G-async-context). Amber:
 /// not an error (a dirty tree is normal mid-work), but warmer than the
-/// dim grey of the cwd / branch chips so uncommitted changes catch the
-/// eye. Branch + ahead/behind chips stay [`BLOCK_HEADER_FG`].
+/// dim grey of the cwd chip so uncommitted changes catch the eye.
 pub const BLOCK_HEADER_DIRTY_FG: Color32 = Color32::from_rgb(0xe0, 0xb8, 0x6e);
 
 /// Foregrounds for the `PR #NN` chip (4G-async-context), colored by the
@@ -272,6 +277,60 @@ pub struct TerminalRender {
 /// `selection`, if `Some`, is painted as a semi-transparent overlay
 /// over the cells covered by the selection range. The hit-testing /
 /// drag tracking lives in the caller — this function only renders.
+/// Number of screen rows to paint below the scrollback history in the
+/// `include_history` (running-command, non-alt-screen) path.
+///
+/// The path paints all of scrollback plus the live screen, but must
+/// NOT paint the blank rows below the visible content — that draws a
+/// panel-sized `DEFAULT_BG` void in a tall pane (the bug the original
+/// `cursor_row + 1` clamp fixed). The subtlety: streaming output
+/// (`cat`, `make`) parks the cursor on the last *written* row, so the
+/// cursor IS the content bottom — but a primary-screen TUI like Claude
+/// Code parks its cursor *inside* an input box and draws its footer
+/// (input border, status line) on rows BELOW the cursor. Clamping to
+/// the cursor alone eats those rows ("the bottom couple of lines are
+/// always missing"). So the content bottom is the lower-most of the
+/// cursor row and the last row that actually has content; we paint
+/// through it, then clamp to the real screen height.
+fn painted_screen_rows(
+    cursor_row: usize,
+    last_content_row: Option<usize>,
+    screen_lines: usize,
+) -> usize {
+    let bottom = cursor_row.max(last_content_row.unwrap_or(0));
+    (bottom + 1).min(screen_lines)
+}
+
+/// Viewport row index (0-based) of the last screen row that paints
+/// anything — a non-space glyph or a non-default background — or
+/// `None` when the whole screen is blank. Uses the same
+/// content-vs-blank test as the per-cell paint loop ([`cell_colors`])
+/// so the painted region and this extent never disagree. Scans
+/// bottom-up and returns on the first hit, so the common case
+/// (content near the bottom) is cheap; cost is bounded by the
+/// viewport, never the scrollback depth.
+fn last_nonempty_screen_row(grid: &Grid<Cell>) -> Option<usize> {
+    let screen_lines = grid.screen_lines();
+    let cols = grid.columns();
+    for row in (0..screen_lines).rev() {
+        for col in 0..cols {
+            if cell_has_content(&grid[Line(row as i32)][Column(col)]) {
+                return Some(row);
+            }
+        }
+    }
+    None
+}
+
+/// Whether a cell paints anything: a solid background, or a visible
+/// non-space glyph. Mirrors what the per-cell paint loop actually
+/// draws (see [`cell_colors`]) so [`last_nonempty_screen_row`] never
+/// disagrees with the painter about where content ends.
+fn cell_has_content(cell: &Cell) -> bool {
+    let (_, bg, paint_glyph) = cell_colors(cell);
+    bg.is_some() || (paint_glyph && cell.c != ' ')
+}
+
 pub fn paint_terminal(
     ui: &mut egui::Ui,
     term: &TerminalState,
@@ -299,15 +358,16 @@ pub fn paint_terminal(
     // would draw `screen_lines - cursor_row - 1` rows of pure
     // `DEFAULT_BG` below the visible output: the panel-sized black
     // void users reported the moment a long-running command kicked
-    // off in a tall pane. Clamp to `history_size + cursor_row + 1`
-    // so the painted area tracks the actual content height; when
-    // output overflows the screen the cursor sits at the last
-    // row and this collapses back to `history_size + screen_lines`
-    // (the pre-clamp behaviour). Alt-screen / no-history paths
-    // keep painting the full screen (a TUI owns its viewport).
+    // off in a tall pane. We clamp the painted area to the actual
+    // content height (see [`painted_screen_rows`]); when output
+    // overflows the screen this collapses back to
+    // `history_size + screen_lines` (the pre-clamp behaviour).
+    // Alt-screen / no-history paths keep painting the full screen
+    // (a TUI owns its viewport).
     let rows = if include_history {
         let cursor_row = grid.cursor.point.line.0.max(0) as usize;
-        history_size + (cursor_row + 1).min(screen_lines)
+        let last_content_row = last_nonempty_screen_row(grid);
+        history_size + painted_screen_rows(cursor_row, last_content_row, screen_lines)
     } else {
         screen_lines
     };
@@ -908,6 +968,19 @@ pub fn format_duration(d: std::time::Duration) -> String {
 /// When `cwd` is `None`, there's no non-zero `exit`, *and* no
 /// `duration`, nothing is painted at all — the header row is skipped
 /// entirely (no allocated rect, so egui inserts no `item_spacing` gap).
+/// Mute a chip's text color toward the dim header grey for sealed
+/// (historical) blocks: blend most of the way to [`BLOCK_HEADER_FG`] so
+/// the chip reads as desaturated / past-tense but keeps a hint of its
+/// original hue (a faded green branch is still recognizably green).
+fn fade_chip_color(c: Color32) -> Color32 {
+    // 0.0 = original, 1.0 = fully grey. Tuned for "nearer grey, still
+    // slightly tinted."
+    const T: f32 = 0.62;
+    let g = BLOCK_HEADER_FG;
+    let lerp = |a: u8, b: u8| (a as f32 * (1.0 - T) + b as f32 * T).round() as u8;
+    Color32::from_rgb(lerp(c.r(), g.r()), lerp(c.g(), g.g()), lerp(c.b(), g.b()))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn paint_block_header(
     ui: &mut egui::Ui,
@@ -917,6 +990,7 @@ pub fn paint_block_header(
     duration: Option<std::time::Duration>,
     git: Option<&crate::git_context::GitContext>,
     pr: Option<&crate::pr_context::PrContext>,
+    faded: bool,
 ) -> Option<Response> {
     let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
     let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
@@ -961,7 +1035,7 @@ pub fn paint_block_header(
         chips.push((&cwd_text, chip_w(&cwd_text), BLOCK_HEADER_FG));
     }
     if !branch_text.is_empty() {
-        chips.push((&branch_text, chip_w(&branch_text), BLOCK_HEADER_FG));
+        chips.push((&branch_text, chip_w(&branch_text), BLOCK_HEADER_BRANCH_FG));
     }
     if !sync_text.is_empty() {
         chips.push((&sync_text, chip_w(&sync_text), BLOCK_HEADER_FG));
@@ -977,6 +1051,20 @@ pub fn paint_block_header(
     }
     if !dur_text.is_empty() {
         chips.push((&dur_text, chip_w(&dur_text), BLOCK_HEADER_FG));
+    }
+
+    // Sealed (historical) blocks render their chips muted — desaturated
+    // toward grey but still slightly tinted — so finished blocks read as
+    // past-tense while the live prompt / running chips stay vivid. The
+    // failed-`exit` chip is the deliberate exception: a non-zero exit
+    // stays vivid red even on a sealed block, so failures don't fade
+    // into scroll-back.
+    if faded {
+        for chip in &mut chips {
+            if chip.2 != BLOCK_HEADER_EXIT_FAIL_FG {
+                chip.2 = fade_chip_color(chip.2);
+            }
+        }
     }
 
     if chips.is_empty() {
@@ -1202,7 +1290,8 @@ pub fn paint_sealed_block(
     // under, frozen as history. NOT the pane's current git, which would
     // be anachronistic on scroll-back. No PR chip: a finished command's
     // CI status is meaningless (you want current), so PR is prompt-only.
-    let header = paint_block_header(ui, cwd, home, exit, Some(duration), git, None);
+    // `faded = true`: sealed chips render muted (past-tense).
+    let header = paint_block_header(ui, cwd, home, exit, Some(duration), git, None, true);
     let header_height = header.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
 
     let cmd_lines = if command.is_empty() { 0 } else { command.split('\n').count() };
@@ -1547,6 +1636,61 @@ mod tests {
     //! by snapshot tests in `tests/snapshots.rs`.
 
     use super::*;
+
+    // ---- painted_screen_rows (running-command paint extent) ---------
+
+    #[test]
+    fn painted_rows_streaming_stops_at_cursor_no_void() {
+        // Streaming output (`cat`, `make`) parks the cursor on the last
+        // written row, which is also the last content row. We paint
+        // through it and NOT the blank rows below (the black-void bug).
+        assert_eq!(painted_screen_rows(4, Some(4), 50), 5);
+    }
+
+    #[test]
+    fn painted_rows_includes_content_below_cursor() {
+        // A primary-screen TUI (Claude Code) parks the cursor inside its
+        // input box (row 10) and draws its footer — input border, status
+        // line — on rows below it (last content row 13). The cursor-only
+        // clamp would yield 11, eating rows 11..=13 ("the bottom couple
+        // of lines are always missing"). We must paint through 13.
+        assert_eq!(painted_screen_rows(10, Some(13), 50), 14);
+    }
+
+    #[test]
+    fn painted_rows_clamp_to_screen_height() {
+        // Content fills the whole screen: collapses to screen_lines.
+        assert_eq!(painted_screen_rows(49, Some(49), 50), 50);
+        // Never exceeds the screen even if both inputs are at the edge.
+        assert_eq!(painted_screen_rows(49, Some(49), 50), 50);
+    }
+
+    #[test]
+    fn painted_rows_empty_screen_paints_one_row() {
+        assert_eq!(painted_screen_rows(0, None, 50), 1);
+    }
+
+    // ---- last_nonempty_screen_row (content extent from a real grid) --
+
+    #[test]
+    fn last_nonempty_row_tracks_content_below_cursor() {
+        // Print three lines, then move the cursor back to the top
+        // (CUP / ESC[H) — exactly what a TUI does to repaint or to park
+        // the caret in an input field above its own footer. The cursor
+        // is now on row 0, but content lives down through row 2; the
+        // content extent must follow the content, not the cursor.
+        let mut term = crate::terminal::TerminalState::new(10, 20);
+        term.feed(b"line0\r\nline1\r\nline2\x1b[H");
+        let cursor_row = term.grid().cursor.point.line.0.max(0) as usize;
+        assert_eq!(cursor_row, 0, "cursor parked back at top");
+        assert_eq!(last_nonempty_screen_row(term.grid()), Some(2));
+    }
+
+    #[test]
+    fn last_nonempty_row_blank_screen_is_none() {
+        let term = crate::terminal::TerminalState::new(10, 20);
+        assert_eq!(last_nonempty_screen_row(term.grid()), None);
+    }
 
     /// 2×2×2 truth table for the caret-visibility rule. Spec/04
     /// says the caret is shown iff `mode_is_editor && pane_has_focus

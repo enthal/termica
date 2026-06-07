@@ -80,6 +80,16 @@ pub struct PaneUiState {
     /// only issue a resize when the cell grid actually changes,
     /// not every frame.
     pub(crate) last_size: Option<(u16, u16)>,
+    /// Debounce state for PTY resizes: the `(rows, cols)` target the
+    /// pane is currently settling toward, plus the egui-time at which
+    /// that target was first seen. An interactive window drag changes
+    /// the computed size every frame; pushing a SIGWINCH on each one
+    /// storms the child (a TUI like Claude Code repaints per SIGWINCH,
+    /// and the interleaved partial repaints pile orphaned frames into
+    /// scrollback). We only commit the resize once the target has held
+    /// steady for a short debounce. `None` when the size is settled.
+    /// See [`crate::render_pane::plan_resize`].
+    pub(crate) pending_size: Option<((u16, u16), f64)>,
     /// Did this pane hold keyboard focus on the most-recently
     /// completed frame? Written by `render_pane` right after the
     /// terminal grid is painted; read by `TermicaApp::update`

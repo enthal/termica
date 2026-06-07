@@ -47,7 +47,7 @@ Responsibilities:
 - Spawn a shell with the right rcfile / init args so our shell integration loads (see [03](03-shell-integration.md)).
 - Read bytes asynchronously into a buffer that the terminal-state task drains.
 - Write input bytes promptly. No coalescing on the input side.
-- Honor resize: when the egui pane's cell-grid dimensions change, set the PTY size before any further input is delivered.
+- Honor resize: when the egui pane's cell-grid dimensions change, set the PTY size before any further input is delivered. **Debounce it** — an interactive window drag recomputes the cell grid every frame, and pushing a SIGWINCH per frame storms the child; a primary-screen TUI (e.g. Claude Code) repaints per SIGWINCH and the interleaved partial repaints pile orphaned frames into scrollback (the "banner renders N times on resize" bug). Commit the resize only once the target size has held steady for a short window (`render_pane::RESIZE_DEBOUNCE_SECS`); the first sizing of a fresh pane commits immediately. A settled drag therefore yields exactly one resize + one repaint.
 - Detect child exit; signal Layer 2 to transition the pane to `Dead`.
 - Clean shutdown: SIGHUP + close master fd.
 

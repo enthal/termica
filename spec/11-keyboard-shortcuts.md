@@ -1,4 +1,4 @@
-**← Previous:** [10 — Roadmap](10-roadmap.md) | **Up:** [SPEC index](../SPEC.md)
+**← Previous:** [10 — Roadmap](10-roadmap.md) | **Up:** [SPEC index](../SPEC.md) | **Next:** [12 — Distribution & releases](12-distribution.md) →
 
 # 11 — Keyboard shortcuts
 
@@ -103,4 +103,4 @@ Configurable keybindings are a [Phase 10 polish item](10-roadmap.md#phase-10--po
 
 ---
 
-**← Previous:** [10 — Roadmap](10-roadmap.md) | **Up:** [SPEC index](../SPEC.md)
+**← Previous:** [10 — Roadmap](10-roadmap.md) | **Up:** [SPEC index](../SPEC.md) | **Next:** [12 — Distribution & releases](12-distribution.md) →

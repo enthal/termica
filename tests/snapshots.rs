@@ -735,6 +735,7 @@ fn snapshot_paint_block_header_cwd_only() {
                 None,
                 None,
                 None,
+                false,
             );
         });
     harness.snapshot("paint_block_header_cwd_only");
@@ -754,6 +755,7 @@ fn snapshot_paint_block_header_zero_exit_hides_exit_chip() {
                 None,
                 None,
                 None,
+                false,
             );
         });
     harness.snapshot("paint_block_header_zero_exit");
@@ -775,6 +777,7 @@ fn snapshot_paint_block_header_substitutes_home_with_tilde() {
                 None,
                 None,
                 None,
+                false,
             );
         });
     harness.snapshot("paint_block_header_tilde_substitution");
@@ -794,6 +797,7 @@ fn snapshot_paint_block_header_nonzero_exit_shows_red_annotation() {
                 None,
                 None,
                 None,
+                false,
             );
         });
     harness.snapshot("paint_block_header_nonzero_exit");
@@ -815,6 +819,7 @@ fn snapshot_paint_block_header_with_duration() {
                 Some(std::time::Duration::from_secs(125)),
                 None,
                 None,
+                false,
             );
         });
     harness.snapshot("paint_block_header_with_duration");
@@ -838,6 +843,7 @@ fn snapshot_paint_block_header_with_git_branch_clean() {
                 None,
                 Some(&git),
                 None,
+                false,
             );
         });
     harness.snapshot("paint_block_header_git_branch_clean");
@@ -870,6 +876,7 @@ fn snapshot_paint_block_header_with_git_dirty_and_sync() {
                 None,
                 Some(&git),
                 None,
+                false,
             );
         });
     harness.snapshot("paint_block_header_git_dirty_and_sync");
@@ -903,6 +910,7 @@ fn snapshot_paint_block_header_with_pr_chip_pending() {
                 None,
                 Some(&git),
                 Some(&pr),
+                false,
             );
         });
     harness.snapshot("paint_block_header_pr_chip_pending");
@@ -927,6 +935,7 @@ fn snapshot_paint_block_header_with_pr_chip_passing() {
                 None,
                 Some(&git),
                 Some(&pr),
+                false,
             );
         });
     harness.snapshot("paint_block_header_pr_chip_passing");
@@ -1445,6 +1454,7 @@ fn snapshot_sticky_header_pinned_at_top() {
             Some(1),
             Some(std::time::Duration::from_millis(123)),
             None,
+            false,
             "ls -la --color=always",
             1,
         );
@@ -1470,6 +1480,7 @@ fn snapshot_sticky_header_multiline_command_capped() {
             Some(0),
             Some(std::time::Duration::from_secs(125)),
             None,
+            false,
             "for f in *.rs; do\n  echo \"$f\"\n  wc -l \"$f\"\n  head -1 \"$f\"\n  tail -1 \"$f\"\ndone",
             1,
         );
@@ -1496,6 +1507,7 @@ fn snapshot_sticky_header_pushed_up_clips_at_top() {
             None,
             Some(std::time::Duration::from_millis(34)),
             None,
+            false,
             "cargo test --workspace",
             1,
         );
