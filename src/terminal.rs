@@ -1076,26 +1076,35 @@ mod tests {
         );
     }
 
-    /// Documents the mechanism behind the "intro banner renders twice
-    /// on resize" report (Claude Code, a primary-screen TUI). It is
-    /// `#[ignore]`d because it asserts the *desired* behaviour, which
-    /// the current renderer does not yet provide — a ready-made failing
-    /// test for whoever fixes it, not a lock-in of the bug.
+    /// Documents the *residual* mechanism behind the "intro banner
+    /// renders N times on resize" report (Claude Code, a primary-screen
+    /// TUI). `#[ignore]`d because it asserts the ideal end-state the
+    /// engine doesn't provide — a ready-made failing test, not a
+    /// lock-in of the bug.
     ///
     /// Repro: an app writes a frame taller than the screen (so its top
     /// scrolls into history), then repaints in place with `ESC[H`
     /// (home) + `ESC[J` (erase-below) + rewrite — exactly what a
     /// resize-triggered redraw does. `ESC[H`/`ESC[J` reach only the
     /// active screen, never scrollback, so the scrolled-out top line is
-    /// orphaned in history while the rewrite re-emits it. Every
-    /// terminal leaves that orphan in scrollback; the Termica-specific
-    /// symptom is that the running-command paint shows history inline,
-    /// contiguous with the live screen, so the orphan and the rewrite
-    /// appear as a visible duplicate. The fix is a rendering-model
-    /// decision (give in-place-repainting primary-screen apps a managed
-    /// viewport, like alt-screen), tracked separately.
+    /// orphaned in history while the rewrite re-emits it. Every terminal
+    /// leaves that orphan in scrollback; the Termica-specific symptom is
+    /// that the running-command paint shows history inline, contiguous
+    /// with the live screen, so the orphan and the rewrite appear as a
+    /// visible duplicate.
+    ///
+    /// What actually shipped: the *storm* form of this — dozens of
+    /// stacked banners during an interactive resize — is fixed at the
+    /// source by debouncing PTY resizes
+    /// ([`crate::render_pane::plan_resize`]), so the child repaints once
+    /// per settled size instead of once per drag-frame. That collapses
+    /// the symptom to at most an occasional single duplicate, which is
+    /// accepted. Fully eliminating *this* single-orphan case would need
+    /// the heavier rendering-model change (dedupe / managed viewport)
+    /// that we deliberately did not take; this test stays as its
+    /// tripwire.
     #[test]
-    #[ignore = "open bug: in-place-repaint apps duplicate scrolled-out content in inline history"]
+    #[ignore = "accepted residual: a single in-place repaint that scrolls still orphans one copy in inline history (storm fixed via resize debounce)"]
     fn app_repaint_across_scroll_should_not_duplicate() {
         let mut state = TerminalState::new(5, 20);
         state.feed(b"BANNER\r\nA\r\nB\r\nC\r\nD\r\nE");

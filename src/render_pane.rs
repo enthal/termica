@@ -781,6 +781,74 @@ pub fn cells_from_pixels(avail: egui::Vec2, cell_w: f32, row_h: f32) -> (u16, u1
     (rows.max(MIN_ROWS), cols.max(MIN_COLS))
 }
 
+/// How long (egui-time seconds) a new pane-size target must hold steady
+/// before we commit the PTY resize. Long enough to swallow the
+/// per-frame size churn of an interactive window drag (~16 ms/frame),
+/// short enough to feel instant on a deliberate resize. See
+/// [`plan_resize`].
+pub(crate) const RESIZE_DEBOUNCE_SECS: f64 = 0.1;
+
+/// What to do with a pending PTY resize this frame — the pure decision
+/// behind [`render_pane`]'s debounce. Returned by [`plan_resize`] so
+/// the timing rule is unit-testable without egui or a PTY.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ResizePlan {
+    /// Issue `session.resize(target)` and record it as committed.
+    pub commit: bool,
+    /// New value to store in `PaneUiState::pending_size`.
+    pub pending: Option<((u16, u16), f64)>,
+    /// If set, ask egui to repaint in this many seconds so the
+    /// debounce can elapse even with no further input.
+    pub repaint_after: Option<f64>,
+}
+
+/// Decide whether to push a PTY resize this frame, debouncing the
+/// per-frame size churn of an interactive window drag.
+///
+/// Rules:
+/// - Target already committed → settled; do nothing, clear pending.
+/// - Nothing committed yet (first sizing of a fresh pane) → commit
+///   immediately; a 100 ms delay on the very first size is visible.
+/// - Otherwise → commit only once the target has held steady for
+///   `debounce`; while it's still changing, (re)start the timer and
+///   ask for a repaint so the deadline can fire without more input.
+///
+/// Why: a window drag recomputes the pane size every frame. Committing
+/// each one storms the child with SIGWINCHs; a TUI like Claude Code
+/// repaints per SIGWINCH and the interleaved partial repaints pile
+/// orphaned frames into scrollback (the "banner renders N times on
+/// resize" bug). Debouncing collapses a drag into a single settled
+/// resize, so the child repaints exactly once.
+pub(crate) fn plan_resize(
+    target: (u16, u16),
+    committed: Option<(u16, u16)>,
+    pending: Option<((u16, u16), f64)>,
+    now: f64,
+    debounce: f64,
+) -> ResizePlan {
+    match committed {
+        Some(c) if c == target => ResizePlan { commit: false, pending: None, repaint_after: None },
+        None => ResizePlan { commit: true, pending: None, repaint_after: None },
+        Some(_) => {
+            // Keep the timer running only while the target is unchanged;
+            // any change (re)starts it at `now`.
+            let since = match pending {
+                Some((p, t)) if p == target => t,
+                _ => now,
+            };
+            if now - since >= debounce {
+                ResizePlan { commit: true, pending: None, repaint_after: None }
+            } else {
+                ResizePlan {
+                    commit: false,
+                    pending: Some((target, since)),
+                    repaint_after: Some(debounce - (now - since)),
+                }
+            }
+        }
+    }
+}
+
 /// Render one pane into `ui`: status header, resize-PTY-to-cells,
 /// link scan + hover, terminal grid, mouse selection, scroll wheel,
 /// input encoding, copy shortcut.
@@ -865,9 +933,24 @@ pub fn render_pane(
     let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
     let (cell_w, row_h) = ui.fonts_mut(|f| (f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
     let (rows, cols) = cells_from_pixels(avail, cell_w, row_h);
-    if slot.ui.last_size != Some((rows, cols)) {
+    // Debounce: an interactive window drag recomputes this size every
+    // frame; committing each one storms the child with SIGWINCHs and
+    // piles orphaned repaint frames into scrollback. Only resize once
+    // the target settles. See `plan_resize`.
+    let plan = plan_resize(
+        (rows, cols),
+        slot.ui.last_size,
+        slot.ui.pending_size,
+        ctx.input(|i| i.time),
+        RESIZE_DEBOUNCE_SECS,
+    );
+    if plan.commit {
         let _ = slot.session.resize(rows, cols);
         slot.ui.last_size = Some((rows, cols));
+    }
+    slot.ui.pending_size = plan.pending;
+    if let Some(secs) = plan.repaint_after {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(secs.max(0.0)));
     }
 
     // ---- pane content: sealed blocks + live terminal -------------
@@ -2868,6 +2951,80 @@ pub fn render_pane(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- plan_resize (resize debounce, #1 banner-storm fix) -----------
+
+    const DB: f64 = RESIZE_DEBOUNCE_SECS;
+
+    #[test]
+    fn resize_first_sizing_commits_immediately() {
+        // A fresh pane (nothing committed) sizes at once — a 100 ms
+        // delay on the very first size would be visible.
+        let p = plan_resize((40, 80), None, None, 5.0, DB);
+        assert!(p.commit);
+        assert_eq!(p.pending, None);
+    }
+
+    #[test]
+    fn resize_unchanged_target_is_idle() {
+        let p = plan_resize((40, 80), Some((40, 80)), None, 5.0, DB);
+        assert!(!p.commit);
+        assert_eq!(p.pending, None);
+        assert_eq!(p.repaint_after, None);
+    }
+
+    #[test]
+    fn resize_new_target_defers_and_starts_timer() {
+        // Target just changed from the committed size: don't commit yet,
+        // start the debounce timer at `now`, ask for a repaint.
+        let now = 10.0;
+        let p = plan_resize((30, 80), Some((40, 80)), None, now, DB);
+        assert!(!p.commit);
+        assert_eq!(p.pending, Some(((30, 80), now)));
+        assert_eq!(p.repaint_after, Some(DB));
+    }
+
+    #[test]
+    fn resize_commits_once_target_holds_for_debounce() {
+        // Timer started at t=10; once the steady target has held past
+        // the debounce window it commits. (Use a margin past the
+        // deadline; real frames never land on the exact float edge.)
+        let p = plan_resize((30, 80), Some((40, 80)), Some(((30, 80), 10.0)), 10.0 + DB + 0.05, DB);
+        assert!(p.commit);
+        assert_eq!(p.pending, None);
+    }
+
+    #[test]
+    fn resize_storm_never_commits_until_settled() {
+        // Simulate an interactive drag: the target changes every frame
+        // (~16 ms apart), each change restarting the timer, so the
+        // debounce deadline is never reached and NO resize is committed
+        // mid-drag — this is the fix for the N-times-stacked banner.
+        let mut committed = Some((40u16, 80u16));
+        let mut pending: Option<((u16, u16), f64)> = None;
+        let mut commits = 0;
+        let mut t = 0.0;
+        // 30 frames of a shrinking-then-growing drag, height churning.
+        for i in 0..30 {
+            let h = 40 - (i % 12) as u16; // wobbles, never stable
+            let target = (h, 80);
+            let p = plan_resize(target, committed, pending, t, DB);
+            if p.commit {
+                committed = Some(target);
+                commits += 1;
+            }
+            pending = p.pending;
+            t += 0.016;
+        }
+        assert_eq!(commits, 0, "no resize should commit during a churning drag");
+
+        // Drag ends: target holds steady; let the debounce elapse.
+        let target = (28, 80);
+        let p1 = plan_resize(target, committed, pending, t, DB); // restart timer
+        assert!(!p1.commit);
+        let p2 = plan_resize(target, committed, p1.pending, t + DB + 0.05, DB); // past deadline
+        assert!(p2.commit, "the settled size commits exactly once after the drag");
+    }
 
     // ---- compute_footer_height (Phase 4D) -----------------------------
 
