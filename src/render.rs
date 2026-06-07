@@ -1016,10 +1016,15 @@ pub fn paint_block_header(
 
     // Sealed (historical) blocks render their chips muted — desaturated
     // toward grey but still slightly tinted — so finished blocks read as
-    // past-tense while the live prompt / running chips stay vivid.
+    // past-tense while the live prompt / running chips stay vivid. The
+    // failed-`exit` chip is the deliberate exception: a non-zero exit
+    // stays vivid red even on a sealed block, so failures don't fade
+    // into scroll-back.
     if faded {
         for chip in &mut chips {
-            chip.2 = fade_chip_color(chip.2);
+            if chip.2 != BLOCK_HEADER_EXIT_FAIL_FG {
+                chip.2 = fade_chip_color(chip.2);
+            }
         }
     }
 
