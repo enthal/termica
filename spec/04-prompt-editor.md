@@ -298,6 +298,8 @@ A minimal shell tokenizer in-house for v1:
 - flags (`-x`, `--long`)
 - comments (`#`)
 
+Backslash escapes are honoured the way the shell reads them: outside quotes `\X` is a literal `X`, so a backslash-escaped quote / space / metacharacter (`what\'s`, `foo\ bar`, `a\|b`) stays part of its word instead of starting a string or breaking the token. Inside double quotes a backslash escapes the next byte too (`"a\"b"` is one string; `"\$x"` is not a variable). Single-quoted strings are literal — a backslash inside `'…'` is an ordinary character, matching the shell.
+
 Tree-sitter is overkill for v1. We will reach for it if and when the in-house tokenizer can't keep up with what we want to highlight.
 
 ## History walk (Up/Down)

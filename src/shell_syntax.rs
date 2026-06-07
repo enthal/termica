@@ -148,7 +148,13 @@ pub fn tokenize(text: &str) -> Vec<Token> {
             i += 1;
             let mut literal_start = opening;
             while i < bytes.len() && bytes[i] != b'"' && bytes[i] != b'\n' {
-                if bytes[i] == b'$' {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] != b'\n' {
+                    // Inside `"…"`, a backslash escapes the next byte
+                    // (`\"`, `\$`, `\\`, `` \` ``): it stays literal so
+                    // an escaped quote doesn't close the string and an
+                    // escaped `$` isn't a variable.
+                    i += 2;
+                } else if bytes[i] == b'$' {
                     if literal_start < i {
                         tokens.push(Token::new(TokenKind::String, literal_start..i));
                     }
@@ -232,10 +238,11 @@ pub fn tokenize(text: &str) -> Vec<Token> {
 
         if b == b'-' && (i == 0 || is_word_break(bytes[i - 1])) {
             // Flag run: `-x`, `--long`, `--long=value`, etc. Goes
-            // until next whitespace / metachar.
+            // until next whitespace / metachar. Backslash escapes
+            // keep an escaped break char inside the flag.
             let start = i;
             while i < bytes.len() && !is_word_break(bytes[i]) {
-                i += 1;
+                i = skip_escaped(bytes, i);
             }
             tokens.push(Token::new(TokenKind::Flag, start..i));
             expecting_command = false;
@@ -259,7 +266,10 @@ pub fn tokenize(text: &str) -> Vec<Token> {
         //   classifies as `Command` (if expecting) or `Word`.
         let start = i;
         while i < bytes.len() && !is_word_break(bytes[i]) {
-            i += 1;
+            // Backslash escapes the next byte (`what\'s`, `foo\ bar`):
+            // the escaped quote / space / metachar stays part of the
+            // word instead of starting a string or breaking the token.
+            i = skip_escaped(bytes, i);
         }
         if start == i {
             // Defensive: shouldn't happen because we checked for
@@ -349,6 +359,17 @@ fn is_word_break(b: u8) -> bool {
         b,
         b' ' | b'\t' | b'\n' | b'|' | b'&' | b';' | b'<' | b'>' | b'\'' | b'"' | b'$' | b'#'
     )
+}
+
+/// Advance one logical character in an unquoted context, honouring
+/// backslash escapes: outside quotes `\X` is a literal `X` (the shell
+/// strips the backslash), so the pair is consumed together and the
+/// escaped byte never acts as a quote / metacharacter / word break.
+/// A trailing backslash (at EOF or before a newline) escapes nothing
+/// and advances one byte. Returns the index past the (possibly
+/// escaped) character.
+fn skip_escaped(bytes: &[u8], i: usize) -> usize {
+    if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] != b'\n' { i + 2 } else { i + 1 }
 }
 
 #[cfg(test)]
@@ -623,6 +644,77 @@ mod tests {
         let t = tokenize(s);
         assert_eq!(kinds(&t), vec![TokenKind::Command, TokenKind::String]);
         assert_eq!(slices(s, &t)[1], "'oops");
+    }
+
+    // ---- backslash escapes (outside quotes) ----------------------
+
+    #[test]
+    fn backslash_escaped_single_quote_does_not_start_a_string() {
+        // `what\'s` — the `\'` is a literal quote, NOT the start of a
+        // single-quoted string. The whole word stays one token and
+        // the rest of the line keeps its normal kinds.
+        let s = "claude what\\'s the haps";
+        let t = tokenize(s);
+        assert_eq!(
+            kinds(&t),
+            vec![TokenKind::Command, TokenKind::Word, TokenKind::Word, TokenKind::Word]
+        );
+        assert_eq!(slices(s, &t)[1], "what\\'s");
+    }
+
+    #[test]
+    fn backslash_escaped_double_quote_does_not_start_a_string() {
+        let s = "echo a\\\"b";
+        let t = tokenize(s);
+        assert_eq!(kinds(&t), vec![TokenKind::Command, TokenKind::Word]);
+        assert_eq!(slices(s, &t)[1], "a\\\"b");
+    }
+
+    #[test]
+    fn backslash_escaped_space_keeps_word_together() {
+        // `foo\ bar` is a single shell word (escaped space).
+        let s = "ls foo\\ bar";
+        let t = tokenize(s);
+        assert_eq!(kinds(&t), vec![TokenKind::Command, TokenKind::Word]);
+        assert_eq!(slices(s, &t)[1], "foo\\ bar");
+    }
+
+    #[test]
+    fn backslash_escaped_metachar_does_not_split_word() {
+        // `a\|b` — the pipe is escaped, so no Pipe token.
+        let s = "echo a\\|b";
+        let t = tokenize(s);
+        assert_eq!(kinds(&t), vec![TokenKind::Command, TokenKind::Word]);
+        assert_eq!(slices(s, &t)[1], "a\\|b");
+    }
+
+    #[test]
+    fn leading_backslash_quote_is_a_word_not_a_string() {
+        // A token that BEGINS with an escaped quote.
+        let s = "echo \\'x";
+        let t = tokenize(s);
+        assert_eq!(kinds(&t), vec![TokenKind::Command, TokenKind::Word]);
+        assert_eq!(slices(s, &t)[1], "\\'x");
+    }
+
+    // ---- backslash escapes (inside double quotes) ----------------
+
+    #[test]
+    fn escaped_quote_inside_double_quotes_does_not_close() {
+        // `"a\"b"` is one String — the inner `\"` is escaped.
+        let s = "echo \"a\\\"b\"";
+        let t = tokenize(s);
+        assert_eq!(kinds(&t), vec![TokenKind::Command, TokenKind::String]);
+        assert_eq!(slices(s, &t)[1], "\"a\\\"b\"");
+    }
+
+    #[test]
+    fn escaped_dollar_inside_double_quotes_is_not_a_variable() {
+        // `"\$USER"` — the `$` is escaped, so no Variable token.
+        let s = "echo \"\\$USER\"";
+        let t = tokenize(s);
+        assert_eq!(kinds(&t), vec![TokenKind::Command, TokenKind::String]);
+        assert_eq!(slices(s, &t)[1], "\"\\$USER\"");
     }
 
     // ---- variables -----------------------------------------------
