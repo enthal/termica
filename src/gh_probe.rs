@@ -6,10 +6,12 @@
 //! shelling out (here to `gh pr view`) off the UI thread and shipping a
 //! parsed [`PrContext`] back over a channel — with one addition: because
 //! CI status changes over time on an unchanged branch, the worker
-//! **self-re-polls while CI is pending** (and only then), so a chip
-//! watching CI go yellow → green updates without any UI involvement.
-//! Settled (passing / failing / none) results don't self-poll, so an
-//! idle branch costs nothing.
+//! **self-re-polls while a PR is open**, fast while its CI is pending
+//! ([`PENDING_POLL_INTERVAL`]) and slow once it settles
+//! ([`SETTLED_POLL_INTERVAL`]), so the chip stays live without any UI
+//! involvement. A branch with no open PR doesn't self-poll, so it costs
+//! nothing. At the slow cadence this is dozens of `gh` calls/hr per
+//! pane-with-a-PR — comfortably inside GitHub's 5000 req/hr budget.
 //!
 //! Triggering (from the pane): a probe is requested when the cwd changes
 //! or the branch changes (a `git checkout` keeps cwd but swaps the PR).
@@ -27,10 +29,16 @@ use std::time::Duration;
 
 use crate::pr_context::{CiStatus, PrContext, parse_pr_view};
 
-/// How long the worker waits for a new request before self-re-polling a
-/// branch whose CI is still pending. Short enough to feel live, long
-/// enough not to hammer the GitHub API.
+/// Self-re-poll interval while a PR's CI is **pending** — short so a
+/// chip watching a run go yellow → green updates promptly.
 const PENDING_POLL_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Self-re-poll interval while a PR exists but its CI has **settled**
+/// (passing / failing / no checks). Slow — just enough to notice a fresh
+/// CI run started after a push without hammering the API. With GitHub's
+/// 5000 req/hr budget this is ~40/hr per pane-with-a-PR; panes with no
+/// open PR don't self-poll at all.
+const SETTLED_POLL_INTERVAL: Duration = Duration::from_secs(90);
 
 /// A completed PR probe: the cwd it ran for and the parsed context —
 /// `None` when the branch has no open PR (or `gh` is unavailable /
@@ -133,44 +141,59 @@ fn should_request(last_requested: Option<&Path>, cwd: &Path, force: bool) -> boo
 }
 
 /// The worker loop. Blocks on the request channel, but once it has
-/// produced a *pending*-CI result it instead waits only up to
-/// [`PENDING_POLL_INTERVAL`] for a new request before re-polling that
-/// same cwd — so a watched CI run refreshes itself. Coalesces request
-/// bursts to the most recent cwd. Exits when the request `Sender` drops
-/// (teardown) or the result `Receiver` is gone.
+/// produced a result for a branch *with an open PR* it instead waits
+/// only up to the [self-poll interval](self_poll_interval) for a new
+/// request before re-polling that same cwd — fast while CI is pending,
+/// slow once it has settled — so the chip stays live. A branch with no
+/// open PR doesn't self-poll (the worker blocks for the next request).
+/// Coalesces request bursts to the most recent cwd. Exits when the
+/// request `Sender` drops (teardown) or the result `Receiver` is gone.
 fn run_worker(
     request_rx: mpsc::Receiver<PathBuf>,
     result_tx: mpsc::Sender<GhProbeResult>,
     runner: Box<dyn GhRunner>,
 ) {
-    // The cwd to self-re-poll while its CI is pending; `None` when the
-    // last result was settled (so we block indefinitely for a request).
-    // `next_cwd` returns `None` once the request `Sender` drops (teardown).
-    let mut pending_cwd: Option<PathBuf> = None;
-    while let Some(mut cwd) = next_cwd(&request_rx, pending_cwd.take()) {
+    // `(cwd, interval)` to self-re-poll; `None` when the last result had
+    // no open PR (so we block indefinitely for a request). `next_cwd`
+    // returns `None` once the request `Sender` drops (teardown).
+    let mut pending: Option<(PathBuf, Duration)> = None;
+    while let Some(mut cwd) = next_cwd(&request_rx, pending.take()) {
         // Coalesce a burst down to the newest queued cwd.
         while let Ok(newer) = request_rx.try_recv() {
             cwd = newer;
         }
         let pr = runner.probe(&cwd);
-        // Self-re-poll only while CI is actively pending.
-        pending_cwd = match &pr {
-            Some(p) if p.ci == CiStatus::Pending => Some(cwd.clone()),
-            _ => None,
-        };
+        // Schedule the next self-poll based on whether a PR exists and
+        // its CI status (pending → fast, settled → slow, none → off).
+        pending = self_poll_interval(pr.as_ref()).map(|i| (cwd.clone(), i));
         if result_tx.send(GhProbeResult { cwd, pr }).is_err() {
             break; // pane dropped.
         }
     }
 }
 
+/// How long to wait before self-re-polling, given the last result:
+/// fast while CI is pending, slow once settled, and `None` (don't
+/// self-poll) when there's no open PR. Pure, so the cadence policy is
+/// unit-tested.
+fn self_poll_interval(pr: Option<&PrContext>) -> Option<Duration> {
+    match pr {
+        Some(p) if p.ci == CiStatus::Pending => Some(PENDING_POLL_INTERVAL),
+        Some(_) => Some(SETTLED_POLL_INTERVAL),
+        None => None,
+    }
+}
+
 /// Get the next cwd to probe: if we have a `pending` cwd to re-poll, wait
-/// only up to [`PENDING_POLL_INTERVAL`] for a fresh request (falling back
-/// to the pending cwd on timeout); otherwise block until a request
-/// arrives. `None` signals the request channel is disconnected.
-fn next_cwd(request_rx: &mpsc::Receiver<PathBuf>, pending: Option<PathBuf>) -> Option<PathBuf> {
+/// only up to its interval for a fresh request (falling back to the
+/// pending cwd on timeout); otherwise block until a request arrives.
+/// `None` signals the request channel is disconnected.
+fn next_cwd(
+    request_rx: &mpsc::Receiver<PathBuf>,
+    pending: Option<(PathBuf, Duration)>,
+) -> Option<PathBuf> {
     match pending {
-        Some(p) => match request_rx.recv_timeout(PENDING_POLL_INTERVAL) {
+        Some((p, interval)) => match request_rx.recv_timeout(interval) {
             Ok(c) => Some(c),
             Err(mpsc::RecvTimeoutError::Timeout) => Some(p),
             Err(mpsc::RecvTimeoutError::Disconnected) => None,
@@ -182,6 +205,24 @@ fn next_cwd(request_rx: &mpsc::Receiver<PathBuf>, pending: Option<PathBuf>) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn self_poll_interval_by_ci_status() {
+        // No PR → don't self-poll at all (block for the next request).
+        assert_eq!(self_poll_interval(None), None);
+        // Pending CI → fast cadence.
+        assert_eq!(
+            self_poll_interval(Some(&PrContext { number: 1, ci: CiStatus::Pending })),
+            Some(PENDING_POLL_INTERVAL)
+        );
+        // Settled (passing / failing / none) → slow cadence.
+        for ci in [CiStatus::Passing, CiStatus::Failing, CiStatus::None] {
+            assert_eq!(
+                self_poll_interval(Some(&PrContext { number: 1, ci })),
+                Some(SETTLED_POLL_INTERVAL)
+            );
+        }
+    }
 
     #[test]
     fn pr_view_args_are_stable() {

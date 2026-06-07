@@ -33,8 +33,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use crate::git_context::{GitContext, parse_numstat, parse_status_v2};
+
+/// Self-re-poll interval while the pane's cwd is inside a git repo, so the
+/// branch / dirty chips track changes made by other tools (an external
+/// edit, a `git checkout` in another terminal) without waiting for a
+/// command to finish in *this* pane. Local git is cheap (no network), so
+/// a few seconds is fine; a cwd outside any repo doesn't self-poll.
+const GIT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A completed probe: the `cwd` it ran for, and the parsed context —
 /// `None` when `cwd` is not inside a git work tree (or `git` is absent).
@@ -179,23 +187,47 @@ fn should_request(last_requested: Option<&Path>, cwd: &Path, force: bool) -> boo
 
 /// The worker loop. Blocks on the request channel; for each request,
 /// coalesces any further queued requests down to the most recent `cwd`,
-/// runs the probe, and ships the result. Exits when the request `Sender`
-/// drops (pane teardown) or the result `Receiver` is gone.
+/// runs the probe, and ships the result. While the last result was
+/// inside a repo it self-re-polls that cwd every [`GIT_POLL_INTERVAL`]
+/// (catching external changes) instead of blocking; a non-repo cwd
+/// blocks for the next request. Exits when the request `Sender` drops
+/// (pane teardown) or the result `Receiver` is gone.
 fn run_worker(
     request_rx: mpsc::Receiver<PathBuf>,
     result_tx: mpsc::Sender<GitProbeResult>,
     runner: Box<dyn GitRunner>,
 ) {
-    while let Ok(mut cwd) = request_rx.recv() {
+    // The cwd to self-re-poll while it's a repo; `None` when the last
+    // result was not a repo (block for the next request instead).
+    let mut pending: Option<PathBuf> = None;
+    while let Some(mut cwd) = next_cwd(&request_rx, pending.take()) {
         // Coalesce a burst: if several `cwd` updates queued while we were
         // busy, only the newest is worth probing.
         while let Ok(newer) = request_rx.try_recv() {
             cwd = newer;
         }
         let context = runner.probe(&cwd);
+        // Keep refreshing while we're in a repo; stop self-polling once
+        // the cwd leaves one (re-armed by the next pane request).
+        pending = context.is_some().then(|| cwd.clone());
         if result_tx.send(GitProbeResult { cwd, context }).is_err() {
             break; // pane dropped — stop working.
         }
+    }
+}
+
+/// Get the next cwd to probe: if we have a `pending` repo cwd, wait only
+/// up to [`GIT_POLL_INTERVAL`] for a fresh request (falling back to the
+/// pending cwd on timeout); otherwise block until a request arrives.
+/// `None` signals the request channel is disconnected (teardown).
+fn next_cwd(request_rx: &mpsc::Receiver<PathBuf>, pending: Option<PathBuf>) -> Option<PathBuf> {
+    match pending {
+        Some(p) => match request_rx.recv_timeout(GIT_POLL_INTERVAL) {
+            Ok(c) => Some(c),
+            Err(mpsc::RecvTimeoutError::Timeout) => Some(p),
+            Err(mpsc::RecvTimeoutError::Disconnected) => None,
+        },
+        None => request_rx.recv().ok(),
     }
 }
 
