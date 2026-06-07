@@ -15,3 +15,6 @@ git_tag_name = "v{{ version }}"
 git_release_enable = false
 # Keep a Keep-a-Changelog style CHANGELOG.md in the repo.
 changelog_update = true
+# Pre-1.0, still bump the MINOR on `feat:` (0.1 -> 0.2), not just patch, so
+# version numbers track feature progress. (Default would patch-bump in 0.x.)
+features_always_increment_minor = true
