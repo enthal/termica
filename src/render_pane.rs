@@ -1151,17 +1151,8 @@ pub fn render_pane(
     // measurement of where content ends; our pre-layout
     // `content_h` estimate was sometimes off, sending the snap to
     // the wrong place.
-    // `find_scrolling` also needs the offset override: when the user is
-    // glued to the bottom, ScrollArea's "we're at the end" cache
-    // swallows the `scroll_to_rect` we issue for the current match (the
-    // same gotcha `force_to_top` hits). Resetting the offset to 0 clears
-    // that cache; the `scroll_to_rect` in the closure then re-centers on
-    // the match the same frame, so there's no visible jump to the top.
-    let scroll_area = if force_to_top || find_scrolling {
-        scroll_area.vertical_scroll_offset(0.0)
-    } else {
-        scroll_area
-    };
+    let scroll_area =
+        if force_to_top { scroll_area.vertical_scroll_offset(0.0) } else { scroll_area };
     // Live elapsed time of the running command (`None` when idle),
     // sampled once this frame for the ticking duration chip (4G).
     // While a command runs, schedule a repaint so the chip keeps
@@ -1360,7 +1351,13 @@ pub fn render_pane(
                         egui::pos2(o.x + m.col_start as f32 * cell_w, y),
                         egui::pos2(o.x + m.col_end as f32 * cell_w, y + row_h),
                     );
-                    ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                    // `None` align scrolls the *minimum* to make the match
+                    // visible — and is a no-op when it's already in view
+                    // (egui's "already in view → delta 0" branch). That's
+                    // what stops every keystroke / Prev / Next from
+                    // re-animating a scroll to a match that hasn't moved.
+                    // Instant (no animation) so a real jump doesn't drift.
+                    ui.scroll_to_rect_animation(rect, None, egui::style::ScrollAnimation::none());
                 }
             }
         } // end of `if !in_alt_screen { ... }`
