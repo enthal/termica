@@ -1337,7 +1337,7 @@ pub fn paint_sealed_block(
 /// space. Either piece is `None` when no part of the selection
 /// lands in that region.
 type SelectionRange = (BlockCursor, BlockCursor);
-fn split_selection_at_row(
+pub(crate) fn split_selection_at_row(
     selection: Option<SelectionRange>,
     cmd_lines: usize,
 ) -> (Option<SelectionRange>, Option<SelectionRange>) {
