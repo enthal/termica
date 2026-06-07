@@ -343,9 +343,11 @@ In-pane search opens a small overlay bar at the top of the pane:
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Prev / Next** (or **Enter** / **Shift+Enter**) jump to the
-  previous / next match, scrolling the transcript so the current match
-  is centered. The count (`3 of 14`) updates live.
+- Find **searches from the bottom**: a fresh query (or any toggle)
+  homes on the match nearest the live tail. **Enter** / **Prev** step
+  *up* (toward older output); **Shift+Enter** / **Next** step *down*.
+  The transcript scrolls so the current match is centered and the count
+  (`3 of 14`) updates live.
 - Match highlights paint as overlays in the cell renderer: all matches
   in translucent amber, the current match brighter.
 - `Aa` toggles match-case; `.*` toggles regex (a bad pattern shows

@@ -299,6 +299,12 @@ pub struct FindOverlay {
     pub draft: String,
     /// Whether the `▾` history dropdown list is showing.
     pub dropdown_open: bool,
+    /// After the next [`Self::recompute`], home the selection on the
+    /// **bottom** (last) match rather than clamping. Find searches from
+    /// the bottom: a fresh query / toggle lands on the match nearest the
+    /// live tail, and `Enter` then walks *upward*. Set on open, on a
+    /// query edit, and on any toggle; cleared once applied.
+    pub want_bottom: bool,
 }
 
 impl FindOverlay {
@@ -317,6 +323,7 @@ impl FindOverlay {
             history_pos: None,
             draft: String::new(),
             dropdown_open: false,
+            want_bottom: true,
         }
     }
 
@@ -335,8 +342,13 @@ impl FindOverlay {
             Ok(matcher) => {
                 self.matches = find_matches(lines, &matcher, self.filter);
                 self.regex_error = false;
-                if self.selected >= self.matches.len() {
-                    self.selected = 0;
+                let last = self.matches.len().saturating_sub(1);
+                if self.want_bottom {
+                    // Home on the bottom-most (most recent) match.
+                    self.selected = last;
+                    self.want_bottom = false;
+                } else if self.selected > last {
+                    self.selected = last;
                 }
             }
             Err(_) => {
@@ -366,23 +378,23 @@ impl FindOverlay {
         }
     }
 
-    /// Cycle the `All` / `Commands` / `Outputs` filter and reset the
-    /// selection to the top of the (about-to-be-recomputed) list.
+    /// Cycle the `All` / `Commands` / `Outputs` filter; the selection
+    /// re-homes on the bottom-most match at the next recompute.
     pub fn cycle_filter(&mut self) {
         self.filter = self.filter.next();
-        self.selected = 0;
+        self.want_bottom = true;
     }
 
-    /// Flip the `Aa` (case) toggle; selection resets on recompute.
+    /// Flip the `Aa` (case) toggle; selection re-homes on recompute.
     pub fn toggle_case(&mut self) {
         self.case_sensitive = !self.case_sensitive;
-        self.selected = 0;
+        self.want_bottom = true;
     }
 
-    /// Flip the `.*` (regex) toggle.
+    /// Flip the `.*` (regex) toggle; selection re-homes on recompute.
     pub fn toggle_regex(&mut self) {
         self.regex = !self.regex;
-        self.selected = 0;
+        self.want_bottom = true;
     }
 
     /// Walk to an **older** history entry (`↑`). The first press saves
@@ -484,7 +496,6 @@ pub fn paint_overlay(
 ) -> FindOutcome {
     let area_id = ui.id().with(("find-overlay", pane_id));
     let margin = 8.0;
-    let panel_w = (pane_rect.width() - 2.0 * margin).clamp(280.0, 920.0);
     let mut outcome = FindOutcome::default();
 
     // Read navigation keys from the raw input layer (the TextEdit
@@ -500,13 +511,18 @@ pub fn paint_overlay(
         )
     });
 
+    // Flush to the pane's top-right (`RIGHT_TOP` pivot → the box grows
+    // leftward from the corner), sized to its content so it never
+    // covers the cwd / git chips + command on the left. `Order::Tooltip`
+    // sits above the sticky-top block header (`Order::Foreground`) so
+    // the find bar wins where they overlap.
     egui::Area::new(area_id)
-        .order(egui::Order::Foreground)
-        .fixed_pos(pane_rect.left_top() + egui::vec2(margin, margin))
+        .order(egui::Order::Tooltip)
+        .pivot(egui::Align2::RIGHT_TOP)
+        .fixed_pos(pane_rect.right_top() + egui::vec2(-margin, margin))
         .show(ui.ctx(), |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.set_width(panel_w);
-                ui.horizontal_wrapped(|ui| {
+                ui.horizontal(|ui| {
                     ui.strong("find");
 
                     let prev_query = overlay.query.clone();
@@ -521,10 +537,11 @@ pub fn paint_overlay(
                         resp.request_focus();
                     }
                     // A real edit (not a history walk) returns to live
-                    // editing and re-homes the selection to the first match.
+                    // editing and re-homes on the bottom-most match
+                    // (find searches from the bottom).
                     if overlay.query != prev_query {
                         overlay.history_pos = None;
-                        overlay.selected = 0;
+                        overlay.want_bottom = true;
                         outcome.scroll_to_selected = true;
                     }
 
@@ -610,13 +627,15 @@ pub fn paint_overlay(
         });
 
     // Keyboard, after layout so toggles/clicks above are already applied.
+    // Find searches from the bottom: Enter steps *up* (prev / older),
+    // Shift+Enter steps *down* (next / newer).
     if escape {
         outcome.close = true;
     } else if enter {
         if shift {
-            overlay.prev_match();
-        } else {
             overlay.next_match();
+        } else {
+            overlay.prev_match();
         }
         overlay.commit_history();
         outcome.scroll_to_selected = true;
@@ -836,6 +855,37 @@ mod tests {
         o.next_match();
         o.prev_match();
         assert_eq!(o.selected, 0);
+    }
+
+    #[test]
+    fn fresh_query_homes_on_the_bottom_match() {
+        // Find searches from the bottom: a fresh overlay (want_bottom)
+        // lands on the LAST match, not the first.
+        let mut stack = BlockStack::new(0);
+        let mut term = TerminalState::new(4, 20);
+        seal(&mut stack, &mut term, "aaa", b"\r\n");
+        let lines = collect_searchable_lines(&stack);
+        let mut o = FindOverlay::open(vec![]);
+        o.query = "a".to_string();
+        o.recompute(&lines);
+        assert_eq!(o.matches.len(), 3);
+        assert_eq!(o.selected, 2, "homes on the bottom-most match");
+        assert!(!o.want_bottom, "flag cleared after applying");
+    }
+
+    #[test]
+    fn toggles_re_home_on_bottom() {
+        let mut stack = BlockStack::new(0);
+        let mut term = TerminalState::new(4, 20);
+        seal(&mut stack, &mut term, "a a a", b"\r\n");
+        let lines = collect_searchable_lines(&stack);
+        let mut o = FindOverlay::open(vec![]);
+        o.query = "a".to_string();
+        o.recompute(&lines);
+        o.selected = 0;
+        o.cycle_filter(); // sets want_bottom
+        o.recompute(&lines);
+        assert_eq!(o.selected, o.matches.len() - 1, "filter change re-homes to bottom");
     }
 
     #[test]
