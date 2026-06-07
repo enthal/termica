@@ -298,15 +298,17 @@ pub fn paint_overlay(
                             let is_selected = r.row == overlay.selected;
                             let clicked = paint_clickable_row(
                                 ui,
-                                &r.text,
-                                &query,
-                                r.cwd.as_deref(),
-                                r.exit_code,
-                                &r.source,
-                                r.started_at_ms,
-                                now_ms,
-                                is_selected,
-                                panel_w,
+                                HistoryRow {
+                                    text: &r.text,
+                                    query: &query,
+                                    cwd: r.cwd.as_deref(),
+                                    exit_code: r.exit_code,
+                                    source: &r.source,
+                                    started_at_ms: r.started_at_ms,
+                                    now_ms,
+                                    is_selected,
+                                    panel_w,
+                                },
                             );
                             if clicked {
                                 action = Some(OverlayAction::Submit(r.text));
@@ -347,19 +349,33 @@ fn scope_label(s: OverlayScope) -> &'static str {
 /// meta line: compact age (with the full age string as a hover
 /// tooltip), then cwd, exit code, and source tag (`zsh`/`bash`/`fish`)
 /// when present. Returns `true` when the user clicked the row.
-#[allow(clippy::too_many_arguments)]
-fn paint_clickable_row(
-    ui: &mut egui::Ui,
-    text: &str,
-    query: &str,
-    cwd: Option<&str>,
+/// The per-row inputs for [`paint_clickable_row`]: the history entry's
+/// fields plus the render context (the live query for match-highlight,
+/// `now_ms` for the age label, selection state, and the panel width).
+struct HistoryRow<'a> {
+    text: &'a str,
+    query: &'a str,
+    cwd: Option<&'a str>,
     exit_code: Option<i32>,
-    source: &str,
+    source: &'a str,
     started_at_ms: i64,
     now_ms: i64,
     is_selected: bool,
     panel_w: f32,
-) -> bool {
+}
+
+fn paint_clickable_row(ui: &mut egui::Ui, row: HistoryRow<'_>) -> bool {
+    let HistoryRow {
+        text,
+        query,
+        cwd,
+        exit_code,
+        source,
+        started_at_ms,
+        now_ms,
+        is_selected,
+        panel_w,
+    } = row;
     let frame = if is_selected {
         egui::Frame::NONE.fill(ui.visuals().selection.bg_fill.linear_multiply(0.35))
     } else {
