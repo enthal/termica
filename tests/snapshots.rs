@@ -485,6 +485,7 @@ fn snapshot_paint_sealed_block_echo() {
                 None,
                 Some(0),
                 std::time::Duration::from_millis(123),
+                None,
             );
         });
     harness.snapshot("paint_sealed_block_echo");
@@ -506,6 +507,7 @@ fn snapshot_paint_sealed_block_ls_output() {
                 None,
                 Some(0),
                 std::time::Duration::from_millis(1_500),
+                None,
             );
         });
     harness.snapshot("paint_sealed_block_ls_output");
@@ -527,6 +529,7 @@ fn snapshot_paint_sealed_block_multiline_command() {
                 None,
                 Some(0),
                 std::time::Duration::from_millis(34),
+                None,
             );
         });
     harness.snapshot("paint_sealed_block_multiline_command");
@@ -731,6 +734,8 @@ fn snapshot_paint_block_header_cwd_only() {
                 None,
                 None,
                 None,
+                None,
+                false,
             );
         });
     harness.snapshot("paint_block_header_cwd_only");
@@ -749,6 +754,8 @@ fn snapshot_paint_block_header_zero_exit_hides_exit_chip() {
                 Some(0),
                 None,
                 None,
+                None,
+                false,
             );
         });
     harness.snapshot("paint_block_header_zero_exit");
@@ -769,6 +776,8 @@ fn snapshot_paint_block_header_substitutes_home_with_tilde() {
                 None,
                 None,
                 None,
+                None,
+                false,
             );
         });
     harness.snapshot("paint_block_header_tilde_substitution");
@@ -787,6 +796,8 @@ fn snapshot_paint_block_header_nonzero_exit_shows_red_annotation() {
                 Some(127),
                 None,
                 None,
+                None,
+                false,
             );
         });
     harness.snapshot("paint_block_header_nonzero_exit");
@@ -807,6 +818,8 @@ fn snapshot_paint_block_header_with_duration() {
                 Some(1),
                 Some(std::time::Duration::from_secs(125)),
                 None,
+                None,
+                false,
             );
         });
     harness.snapshot("paint_block_header_with_duration");
@@ -829,6 +842,8 @@ fn snapshot_paint_block_header_with_git_branch_clean() {
                 None,
                 None,
                 Some(&git),
+                None,
+                false,
             );
         });
     harness.snapshot("paint_block_header_git_branch_clean");
@@ -860,9 +875,70 @@ fn snapshot_paint_block_header_with_git_dirty_and_sync() {
                 None,
                 None,
                 Some(&git),
+                None,
+                false,
             );
         });
     harness.snapshot("paint_block_header_git_dirty_and_sync");
+}
+
+#[test]
+fn snapshot_paint_block_header_with_pr_chip_pending() {
+    // 4G-async-context PR chip: the live prompt header shows cwd, branch,
+    // dirty, then a `PR #NN` chip colored by CI status (here yellow =
+    // pending). This is the prompt-only "now, about to act" surface.
+    let cwd = std::path::PathBuf::from("/Users/tim/git/enthal/termica");
+    let home = std::path::PathBuf::from("/Users/tim");
+    let git = termica::git_context::GitContext {
+        branch: Some("feat/pr-status-chip".to_string()),
+        dirty: termica::git_context::DirtySummary {
+            files_changed: 1,
+            lines_added: 8,
+            lines_removed: 0,
+        },
+        ..Default::default()
+    };
+    let pr =
+        termica::pr_context::PrContext { number: 127, ci: termica::pr_context::CiStatus::Pending };
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(760.0, 40.0)).build_ui(move |ui| {
+            let _ = render::paint_block_header(
+                ui,
+                Some(cwd.as_path()),
+                Some(home.as_path()),
+                None,
+                None,
+                Some(&git),
+                Some(&pr),
+                false,
+            );
+        });
+    harness.snapshot("paint_block_header_pr_chip_pending");
+}
+
+#[test]
+fn snapshot_paint_block_header_with_pr_chip_passing() {
+    // Same surface, CI passing (green chip), clean tree.
+    let cwd = std::path::PathBuf::from("/Users/tim/git/enthal/termica");
+    let home = std::path::PathBuf::from("/Users/tim");
+    let git =
+        termica::git_context::GitContext { branch: Some("main".to_string()), ..Default::default() };
+    let pr =
+        termica::pr_context::PrContext { number: 124, ci: termica::pr_context::CiStatus::Passing };
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(760.0, 40.0)).build_ui(move |ui| {
+            let _ = render::paint_block_header(
+                ui,
+                Some(cwd.as_path()),
+                Some(home.as_path()),
+                None,
+                None,
+                Some(&git),
+                Some(&pr),
+                false,
+            );
+        });
+    harness.snapshot("paint_block_header_pr_chip_passing");
 }
 
 #[test]
@@ -881,9 +957,45 @@ fn snapshot_paint_sealed_block_with_header_and_failed_exit() {
                 Some(home.as_path()),
                 Some(127),
                 std::time::Duration::from_millis(42),
+                None,
             );
         });
     harness.snapshot("paint_sealed_block_with_header_and_failed_exit");
+}
+
+#[test]
+fn snapshot_paint_sealed_block_with_captured_git() {
+    // 4G-async-context capture-at-run-time: a sealed block shows the
+    // branch / dirty it ran under, frozen as history — cwd, branch, then
+    // the amber dirty chip, then the duration.
+    let cwd = std::path::PathBuf::from("/Users/tim/git/enthal/termica");
+    let home = std::path::PathBuf::from("/Users/tim");
+    let git = termica::git_context::GitContext {
+        branch: Some("feat/git-capture-at-runtime".to_string()),
+        ahead: 0,
+        behind: 0,
+        dirty: termica::git_context::DirtySummary {
+            files_changed: 2,
+            lines_added: 40,
+            lines_removed: 3,
+        },
+    };
+    let snapshot = sealed_snapshot(3, 40, b"build succeeded\r\n");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 120.0)).build_ui(move |ui| {
+            let _ = render::paint_sealed_block(
+                ui,
+                "cargo build",
+                &snapshot,
+                None,
+                Some(cwd.as_path()),
+                Some(home.as_path()),
+                Some(0),
+                std::time::Duration::from_secs(12),
+                Some(&git),
+            );
+        });
+    harness.snapshot("paint_sealed_block_with_captured_git");
 }
 
 #[test]
@@ -905,6 +1017,7 @@ fn snapshot_paint_sealed_block_with_selection_spans_command_and_output() {
                 None,
                 Some(0),
                 std::time::Duration::from_millis(200),
+                None,
             );
         });
     harness.snapshot("paint_sealed_block_with_selection");
@@ -927,6 +1040,7 @@ fn snapshot_paint_sealed_block_with_selection_in_command_only() {
                 None,
                 Some(0),
                 std::time::Duration::from_millis(200),
+                None,
             );
         });
     harness.snapshot("paint_sealed_block_with_selection_in_command_only");
@@ -1340,6 +1454,7 @@ fn snapshot_sticky_header_pinned_at_top() {
             Some(1),
             Some(std::time::Duration::from_millis(123)),
             None,
+            false,
             "ls -la --color=always",
             1,
         );
@@ -1365,6 +1480,7 @@ fn snapshot_sticky_header_multiline_command_capped() {
             Some(0),
             Some(std::time::Duration::from_secs(125)),
             None,
+            false,
             "for f in *.rs; do\n  echo \"$f\"\n  wc -l \"$f\"\n  head -1 \"$f\"\n  tail -1 \"$f\"\ndone",
             1,
         );
@@ -1391,6 +1507,7 @@ fn snapshot_sticky_header_pushed_up_clips_at_top() {
             None,
             Some(std::time::Duration::from_millis(34)),
             None,
+            false,
             "cargo test --workspace",
             1,
         );

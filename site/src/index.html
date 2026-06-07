@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Termica — a native terminal workspace</title>
+  <title>Termica — a modern interface for the shell you already use</title>
   <meta name="description" content="Termica is a modern interface for the shell you already use — a real, native terminal in Rust, with vim, ssh and tmux working exactly as they should." />
 
   <link rel="icon" href="/favicon.ico" sizes="any" />
@@ -14,20 +14,22 @@
 
   <!-- Open Graph / social -->
   <meta property="og:type" content="website" />
-  <meta property="og:title" content="Termica — a native terminal workspace" />
-  <meta property="og:description" content="A modern interface for the shell you already use. A real, native terminal. Rust · egui." />
+  <meta property="og:title" content="Termica — a modern interface for the shell you already use" />
+  <meta property="og:description" content="A real, native terminal in Rust. vim, ssh, htop, tmux — all exactly as they should be. With command blocks, history, and completion on top." />
   <meta property="og:url" content="https://termica.io/" />
-  <meta property="og:image" content="https://termica.io/icon.png" />
-  <meta name="twitter:card" content="summary" />
+  <meta property="og:image" content="https://termica.io/img/og.jpg" />
+  <meta property="og:image:type" content="image/jpeg" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta name="twitter:card" content="summary_large_image" />
 
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
   <div class="glow" aria-hidden="true"></div>
 
-  <main class="hero">
-    <img class="logo" src="/icon.png" width="160" height="160"
+  <header class="hero">
+    <img class="logo" src="/icon.png" width="140" height="140"
          alt="Termica icon — a neon T over a terminal prompt" />
 
     <h1 class="wordmark">Termica</h1>
@@ -35,22 +37,60 @@
     <p class="tagline">
       A modern interface for the shell you already use.
     </p>
+  </header>
 
-    <p class="prompt" aria-hidden="true">
-      <span class="caret">&gt;_</span> <span class="typed">cargo run</span>
-    </p>
+  <figure class="shot">
+    <img src="/img/hero.webp" srcset="/img/hero.webp 1x, /img/hero@2x.webp 2x"
+         width="1000" height="647" decoding="async"
+         alt="Termica running three panes: a stack of command blocks with cwd, exit-code and duration chips and a syntax-highlighted prompt; bat viewing Rust source; and htop running full-width." />
+  </figure>
 
-    <div class="actions">
-      <a class="btn btn-primary" href="https://github.com/enthal/termica">
-        View on GitHub
-      </a>
-    </div>
-
+  <div class="cta">
+    <a class="btn btn-primary" href="https://github.com/enthal/termica">
+      View on GitHub
+    </a>
     <p class="meta muted">Built in Rust with egui · Open source</p>
+  </div>
+
+  <main class="features">
+    <section class="feature">
+      <div class="feature-text">
+        <h2>Find anything you've ever run</h2>
+        <p>
+          Press <kbd>Ctrl</kbd>+<kbd>R</kbd> for a fuzzy search across your whole
+          history — this pane or everywhere. Matches highlight as you type, and
+          your history follows you across sessions.
+        </p>
+      </div>
+      <figure class="feature-shot">
+        <img src="/img/history.webp" srcset="/img/history.webp 1x, /img/history@2x.webp 2x"
+             width="1000" height="747" loading="lazy" decoding="async"
+             alt="Termica's Ctrl+R history overlay: a query box over past commands with the matched substrings highlighted, plus relative timestamps, working directory and exit status." />
+      </figure>
+    </section>
+
+    <section class="feature feature-reverse">
+      <div class="feature-text">
+        <h2>Tab, and go</h2>
+        <p>
+          Completion that knows where things come from — filesystem paths,
+          executables on your <code>$PATH</code>, and your command history — each
+          labeled at a glance. Navigate with the arrow keys, accept with
+          <kbd>Tab</kbd>.
+        </p>
+      </div>
+      <figure class="feature-shot">
+        <img src="/img/completion.webp" srcset="/img/completion.webp 1x, /img/completion@2x.webp 2x"
+             width="1000" height="406" loading="lazy" decoding="async"
+             alt="Termica's tab-completion popup completing a command prefix, each candidate tagged with its source — here, executables on $PATH." />
+      </figure>
+    </section>
   </main>
 
   <footer class="footer muted">
-    &copy; <span id="year">2026</span> Termica
+    <a class="footer-link" href="https://github.com/enthal/termica">GitHub</a>
+    <span aria-hidden="true">·</span>
+    <span>&copy; <span id="year">2026</span> Termica</span>
   </footer>
 
   <script>
