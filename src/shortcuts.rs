@@ -69,6 +69,7 @@ pub fn match_pane_shortcut(
             (egui::Key::W, false) => Some(PaneAction::CloseTab),
             (egui::Key::Q, false) => Some(PaneAction::Quit),
             (egui::Key::K, false) => Some(PaneAction::ClearScrollback),
+            (egui::Key::F, false) => Some(PaneAction::OpenFind),
             (egui::Key::CloseBracket | egui::Key::CloseCurlyBracket, true) => {
                 Some(PaneAction::NextTab)
             }
@@ -110,6 +111,7 @@ pub fn match_pane_shortcut(
             egui::Key::W => Some(PaneAction::CloseTab),
             egui::Key::Q => Some(PaneAction::Quit),
             egui::Key::K => Some(PaneAction::ClearScrollback),
+            egui::Key::F => Some(PaneAction::OpenFind),
             egui::Key::CloseBracket | egui::Key::CloseCurlyBracket => Some(PaneAction::NextTab),
             egui::Key::OpenBracket | egui::Key::OpenCurlyBracket => Some(PaneAction::PrevTab),
             _ => None,
@@ -161,6 +163,31 @@ mod tests {
             match_pane_shortcut(egui::Key::K, mac_cmd_only(), true),
             Some(PaneAction::ClearScrollback)
         );
+    }
+
+    #[test]
+    fn macos_cmd_f_maps_to_open_find() {
+        assert_eq!(
+            match_pane_shortcut(egui::Key::F, mac_cmd_only(), true),
+            Some(PaneAction::OpenFind)
+        );
+    }
+
+    #[test]
+    fn linux_ctrl_shift_f_maps_to_open_find() {
+        assert_eq!(
+            match_pane_shortcut(egui::Key::F, linux_ctrl_shift(), false),
+            Some(PaneAction::OpenFind)
+        );
+    }
+
+    #[test]
+    fn linux_plain_ctrl_f_is_not_a_shortcut() {
+        // Plain Ctrl+F is readline `forward-char`; it must pass through
+        // to the shell, not open the find overlay. Only Ctrl+Shift+F is
+        // ours on Linux.
+        let ctrl_only = egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::default() };
+        assert_eq!(match_pane_shortcut(egui::Key::F, ctrl_only, false), None);
     }
 
     #[test]

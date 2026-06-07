@@ -40,6 +40,7 @@ It embeds your existing `zsh`, `bash`, or `fish` — Termica is not a new shell,
 - **Editor-driven prompt.** At a known shell prompt, the line editor becomes a native editor: click to place the cursor, drag to select, multiline editing, undo/redo, and shell syntax highlighting. Press Enter to send the command.
 - **Structured command blocks.** Each command and its output are sealed into a block you can select across, copy, and read back with its exit status.
 - **Command history that remembers.** Backed by SQLite and seeded from your existing shell history. Walk it with ↑/↓ in the prompt, or open a fuzzy-search overlay with Ctrl+R, scoped to the current pane or everywhere.
+- **Find in the transcript.** Cmd+F opens an in-pane find bar that searches your command blocks — match case, regex, and an All / Commands / Outputs filter — highlighting hits over the grid. Enter / Shift+Enter step through matches; ↑/↓ recall previous searches.
 - **Tab completion.** A completion popup sourced from filesystem paths, command history, and executables on your `PATH`.
 - **Tabs and splits.** A workspace of tabs and drag-to-split panes, each a real PTY session, with per-pane keyboard focus.
 - **Clickable links and paths.** URLs and on-disk file paths in output are detected and openable on Cmd/Ctrl-hover.
@@ -102,6 +103,7 @@ Shortcuts use **Cmd** on macOS and **Ctrl+Shift** on Linux.
 | Next / previous tab | Cmd+Shift+] / [ | Ctrl+Shift+] / [ |
 | Clear scrollback | Cmd+K | Ctrl+Shift+K |
 | Scroll through scrollback | Cmd+Option+↑ / ↓ | Ctrl+Alt+↑ / ↓ |
+| Find in pane | Cmd+F | Ctrl+Shift+F |
 | Quit | Cmd+Q | Ctrl+Shift+Q |
 
 At the prompt:
