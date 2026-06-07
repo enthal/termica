@@ -1,0 +1,57 @@
+name: release-plz
+
+# Version management: on every push to main, release-plz keeps an open
+# "Release PR" that bumps the version + updates CHANGELOG.md from the
+# conventional commits. Merging that PR cuts a release — release-plz tags
+# `vX.Y.Z`, and that tag triggers release.yml to build the binaries.
+#
+# The tag MUST be pushed with a PAT (RELEASE_PLZ_TOKEN), not the default
+# GITHUB_TOKEN: tags created by GITHUB_TOKEN do not trigger other workflows,
+# so release.yml would never fire. See spec/12-distribution.md.
+#
+# No crates.io publishing happens (Cargo.toml sets `publish = false`), so no
+# CARGO_REGISTRY_TOKEN is needed.
+#
+# The release-plz action is pinned by commit SHA (= v0.5.129) — immutable,
+# and avoids the version tag being mangled by email-style obfuscation.
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  release-plz-pr:
+    name: Release PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@064f4d1e36c843611ddf013be726beaa4ad804db # v0.5.129
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+  release-plz-release:
+    name: Tag release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@064f4d1e36c843611ddf013be726beaa4ad804db # v0.5.129
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}

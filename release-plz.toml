@@ -1,0 +1,20 @@
+# release-plz configuration — see spec/12-distribution.md.
+#
+# release-plz bumps the version + changelog (in the Release PR) and, on merge,
+# creates the git tag. It does NOT create the GitHub Release or publish to
+# crates.io:
+#   - The GitHub Release (with binaries) is created by release.yml, triggered
+#     by the tag, so git_release_enable = false here.
+#   - crates.io publishing is off because Cargo.toml sets `publish = false`.
+
+[workspace]
+# Cut a release commit/PR from conventional commits.
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+# release.yml owns the GitHub Release (it has the built artifacts).
+git_release_enable = false
+# Keep a Keep-a-Changelog style CHANGELOG.md in the repo.
+changelog_update = true
+# Pre-1.0, still bump the MINOR on `feat:` (0.1 -> 0.2), not just patch, so
+# version numbers track feature progress. (Default would patch-bump in 0.x.)
+features_always_increment_minor = true

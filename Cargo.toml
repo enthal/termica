@@ -6,6 +6,20 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/enthal/termica"
 description = "A native terminal workspace with a modern editor-driven shell experience, built on Rust and egui."
 rust-version = "1.95"
+# Termica is an application, not a library — never publish to crates.io.
+# This also tells release-plz to bump/tag/changelog without `cargo publish`.
+publish = false
+
+# Native installer packaging for releases — see spec/12-distribution.md.
+# `cargo packager --release` runs before-packaging-command to build the
+# binary, then bundles it (.dmg on macOS, .deb / .AppImage on Linux).
+# Output formats are selected per-platform on the CLI in release.yml.
+[package.metadata.packager]
+product-name = "Termica"
+identifier = "io.termica.termica"
+icons = ["assets/app_icon.png"]
+before-packaging-command = "cargo build --release"
+out-dir = "dist"
 
 [workspace]
 # A single root crate today; the architecture in spec/01-architecture.md
