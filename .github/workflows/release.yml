@@ -1,0 +1,87 @@
+name: Release
+
+# Builds native installers and attaches them to the GitHub Release.
+#
+# - On a `v*` tag (pushed by release-plz with a PAT — see release-plz.yml):
+#   build, package, and create/update the GitHub Release with the artifacts.
+# - On manual dispatch: build + package and upload as workflow artifacts only
+#   (no release). Use this to test the pipeline without cutting a version.
+#
+# macOS builds are UNSIGNED for now (see spec/12-distribution.md); the signing
+# steps will slot in later, gated behind secrets.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # create releases / upload assets
+
+jobs:
+  package:
+    name: Package (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14 # Apple Silicon
+            label: macos-arm64
+            formats: dmg
+          - os: macos-13 # Intel
+            label: macos-x64
+            formats: dmg
+          - os: ubuntu-22.04
+            label: linux-x64
+            formats: deb appimage
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libfuse2
+
+      # The repo pins its toolchain via rust-toolchain.toml; the first cargo
+      # invocation auto-installs it. rust-cache keeps build times sane.
+      - uses: Swatinem/rust-cache@v2
+
+      # Prebuilt cargo-packager (avoids recompiling it under the pinned
+      # toolchain, and is much faster).
+      - uses: cargo-bins/cargo-binstall@main
+      - name: Install cargo-packager
+        run: cargo binstall -y cargo-packager
+
+      - name: Build & package
+        run: cargo packager --release --formats ${{ matrix.formats }} --verbose
+
+      - name: List artifacts
+        shell: bash
+        run: ls -la dist || true
+
+      - name: Upload workflow artifacts (manual test runs)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: termica-${{ matrix.label }}
+          path: |
+            dist/*.dmg
+            dist/*.deb
+            dist/*.AppImage
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release (tagged runs)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.dmg
+            dist/*.deb
+            dist/*.AppImage

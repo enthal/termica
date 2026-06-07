@@ -3,6 +3,9 @@
 .DS_Store
 *.swp
 
+# cargo-packager output (out-dir = "dist") — generated installers.
+/dist/
+
 # egui_kittest snapshot artifacts — the committed `.png` is the source
 # of truth; `.new.png` / `.diff.png` / `.old.png` are regen artifacts.
 *.new.png
