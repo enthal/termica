@@ -1449,13 +1449,14 @@ fn snapshot_sticky_header_pinned_at_top() {
             &ctx,
             viewport,
             0.0,
-            Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
-            Some(std::path::Path::new("/Users/tim")),
-            Some(1),
-            Some(std::time::Duration::from_millis(123)),
-            None,
-            false,
-            "ls -la --color=always",
+            termica::StickyHeaderContent {
+                cwd: Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
+                home: Some(std::path::Path::new("/Users/tim")),
+                exit: Some(1),
+                duration: Some(std::time::Duration::from_millis(123)),
+                command: "ls -la --color=always",
+                ..Default::default()
+            },
             1,
         );
     });
@@ -1475,13 +1476,14 @@ fn snapshot_sticky_header_multiline_command_capped() {
             &ctx,
             viewport,
             0.0,
-            Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
-            Some(std::path::Path::new("/Users/tim")),
-            Some(0),
-            Some(std::time::Duration::from_secs(125)),
-            None,
-            false,
-            "for f in *.rs; do\n  echo \"$f\"\n  wc -l \"$f\"\n  head -1 \"$f\"\n  tail -1 \"$f\"\ndone",
+            termica::StickyHeaderContent {
+                cwd: Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
+                home: Some(std::path::Path::new("/Users/tim")),
+                exit: Some(0),
+                duration: Some(std::time::Duration::from_secs(125)),
+                command: "for f in *.rs; do\n  echo \"$f\"\n  wc -l \"$f\"\n  head -1 \"$f\"\n  tail -1 \"$f\"\ndone",
+                ..Default::default()
+            },
             1,
         );
     });
@@ -1502,17 +1504,85 @@ fn snapshot_sticky_header_pushed_up_clips_at_top() {
             &ctx,
             viewport,
             -12.0,
-            Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
-            Some(std::path::Path::new("/Users/tim")),
-            None,
-            Some(std::time::Duration::from_millis(34)),
-            None,
-            false,
-            "cargo test --workspace",
+            termica::StickyHeaderContent {
+                cwd: Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
+                home: Some(std::path::Path::new("/Users/tim")),
+                duration: Some(std::time::Duration::from_millis(34)),
+                command: "cargo test --workspace",
+                ..Default::default()
+            },
             1,
         );
     });
     harness.snapshot("sticky_header_pushed_up");
+}
+
+/// Regression: the pinned command label must be **interactive**
+/// (`click_and_drag`), not hover-only. A hover-only overlay let presses
+/// fall through to the output scrolling underneath, so double-clicking
+/// the pinned command selected the wrong text (it was not selectable).
+/// The returned `Response` is what the pane routes into a selection of
+/// the pinned block, so it must sense both click and drag.
+#[test]
+fn sticky_header_command_label_is_selectable() {
+    let size = egui::Vec2::new(560.0, 220.0);
+    let mut command_sense = None;
+    let _ = Harness::builder().with_size(size).build_ui(|ui| {
+        let ctx = ui.ctx().clone();
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        let sticky = termica::paint_sticky_header(
+            &ctx,
+            viewport,
+            0.0,
+            termica::StickyHeaderContent {
+                cwd: Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
+                home: Some(std::path::Path::new("/Users/tim")),
+                exit: Some(0),
+                duration: Some(std::time::Duration::from_millis(123)),
+                command: "git commit -m \"fix pinned header\"",
+                ..Default::default()
+            },
+            1,
+        );
+        command_sense = sticky.command.map(|r| r.sense);
+    });
+    let sense = command_sense.expect("pinned header has a command label");
+    assert!(sense.senses_click(), "pinned command label must sense clicks");
+    assert!(sense.senses_drag(), "pinned command label must sense drags (for drag-select)");
+}
+
+/// The pinned command label paints the block's selection highlight so a
+/// selection started on the pinned copy is visible there, in sync with
+/// the inline block. Snapshot guards the highlighted-glyph rendering.
+#[test]
+fn snapshot_sticky_header_with_command_selection() {
+    let size = egui::Vec2::new(560.0, 220.0);
+    let mut harness = Harness::builder().with_size(size).build_ui(move |ui| {
+        paint_fake_output_rows(ui, size);
+        let ctx = ui.ctx().clone();
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        // Select "commit" (cols 4..10) on the single command row.
+        let sel = Some((
+            termica::block_selection::BlockCursor::new(0, 4),
+            termica::block_selection::BlockCursor::new(0, 10),
+        ));
+        termica::paint_sticky_header(
+            &ctx,
+            viewport,
+            0.0,
+            termica::StickyHeaderContent {
+                cwd: Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
+                home: Some(std::path::Path::new("/Users/tim")),
+                exit: Some(0),
+                duration: Some(std::time::Duration::from_millis(123)),
+                command: "git commit -m wip",
+                command_selection: sel,
+                ..Default::default()
+            },
+            1,
+        );
+    });
+    harness.snapshot("sticky_header_with_command_selection");
 }
 
 #[test]
