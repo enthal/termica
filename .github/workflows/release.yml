@@ -52,10 +52,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # Prebuilt cargo-packager (avoids recompiling it under the pinned
-      # toolchain, and is much faster).
+      # toolchain, and is much faster). --force because rust-cache can restore
+      # binstall's "already installed" metadata without the actual binary
+      # (it doesn't cache ~/.cargo/bin), which otherwise makes binstall skip
+      # the install and leaves `cargo packager` missing. Pinned for determinism.
       - uses: cargo-bins/cargo-binstall@main
       - name: Install cargo-packager
-        run: cargo binstall -y cargo-packager
+        run: cargo binstall -y --force [email protected]
 
       - name: Build & package
         run: cargo packager --release --formats ${{ matrix.formats }} --verbose
