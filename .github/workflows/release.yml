@@ -58,7 +58,10 @@ jobs:
       # the install and leaves `cargo packager` missing. Pinned for determinism.
       - uses: cargo-bins/cargo-binstall@main
       - name: Install cargo-packager
-        run: cargo binstall -y --force [email protected]
+        # NOTE: use --version, never `cargo-packager@0.11.8` — an `@<dotted
+        # version>` looks like an email and gets silently mangled to
+        # "[email protected]" in transit (same gotcha that hit the action ref).
+        run: cargo binstall -y --force --version 0.11.8 cargo-packager
 
       - name: Build & package
         run: cargo packager --release --formats ${{ matrix.formats }} --verbose
