@@ -24,6 +24,10 @@ FINGERPRINT=(
   icon.png
   img/hero.webp
   img/hero@2x.webp
+  img/history.webp
+  img/history@2x.webp
+  img/completion.webp
+  img/completion@2x.webp
   img/og.jpg
 )
 

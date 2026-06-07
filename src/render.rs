@@ -185,10 +185,15 @@ pub fn color_for_token_kind(kind: crate::shell_syntax::TokenKind) -> Color32 {
 /// in a long transcript. Theme polish lands in Phase 10.
 pub const BLOCK_HEADER_EXIT_FAIL_FG: Color32 = Color32::from_rgb(0xe0, 0x70, 0x70);
 
+/// Foreground for the git branch chip (4G-async-context). A soft green —
+/// the branch is the headline of the git chips, so it reads as "you're
+/// here" without the alarm of the red exit / dirty colors. ahead/behind
+/// stays the dim [`BLOCK_HEADER_FG`].
+pub const BLOCK_HEADER_BRANCH_FG: Color32 = Color32::from_rgb(0x86, 0xc8, 0x88);
+
 /// Foreground for the dirty-working-tree chip (4G-async-context). Amber:
 /// not an error (a dirty tree is normal mid-work), but warmer than the
-/// dim grey of the cwd / branch chips so uncommitted changes catch the
-/// eye. Branch + ahead/behind chips stay [`BLOCK_HEADER_FG`].
+/// dim grey of the cwd chip so uncommitted changes catch the eye.
 pub const BLOCK_HEADER_DIRTY_FG: Color32 = Color32::from_rgb(0xe0, 0xb8, 0x6e);
 
 /// Foregrounds for the `PR #NN` chip (4G-async-context), colored by the
@@ -924,6 +929,19 @@ pub fn format_duration(d: std::time::Duration) -> String {
 /// When `cwd` is `None`, there's no non-zero `exit`, *and* no
 /// `duration`, nothing is painted at all — the header row is skipped
 /// entirely (no allocated rect, so egui inserts no `item_spacing` gap).
+/// Mute a chip's text color toward the dim header grey for sealed
+/// (historical) blocks: blend most of the way to [`BLOCK_HEADER_FG`] so
+/// the chip reads as desaturated / past-tense but keeps a hint of its
+/// original hue (a faded green branch is still recognizably green).
+fn fade_chip_color(c: Color32) -> Color32 {
+    // 0.0 = original, 1.0 = fully grey. Tuned for "nearer grey, still
+    // slightly tinted."
+    const T: f32 = 0.62;
+    let g = BLOCK_HEADER_FG;
+    let lerp = |a: u8, b: u8| (a as f32 * (1.0 - T) + b as f32 * T).round() as u8;
+    Color32::from_rgb(lerp(c.r(), g.r()), lerp(c.g(), g.g()), lerp(c.b(), g.b()))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn paint_block_header(
     ui: &mut egui::Ui,
@@ -933,6 +951,7 @@ pub fn paint_block_header(
     duration: Option<std::time::Duration>,
     git: Option<&crate::git_context::GitContext>,
     pr: Option<&crate::pr_context::PrContext>,
+    faded: bool,
 ) -> Option<Response> {
     let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
     let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
@@ -977,7 +996,7 @@ pub fn paint_block_header(
         chips.push((&cwd_text, chip_w(&cwd_text), BLOCK_HEADER_FG));
     }
     if !branch_text.is_empty() {
-        chips.push((&branch_text, chip_w(&branch_text), BLOCK_HEADER_FG));
+        chips.push((&branch_text, chip_w(&branch_text), BLOCK_HEADER_BRANCH_FG));
     }
     if !sync_text.is_empty() {
         chips.push((&sync_text, chip_w(&sync_text), BLOCK_HEADER_FG));
@@ -993,6 +1012,20 @@ pub fn paint_block_header(
     }
     if !dur_text.is_empty() {
         chips.push((&dur_text, chip_w(&dur_text), BLOCK_HEADER_FG));
+    }
+
+    // Sealed (historical) blocks render their chips muted — desaturated
+    // toward grey but still slightly tinted — so finished blocks read as
+    // past-tense while the live prompt / running chips stay vivid. The
+    // failed-`exit` chip is the deliberate exception: a non-zero exit
+    // stays vivid red even on a sealed block, so failures don't fade
+    // into scroll-back.
+    if faded {
+        for chip in &mut chips {
+            if chip.2 != BLOCK_HEADER_EXIT_FAIL_FG {
+                chip.2 = fade_chip_color(chip.2);
+            }
+        }
     }
 
     if chips.is_empty() {
@@ -1218,7 +1251,8 @@ pub fn paint_sealed_block(
     // under, frozen as history. NOT the pane's current git, which would
     // be anachronistic on scroll-back. No PR chip: a finished command's
     // CI status is meaningless (you want current), so PR is prompt-only.
-    let header = paint_block_header(ui, cwd, home, exit, Some(duration), git, None);
+    // `faded = true`: sealed chips render muted (past-tense).
+    let header = paint_block_header(ui, cwd, home, exit, Some(duration), git, None, true);
     let header_height = header.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
 
     let cmd_lines = if command.is_empty() { 0 } else { command.split('\n').count() };
