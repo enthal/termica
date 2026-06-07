@@ -377,8 +377,9 @@ impl TermicaApp {
                     && !slot.session.terminal().is_alternate_screen()
                 {
                     slot.ui.history_overlay = None;
-                    let history =
-                        slot.ui.find_overlay.take().map(|o| o.history).unwrap_or_default();
+                    // Seed from the pane's persisted query history so a
+                    // reopen after Esc still has the dropdown populated.
+                    let history = slot.ui.find_history.clone();
                     slot.ui.find_overlay = Some(crate::find::FindOverlay::open(history));
                     slot.ui.needs_focus = true;
                 }

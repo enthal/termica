@@ -522,7 +522,7 @@ pub fn paint_overlay(
         .fixed_pos(pane_rect.right_top() + egui::vec2(-margin, margin))
         .show(ui.ctx(), |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.horizontal(|ui| {
+                let top = ui.horizontal(|ui| {
                     ui.strong("find");
 
                     let prev_query = overlay.query.clone();
@@ -606,21 +606,30 @@ pub fn paint_overlay(
                     }
                 });
 
-                // History dropdown list.
+                // History dropdown list. Rows are full-width clickable
+                // (justified layout fills the bar width) so a click
+                // anywhere in a row — not just on the text — picks it.
                 if overlay.dropdown_open && !overlay.history.is_empty() {
                     ui.separator();
+                    let bar_w = top.response.rect.width();
                     egui::ScrollArea::vertical()
                         .id_salt(("find-history", pane_id))
                         .max_height(160.0)
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
-                            let entries = overlay.history.clone();
-                            for (i, h) in entries.iter().enumerate() {
-                                if ui.selectable_label(false, h).clicked() {
-                                    overlay.pick_history(i);
-                                    outcome.scroll_to_selected = true;
-                                }
-                            }
+                            ui.set_min_width(bar_w);
+                            ui.with_layout(
+                                egui::Layout::top_down_justified(egui::Align::LEFT),
+                                |ui| {
+                                    let entries = overlay.history.clone();
+                                    for (i, h) in entries.iter().enumerate() {
+                                        if ui.selectable_label(false, h.as_str()).clicked() {
+                                            overlay.pick_history(i);
+                                            outcome.scroll_to_selected = true;
+                                        }
+                                    }
+                                },
+                            );
                         });
                 }
             });

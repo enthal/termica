@@ -1151,8 +1151,17 @@ pub fn render_pane(
     // measurement of where content ends; our pre-layout
     // `content_h` estimate was sometimes off, sending the snap to
     // the wrong place.
-    let scroll_area =
-        if force_to_top { scroll_area.vertical_scroll_offset(0.0) } else { scroll_area };
+    // `find_scrolling` also needs the offset override: when the user is
+    // glued to the bottom, ScrollArea's "we're at the end" cache
+    // swallows the `scroll_to_rect` we issue for the current match (the
+    // same gotcha `force_to_top` hits). Resetting the offset to 0 clears
+    // that cache; the `scroll_to_rect` in the closure then re-centers on
+    // the match the same frame, so there's no visible jump to the top.
+    let scroll_area = if force_to_top || find_scrolling {
+        scroll_area.vertical_scroll_offset(0.0)
+    } else {
+        scroll_area
+    };
     // Live elapsed time of the running command (`None` when idle),
     // sampled once this frame for the ticking duration chip (4G).
     // While a command runs, schedule a repaint so the chip keeps
@@ -2883,7 +2892,11 @@ pub fn render_pane(
         let pane_rect = ui.max_rect();
         let outcome = crate::find::paint(ui, slot, pane_rect);
         if outcome.close {
-            slot.ui.find_overlay = None;
+            // Persist the query history on the pane before dropping the
+            // overlay so a later Cmd+F reopen still has it.
+            if let Some(o) = slot.ui.find_overlay.take() {
+                slot.ui.find_history = o.history;
+            }
             slot.ui.needs_focus = true;
         } else if outcome.scroll_to_selected {
             slot.ui.find_scroll_pending = true;
