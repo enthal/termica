@@ -449,6 +449,17 @@ fn classify_editor_motion(
     None
 }
 
+/// Should this primary press EXTEND the current selection instead of
+/// starting a fresh one? True only for a Shift+click when a selection
+/// already exists to extend from (Chrome-style: keep the anchor + the
+/// established char/word/line mode, move the head to the click). With
+/// no existing selection there's nothing to anchor to, so a Shift+click
+/// falls through to a normal start. Pure so the routing rule is unit-
+/// testable without an egui event loop.
+fn press_extends_selection(primary_pressed: bool, shift_held: bool, has_selection: bool) -> bool {
+    primary_pressed && shift_held && has_selection
+}
+
 /// Is this event the EOF chord — Ctrl+D — the one keystroke that may
 /// deliberately reach the PTY from an idle prompt editor (exit the
 /// shell)? Pure so the routing rule is unit-testable without an egui
@@ -2085,6 +2096,10 @@ pub fn render_pane(
     // WHICH widget got the press; that comes from per-widget
     // `Response::is_pointer_button_down_on()`.
     let primary_just_pressed = ctx.input(|i| i.pointer.primary_pressed());
+    // Shift held at press time turns a click into a selection EXTEND
+    // (Chrome-style): keep the existing anchor + selection mode and move
+    // the head to the click, rather than starting a fresh selection.
+    let shift_held = ctx.input(|i| i.modifiers.shift);
 
     /// Translate a pointer pixel position inside the editor rect to
     /// a byte index in the editor's text. Out-of-rows clamps to end.
@@ -2321,7 +2336,16 @@ pub fn render_pane(
             origin_cursor.col = origin_cursor.col.min(row_len);
         }
 
-        if primary_just_pressed {
+        // Shift+click EXTENDS the existing pane selection (across blocks
+        // and into / out of command vs output) instead of starting a new
+        // one — falling through to the shared extend branch below, which
+        // honours the retained char / word / line mode.
+        let shift_extend = press_extends_selection(
+            primary_just_pressed,
+            shift_held,
+            slot.session.pane_selection().is_some(),
+        );
+        if primary_just_pressed && !shift_extend {
             // -------- START a selection in the press block ----
             // Anchor + head both land in the origin block;
             // multi-click expands within that block.
@@ -2467,7 +2491,10 @@ pub fn render_pane(
             .unwrap_or_default();
         let byte = editor_byte_for_pos(rect, pos, &editor_text, cell_w, row_h);
 
-        if primary_just_pressed {
+        // Shift+click extends the editor selection from its caret /
+        // anchor (the editor always has a caret to anchor to), honouring
+        // the retained char / word / line mode — fall through to EXTEND.
+        if primary_just_pressed && !shift_held {
             // Press in the editor ends any sealed-block selection.
             slot.session.clear_pane_selection();
             slot.ui.sealed_drag_anchor = None;
@@ -2520,7 +2547,12 @@ pub fn render_pane(
         let press_pt = to_point(pos);
         let link_under_press = links_in_view.iter().find(|l| l.contains(press_pt)).cloned();
 
-        if primary_just_pressed {
+        // Shift+click extends the live-grid selection (in whatever
+        // char / word / line mode it was started) to the click instead
+        // of starting fresh.
+        let shift_extend_grid =
+            press_extends_selection(primary_just_pressed, shift_held, selection.is_some());
+        if primary_just_pressed && !shift_extend_grid {
             if modifier_held && let Some(link) = link_under_press {
                 open_url(&link.url);
             } else {
@@ -2538,10 +2570,12 @@ pub fn render_pane(
                     slot.session.start_selection(press_pt, mode);
                 }
             }
-        } else if rendered.response.dragged() {
+        } else if rendered.response.dragged() || shift_extend_grid {
             // EXTEND. Egui's `dragged()` is the canonical
             // "this widget is being dragged" signal once the
-            // drag threshold is met.
+            // drag threshold is met; `shift_extend_grid` is the
+            // discrete Shift+click extend. Both keep the mode the
+            // selection was started in.
             slot.session.extend_selection(press_pt);
         }
     }
@@ -3178,6 +3212,30 @@ pub fn render_pane(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- press_extends_selection (Shift+click extend) -----------------
+
+    #[test]
+    fn shift_click_with_selection_extends() {
+        assert!(press_extends_selection(true, true, true));
+    }
+
+    #[test]
+    fn shift_click_without_selection_starts_fresh() {
+        // Nothing to anchor to → normal start, not extend.
+        assert!(!press_extends_selection(true, true, false));
+    }
+
+    #[test]
+    fn plain_click_never_extends() {
+        assert!(!press_extends_selection(true, false, true));
+    }
+
+    #[test]
+    fn shift_without_a_press_is_not_an_extend() {
+        // Shift held mid-drag (no fresh press) isn't a Shift+click.
+        assert!(!press_extends_selection(false, true, true));
+    }
 
     // ---- plan_resize (resize debounce, #1 banner-storm fix) -----------
 
