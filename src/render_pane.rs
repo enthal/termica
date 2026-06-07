@@ -1119,28 +1119,27 @@ pub fn render_pane(
         // Keep matches / highlights converging while the field has focus.
         ctx.request_repaint();
     }
-    // A pending scroll-to-match must win over `stick_to_bottom`, which
-    // would otherwise re-pin the user to the live tail every frame.
+    // Issue a scroll-to-match this frame when one was requested.
     let find_scrolling = do_find_scroll && find_selected_match.is_some();
+    // Suppress `stick_to_bottom` for the WHOLE time the find overlay is
+    // open, not just the scroll frame. An animated scroll-to-match sets
+    // its target on frame 1 but doesn't move `offset` until later frames;
+    // if `stick_to_bottom` re-enabled on frame 2 while `offset` was still
+    // at max, ScrollArea's `scroll_stuck_to_end` would snap us back to
+    // the bottom and cancel the animation. Keeping it off the whole time
+    // the overlay is up lets the animation play out (and the user is
+    // browsing matches, not the live tail, anyway).
+    let find_open = slot.ui.find_overlay.is_some();
     // `stick_to_bottom` re-snaps the offset to max every frame the
     // user is at the bottom — which fights any top-snap attempt
     // and silently swallows a Cmd+Option+Up jump while the user is
     // glued to the live tail (the typical case while typing
-    // commands). Two-layer fix:
-    //  1. Disable stick-to-bottom for this frame when `force_to_top`
-    //     — the user is asking to leave the bottom, don't pin them.
-    //  2. Override the persisted scroll offset directly via
-    //     `vertical_scroll_offset(0.0)`. `scroll_to_cursor(TOP)`
-    //     writes into a frame-state hint that ScrollArea consumes
-    //     at the end of `show()`; it doesn't reliably win against
-    //     ScrollArea's internal "was at end" state. A direct offset
-    //     override at the builder level always wins.
-    //  Using `0.0` (not `f32::INFINITY`) avoids the NaN persistence
-    //  trap the bottom-snap path hit earlier — see the existing
-    //  `force_to_bottom` comment below.
+    // commands). Disable it when `force_to_top` (the user is asking to
+    // leave the bottom) or while find is open (see above); `force_to_top`
+    // additionally overrides the persisted offset directly below.
     let scroll_area = egui::ScrollArea::vertical()
         .id_salt(("pane-blocks", slot.session.pane_id()))
-        .stick_to_bottom(!force_to_top && !find_scrolling)
+        .stick_to_bottom(!force_to_top && !find_open)
         .auto_shrink([false, false])
         .max_height(scroll_max_h);
     // `force_to_top` uses a direct offset override (0.0) because
@@ -1347,17 +1346,36 @@ pub fn render_pane(
                 };
                 if let Some(o) = origin {
                     let y = o.y + m.row as f32 * row_h;
+                    // Extend the target rect UP by the height of this
+                    // block's sticky-top header (the pinned chrome +
+                    // capped command). An output match scrolled flush to
+                    // the viewport top would otherwise land *behind* that
+                    // pinned header; raising the rect's top makes egui
+                    // scroll a header's-worth further so the match clears
+                    // it. Command matches need no margin — when their
+                    // block pins, the command IS the pinned header.
+                    let header_margin = if matches!(m.kind, crate::find::LineKind::Output) {
+                        block_extents
+                            .iter()
+                            .find(|e| e.id == m.block_id)
+                            .map(|e| e.sticky_h)
+                            .unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
                     let rect = egui::Rect::from_min_max(
-                        egui::pos2(o.x + m.col_start as f32 * cell_w, y),
+                        egui::pos2(o.x + m.col_start as f32 * cell_w, y - header_margin),
                         egui::pos2(o.x + m.col_end as f32 * cell_w, y + row_h),
                     );
-                    // `None` align scrolls the *minimum* to make the match
-                    // visible — and is a no-op when it's already in view
-                    // (egui's "already in view → delta 0" branch). That's
-                    // what stops every keystroke / Prev / Next from
-                    // re-animating a scroll to a match that hasn't moved.
-                    // Instant (no animation) so a real jump doesn't drift.
-                    ui.scroll_to_rect_animation(rect, None, egui::style::ScrollAnimation::none());
+                    // `None` align scrolls the *minimum* to make the
+                    // (header-padded) match rect visible — a no-op when
+                    // it's already fully in view (egui's "already in view
+                    // → delta 0" branch), so a keystroke / Prev / Next
+                    // that doesn't move the match doesn't re-scroll. The
+                    // default animation plays from the CURRENT offset
+                    // (we no longer reset to the top), so it's a short
+                    // glide, not a jump from the top of scrollback.
+                    ui.scroll_to_rect(rect, None);
                 }
             }
         } // end of `if !in_alt_screen { ... }`
