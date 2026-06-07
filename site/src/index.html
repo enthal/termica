@@ -52,6 +52,41 @@
     <p class="meta muted">Built in Rust with egui · Open source</p>
   </div>
 
+  <main class="features">
+    <section class="feature">
+      <div class="feature-text">
+        <h2>Find anything you've ever run</h2>
+        <p>
+          Press <kbd>Ctrl</kbd>+<kbd>R</kbd> for a fuzzy search across your whole
+          history — this pane or everywhere. Matches highlight as you type, and
+          your history follows you across sessions.
+        </p>
+      </div>
+      <figure class="feature-shot">
+        <img src="/img/history.webp" srcset="/img/history.webp 1x, /img/history@2x.webp 2x"
+             width="1000" height="747" loading="lazy" decoding="async"
+             alt="Termica's Ctrl+R history overlay: a query box over past commands with the matched substrings highlighted, plus relative timestamps, working directory and exit status." />
+      </figure>
+    </section>
+
+    <section class="feature feature-reverse">
+      <div class="feature-text">
+        <h2>Tab, and go</h2>
+        <p>
+          Completion that knows where things come from — filesystem paths,
+          executables on your <code>$PATH</code>, and your command history — each
+          labeled at a glance. Navigate with the arrow keys, accept with
+          <kbd>Tab</kbd>.
+        </p>
+      </div>
+      <figure class="feature-shot">
+        <img src="/img/completion.webp" srcset="/img/completion.webp 1x, /img/completion@2x.webp 2x"
+             width="1000" height="406" loading="lazy" decoding="async"
+             alt="Termica's tab-completion popup completing a command prefix, each candidate tagged with its source — here, executables on $PATH." />
+      </figure>
+    </section>
+  </main>
+
   <footer class="footer muted">
     <a class="footer-link" href="https://github.com/enthal/termica">GitHub</a>
     <span aria-hidden="true">·</span>

@@ -290,6 +290,7 @@ pub fn paint_sticky_header(
     exit: Option<i32>,
     duration: Option<std::time::Duration>,
     git: Option<&crate::git_context::GitContext>,
+    faded: bool,
     command: &str,
     pane_id: u64,
 ) {
@@ -303,8 +304,9 @@ pub fn paint_sticky_header(
             let strip_idx = ui.painter().add(egui::Shape::Noop);
             let top = ui.next_widget_position().y;
             // Sticky pins a running / sealed block — no PR chip (it's a
-            // live-prompt-only affordance).
-            let _ = render::paint_block_header(ui, cwd, home, exit, duration, git, None);
+            // live-prompt-only affordance). `faded` matches the pinned
+            // block (sealed → muted, running → vivid).
+            let _ = render::paint_block_header(ui, cwd, home, exit, duration, git, None, faded);
             let capped = cap_command_for_sticky(command, STICKY_MAX_CMD_LINES);
             if !capped.is_empty() {
                 paint_command_label_static(ui, &capped);
@@ -1238,6 +1240,7 @@ pub fn render_pane(
                             running_elapsed,
                             header.git.as_ref(),
                             None,
+                            false,
                         );
                         let chip_h = hdr.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
                         let cmd_resp =
@@ -1409,18 +1412,19 @@ pub fn render_pane(
     if !in_alt_screen
         && let Some((sticky_id, paint_y)) =
             compute_sticky_header(&block_extents, scroll_viewport.top())
-        && let Some((cwd, exit, duration, git, command)) =
+        && let Some((cwd, exit, duration, git, faded, command)) =
             slot.session.blocks().iter().find_map(|b| match b {
                 crate::block::Block::Sealed { id, header, exit, command, duration, .. }
                     if *id == sticky_id =>
                 {
                     // Mirrors the inline sealed header: git captured at
-                    // command-start (4G-async-context).
+                    // command-start (4G-async-context), chips muted.
                     Some((
                         header.cwd.clone(),
                         *exit,
                         Some(*duration),
                         header.git.clone(),
+                        true,
                         command.clone(),
                     ))
                 }
@@ -1428,11 +1432,13 @@ pub fn render_pane(
                     // The pinned running header ticks too (4G-live-duration)
                     // and shows the git captured at command-start
                     // (4G-async-context), matching its inline counterpart.
+                    // Running is live → chips vivid (not faded).
                     Some((
                         header.cwd.clone(),
                         None,
                         running_elapsed,
                         header.git.clone(),
+                        false,
                         command.clone(),
                     ))
                 }
@@ -1448,6 +1454,7 @@ pub fn render_pane(
             exit,
             duration,
             git.as_ref(),
+            faded,
             &command,
             slot.session.pane_id(),
         );
@@ -1544,7 +1551,8 @@ pub fn render_pane(
             && let Some(crate::block::Block::Prompt { header, .. }) = slot.session.blocks().last()
         {
             // The live prompt shows current git + the PR chip (number +
-            // live CI color) — the "now, about to act" state.
+            // live CI color) — the "now, about to act" state. Vivid (not
+            // faded).
             let _ = render::paint_block_header(
                 ui,
                 header.cwd.as_deref(),
@@ -1553,6 +1561,7 @@ pub fn render_pane(
                 None,
                 git_ctx.as_ref(),
                 pr_ctx.as_ref(),
+                false,
             );
         }
 
