@@ -75,7 +75,14 @@ pub fn open_completion_at(
     home: Option<&Path>,
     history_lookup: impl FnOnce() -> Vec<String>,
 ) -> Option<CompletionPopup> {
-    let (token_start, token) = local::token_under_cursor(editor_text, cursor);
+    // Quote / escape-aware: an opening quote bounds the token (so a
+    // quoted filename with spaces completes), `token` is the unescaped
+    // literal to match, and `quote` drives how the substituted value is
+    // re-escaped so it round-trips into the same context.
+    let ctx = local::completion_context(editor_text, cursor);
+    let token_start = ctx.start;
+    let token = ctx.prefix.as_str();
+    let quote = ctx.quote;
     let pathish = local::token_is_pathish(token);
     let cmd_pos = local::is_command_position(editor_text, cursor);
 
@@ -103,7 +110,11 @@ pub fn open_completion_at(
             //   reads it as a path, not a command.
             // - `/etc/pas<Tab>` accepts `/etc/passwd` — leading
             //   slash kept, no extra `./`.
-            let prefix_with_dot_slash = !pathish && !cmd_pos && dir_part.is_empty();
+            // Suppressed inside an explicit quote (`"my fi<Tab>`): the
+            // user already signalled "this is a filename", so a quoted
+            // bare name needs no `./` disambiguation.
+            let prefix_with_dot_slash =
+                !pathish && !cmd_pos && dir_part.is_empty() && quote.is_none();
             if !dir_part.is_empty() {
                 for c in &mut entries_cands {
                     let full = if dir_part == "/" {
@@ -120,6 +131,13 @@ pub fn open_completion_at(
                     c.display = full.clone();
                     c.value = full;
                 }
+            }
+            // Escape the SUBSTITUTED value for the quote context so a
+            // filename with spaces / metacharacters round-trips into the
+            // shell (Bug 3). The `display` set above stays the plain,
+            // human-readable name — escaping is invisible in the menu.
+            for c in &mut entries_cands {
+                c.value = local::escape_for_context(&c.value, quote);
             }
             sources.push(entries_cands);
         }
@@ -359,6 +377,65 @@ mod tests {
         // dump $PATH on a bare Tab). Result: no popup.
         let p = open_completion_at("", 0, None, None, Vec::new);
         assert!(p.is_none());
+    }
+
+    // ---- quote-aware completion (Bug 2 + Bug 3) ------------------
+
+    #[test]
+    fn open_completion_quoted_filename_with_space_is_recognized() {
+        // `ls "my fi<Tab>` — the opening quote bounds the token and
+        // the space inside it does NOT break it, so "my file.txt"
+        // matches. Inside double quotes the space is literal, so the
+        // substituted value is NOT escaped, and no `./` is added.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("my file.txt"), b"").unwrap();
+        std::fs::write(dir.path().join("other.txt"), b"").unwrap();
+        let text = "ls \"my fi";
+        let popup = open_completion_at(text, text.len(), Some(dir.path()), None, Vec::new)
+            .expect("quoted token should produce a popup");
+        assert_eq!(popup.origin_byte, 4, "replace region starts after the opening quote");
+        let cand = popup
+            .candidates
+            .iter()
+            .find(|c| c.display == "my file.txt")
+            .expect("the spacey file matches the quoted prefix");
+        assert_eq!(cand.value, "my file.txt", "no escape / no ./ inside an explicit quote");
+    }
+
+    #[test]
+    fn open_completion_unquoted_escaped_space_token_is_recognized() {
+        // `ls my\ fi<Tab>` — the escaped space keeps the token whole;
+        // matching uses the unescaped "my fi". (Pre-fix the token
+        // broke at the space to just "fi" and matched nothing.)
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("my file.txt"), b"").unwrap();
+        let text = "ls my\\ fi";
+        let popup = open_completion_at(text, text.len(), Some(dir.path()), None, Vec::new)
+            .expect("escaped-space token should produce a popup");
+        assert!(
+            popup.candidates.iter().any(|c| c.display.ends_with("my file.txt")),
+            "escaped-space token matches the spacey file"
+        );
+    }
+
+    #[test]
+    fn open_completion_unquoted_space_filename_escapes_value_not_display() {
+        // `ls my<Tab>` completing to "my file.txt": the popup menu
+        // shows the plain name, but the substituted value escapes the
+        // space so the shell doesn't word-split it (Bug 3).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("my file.txt"), b"").unwrap();
+        let text = "ls my";
+        let popup =
+            open_completion_at(text, text.len(), Some(dir.path()), None, Vec::new).expect("popup");
+        let cand =
+            popup.candidates.iter().find(|c| c.display.ends_with("my file.txt")).expect("match");
+        assert!(!cand.display.contains('\\'), "menu shows the plain, human-readable name");
+        assert!(
+            cand.value.contains("my\\ file.txt"),
+            "substituted value escapes the space: got {:?}",
+            cand.value
+        );
     }
 }
 

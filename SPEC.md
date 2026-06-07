@@ -29,6 +29,7 @@ Three properties drive every design choice:
 | 09 | [Testing](spec/09-testing.md) | Unit / VT golden / integration / `egui_kittest` / perf, the hybrid rule |
 | 10 | [Roadmap](spec/10-roadmap.md) | MVP definition, phases 0–10, post-MVP, risks |
 | 11 | [Keyboard shortcuts](spec/11-keyboard-shortcuts.md) | Single source of truth for every app-level chord |
+| 12 | [Distribution & releases](spec/12-distribution.md) | Versioning, release CI, macOS/Linux packaging, download links |
 
 ## Tech stack at a glance
 

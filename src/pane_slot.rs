@@ -61,6 +61,11 @@ pub enum PaneAction {
     /// jump to the live tail (editor / running grid). Same chord
     /// family as `ScrollToTop`; mirror direction.
     ScrollToBottom,
+    /// Cmd+F (macOS) / Ctrl+Shift+F (Linux/Windows): open the in-pane
+    /// find overlay (Phase 8). No-op in alt-screen mode — the running
+    /// full-screen program owns the viewport, and the transcript it
+    /// would search isn't visible.
+    OpenFind,
 }
 
 /// Per-pane UI interaction state. Each pane gets its own multi-
@@ -75,6 +80,16 @@ pub struct PaneUiState {
     /// only issue a resize when the cell grid actually changes,
     /// not every frame.
     pub(crate) last_size: Option<(u16, u16)>,
+    /// Debounce state for PTY resizes: the `(rows, cols)` target the
+    /// pane is currently settling toward, plus the egui-time at which
+    /// that target was first seen. An interactive window drag changes
+    /// the computed size every frame; pushing a SIGWINCH on each one
+    /// storms the child (a TUI like Claude Code repaints per SIGWINCH,
+    /// and the interleaved partial repaints pile orphaned frames into
+    /// scrollback). We only commit the resize once the target has held
+    /// steady for a short debounce. `None` when the size is settled.
+    /// See [`crate::render_pane::plan_resize`].
+    pub(crate) pending_size: Option<((u16, u16), f64)>,
     /// Did this pane hold keyboard focus on the most-recently
     /// completed frame? Written by `render_pane` right after the
     /// terminal grid is painted; read by `TermicaApp::update`
@@ -152,6 +167,22 @@ pub struct PaneUiState {
     /// non-navigation keystroke. See [`crate::completion`] +
     /// [spec/04a](../spec/04a-completion.md).
     pub completion_popup: Option<crate::completion::CompletionPopup>,
+    /// `Some` while the `Cmd/Ctrl+F` find overlay is open (Phase 8).
+    /// Holds the query, the `Aa` / `.*` / filter toggles, the ordered
+    /// match list + current selection, and this pane's query history.
+    /// Survives close/reopen only via its `history` (taken across the
+    /// `OpenFind` action). Cleared on Esc / the Done button.
+    pub find_overlay: Option<crate::find::FindOverlay>,
+    /// This pane's find-query history, kept on the pane (not the
+    /// overlay) so it **survives Esc → Cmd+F reopen**. Seeded into a
+    /// fresh `FindOverlay` on open and written back when the overlay
+    /// closes. Newest first, in-memory for the session.
+    pub(crate) find_history: Vec<String>,
+    /// "Scroll the current find match into view on the next render."
+    /// Set when the selection (or query) changes in the overlay; the
+    /// match rects are only known after the scroll area lays out, so
+    /// the scroll is applied one frame later. Consumed in `render_pane`.
+    pub(crate) find_scroll_pending: bool,
     /// Editor cursor (byte index) observed on the previous frame.
     /// Used by `render_pane` to detect caret motion and reset the
     /// blink cycle to "visible" so a moved caret never lands during

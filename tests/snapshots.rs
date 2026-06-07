@@ -1449,13 +1449,14 @@ fn snapshot_sticky_header_pinned_at_top() {
             &ctx,
             viewport,
             0.0,
-            Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
-            Some(std::path::Path::new("/Users/tim")),
-            Some(1),
-            Some(std::time::Duration::from_millis(123)),
-            None,
-            false,
-            "ls -la --color=always",
+            termica::StickyHeaderContent {
+                cwd: Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
+                home: Some(std::path::Path::new("/Users/tim")),
+                exit: Some(1),
+                duration: Some(std::time::Duration::from_millis(123)),
+                command: "ls -la --color=always",
+                ..Default::default()
+            },
             1,
         );
     });
@@ -1475,13 +1476,14 @@ fn snapshot_sticky_header_multiline_command_capped() {
             &ctx,
             viewport,
             0.0,
-            Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
-            Some(std::path::Path::new("/Users/tim")),
-            Some(0),
-            Some(std::time::Duration::from_secs(125)),
-            None,
-            false,
-            "for f in *.rs; do\n  echo \"$f\"\n  wc -l \"$f\"\n  head -1 \"$f\"\n  tail -1 \"$f\"\ndone",
+            termica::StickyHeaderContent {
+                cwd: Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
+                home: Some(std::path::Path::new("/Users/tim")),
+                exit: Some(0),
+                duration: Some(std::time::Duration::from_secs(125)),
+                command: "for f in *.rs; do\n  echo \"$f\"\n  wc -l \"$f\"\n  head -1 \"$f\"\n  tail -1 \"$f\"\ndone",
+                ..Default::default()
+            },
             1,
         );
     });
@@ -1502,17 +1504,85 @@ fn snapshot_sticky_header_pushed_up_clips_at_top() {
             &ctx,
             viewport,
             -12.0,
-            Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
-            Some(std::path::Path::new("/Users/tim")),
-            None,
-            Some(std::time::Duration::from_millis(34)),
-            None,
-            false,
-            "cargo test --workspace",
+            termica::StickyHeaderContent {
+                cwd: Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
+                home: Some(std::path::Path::new("/Users/tim")),
+                duration: Some(std::time::Duration::from_millis(34)),
+                command: "cargo test --workspace",
+                ..Default::default()
+            },
             1,
         );
     });
     harness.snapshot("sticky_header_pushed_up");
+}
+
+/// Regression: the pinned command label must be **interactive**
+/// (`click_and_drag`), not hover-only. A hover-only overlay let presses
+/// fall through to the output scrolling underneath, so double-clicking
+/// the pinned command selected the wrong text (it was not selectable).
+/// The returned `Response` is what the pane routes into a selection of
+/// the pinned block, so it must sense both click and drag.
+#[test]
+fn sticky_header_command_label_is_selectable() {
+    let size = egui::Vec2::new(560.0, 220.0);
+    let mut command_sense = None;
+    let _ = Harness::builder().with_size(size).build_ui(|ui| {
+        let ctx = ui.ctx().clone();
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        let sticky = termica::paint_sticky_header(
+            &ctx,
+            viewport,
+            0.0,
+            termica::StickyHeaderContent {
+                cwd: Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
+                home: Some(std::path::Path::new("/Users/tim")),
+                exit: Some(0),
+                duration: Some(std::time::Duration::from_millis(123)),
+                command: "git commit -m \"fix pinned header\"",
+                ..Default::default()
+            },
+            1,
+        );
+        command_sense = sticky.command.map(|r| r.sense);
+    });
+    let sense = command_sense.expect("pinned header has a command label");
+    assert!(sense.senses_click(), "pinned command label must sense clicks");
+    assert!(sense.senses_drag(), "pinned command label must sense drags (for drag-select)");
+}
+
+/// The pinned command label paints the block's selection highlight so a
+/// selection started on the pinned copy is visible there, in sync with
+/// the inline block. Snapshot guards the highlighted-glyph rendering.
+#[test]
+fn snapshot_sticky_header_with_command_selection() {
+    let size = egui::Vec2::new(560.0, 220.0);
+    let mut harness = Harness::builder().with_size(size).build_ui(move |ui| {
+        paint_fake_output_rows(ui, size);
+        let ctx = ui.ctx().clone();
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        // Select "commit" (cols 4..10) on the single command row.
+        let sel = Some((
+            termica::block_selection::BlockCursor::new(0, 4),
+            termica::block_selection::BlockCursor::new(0, 10),
+        ));
+        termica::paint_sticky_header(
+            &ctx,
+            viewport,
+            0.0,
+            termica::StickyHeaderContent {
+                cwd: Some(std::path::Path::new("/Users/tim/git/enthal/termica")),
+                home: Some(std::path::Path::new("/Users/tim")),
+                exit: Some(0),
+                duration: Some(std::time::Duration::from_millis(123)),
+                command: "git commit -m wip",
+                command_selection: sel,
+                ..Default::default()
+            },
+            1,
+        );
+    });
+    harness.snapshot("sticky_header_with_command_selection");
 }
 
 #[test]
@@ -1537,4 +1607,107 @@ fn snapshot_watermark_centered_in_narrow_pane() {
             paint(ui.ctx(), ui.painter(), ui.clip_rect(), settings, 1.0);
         });
     harness.snapshot("watermark_narrow_pane");
+}
+
+// ---- Phase 8: in-pane find overlay + match highlights --------------------
+
+/// Build a synthetic [`termica::find::FindOverlay`] with a fixed query,
+/// toggles, and a given number of matches so the count chip ("N of M")
+/// renders deterministically without a real block stack.
+fn find_overlay(
+    query: &str,
+    n_matches: usize,
+    selected: usize,
+    case_sensitive: bool,
+    regex: bool,
+    filter: termica::find::SearchFilter,
+) -> termica::find::FindOverlay {
+    use termica::block::BlockId;
+    use termica::find::{FindOverlay, LineKind, SearchMatch};
+    let mut o = FindOverlay::open(vec![]);
+    o.query = query.to_string();
+    o.case_sensitive = case_sensitive;
+    o.regex = regex;
+    o.filter = filter;
+    o.selected = selected;
+    o.matches = (0..n_matches)
+        .map(|i| SearchMatch {
+            block_id: BlockId(0),
+            kind: LineKind::Output,
+            row: i,
+            col_start: 0,
+            col_end: query.chars().count(),
+        })
+        .collect();
+    o
+}
+
+#[test]
+fn snapshot_find_overlay_with_matches() {
+    let mut overlay = find_overlay("error", 14, 2, false, false, termica::find::SearchFilter::Both);
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(900.0, 200.0)).build_ui(move |ui| {
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 200.0));
+            let _ = termica::find::paint_overlay(ui, &mut overlay, 1, rect);
+        });
+    harness.snapshot("find_overlay_with_matches");
+}
+
+#[test]
+fn snapshot_find_overlay_commands_filter_case_sensitive() {
+    // `Commands` filter + `Aa` (match case) both engaged so the toggle
+    // chips show their active state.
+    let mut overlay =
+        find_overlay("Cargo", 3, 0, true, false, termica::find::SearchFilter::CommandOnly);
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(900.0, 200.0)).build_ui(move |ui| {
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 200.0));
+            let _ = termica::find::paint_overlay(ui, &mut overlay, 1, rect);
+        });
+    harness.snapshot("find_overlay_commands_filter_case_sensitive");
+}
+
+#[test]
+fn snapshot_find_overlay_regex_error() {
+    let mut overlay =
+        find_overlay("(unclosed", 0, 0, false, true, termica::find::SearchFilter::Both);
+    overlay.regex_error = true;
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(900.0, 200.0)).build_ui(move |ui| {
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 200.0));
+            let _ = termica::find::paint_overlay(ui, &mut overlay, 1, rect);
+        });
+    harness.snapshot("find_overlay_regex_error");
+}
+
+#[test]
+fn snapshot_find_overlay_history_dropdown() {
+    let mut overlay = find_overlay("err", 5, 0, false, false, termica::find::SearchFilter::Both);
+    overlay.history = vec!["error".to_string(), "cargo test".to_string(), "TODO".to_string()];
+    overlay.dropdown_open = true;
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(900.0, 360.0)).build_ui(move |ui| {
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 360.0));
+            let _ = termica::find::paint_overlay(ui, &mut overlay, 1, rect);
+        });
+    harness.snapshot("find_overlay_history_dropdown");
+}
+
+#[test]
+fn snapshot_find_match_highlights_over_snapshot() {
+    // Paint a sealed snapshot, then lay find highlights over it: two
+    // plain matches + one "current" match (brighter), to lock in the
+    // highlighter-over-glyphs look.
+    let lines = sealed_snapshot(4, 40, b"error: build failed\r\nwarning: error here\r\nall good");
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(700.0, 180.0)).build_ui(move |ui| {
+            let resp = render::paint_styled_lines(ui, &lines, None);
+            let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
+            let (cell_w, row_h) =
+                ui.fonts_mut(|f| (f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
+            // "error" at row0 col0 (current), row1 col9, and "all" row2.
+            let ranges = [(0usize, 0usize, 5usize, true), (1, 9, 14, false), (2, 0, 3, false)];
+            render::paint_match_highlights(ui.painter(), resp.rect.min, cell_w, row_h, &ranges);
+        });
+    harness.snapshot("find_match_highlights");
 }

@@ -1,4 +1,4 @@
-**← Previous:** [10 — Roadmap](10-roadmap.md) | **Up:** [SPEC index](../SPEC.md)
+**← Previous:** [10 — Roadmap](10-roadmap.md) | **Up:** [SPEC index](../SPEC.md) | **Next:** [12 — Distribution & releases](12-distribution.md) →
 
 # 11 — Keyboard shortcuts
 
@@ -80,7 +80,9 @@ Mouse (editor):
 | Shortcut | Action | Phase |
 |---|---|---|
 | Continuation marker re-entry | After a submit, a DCS-JSON `continuation` event from the shell (`PS2` fired) re-promotes the editor and restores `last_submitted + "\n"`; only the suffix beyond `last_submitted` is sent on the next submit. | ✅ Phase 4C polish ([#58](https://github.com/enthal/termica/pull/58)) |
-| `Cmd+F` / `Ctrl+F` | In-pane find overlay (literal / case-insensitive / regex / fuzzy). | Phase 8 |
+| `Cmd+F` / `Ctrl+Shift+F` | In-pane find overlay over the focused pane's sealed blocks (literal / case-insensitive / regex; `Aa` + `.*` toggles; All/Commands/Outputs filter). `Ctrl+Shift+F` on Linux because plain `Ctrl+F` is readline `forward-char`. Fuzzy is post-MVP. | ✅ Phase 8 ([`feat/in-pane-search`](https://github.com/enthal/termica/tree/feat/in-pane-search)) |
+| `↑` / `↓` (in find field) | Walk find-query history; `▾` opens the recent-query dropdown. | ✅ Phase 8 |
+| `Enter` / `Shift+Enter` (in find field) | Find searches from the bottom: `Enter` steps **up** (previous / older match), `Shift+Enter` steps **down** (next / newer). `Esc` dismisses. | ✅ Phase 8 |
 | `Cmd+P` / `Ctrl+P` | Command palette. | Post-MVP |
 
 ## How a shortcut gets wired
@@ -101,4 +103,4 @@ Configurable keybindings are a [Phase 10 polish item](10-roadmap.md#phase-10--po
 
 ---
 
-**← Previous:** [10 — Roadmap](10-roadmap.md) | **Up:** [SPEC index](../SPEC.md)
+**← Previous:** [10 — Roadmap](10-roadmap.md) | **Up:** [SPEC index](../SPEC.md) | **Next:** [12 — Distribution & releases](12-distribution.md) →

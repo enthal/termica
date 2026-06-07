@@ -118,6 +118,7 @@ Shell-binding keys (`Ctrl+R`, `Ctrl+P`, `Ctrl+N`, `Ctrl+S`, `Ctrl+G`) are **cons
 | Double-click + drag | Extend selection by **word**: each word the pointer enters is added to (or trimmed from) the selection; the anchor is the original double-clicked word, so the selection always covers `min(anchor_start, current_start) … max(anchor_end, current_end)` |
 | Triple-click | Select the line under the pointer |
 | Triple-click + drag | Same as double-click + drag but by **line** |
+| Shift+click | Extend the existing selection to the click, keeping the anchor and the current char / word / line mode (see [§Cross-block selection](#cross-block-selection)). With no selection yet, behaves like a plain click. |
 
 The word / line range helpers (`word_range_at`, `line_range_at` in [`src/prompt_editor.rs`](../src/prompt_editor.rs)) are pure functions, unit-tested, and shared between the press handler and the drag handler so single-click → drag and double/triple-click → drag agree on what a "word" or a "line" is. The per-pane anchor range (`PaneUiState::editor_drag_anchor`) is cleared on a single click so the next drag starts in character mode again.
 
@@ -297,6 +298,8 @@ A minimal shell tokenizer in-house for v1:
 - subshells (`$(...)`, `` `...` ``)
 - flags (`-x`, `--long`)
 - comments (`#`)
+
+Backslash escapes are honoured the way the shell reads them: outside quotes `\X` is a literal `X`, so a backslash-escaped quote / space / metacharacter (`what\'s`, `foo\ bar`, `a\|b`) stays part of its word instead of starting a string or breaking the token. Inside double quotes a backslash escapes the next byte too (`"a\"b"` is one string; `"\$x"` is not a variable). Single-quoted strings are literal — a backslash inside `'…'` is an ordinary character, matching the shell.
 
 Tree-sitter is overkill for v1. We will reach for it if and when the in-house tokenizer can't keep up with what we want to highlight.
 
@@ -495,7 +498,7 @@ Three rules govern the per-frame layout pass:
 
 The pinned region is what identifies the block: its cwd / exit chip **and its command label**, the latter capped at 4 lines (a longer multiline command is truncated with a trailing `…`) so the strip can't grow without bound. Just the cwd would be ambiguous — many blocks share a cwd; the command is the discriminator.
 
-The layout helper that decides which block is "sticky-eligible" and computes the paint offset is the unit-testable boundary: pure math, no egui dependency, covered by tests that walk scroll positions through a synthetic block list. It ships as [`render_pane::compute_sticky_header`](../src/render_pane.rs) — given each block's screen-y extent + the height of its pinned region (chip + capped command) and the viewport top, it returns the block to pin and the y to paint it at (flush at the top, or pushed up by the next block during the handoff). The actual paint is [`render_pane::paint_sticky_header`](../src/render_pane.rs): an opaque strip (so content scrolling underneath is occluded) plus the reused `paint_block_header` chrome and a non-interactive command label, clipped to the viewport so a pushed-up header slides under the top edge.
+The layout helper that decides which block is "sticky-eligible" and computes the paint offset is the unit-testable boundary: pure math, no egui dependency, covered by tests that walk scroll positions through a synthetic block list. It ships as [`render_pane::compute_sticky_header`](../src/render_pane.rs) — given each block's screen-y extent + the height of its pinned region (chip + capped command) and the viewport top, it returns the block to pin and the y to paint it at (flush at the top, or pushed up by the next block during the handoff). The actual paint is [`render_pane::paint_sticky_header`](../src/render_pane.rs): an opaque strip (so content scrolling underneath is occluded) plus the reused `paint_block_header` chrome and the block's command label, clipped to the viewport so a pushed-up header slides under the top edge. The pinned command label is **interactive** (selectable, like its inline twin): because the strip is a foreground overlay, a non-interactive label let presses fall through to the output scrolling underneath, so double-clicking the pinned command selected the wrong text. `paint_sticky_header` returns the command label's `Response`, and the pane routes a press on it into a selection of the pinned block — confined to the command rows the strip shows, since the strip overlays output that has scrolled off-screen and is no longer at the pixel the real block would map it to. The pinned label also paints the block's command-region selection (clipped to the shown rows) so the highlight stays in sync with the inline block. Only a sealed block's pinned command is selectable; a running block's command label is not selectable inline either, so its pinned copy merely absorbs the press.
 
 ## Cross-block selection
 
@@ -535,6 +538,16 @@ When the user drags across a block boundary, the selection logically spans all t
 This unified rule replaces an earlier "stay in source block" carve-out. The carve-out's failure modes were two: (a) forward cross-block drag degraded to char-precision in the head block, (b) backward cross-block drag "lost" the anchor word in the source block because `PaneSelection::ordered()` flipped the endpoints and the anchor at the word's left edge became the high end of the selection, which made `block_range_for(anchor_block)` clip BEFORE the word. The far-edge rule eliminates both because the anchor cursor adapts to which end it represents in pane order.
 
 `PaneSelection` deliberately does NOT carry a `SelectionMode` field because mode lives at the gesture layer (the multi-click anchor in `PaneUiState`), not the selection-data layer. The clipped per-block ranges always describe character-precise endpoints — once a Word / Line anchor has snapped its endpoints outward, the `PaneCursor` values are already at word/line bounds.
+
+**Shift+click extend (Chrome-style).** A primary click with **Shift** held does not start a fresh selection — it **extends** the existing one to the click, keeping the original anchor and re-using the same machinery a drag does. The decision is the pure [`render_pane::press_extends_selection`]`(primary_pressed, shift_held, has_selection)`: it extends only on a Shift+click when a selection already exists to anchor to; with no selection there's nothing to extend from, so it falls through to a normal start. Because a plain click leaves a (collapsed) selection behind, the usual flow — click to place the caret, Shift+click to select to there — works.
+
+The extend **preserves the selection mode** the gesture established, because Shift+click routes through the very same extend branch as a drag, which reads the retained `PaneUiState::click_count` + `sealed_drag_anchor` (sealed blocks) / `editor_drag_anchor` (editor) / the live grid's own `SelectionMode`:
+
+- after a single click → char-precise extend (`update_pane_selection_head` / `set_cursor_extending` / `Selection::extend_to`);
+- after a double-click → **word**-granular extend, snapping the head to the Shift+clicked word via the same far-edge rule above;
+- after a triple-click → **line**-granular extend.
+
+This holds in all three selection domains and, in the sealed domain, **across block boundaries and into / out of a block's command vs. output** — Shift+click reuses `find_head_block_for_pos` + `extend_multiclick_selection_endpoints`, so the head can land in a different block (or the pinned sticky header) than the anchor. Shift+click never opens a Cmd-clickable link (link-open lives only on the fresh-start path).
 
 ## Resize: sealed blocks don't reflow
 

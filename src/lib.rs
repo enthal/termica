@@ -34,6 +34,7 @@ pub mod block_selection;
 pub mod completion;
 pub mod echo_suppress;
 pub mod events;
+pub mod find;
 pub mod focused_chrome;
 pub mod gh_probe;
 pub mod git_context;
@@ -76,8 +77,8 @@ pub use app::TermicaApp;
 pub use behavior::paint_focused_tab_underline;
 pub use pane_slot::{PaneAction, PaneId, PaneSlot, PaneUiState};
 pub use render_pane::{
-    ALT_SCREEN_BORDER_COLOR, ALT_SCREEN_BORDER_WIDTH, cells_from_pixels, paint_alt_screen_border,
-    paint_sticky_header, render_pane,
+    ALT_SCREEN_BORDER_COLOR, ALT_SCREEN_BORDER_WIDTH, StickyHeaderContent, StickyHeaderRender,
+    cells_from_pixels, paint_alt_screen_border, paint_sticky_header, render_pane,
 };
 pub use shortcuts::match_pane_shortcut;
 pub use tab_title::{active_pane_in_tabs, home_relative_cwd, tab_title_for};

@@ -55,6 +55,171 @@ pub fn is_token_separator(c: char) -> bool {
     c.is_whitespace() || matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')')
 }
 
+/// Quote / escape-aware completion context at `cursor`.
+///
+/// Unlike [`token_under_cursor`], this understands shell quoting so a
+/// quoted filename completes correctly: an opening quote bounds the
+/// token (and `start` points just past it, so accept replaces the
+/// quoted body), spaces inside a quote — or backslash-escaped — do
+/// NOT break the token, and `prefix` is the **unescaped, unquoted**
+/// literal to match candidates against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionContext {
+    /// Byte index where the replaced region begins. For an open
+    /// quote this is the byte *after* the quote so the substitution
+    /// lands inside it; otherwise the start of the current word.
+    pub start: usize,
+    /// The literal content to match against candidates: quotes
+    /// removed, backslash escapes resolved.
+    pub prefix: String,
+    /// The active unclosed quote at the cursor, if any. Drives how
+    /// the substituted value is escaped ([`escape_for_context`]).
+    pub quote: Option<char>,
+}
+
+/// Scan the buffer up to `cursor`, tracking shell quote + escape
+/// state, and return the [`CompletionContext`] for the word ending at
+/// `cursor`. Pure; the heart of quote-aware Tab completion.
+pub fn completion_context(text: &str, cursor: usize) -> CompletionContext {
+    let cursor = crate::prompt_editor::clamp_to_char_boundary(text, cursor);
+    let prefix = text.get(..cursor).unwrap_or("");
+    let mut quote: Option<char> = None;
+    let mut quote_open_at: Option<usize> = None;
+    let mut word_start: Option<usize> = None;
+    let mut escaped = false;
+    let mut literal = String::new();
+    for (b, c) in prefix.char_indices() {
+        if escaped {
+            // The previous backslash escapes this char (unquoted or
+            // inside `"…"`): it's literal, never a quote / separator.
+            literal.push(c);
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some('\'') => {
+                // Single quotes: everything literal until the next `'`.
+                if c == '\'' {
+                    quote = None;
+                } else {
+                    literal.push(c);
+                }
+            }
+            Some('"') => {
+                if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    quote = None;
+                } else {
+                    literal.push(c);
+                }
+            }
+            _ => {
+                if c == '\\' {
+                    if word_start.is_none() {
+                        word_start = Some(b);
+                    }
+                    escaped = true;
+                } else if c == '\'' || c == '"' {
+                    if word_start.is_none() {
+                        word_start = Some(b);
+                    }
+                    quote = Some(c);
+                    quote_open_at = Some(b);
+                } else if is_token_separator(c) {
+                    // Unquoted separator ends the current word.
+                    word_start = None;
+                    quote_open_at = None;
+                    literal.clear();
+                } else {
+                    if word_start.is_none() {
+                        word_start = Some(b);
+                    }
+                    literal.push(c);
+                }
+            }
+        }
+    }
+    let start = match (quote, quote_open_at) {
+        // Inside an open quote: replace the quoted body, after the quote.
+        (Some(_), Some(open)) => open + c_len(prefix, open),
+        _ => word_start.unwrap_or(cursor),
+    };
+    CompletionContext { start, prefix: literal, quote }
+}
+
+/// Byte length of the char at `idx` in `s` (quotes are always ASCII
+/// `'`/`"` = 1 byte, but stay boundary-safe rather than assuming).
+fn c_len(s: &str, idx: usize) -> usize {
+    s[idx..].chars().next().map(|c| c.len_utf8()).unwrap_or(1)
+}
+
+/// Escape `value` so it round-trips literally when inserted into the
+/// editor at the given quote context. Applied to the SUBSTITUTED text
+/// only — the popup's `display` keeps the human-readable name.
+///
+/// - Unquoted (`None`): backslash-escape whitespace and shell
+///   metacharacters (`my file` → `my\ file`). Path separators (`/`)
+///   are left intact so a completed path stays a path.
+/// - Inside double quotes (`Some('"')`): only `"`, `$`, `` ` `` and
+///   `\` need escaping; spaces and globs are literal inside `"…"`.
+/// - Inside single quotes (`Some('\'')`): everything is literal, so
+///   the value passes through unchanged (a `'` in the name can't be
+///   represented inside `'…'`; that rare case is left as-is).
+pub fn escape_for_context(value: &str, quote: Option<char>) -> String {
+    match quote {
+        Some('\'') => value.to_string(),
+        Some('"') => {
+            let mut out = String::with_capacity(value.len());
+            for c in value.chars() {
+                if matches!(c, '"' | '$' | '`' | '\\') {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            out
+        }
+        _ => {
+            let mut out = String::with_capacity(value.len());
+            for c in value.chars() {
+                if needs_unquoted_escape(c) {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            out
+        }
+    }
+}
+
+/// Shell-special chars that must be backslash-escaped in an unquoted
+/// completion value. `/` is deliberately excluded so a completed path
+/// keeps its separators; `.`, `-`, `_`, `~`, `#` etc. are ordinary
+/// inside a word and need no escape.
+fn needs_unquoted_escape(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '\\' | '\''
+                | '"'
+                | '$'
+                | '`'
+                | '|'
+                | '&'
+                | ';'
+                | '('
+                | ')'
+                | '<'
+                | '>'
+                | '*'
+                | '?'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+        )
+}
+
 /// True if the byte position `cursor` is in "command position"
 /// in `text` — i.e. there is NO non-separator content before it
 /// on this command-line stretch (the stretch before the cursor
@@ -300,6 +465,113 @@ pub fn complete_from_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- completion_context (quote / escape aware) -----------------
+
+    #[test]
+    fn ctx_unquoted_word_matches_plain_token() {
+        let c = completion_context("ls foo", 6);
+        assert_eq!(c.start, 3);
+        assert_eq!(c.prefix, "foo");
+        assert_eq!(c.quote, None);
+    }
+
+    #[test]
+    fn ctx_open_double_quote_starts_after_quote_and_keeps_spaces() {
+        // `ls "my fi` — the opening `"` bounds the token; the space
+        // inside it does NOT break the token.
+        let text = "ls \"my fi";
+        let c = completion_context(text, text.len());
+        assert_eq!(c.start, 4); // right after the opening quote
+        assert_eq!(c.prefix, "my fi");
+        assert_eq!(c.quote, Some('"'));
+    }
+
+    #[test]
+    fn ctx_open_single_quote_starts_after_quote() {
+        let text = "cat 'my fi";
+        let c = completion_context(text, text.len());
+        assert_eq!(c.start, 5);
+        assert_eq!(c.prefix, "my fi");
+        assert_eq!(c.quote, Some('\''));
+    }
+
+    #[test]
+    fn ctx_cursor_right_after_opening_quote_is_empty_prefix() {
+        let text = "ls \"";
+        let c = completion_context(text, text.len());
+        assert_eq!(c.start, 4);
+        assert_eq!(c.prefix, "");
+        assert_eq!(c.quote, Some('"'));
+    }
+
+    #[test]
+    fn ctx_unquoted_escaped_space_is_one_token_unescaped_prefix() {
+        // `ls my\ fi` — the escaped space keeps the token together;
+        // the matching prefix is unescaped.
+        let text = "ls my\\ fi";
+        let c = completion_context(text, text.len());
+        assert_eq!(c.start, 3); // at 'm', includes the whole escaped token
+        assert_eq!(c.prefix, "my fi");
+        assert_eq!(c.quote, None);
+    }
+
+    #[test]
+    fn ctx_closed_quote_then_new_unquoted_token() {
+        // `ls "a b" c` — the quote is closed; the current token is the
+        // fresh unquoted `c`.
+        let text = "ls \"a b\" c";
+        let c = completion_context(text, text.len());
+        assert_eq!(c.prefix, "c");
+        assert_eq!(c.quote, None);
+        assert_eq!(c.start, text.len() - 1);
+    }
+
+    #[test]
+    fn ctx_quoted_path_splits_on_inner_slash() {
+        let text = "ls \"my dir/fi";
+        let c = completion_context(text, text.len());
+        assert_eq!(c.prefix, "my dir/fi");
+        assert_eq!(c.quote, Some('"'));
+        assert_eq!(c.start, 4);
+    }
+
+    // ---- escape_for_context ----------------------------------------
+
+    #[test]
+    fn escape_unquoted_backslashes_spaces() {
+        assert_eq!(escape_for_context("my file.txt", None), "my\\ file.txt");
+    }
+
+    #[test]
+    fn escape_unquoted_leaves_plain_name_alone() {
+        assert_eq!(escape_for_context("simple.txt", None), "simple.txt");
+    }
+
+    #[test]
+    fn escape_unquoted_keeps_path_separators() {
+        assert_eq!(escape_for_context("src/my file", None), "src/my\\ file");
+    }
+
+    #[test]
+    fn escape_unquoted_escapes_shell_metachars() {
+        assert_eq!(escape_for_context("a(b)*", None), "a\\(b\\)\\*");
+    }
+
+    #[test]
+    fn escape_double_quote_keeps_spaces_literal() {
+        assert_eq!(escape_for_context("my file.txt", Some('"')), "my file.txt");
+    }
+
+    #[test]
+    fn escape_double_quote_escapes_dollar_and_quote() {
+        assert_eq!(escape_for_context("a\"b$c", Some('"')), "a\\\"b\\$c");
+    }
+
+    #[test]
+    fn escape_single_quote_passes_through() {
+        assert_eq!(escape_for_context("my file.txt", Some('\'')), "my file.txt");
+    }
 
     // ---- token_under_cursor ----------------------------------------
 

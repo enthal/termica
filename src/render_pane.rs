@@ -191,6 +191,17 @@ pub(crate) struct BlockExtent {
     pub sticky_h: f32,
 }
 
+/// Phase 8 — find-match highlight rectangles for one sealed block,
+/// split by which painted widget they sit on. Each tuple is
+/// `(row, col_start, col_end, is_current)` in char/cell coordinates;
+/// `render::paint_match_highlights` turns them into rects relative to
+/// the command-label / snapshot origin.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct FindBlockHighlights {
+    pub command: Vec<(usize, usize, usize, bool)>,
+    pub output: Vec<(usize, usize, usize, bool)>,
+}
+
 /// Decide which block's header pins to the viewport top (spec/04
 /// §"Layout: fixed-footer prompt, sticky-top header", rule 3) and the
 /// screen-y at which to paint it. Pure math, no egui — the spec-
@@ -262,6 +273,66 @@ pub(crate) fn cap_command_for_sticky(command: &str, max: usize) -> String {
     out
 }
 
+/// Clip a command-region selection (0-based command rows) to the first
+/// `visible_rows` lines actually painted in the pinned header — the
+/// pinned command is capped at [`STICKY_MAX_CMD_LINES`]. Returns `None`
+/// when the whole selection lies below the visible cap; when it extends
+/// past the cap, the highlight runs to the end of the last visible line
+/// (`usize::MAX` col). Pure so the sticky paint and the click routing
+/// agree on exactly which command rows are shown.
+pub(crate) fn clamp_command_selection_to_visible(
+    sel: Option<(crate::block_selection::BlockCursor, crate::block_selection::BlockCursor)>,
+    visible_rows: usize,
+) -> Option<(crate::block_selection::BlockCursor, crate::block_selection::BlockCursor)> {
+    let (start, end) = sel?;
+    if visible_rows == 0 || start.row >= visible_rows {
+        return None;
+    }
+    let end = if end.row >= visible_rows {
+        crate::block_selection::BlockCursor::new(visible_rows - 1, usize::MAX)
+    } else {
+        end
+    };
+    Some((start, end))
+}
+
+/// Result of painting a pinned (sticky-top) block header: the egui
+/// [`Response`](egui::Response) over its command label, when the pinned
+/// block had a non-empty command. The pane's click / drag routing uses
+/// this exactly like [`render::SealedBlockRender::command`] — so a press
+/// on the pinned command starts a selection in the block it duplicates,
+/// rather than falling through to the output scrolling underneath the
+/// foreground overlay (the pinned copy is on top in z-order).
+#[derive(Debug, Default)]
+pub struct StickyHeaderRender {
+    /// Response over the pinned command label. Senses `click_and_drag`.
+    /// `None` when the pinned block has an empty command line.
+    pub command: Option<egui::Response>,
+}
+
+/// The block-identifying content painted into a pinned (sticky) header:
+/// the same cwd / exit / duration / git chrome as the inline block,
+/// whether it's `faded` (sealed → muted, running → vivid), and the
+/// command label plus its already-clipped command-region selection.
+/// Bundled so [`paint_sticky_header`] takes a handful of arguments
+/// rather than a dozen positional ones.
+///
+/// Derives [`Default`] so call sites can set only the fields they care
+/// about and elide the rest with `..Default::default()` — an absent
+/// cwd / exit / git, not faded, a fully-shown command with no selection.
+#[derive(Default)]
+pub struct StickyHeaderContent<'a> {
+    pub cwd: Option<&'a std::path::Path>,
+    pub home: Option<&'a std::path::Path>,
+    pub exit: Option<i32>,
+    pub duration: Option<std::time::Duration>,
+    pub git: Option<&'a crate::git_context::GitContext>,
+    pub faded: bool,
+    pub command: &'a str,
+    pub command_selection:
+        Option<(crate::block_selection::BlockCursor, crate::block_selection::BlockCursor)>,
+}
+
 /// Paint a pinned block header at screen-y `paint_y`, pinned to the top
 /// of the scroll `viewport` (4E): the block's cwd / exit chip and its
 /// command label (capped at [`STICKY_MAX_CMD_LINES`] lines), so the
@@ -269,32 +340,32 @@ pub(crate) fn cap_command_for_sticky(command: &str, max: usize) -> String {
 /// not just its cwd. Painted on an opaque [`render::DEFAULT_BG`] strip
 /// so the content scrolling underneath is occluded, in a foreground
 /// `Area` clipped to `viewport` so a header pushed up by the next block
-/// slides under the top edge. The command is painted non-interactively
-/// (hover sense only) so the decorative overlay never eats clicks meant
-/// for the content below.
+/// slides under the top edge.
+///
+/// The command label is interactive (`click_and_drag`, via
+/// [`render::paint_command_label_with_selection`]): because the overlay
+/// is on top in z-order, a hover-only label let presses fall THROUGH to
+/// the output scrolling underneath, so double-clicking the pinned
+/// command selected the wrong text. The returned [`StickyHeaderRender`]
+/// hands the command's `Response` back so the pane routes that press
+/// into a selection of the pinned block (see the sealed-selection
+/// router). `command_selection` is the block's command-region selection
+/// already clipped to the rows shown here, painted under the glyphs so
+/// the pinned label highlights in sync with its inline twin.
 ///
 /// Split out from the pane render so the paint is snapshot-testable in
 /// isolation; the sticky-eligibility / position decision is the pure
 /// [`compute_sticky_header`].
-// Geometry (`viewport`, `paint_y`), chrome content (`cwd`, `home`,
-// `exit`, `duration`, `command`), and the `ctx` / `pane_id` needed to
-// spawn the `Area` are all genuinely distinct inputs — same shape as
-// the file's other paint helpers.
-#[allow(clippy::too_many_arguments)]
 pub fn paint_sticky_header(
     ctx: &egui::Context,
     viewport: egui::Rect,
     paint_y: f32,
-    cwd: Option<&std::path::Path>,
-    home: Option<&std::path::Path>,
-    exit: Option<i32>,
-    duration: Option<std::time::Duration>,
-    git: Option<&crate::git_context::GitContext>,
-    faded: bool,
-    command: &str,
+    content: StickyHeaderContent<'_>,
     pane_id: u64,
-) {
-    egui::Area::new(egui::Id::new(("sticky-header", pane_id)))
+) -> StickyHeaderRender {
+    let StickyHeaderContent { cwd, home, exit, duration, git, faded, command, command_selection } =
+        content;
+    let inner = egui::Area::new(egui::Id::new(("sticky-header", pane_id)))
         .order(egui::Order::Foreground)
         .fixed_pos(egui::pos2(viewport.left(), paint_y))
         .show(ctx, |ui| {
@@ -308,43 +379,21 @@ pub fn paint_sticky_header(
             // block (sealed → muted, running → vivid).
             let _ = render::paint_block_header(ui, cwd, home, exit, duration, git, None, faded);
             let capped = cap_command_for_sticky(command, STICKY_MAX_CMD_LINES);
-            if !capped.is_empty() {
-                paint_command_label_static(ui, &capped);
-            }
+            // Interactive (not hover-only) so the foreground overlay
+            // captures the press instead of leaking it to the output
+            // below; the response is routed by the caller.
+            let command_resp = (!capped.is_empty()).then(|| {
+                render::paint_command_label_with_selection(ui, &capped, command_selection)
+            });
             let bottom = ui.next_widget_position().y;
             let strip = egui::Rect::from_min_max(
                 egui::pos2(viewport.left(), top),
                 egui::pos2(viewport.right(), bottom),
             );
             ui.painter().set(strip_idx, egui::Shape::rect_filled(strip, 0.0, render::DEFAULT_BG));
+            command_resp
         });
-}
-
-/// Paint a (possibly multiline) command label like
-/// [`render::paint_command_label`] but with **hover** sense only —
-/// the sticky overlay is decorative and must not capture clicks /
-/// drags meant for the content scrolling underneath it. Advances the
-/// `ui` cursor so the caller's union-rect measurement includes it.
-fn paint_command_label_static(ui: &mut egui::Ui, command: &str) {
-    let font = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
-    let (cell_w, label_row_h) = ui.fonts_mut(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
-    let lines: Vec<&str> = command.split('\n').collect();
-    let cols = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0).max(1);
-    let size = egui::vec2(cols as f32 * cell_w, lines.len() as f32 * label_row_h);
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-    let painter = ui.painter_at(rect);
-    for (i, line) in lines.iter().enumerate() {
-        if line.is_empty() {
-            continue;
-        }
-        painter.text(
-            egui::pos2(rect.min.x, rect.min.y + i as f32 * label_row_h),
-            egui::Align2::LEFT_TOP,
-            line,
-            font.clone(),
-            render::EDITOR_FG,
-        );
-    }
+    StickyHeaderRender { command: inner.inner }
 }
 
 /// Translate a `(Key, Modifiers)` pair into an [`EditorMotion`] +
@@ -398,6 +447,17 @@ fn classify_editor_motion(
         }
     }
     None
+}
+
+/// Should this primary press EXTEND the current selection instead of
+/// starting a fresh one? True only for a Shift+click when a selection
+/// already exists to extend from (Chrome-style: keep the anchor + the
+/// established char/word/line mode, move the head to the click). With
+/// no existing selection there's nothing to anchor to, so a Shift+click
+/// falls through to a normal start. Pure so the routing rule is unit-
+/// testable without an egui event loop.
+fn press_extends_selection(primary_pressed: bool, shift_held: bool, has_selection: bool) -> bool {
+    primary_pressed && shift_held && has_selection
 }
 
 /// Is this event the EOF chord — Ctrl+D — the one keystroke that may
@@ -781,6 +841,74 @@ pub fn cells_from_pixels(avail: egui::Vec2, cell_w: f32, row_h: f32) -> (u16, u1
     (rows.max(MIN_ROWS), cols.max(MIN_COLS))
 }
 
+/// How long (egui-time seconds) a new pane-size target must hold steady
+/// before we commit the PTY resize. Long enough to swallow the
+/// per-frame size churn of an interactive window drag (~16 ms/frame),
+/// short enough to feel instant on a deliberate resize. See
+/// [`plan_resize`].
+pub(crate) const RESIZE_DEBOUNCE_SECS: f64 = 0.1;
+
+/// What to do with a pending PTY resize this frame — the pure decision
+/// behind [`render_pane`]'s debounce. Returned by [`plan_resize`] so
+/// the timing rule is unit-testable without egui or a PTY.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ResizePlan {
+    /// Issue `session.resize(target)` and record it as committed.
+    pub commit: bool,
+    /// New value to store in `PaneUiState::pending_size`.
+    pub pending: Option<((u16, u16), f64)>,
+    /// If set, ask egui to repaint in this many seconds so the
+    /// debounce can elapse even with no further input.
+    pub repaint_after: Option<f64>,
+}
+
+/// Decide whether to push a PTY resize this frame, debouncing the
+/// per-frame size churn of an interactive window drag.
+///
+/// Rules:
+/// - Target already committed → settled; do nothing, clear pending.
+/// - Nothing committed yet (first sizing of a fresh pane) → commit
+///   immediately; a 100 ms delay on the very first size is visible.
+/// - Otherwise → commit only once the target has held steady for
+///   `debounce`; while it's still changing, (re)start the timer and
+///   ask for a repaint so the deadline can fire without more input.
+///
+/// Why: a window drag recomputes the pane size every frame. Committing
+/// each one storms the child with SIGWINCHs; a TUI like Claude Code
+/// repaints per SIGWINCH and the interleaved partial repaints pile
+/// orphaned frames into scrollback (the "banner renders N times on
+/// resize" bug). Debouncing collapses a drag into a single settled
+/// resize, so the child repaints exactly once.
+pub(crate) fn plan_resize(
+    target: (u16, u16),
+    committed: Option<(u16, u16)>,
+    pending: Option<((u16, u16), f64)>,
+    now: f64,
+    debounce: f64,
+) -> ResizePlan {
+    match committed {
+        Some(c) if c == target => ResizePlan { commit: false, pending: None, repaint_after: None },
+        None => ResizePlan { commit: true, pending: None, repaint_after: None },
+        Some(_) => {
+            // Keep the timer running only while the target is unchanged;
+            // any change (re)starts it at `now`.
+            let since = match pending {
+                Some((p, t)) if p == target => t,
+                _ => now,
+            };
+            if now - since >= debounce {
+                ResizePlan { commit: true, pending: None, repaint_after: None }
+            } else {
+                ResizePlan {
+                    commit: false,
+                    pending: Some((target, since)),
+                    repaint_after: Some(debounce - (now - since)),
+                }
+            }
+        }
+    }
+}
+
 /// Render one pane into `ui`: status header, resize-PTY-to-cells,
 /// link scan + hover, terminal grid, mouse selection, scroll wheel,
 /// input encoding, copy shortcut.
@@ -865,9 +993,24 @@ pub fn render_pane(
     let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
     let (cell_w, row_h) = ui.fonts_mut(|f| (f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
     let (rows, cols) = cells_from_pixels(avail, cell_w, row_h);
-    if slot.ui.last_size != Some((rows, cols)) {
+    // Debounce: an interactive window drag recomputes this size every
+    // frame; committing each one storms the child with SIGWINCHs and
+    // piles orphaned repaint frames into scrollback. Only resize once
+    // the target settles. See `plan_resize`.
+    let plan = plan_resize(
+        (rows, cols),
+        slot.ui.last_size,
+        slot.ui.pending_size,
+        ctx.input(|i| i.time),
+        RESIZE_DEBOUNCE_SECS,
+    );
+    if plan.commit {
         let _ = slot.session.resize(rows, cols);
         slot.ui.last_size = Some((rows, cols));
+    }
+    slot.ui.pending_size = plan.pending;
+    if let Some(secs) = plan.repaint_after {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(secs.max(0.0)));
     }
 
     // ---- pane content: sealed blocks + live terminal -------------
@@ -1077,25 +1220,60 @@ pub fn render_pane(
     }
     let force_to_bottom = one_shot_bottom || multi_frame_bottom;
     let force_to_top = std::mem::take(&mut slot.ui.scroll_to_top_pending);
+
+    // ---- Phase 8 in-pane find: recompute + highlight map ----------
+    //
+    // The find overlay searches THIS pane's sealed blocks. Recompute
+    // the match list against the current query / toggles each frame
+    // (the overlay clears its matches on an empty query, so this is a
+    // no-op while the field is blank), then build an owned per-block
+    // highlight map + a clone of the selected match BEFORE the scroll
+    // closure borrows `slot` mutably — the closure paints from these.
+    // Disabled in alt-screen mode (no transcript blocks are painted).
+    let do_find_scroll = std::mem::take(&mut slot.ui.find_scroll_pending);
+    let mut find_hl_by_block: std::collections::HashMap<
+        crate::block::BlockId,
+        FindBlockHighlights,
+    > = std::collections::HashMap::new();
+    let mut find_selected_match: Option<crate::find::SearchMatch> = None;
+    if slot.ui.find_overlay.is_some() && !in_alt_screen {
+        let lines = crate::find::collect_searchable_lines(slot.session.blocks());
+        if let Some(fo) = slot.ui.find_overlay.as_mut() {
+            fo.recompute(&lines);
+            find_selected_match = fo.selected_match().cloned();
+            for (i, m) in fo.matches.iter().enumerate() {
+                let entry = find_hl_by_block.entry(m.block_id).or_default();
+                let tuple = (m.row, m.col_start, m.col_end, i == fo.selected);
+                match m.kind {
+                    crate::find::LineKind::Command => entry.command.push(tuple),
+                    crate::find::LineKind::Output => entry.output.push(tuple),
+                }
+            }
+        }
+        // Keep matches / highlights converging while the field has focus.
+        ctx.request_repaint();
+    }
+    // Issue a scroll-to-match this frame when one was requested.
+    let find_scrolling = do_find_scroll && find_selected_match.is_some();
+    // Suppress `stick_to_bottom` for the WHOLE time the find overlay is
+    // open, not just the scroll frame. An animated scroll-to-match sets
+    // its target on frame 1 but doesn't move `offset` until later frames;
+    // if `stick_to_bottom` re-enabled on frame 2 while `offset` was still
+    // at max, ScrollArea's `scroll_stuck_to_end` would snap us back to
+    // the bottom and cancel the animation. Keeping it off the whole time
+    // the overlay is up lets the animation play out (and the user is
+    // browsing matches, not the live tail, anyway).
+    let find_open = slot.ui.find_overlay.is_some();
     // `stick_to_bottom` re-snaps the offset to max every frame the
     // user is at the bottom — which fights any top-snap attempt
     // and silently swallows a Cmd+Option+Up jump while the user is
     // glued to the live tail (the typical case while typing
-    // commands). Two-layer fix:
-    //  1. Disable stick-to-bottom for this frame when `force_to_top`
-    //     — the user is asking to leave the bottom, don't pin them.
-    //  2. Override the persisted scroll offset directly via
-    //     `vertical_scroll_offset(0.0)`. `scroll_to_cursor(TOP)`
-    //     writes into a frame-state hint that ScrollArea consumes
-    //     at the end of `show()`; it doesn't reliably win against
-    //     ScrollArea's internal "was at end" state. A direct offset
-    //     override at the builder level always wins.
-    //  Using `0.0` (not `f32::INFINITY`) avoids the NaN persistence
-    //  trap the bottom-snap path hit earlier — see the existing
-    //  `force_to_bottom` comment below.
+    // commands). Disable it when `force_to_top` (the user is asking to
+    // leave the bottom) or while find is open (see above); `force_to_top`
+    // additionally overrides the persisted offset directly below.
     let scroll_area = egui::ScrollArea::vertical()
         .id_salt(("pane-blocks", slot.session.pane_id()))
-        .stick_to_bottom(!force_to_top)
+        .stick_to_bottom(!force_to_top && !find_open)
         .auto_shrink([false, false])
         .max_height(scroll_max_h);
     // `force_to_top` uses a direct offset override (0.0) because
@@ -1264,6 +1442,77 @@ pub fn render_pane(
                     }
                 }
             }
+
+            // ---- Phase 8 find highlights + scroll-to-match --------
+            //
+            // Paint translucent amber over every match in this pane's
+            // sealed blocks (current match brighter), then bring the
+            // current match into view. Both run here, after the block
+            // loop, because they need the per-block painted rects
+            // (`sealed_block_renders`) which only exist post-paint.
+            if !find_hl_by_block.is_empty() {
+                for (id, sr) in &sealed_block_renders {
+                    let Some(hl) = find_hl_by_block.get(id) else { continue };
+                    if let Some(cmd) = &sr.command {
+                        render::paint_match_highlights(
+                            ui.painter(),
+                            cmd.rect.min,
+                            cell_w,
+                            row_h,
+                            &hl.command,
+                        );
+                    }
+                    render::paint_match_highlights(
+                        ui.painter(),
+                        sr.snapshot.rect.min,
+                        cell_w,
+                        row_h,
+                        &hl.output,
+                    );
+                }
+            }
+            if find_scrolling
+                && let Some(m) = &find_selected_match
+                && let Some((_, sr)) = sealed_block_renders.iter().find(|(id, _)| *id == m.block_id)
+            {
+                let origin = match m.kind {
+                    crate::find::LineKind::Command => sr.command.as_ref().map(|r| r.rect.min),
+                    crate::find::LineKind::Output => Some(sr.snapshot.rect.min),
+                };
+                if let Some(o) = origin {
+                    let y = o.y + m.row as f32 * row_h;
+                    // Extend the target rect UP by the height of this
+                    // block's sticky-top header (the pinned chrome +
+                    // capped command). An output match scrolled flush to
+                    // the viewport top would otherwise land *behind* that
+                    // pinned header; raising the rect's top makes egui
+                    // scroll a header's-worth further so the match clears
+                    // it. Command matches need no margin — when their
+                    // block pins, the command IS the pinned header.
+                    let header_margin = if matches!(m.kind, crate::find::LineKind::Output) {
+                        block_extents
+                            .iter()
+                            .find(|e| e.id == m.block_id)
+                            .map(|e| e.sticky_h)
+                            .unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
+                    let rect = egui::Rect::from_min_max(
+                        egui::pos2(o.x + m.col_start as f32 * cell_w, y - header_margin),
+                        egui::pos2(o.x + m.col_end as f32 * cell_w, y + row_h),
+                    );
+                    // `None` align scrolls the *minimum* to make the
+                    // (header-padded) match rect visible — a no-op when
+                    // it's already fully in view (egui's "already in view
+                    // → delta 0" branch), so a keystroke / Prev / Next
+                    // that doesn't move the match doesn't re-scroll. The
+                    // default animation plays from the CURRENT offset
+                    // (we no longer reset to the top), so it's a short
+                    // glide, not a jump from the top of scrollback.
+                    ui.scroll_to_rect(rect, None);
+                }
+            }
         } // end of `if !in_alt_screen { ... }`
 
         // ---- Live terminal ------------------------------------
@@ -1409,6 +1658,14 @@ pub fn render_pane(
     // pure decision; here we just look up the chosen block's chrome +
     // command and repaint them in a clipped foreground `Area`, over an
     // opaque strip so the content scrolling underneath is occluded.
+    //
+    // The pinned command label's `Response` is captured here and routed
+    // by the sealed-selection handler below, so a press on the pinned
+    // copy selects its block's command instead of falling through to the
+    // output underneath the foreground overlay. Only set for a sealed
+    // block — a running command label is not selectable inline either,
+    // so its pinned copy just absorbs the press.
+    let mut sticky_command: Option<(crate::block::BlockId, egui::Response)> = None;
     if !in_alt_screen
         && let Some((sticky_id, paint_y)) =
             compute_sticky_header(&block_extents, scroll_viewport.top())
@@ -1445,19 +1702,39 @@ pub fn render_pane(
                 _ => None,
             })
     {
-        paint_sticky_header(
+        // Command-region selection for the pinned block, clipped to the
+        // command rows then to the lines actually shown, so the pinned
+        // label highlights in sync with its inline twin. `None` for a
+        // running block (no sealed rows) — it has no selection.
+        let sealed_rows = slot.session.sealed_block_rows(sticky_id);
+        let sticky_cmd_sel = sealed_rows.and_then(|(cmd_lines, snap_lines)| {
+            let unified = pane_sel.as_ref()?.block_range_for(sticky_id, cmd_lines + snap_lines)?;
+            clamp_command_selection_to_visible(
+                render::split_selection_at_row(Some(unified), cmd_lines).0,
+                cmd_lines.min(STICKY_MAX_CMD_LINES),
+            )
+        });
+        let sticky = paint_sticky_header(
             ctx,
             scroll_viewport,
             paint_y,
-            cwd.as_deref(),
-            home,
-            exit,
-            duration,
-            git.as_ref(),
-            faded,
-            &command,
+            StickyHeaderContent {
+                cwd: cwd.as_deref(),
+                home,
+                exit,
+                duration,
+                git: git.as_ref(),
+                faded,
+                command: &command,
+                command_selection: sticky_cmd_sel,
+            },
             slot.session.pane_id(),
         );
+        if sealed_rows.is_some()
+            && let Some(resp) = sticky.command
+        {
+            sticky_command = Some((sticky_id, resp));
+        }
     }
     if highlighted_link.is_some() {
         ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1819,6 +2096,10 @@ pub fn render_pane(
     // WHICH widget got the press; that comes from per-widget
     // `Response::is_pointer_button_down_on()`.
     let primary_just_pressed = ctx.input(|i| i.pointer.primary_pressed());
+    // Shift held at press time turns a click into a selection EXTEND
+    // (Chrome-style): keep the existing anchor + selection mode and move
+    // the head to the click, rather than starting a fresh selection.
+    let shift_held = ctx.input(|i| i.modifiers.shift);
 
     /// Translate a pointer pixel position inside the editor rect to
     /// a byte index in the editor's text. Out-of-rows clamps to end.
@@ -1982,8 +2263,14 @@ pub fn render_pane(
                 None
             }
         });
+    // The pinned (sticky) command label is a foreground overlay; a
+    // press on it is a press inside this pane (claim focus) and routes
+    // into a sealed selection below — taking priority over the inline
+    // block it duplicates, which it sits on top of in z-order.
+    let sticky_pressed =
+        sticky_command.as_ref().is_some_and(|(_, r)| r.is_pointer_button_down_on());
     let any_pane_widget_pressed =
-        live_grid_pressed || editor_pressed || sealed_pressed_id.is_some();
+        live_grid_pressed || editor_pressed || sealed_pressed_id.is_some() || sticky_pressed;
 
     // Focus-on-background-click: if a primary press happened this
     // frame AND the pointer is currently over an uncovered area of
@@ -1998,171 +2285,192 @@ pub fn render_pane(
         focus_response.request_focus();
     }
 
-    // ---- Sealed-block click / drag routing ----------------------
+    // ---- Sealed-block / pinned-header click / drag routing ------
     //
-    // Per-widget: the snapshot OR command label of one specific
-    // sealed block is receiving the press. Egui's interaction
-    // layer guarantees this is exclusive — at most one block fires
-    // per frame, never both panes during a splitter drag. egui's
-    // exclusive drag ownership also keeps that block's
-    // `is_pointer_button_down_on()` true even when the pointer
-    // moves OFF the block's rect, so this branch keeps running
-    // through a cross-block drag.
-    if !modal_open && let Some(origin_block_id) = sealed_pressed_id {
-        // Find the response set for the origin (press) block. The
-        // press may be on either sub-widget (command label or
-        // snapshot).
-        if let Some((_, sealed_origin)) =
-            sealed_block_renders.iter().find(|(id, _)| *id == origin_block_id)
-        {
-            let pos = sealed_origin
-                .snapshot
-                .interact_pointer_pos()
-                .or_else(|| sealed_origin.command.as_ref().and_then(|c| c.interact_pointer_pos()));
-            if let Some(pos) = pos {
-                // Origin-block cursor: where the press / multi-click
-                // landed, in the origin block's row space.
-                let origin_rect = sealed_origin.bounding_rect();
-                let (origin_cmd_lines, origin_snap_lines) =
-                    slot.session.sealed_block_rows(origin_block_id).unwrap_or((0, 0));
-                let origin_total_rows = origin_cmd_lines + origin_snap_lines;
-                let mut origin_cursor =
-                    sealed_cursor_for_pos(origin_rect, pos, cell_w, row_h, origin_total_rows);
-                if let Some(row_len) =
-                    slot.session.sealed_row_len(origin_block_id, origin_cursor.row)
-                {
-                    origin_cursor.col = origin_cursor.col.min(row_len);
-                }
+    // The press origin for a sealed-style selection: the pinned
+    // (sticky) command label wins — it's a foreground overlay drawn on
+    // top of the block it duplicates, so a press there is the user
+    // clicking the pinned copy, not the output scrolling underneath.
+    // Otherwise it's a press on an inline sealed block (its command
+    // label OR snapshot). Both resolve to `(block, rect, pos)`; the rest
+    // of the routing is keyed by block id + cursor, so it's identical
+    // for either origin. Egui guarantees the press is exclusive (at most
+    // one widget fires per frame, never both panes during a splitter
+    // drag) and exclusive drag ownership keeps the origin widget's press
+    // true even when the pointer moves OFF its rect mid-drag.
+    // The `from_sticky` flag matters for drag-extend: the pinned strip
+    // is a foreground duplicate of command rows that have scrolled above
+    // the viewport, so its rect maps `pos` into command-row space, while
+    // the inline block's real rect (used by `find_head_block_for_pos`)
+    // maps the SAME pixel into the scrolled-off output it overlays. The
+    // two disagree, so a sticky drag is confined to the command rows it
+    // shows rather than routed through the real-rect mapper.
+    let selection_origin: Option<(crate::block::BlockId, egui::Rect, egui::Pos2, bool)> =
+        sticky_command
+            .as_ref()
+            .filter(|(_, resp)| resp.is_pointer_button_down_on())
+            .and_then(|(id, resp)| {
+                resp.interact_pointer_pos().map(|pos| (*id, resp.rect, pos, true))
+            })
+            .or_else(|| {
+                let id = sealed_pressed_id?;
+                let (_, origin) = sealed_block_renders.iter().find(|(bid, _)| *bid == id)?;
+                let pos = origin
+                    .snapshot
+                    .interact_pointer_pos()
+                    .or_else(|| origin.command.as_ref().and_then(|c| c.interact_pointer_pos()))?;
+                Some((id, origin.bounding_rect(), pos, false))
+            });
+    if !modal_open && let Some((origin_block_id, origin_rect, pos, from_sticky)) = selection_origin
+    {
+        // Origin-block cursor: where the press / multi-click landed, in
+        // the origin block's row space. For a pinned press, `origin_rect`
+        // top IS command row 0 (the pinned strip shows only the command
+        // rows), so the same mapping yields a command-row cursor.
+        let (origin_cmd_lines, origin_snap_lines) =
+            slot.session.sealed_block_rows(origin_block_id).unwrap_or((0, 0));
+        let origin_total_rows = origin_cmd_lines + origin_snap_lines;
+        let mut origin_cursor =
+            sealed_cursor_for_pos(origin_rect, pos, cell_w, row_h, origin_total_rows);
+        if let Some(row_len) = slot.session.sealed_row_len(origin_block_id, origin_cursor.row) {
+            origin_cursor.col = origin_cursor.col.min(row_len);
+        }
 
-                if primary_just_pressed {
-                    // -------- START a selection in the press block ----
-                    // Anchor + head both land in the origin block;
-                    // multi-click expands within that block.
-                    let sealed_link =
-                        slot.session.sealed_block_links(origin_block_id, home).and_then(|links| {
-                            links
-                                .iter()
-                                .find(|l| l.contains(origin_cursor.row, origin_cursor.col))
-                                .cloned()
-                        });
-                    if modifier_held && let Some(link) = &sealed_link {
-                        // Cmd-click on a URL / path: open it, don't
-                        // start a selection.
-                        open_url(&link.url);
-                    } else {
-                        let click_count = bump_multi_click(&mut slot.ui, now, pos);
-                        let mk_anchor_head =
-                            |a: crate::block_selection::BlockCursor,
-                             b: crate::block_selection::BlockCursor|
-                             -> crate::pane_selection::PaneSelection {
-                                crate::pane_selection::PaneSelection::new(
-                                    crate::pane_selection::PaneCursor::in_block(origin_block_id, a),
-                                    crate::pane_selection::PaneCursor::in_block(origin_block_id, b),
-                                )
-                            };
-                        match click_count {
-                            2 => {
-                                if let Some(link) = &sealed_link {
-                                    let a = crate::block_selection::BlockCursor::new(
-                                        link.row,
-                                        link.col_start,
-                                    );
-                                    let b = crate::block_selection::BlockCursor::new(
-                                        link.row,
-                                        link.col_end + 1,
-                                    );
-                                    slot.ui.sealed_drag_anchor = Some((origin_block_id, a, b));
-                                    slot.session.set_pane_selection(mk_anchor_head(a, b));
-                                } else if let Some((a, b)) =
-                                    slot.session.sealed_word_range(origin_block_id, origin_cursor)
-                                {
-                                    slot.ui.sealed_drag_anchor = Some((origin_block_id, a, b));
-                                    slot.session.set_pane_selection(mk_anchor_head(a, b));
-                                }
-                            }
-                            3 => {
-                                if let Some((a, b)) =
-                                    slot.session.sealed_line_range(origin_block_id, origin_cursor)
-                                {
-                                    slot.ui.sealed_drag_anchor = Some((origin_block_id, a, b));
-                                    slot.session.set_pane_selection(mk_anchor_head(a, b));
-                                }
-                            }
-                            _ => {
-                                slot.ui.sealed_drag_anchor = None;
-                                slot.session.set_pane_selection(mk_anchor_head(
-                                    origin_cursor,
-                                    origin_cursor,
-                                ));
-                            }
-                        }
-                    }
-                } else if let Some(sel) = slot.session.pane_selection().copied() {
-                    // -------- EXTEND the selection -------------------
-                    //
-                    // Cross-block: the pointer may be over a different
-                    // sealed block than the origin. Find whichever
-                    // block the pointer is currently over (or clamp to
-                    // top / bottom of the painted list) and translate
-                    // `pos` to a cursor in that block's row space.
-                    let (head_block_id, head_cursor) = find_head_block_for_pos(
-                        pos,
-                        &sealed_block_renders,
-                        cell_w,
-                        row_h,
-                        &slot.session,
-                    );
-                    match (slot.ui.click_count, slot.ui.sealed_drag_anchor) {
-                        (2, Some((anchor_block, a_start, a_end))) => {
-                            // Word-mode drag, same-block OR cross-block:
-                            // the unified far-edge rule in
-                            // `extend_multiclick_selection_endpoints`
-                            // handles both. Pre-fix this branch ran
-                            // only when `anchor_block == head_block_id`
-                            // — cross-block drag fell through to
-                            // char mode in the head block and "lost"
-                            // the anchor word when dragged upward.
-                            if let Some(head_bounds) =
-                                slot.session.sealed_word_range(head_block_id, head_cursor)
-                            {
-                                let (anc_pc, head_pc) =
-                                    crate::pane_selection::extend_multiclick_selection_endpoints(
-                                        anchor_block,
-                                        (a_start, a_end),
-                                        head_block_id,
-                                        head_bounds,
-                                    );
-                                slot.session.update_pane_selection_endpoints(anc_pc, head_pc);
-                            }
-                        }
-                        (3, Some((anchor_block, a_start, a_end))) => {
-                            // Line-mode drag — same rule, line bounds.
-                            if let Some(head_bounds) =
-                                slot.session.sealed_line_range(head_block_id, head_cursor)
-                            {
-                                let (anc_pc, head_pc) =
-                                    crate::pane_selection::extend_multiclick_selection_endpoints(
-                                        anchor_block,
-                                        (a_start, a_end),
-                                        head_block_id,
-                                        head_bounds,
-                                    );
-                                slot.session.update_pane_selection_endpoints(anc_pc, head_pc);
-                            }
-                        }
-                        _ => {
-                            // Char mode (no multi-click anchor): just
-                            // move the head. Anchor stays pinned
-                            // wherever the press landed.
-                            let _ = sel; // anchor is still fine
-                            slot.session.update_pane_selection_head(
-                                crate::pane_selection::PaneCursor::in_block(
-                                    head_block_id,
-                                    head_cursor,
-                                ),
+        // Shift+click EXTENDS the existing pane selection (across blocks
+        // and into / out of command vs output) instead of starting a new
+        // one — falling through to the shared extend branch below, which
+        // honours the retained char / word / line mode.
+        let shift_extend = press_extends_selection(
+            primary_just_pressed,
+            shift_held,
+            slot.session.pane_selection().is_some(),
+        );
+        if primary_just_pressed && !shift_extend {
+            // -------- START a selection in the press block ----
+            // Anchor + head both land in the origin block;
+            // multi-click expands within that block.
+            let sealed_link =
+                slot.session.sealed_block_links(origin_block_id, home).and_then(|links| {
+                    links.iter().find(|l| l.contains(origin_cursor.row, origin_cursor.col)).cloned()
+                });
+            if modifier_held && let Some(link) = &sealed_link {
+                // Cmd-click on a URL / path: open it, don't
+                // start a selection.
+                open_url(&link.url);
+            } else {
+                let click_count = bump_multi_click(&mut slot.ui, now, pos);
+                let mk_anchor_head = |a: crate::block_selection::BlockCursor,
+                                      b: crate::block_selection::BlockCursor|
+                 -> crate::pane_selection::PaneSelection {
+                    crate::pane_selection::PaneSelection::new(
+                        crate::pane_selection::PaneCursor::in_block(origin_block_id, a),
+                        crate::pane_selection::PaneCursor::in_block(origin_block_id, b),
+                    )
+                };
+                match click_count {
+                    2 => {
+                        if let Some(link) = &sealed_link {
+                            let a =
+                                crate::block_selection::BlockCursor::new(link.row, link.col_start);
+                            let b = crate::block_selection::BlockCursor::new(
+                                link.row,
+                                link.col_end + 1,
                             );
+                            slot.ui.sealed_drag_anchor = Some((origin_block_id, a, b));
+                            slot.session.set_pane_selection(mk_anchor_head(a, b));
+                        } else if let Some((a, b)) =
+                            slot.session.sealed_word_range(origin_block_id, origin_cursor)
+                        {
+                            slot.ui.sealed_drag_anchor = Some((origin_block_id, a, b));
+                            slot.session.set_pane_selection(mk_anchor_head(a, b));
                         }
                     }
+                    3 => {
+                        if let Some((a, b)) =
+                            slot.session.sealed_line_range(origin_block_id, origin_cursor)
+                        {
+                            slot.ui.sealed_drag_anchor = Some((origin_block_id, a, b));
+                            slot.session.set_pane_selection(mk_anchor_head(a, b));
+                        }
+                    }
+                    _ => {
+                        slot.ui.sealed_drag_anchor = None;
+                        slot.session
+                            .set_pane_selection(mk_anchor_head(origin_cursor, origin_cursor));
+                    }
+                }
+            }
+        } else if let Some(sel) = slot.session.pane_selection().copied() {
+            // -------- EXTEND the selection -------------------
+            //
+            // Cross-block: the pointer may be over a different
+            // sealed block than the origin. Find whichever
+            // block the pointer is currently over (or clamp to
+            // top / bottom of the painted list) and translate
+            // `pos` to a cursor in that block's row space.
+            //
+            // A sticky-origin drag stays in the pinned block and is
+            // confined to the command rows the strip shows — mapped
+            // through `origin_rect` (its top is command row 0), not the
+            // real-rect mapper, which would target the scrolled-off
+            // output the strip overlays.
+            let (head_block_id, head_cursor) = if from_sticky {
+                let mut c =
+                    sealed_cursor_for_pos(origin_rect, pos, cell_w, row_h, origin_total_rows);
+                c.row = c.row.min(origin_cmd_lines.saturating_sub(1));
+                if let Some(row_len) = slot.session.sealed_row_len(origin_block_id, c.row) {
+                    c.col = c.col.min(row_len);
+                }
+                (origin_block_id, c)
+            } else {
+                find_head_block_for_pos(pos, &sealed_block_renders, cell_w, row_h, &slot.session)
+            };
+            match (slot.ui.click_count, slot.ui.sealed_drag_anchor) {
+                (2, Some((anchor_block, a_start, a_end))) => {
+                    // Word-mode drag, same-block OR cross-block:
+                    // the unified far-edge rule in
+                    // `extend_multiclick_selection_endpoints`
+                    // handles both. Pre-fix this branch ran
+                    // only when `anchor_block == head_block_id`
+                    // — cross-block drag fell through to
+                    // char mode in the head block and "lost"
+                    // the anchor word when dragged upward.
+                    if let Some(head_bounds) =
+                        slot.session.sealed_word_range(head_block_id, head_cursor)
+                    {
+                        let (anc_pc, head_pc) =
+                            crate::pane_selection::extend_multiclick_selection_endpoints(
+                                anchor_block,
+                                (a_start, a_end),
+                                head_block_id,
+                                head_bounds,
+                            );
+                        slot.session.update_pane_selection_endpoints(anc_pc, head_pc);
+                    }
+                }
+                (3, Some((anchor_block, a_start, a_end))) => {
+                    // Line-mode drag — same rule, line bounds.
+                    if let Some(head_bounds) =
+                        slot.session.sealed_line_range(head_block_id, head_cursor)
+                    {
+                        let (anc_pc, head_pc) =
+                            crate::pane_selection::extend_multiclick_selection_endpoints(
+                                anchor_block,
+                                (a_start, a_end),
+                                head_block_id,
+                                head_bounds,
+                            );
+                        slot.session.update_pane_selection_endpoints(anc_pc, head_pc);
+                    }
+                }
+                _ => {
+                    // Char mode (no multi-click anchor): just
+                    // move the head. Anchor stays pinned
+                    // wherever the press landed.
+                    let _ = sel; // anchor is still fine
+                    slot.session.update_pane_selection_head(
+                        crate::pane_selection::PaneCursor::in_block(head_block_id, head_cursor),
+                    );
                 }
             }
         }
@@ -2183,7 +2491,10 @@ pub fn render_pane(
             .unwrap_or_default();
         let byte = editor_byte_for_pos(rect, pos, &editor_text, cell_w, row_h);
 
-        if primary_just_pressed {
+        // Shift+click extends the editor selection from its caret /
+        // anchor (the editor always has a caret to anchor to), honouring
+        // the retained char / word / line mode — fall through to EXTEND.
+        if primary_just_pressed && !shift_held {
             // Press in the editor ends any sealed-block selection.
             slot.session.clear_pane_selection();
             slot.ui.sealed_drag_anchor = None;
@@ -2236,7 +2547,12 @@ pub fn render_pane(
         let press_pt = to_point(pos);
         let link_under_press = links_in_view.iter().find(|l| l.contains(press_pt)).cloned();
 
-        if primary_just_pressed {
+        // Shift+click extends the live-grid selection (in whatever
+        // char / word / line mode it was started) to the click instead
+        // of starting fresh.
+        let shift_extend_grid =
+            press_extends_selection(primary_just_pressed, shift_held, selection.is_some());
+        if primary_just_pressed && !shift_extend_grid {
             if modifier_held && let Some(link) = link_under_press {
                 open_url(&link.url);
             } else {
@@ -2254,10 +2570,12 @@ pub fn render_pane(
                     slot.session.start_selection(press_pt, mode);
                 }
             }
-        } else if rendered.response.dragged() {
+        } else if rendered.response.dragged() || shift_extend_grid {
             // EXTEND. Egui's `dragged()` is the canonical
             // "this widget is being dragged" signal once the
-            // drag threshold is met.
+            // drag threshold is met; `shift_extend_grid` is the
+            // discrete Shift+click extend. Both keep the mode the
+            // selection was started in.
             slot.session.extend_selection(press_pt);
         }
     }
@@ -2513,6 +2831,12 @@ pub fn render_pane(
             // navigation checks in `crate::history_overlay::paint`.
             // We just skip the editor / PTY paths so nothing leaks.
             if slot.ui.history_overlay.is_some() {
+                continue;
+            }
+            // Same modality for the Phase 8 find overlay: while it's
+            // open its `TextEdit` + `ctx.input` navigation checks own
+            // the keyboard; skip the editor / PTY paths so nothing leaks.
+            if slot.ui.find_overlay.is_some() {
                 continue;
             }
             // ---- Tab completion popup interception -----------------
@@ -2784,6 +3108,26 @@ pub fn render_pane(
         }
     }
 
+    // Phase 8: paint the find overlay on top of everything, and apply
+    // its outcome. Like the Ctrl+R overlay, the event loop above
+    // blocked the editor / PTY paths while it's open. A selection /
+    // query change schedules a scroll-to-match for the next frame
+    // (the match rects only exist after the scroll area lays out).
+    if slot.ui.find_overlay.is_some() {
+        let pane_rect = ui.max_rect();
+        let outcome = crate::find::paint(ui, slot, pane_rect);
+        if outcome.close {
+            // Persist the query history on the pane before dropping the
+            // overlay so a later Cmd+F reopen still has it.
+            if let Some(o) = slot.ui.find_overlay.take() {
+                slot.ui.find_history = o.history;
+            }
+            slot.ui.needs_focus = true;
+        } else if outcome.scroll_to_selected {
+            slot.ui.find_scroll_pending = true;
+        }
+    }
+
     // ---- blank-pane watermark overlay ---------------------------
     //
     // Painted last, on top of the terminal's opaque fill, so the faint
@@ -2868,6 +3212,104 @@ pub fn render_pane(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- press_extends_selection (Shift+click extend) -----------------
+
+    #[test]
+    fn shift_click_with_selection_extends() {
+        assert!(press_extends_selection(true, true, true));
+    }
+
+    #[test]
+    fn shift_click_without_selection_starts_fresh() {
+        // Nothing to anchor to → normal start, not extend.
+        assert!(!press_extends_selection(true, true, false));
+    }
+
+    #[test]
+    fn plain_click_never_extends() {
+        assert!(!press_extends_selection(true, false, true));
+    }
+
+    #[test]
+    fn shift_without_a_press_is_not_an_extend() {
+        // Shift held mid-drag (no fresh press) isn't a Shift+click.
+        assert!(!press_extends_selection(false, true, true));
+    }
+
+    // ---- plan_resize (resize debounce, #1 banner-storm fix) -----------
+
+    const DB: f64 = RESIZE_DEBOUNCE_SECS;
+
+    #[test]
+    fn resize_first_sizing_commits_immediately() {
+        // A fresh pane (nothing committed) sizes at once — a 100 ms
+        // delay on the very first size would be visible.
+        let p = plan_resize((40, 80), None, None, 5.0, DB);
+        assert!(p.commit);
+        assert_eq!(p.pending, None);
+    }
+
+    #[test]
+    fn resize_unchanged_target_is_idle() {
+        let p = plan_resize((40, 80), Some((40, 80)), None, 5.0, DB);
+        assert!(!p.commit);
+        assert_eq!(p.pending, None);
+        assert_eq!(p.repaint_after, None);
+    }
+
+    #[test]
+    fn resize_new_target_defers_and_starts_timer() {
+        // Target just changed from the committed size: don't commit yet,
+        // start the debounce timer at `now`, ask for a repaint.
+        let now = 10.0;
+        let p = plan_resize((30, 80), Some((40, 80)), None, now, DB);
+        assert!(!p.commit);
+        assert_eq!(p.pending, Some(((30, 80), now)));
+        assert_eq!(p.repaint_after, Some(DB));
+    }
+
+    #[test]
+    fn resize_commits_once_target_holds_for_debounce() {
+        // Timer started at t=10; once the steady target has held past
+        // the debounce window it commits. (Use a margin past the
+        // deadline; real frames never land on the exact float edge.)
+        let p = plan_resize((30, 80), Some((40, 80)), Some(((30, 80), 10.0)), 10.0 + DB + 0.05, DB);
+        assert!(p.commit);
+        assert_eq!(p.pending, None);
+    }
+
+    #[test]
+    fn resize_storm_never_commits_until_settled() {
+        // Simulate an interactive drag: the target changes every frame
+        // (~16 ms apart), each change restarting the timer, so the
+        // debounce deadline is never reached and NO resize is committed
+        // mid-drag — this is the fix for the N-times-stacked banner.
+        let mut committed = Some((40u16, 80u16));
+        let mut pending: Option<((u16, u16), f64)> = None;
+        let mut commits = 0;
+        let mut t = 0.0;
+        // 30 frames of a shrinking-then-growing drag, height churning.
+        for i in 0..30 {
+            let h = 40 - (i % 12) as u16; // wobbles, never stable
+            let target = (h, 80);
+            let p = plan_resize(target, committed, pending, t, DB);
+            if p.commit {
+                committed = Some(target);
+                commits += 1;
+            }
+            pending = p.pending;
+            t += 0.016;
+        }
+        assert_eq!(commits, 0, "no resize should commit during a churning drag");
+
+        // Drag ends: target holds steady; let the debounce elapse.
+        let target = (28, 80);
+        let p1 = plan_resize(target, committed, pending, t, DB); // restart timer
+        assert!(!p1.commit);
+        let p2 = plan_resize(target, committed, p1.pending, t + DB + 0.05, DB); // past deadline
+        assert!(p2.commit, "the settled size commits exactly once after the drag");
+    }
 
     // ---- compute_footer_height (Phase 4D) -----------------------------
 
@@ -3011,6 +3453,41 @@ mod tests {
     #[test]
     fn cap_command_empty_is_empty() {
         assert_eq!(cap_command_for_sticky("", 4), "");
+    }
+
+    fn bc(row: usize, col: usize) -> crate::block_selection::BlockCursor {
+        crate::block_selection::BlockCursor::new(row, col)
+    }
+
+    #[test]
+    fn clamp_command_sel_none_passes_through() {
+        assert_eq!(clamp_command_selection_to_visible(None, 4), None);
+    }
+
+    #[test]
+    fn clamp_command_sel_zero_visible_is_none() {
+        assert_eq!(clamp_command_selection_to_visible(Some((bc(0, 0), bc(0, 3))), 0), None);
+    }
+
+    #[test]
+    fn clamp_command_sel_fully_within_cap_unchanged() {
+        let sel = (bc(0, 2), bc(2, 5));
+        assert_eq!(clamp_command_selection_to_visible(Some(sel), 4), Some(sel));
+    }
+
+    #[test]
+    fn clamp_command_sel_start_below_cap_is_none() {
+        // Selection begins on a row not shown in the pinned strip.
+        assert_eq!(clamp_command_selection_to_visible(Some((bc(4, 0), bc(6, 2))), 4), None);
+    }
+
+    #[test]
+    fn clamp_command_sel_end_past_cap_runs_to_last_visible_line() {
+        // End spills past the cap → highlight to end of last shown row.
+        assert_eq!(
+            clamp_command_selection_to_visible(Some((bc(1, 3), bc(5, 2))), 4),
+            Some((bc(1, 3), bc(3, usize::MAX)))
+        );
     }
 
     #[test]

@@ -124,6 +124,13 @@ rusqlite = { version = "0.34", features = ["bundled"] }
 # convention and matches what spec/08 calls "`<data-dir>/`".
 directories = "5"
 
+# Phase 8: the in-pane find overlay's regex match mode (spec/07
+# §"Search engine"). Literal + case-insensitive matching is done in
+# our own char-column scanner (so highlight columns line up with the
+# cell grid); regex is delegated to this crate via `RegexBuilder`
+# with `case_insensitive` wired to the overlay's `Aa` toggle.
+regex = "1"
+
 # macOS-only: we need `EventLoopBuilderExtMacOS::with_default_menu(false)`
 # to disable winit's default app menubar. Its Quit item invokes
 # `[NSApplication terminate:]` directly, which bypasses our key

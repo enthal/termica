@@ -219,6 +219,17 @@ Always available; lives in `completion::local`. No process spawn, no IPC. Pure f
 | `$PATH` executable scan | First token (the command), no `/` in it | Walk `$PATH` once per Tab, filter by prefix; cache the executable list per cwd at 10s TTL |
 | History match | First token matches the start of a previous command | Pull from the `runs` table ([spec/07](07-history-and-search.md)) filtered by current cwd; ranks by recency × frequency |
 
+### Quoting and escaping
+
+The token under the cursor is found **quote- and escape-aware** ([`completion::local::completion_context`](../src/completion/local.rs)), so a quoted or escaped filename completes correctly:
+
+- An **opening quote** bounds the token. `ls "my fi⇥` completes against `my fi` (spaces inside the quote do **not** split the token, unlike an unquoted space), and the replaced range starts just after the quote so accepting lands the name inside the quotes. A backslash-escaped space (`ls my\ fi⇥`) is likewise one token; the matched prefix is the **unescaped** literal (`my fi`).
+- The **substituted value** is escaped for the context it lands in ([`completion::local::escape_for_context`](../src/completion/local.rs)) while the popup's **display** stays the plain, human-readable name:
+  - unquoted → backslash-escape whitespace and shell metacharacters (`my file.txt` → `my\ file.txt`), leaving `/` intact so a path stays a path;
+  - inside `"…"` → escape only `"`, `$`, `` ` ``, `\` (spaces and globs are literal there);
+  - inside `'…'` → pass through unchanged.
+- The `./` disambiguation prefix added to a non-pathish argument (`C⇥` → `./CLAUDE.md`) is **suppressed inside an explicit quote** — a quoted bare name needs no disambiguation.
+
 Local heuristics are **synchronous**. They run on the main thread, never spawn anything, and complete in well under 5 ms. They always populate the popup before sources 1 and 2 have a chance to respond — which is the point: the popup opens instantly, then the more-expensive sources stream in candidates as they arrive.
 
 ## Popup widget
