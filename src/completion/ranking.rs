@@ -17,6 +17,9 @@ use super::{CompletionCandidate, CompletionSource};
 /// always know they're paths and don't compete with the others.
 fn source_weight(s: CompletionSource) -> f32 {
     match s {
+        // Env-var completion is exclusive (its own popup), so this
+        // weight only matters if it ever shares a merge; rank it high.
+        CompletionSource::EnvVar => 1.0,
         CompletionSource::History => 1.0,
         CompletionSource::PathExecutable => 0.8,
         CompletionSource::Path => 0.6,

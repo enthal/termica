@@ -231,23 +231,32 @@ fn needs_unquoted_escape(c: char) -> bool {
 /// `<Tab>` at the start of the buffer is command-mode; `git ` is
 /// command-mode followed by argument-mode for the next token.
 pub fn is_command_position(text: &str, cursor: usize) -> bool {
-    // The current TOKEN starts at `token_start`. Command position
-    // means "between the most recent command-sequencer (`|`, `&`,
-    // `;`) and the start of the current token, there is no non-
-    // whitespace content." If there is, the current token is an
-    // argument to that earlier content; otherwise it's a command
-    // name.
+    // The current TOKEN starts at `token_start`. Command position means
+    // "in the command stretch before this token (since the most recent
+    // `|` / `&` / `;`), every word is an inline env assignment
+    // (`NAME=value`)" — so the token is the command name. A leading
+    // `a=b echo` keeps `echo` in command position (mirrors the syntax
+    // highlighter), while `git status` puts `status` in argument
+    // position.
     let (token_start, _) = token_under_cursor(text, cursor);
     let prefix = text.get(..token_start).unwrap_or("");
-    let mut has_content_since_last_sequencer = false;
-    for c in prefix.chars() {
-        if matches!(c, '|' | '&' | ';') {
-            has_content_since_last_sequencer = false;
-        } else if !c.is_whitespace() {
-            has_content_since_last_sequencer = true;
-        }
+    let stretch_start = prefix.rfind(['|', '&', ';']).map(|i| i + 1).unwrap_or(0);
+    let stretch = prefix.get(stretch_start..).unwrap_or("");
+    stretch.split_whitespace().all(is_env_assignment)
+}
+
+/// True if `word` is a shell inline env assignment — `NAME=...` where
+/// `NAME` is a valid identifier (`[A-Za-z_][A-Za-z0-9_]*`). The value
+/// part is unrestricted.
+fn is_env_assignment(word: &str) -> bool {
+    let Some(eq) = word.find('=') else { return false };
+    let name = &word[..eq];
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
     }
-    !has_content_since_last_sequencer
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Path-shaped triggers: the token is path-mode iff it starts
@@ -266,6 +275,35 @@ pub fn token_is_pathish(token: &str) -> bool {
         return true;
     }
     matches!(token.chars().next(), Some('~'))
+}
+
+/// If `token` is an environment-variable reference being typed — `$`,
+/// `$NAME` — return the (possibly empty) name prefix to complete. A `/`
+/// in the token means it's a path expansion (`$HOME/sub`), handled by
+/// the filesystem source instead, so this returns `None`. Anything not
+/// shaped like a `$`-prefixed identifier returns `None`.
+pub fn env_var_prefix(token: &str) -> Option<&str> {
+    let rest = token.strip_prefix('$')?;
+    if rest.contains('/') {
+        return None;
+    }
+    if rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { Some(rest) } else { None }
+}
+
+/// Env-var name candidates whose name starts with `prefix` (case-
+/// sensitive, like the shell). Each candidate's value is the full
+/// `$NAME` so accepting it replaces the typed `$pre` token. `names` is
+/// the list of variable names (production passes `std::env::vars`);
+/// taking it as a parameter keeps this pure + testable.
+pub fn complete_env_vars(prefix: &str, names: &[String]) -> Vec<CompletionCandidate> {
+    let mut out: Vec<CompletionCandidate> = names
+        .iter()
+        .filter(|n| n.starts_with(prefix))
+        .map(|n| CompletionCandidate::simple(format!("${n}"), CompletionSource::EnvVar))
+        .collect();
+    out.sort_by(|a, b| a.value.cmp(&b.value));
+    out.dedup_by(|a, b| a.value == b.value);
+    out
 }
 
 /// Split a path-shaped completion token into `(dir_part, file_prefix)`:
@@ -660,6 +698,61 @@ mod tests {
     #[test]
     fn after_semicolon_resets_to_command_position() {
         assert!(is_command_position("cd /tmp; ls", 11));
+    }
+
+    #[test]
+    fn inline_env_assignment_keeps_command_position() {
+        // `a=b ec<TAB>` — `ec` is the command, not an argument to `a=b`.
+        assert!(is_command_position("a=b ec", 6));
+        // Multiple assignments.
+        assert!(is_command_position("A=1 B=2 ec", 10));
+        // Assignment with a path value still leaves the next word a command.
+        assert!(is_command_position("PATH=/x/y gi", 12));
+    }
+
+    #[test]
+    fn argument_after_env_prefixed_command_is_not_command_position() {
+        // `a=b echo ar<TAB>` — `ar` is an argument to `echo`.
+        assert!(!is_command_position("a=b echo ar", 11));
+    }
+
+    #[test]
+    fn bare_word_with_no_equals_is_not_an_assignment() {
+        assert!(!is_command_position("notassign ec", 12));
+    }
+
+    // ---- env-var completion ---------------------------------------
+
+    #[test]
+    fn env_var_prefix_detects_dollar_tokens() {
+        assert_eq!(env_var_prefix("$"), Some(""));
+        assert_eq!(env_var_prefix("$HO"), Some("HO"));
+        assert_eq!(env_var_prefix("$HOME"), Some("HOME"));
+        // A path expansion is NOT name completion.
+        assert_eq!(env_var_prefix("$HOME/sub"), None);
+        // Not a `$`-token.
+        assert_eq!(env_var_prefix("HOME"), None);
+        assert_eq!(env_var_prefix("./x"), None);
+    }
+
+    #[test]
+    fn complete_env_vars_filters_sorts_and_prefixes_dollar() {
+        let names = vec![
+            "HOME".to_string(),
+            "HOSTNAME".to_string(),
+            "PATH".to_string(),
+            "HOME".to_string(), // dup
+        ];
+        // `$` → all (deduped, sorted, each `$`-prefixed).
+        let all = complete_env_vars("", &names);
+        let values: Vec<&str> = all.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(values, vec!["$HOME", "$HOSTNAME", "$PATH"]);
+        assert!(all.iter().all(|c| c.source == CompletionSource::EnvVar));
+
+        // `HO` → HOME, HOSTNAME only.
+        let ho = complete_env_vars("HO", &names);
+        let values: Vec<&str> = ho.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(values, vec!["$HOME", "$HOSTNAME"]);
     }
 
     // ---- token_is_pathish -----------------------------------------

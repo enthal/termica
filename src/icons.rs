@@ -70,13 +70,15 @@ pub fn paint_arrow_glyph(
     let c = rect.center();
     let s = rect.height() * 0.26;
     let stroke = egui::Stroke::new(1.6, color);
-    let (tip_y, tail_y, head_y) =
-        if down { (c.y + s, c.y - s, c.y + s * 0.35) } else { (c.y - s, c.y + s, c.y - s * 0.35) };
+    let (tip_y, tail_y) = if down { (c.y + s, c.y - s) } else { (c.y - s, c.y + s) };
     // Stem.
     painter.line_segment([egui::pos2(c.x, tail_y), egui::pos2(c.x, tip_y)], stroke);
-    // Chevron head at the tip.
-    painter.line_segment([egui::pos2(c.x - s * 0.6, head_y), egui::pos2(c.x, tip_y)], stroke);
-    painter.line_segment([egui::pos2(c.x + s * 0.6, head_y), egui::pos2(c.x, tip_y)], stroke);
+    // Chevron head at the tip — slightly longer arms for a cleaner
+    // arrow than a stubby caret.
+    let arm = s * 0.85;
+    let arm_y = if down { c.y + s - arm } else { c.y - s + arm };
+    painter.line_segment([egui::pos2(c.x - arm, arm_y), egui::pos2(c.x, tip_y)], stroke);
+    painter.line_segment([egui::pos2(c.x + arm, arm_y), egui::pos2(c.x, tip_y)], stroke);
 }
 
 /// Up-arrow button — "previous match" (find searches from the bottom,
@@ -172,24 +174,34 @@ pub fn block_filter_button(
     response.on_hover_text(hover)
 }
 
-/// Draw the macOS Command (⌘) symbol — the "looped square": a small
-/// square with an open loop at each corner. Used in the keybindings
-/// cheat-sheet so the Cmd modifier reads natively without a Unicode
-/// glyph. `color` and `rect` set the ink and bounds.
+/// Draw the macOS Command (⌘) "looped square" — the four edges of a
+/// central square (a `#`) capped by a circular loop tangent at each
+/// corner. Geometry follows the standard glyph (tabler / Susan Kare
+/// proportions): loop centres at ±`a`, radius `r`, straight edges at
+/// ±`(a − r)` spanning the full ±`a` so each is tangent to two loops.
+/// Drawn rather than using the Unicode ⌘ (CLAUDE.md "no Unicode symbols
+/// for icons").
 pub fn paint_command_symbol(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let c = rect.center();
-    let s = rect.height() * 0.22; // half-side of the central square
-    let r = s * 0.6; // loop radius
-    let stroke = egui::Stroke::new(1.5, color);
-    // Central square joining the four loop centres.
-    let corners = [
-        egui::pos2(c.x - s, c.y - s),
-        egui::pos2(c.x + s, c.y - s),
-        egui::pos2(c.x + s, c.y + s),
-        egui::pos2(c.x - s, c.y + s),
-    ];
-    for i in 0..4 {
-        painter.line_segment([corners[i], corners[(i + 1) % 4]], stroke);
-        painter.circle_stroke(corners[i], r, stroke);
+    let ext = rect.height() * 0.34; // glyph half-extent (loop far edge = a + r)
+    let r = ext * 0.30; // loop radius
+    let a = ext - r; // loop-centre offset → outer edge at `ext`
+    let inner = a - r; // straight edges, tangent to the loops
+    let stroke = egui::Stroke::new(1.3, color);
+
+    // Four straight edges forming a `#`: horizontals at y = ±inner and
+    // verticals at x = ±inner, each spanning the full ±a so its ends
+    // land on the tangent points of the two loops it joins.
+    painter
+        .line_segment([egui::pos2(c.x - a, c.y - inner), egui::pos2(c.x + a, c.y - inner)], stroke);
+    painter
+        .line_segment([egui::pos2(c.x - a, c.y + inner), egui::pos2(c.x + a, c.y + inner)], stroke);
+    painter
+        .line_segment([egui::pos2(c.x - inner, c.y - a), egui::pos2(c.x - inner, c.y + a)], stroke);
+    painter
+        .line_segment([egui::pos2(c.x + inner, c.y - a), egui::pos2(c.x + inner, c.y + a)], stroke);
+    // A loop ring at each corner, tangent to the two edges meeting there.
+    for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+        painter.circle_stroke(egui::pos2(c.x + sx * a, c.y + sy * a), r, stroke);
     }
 }

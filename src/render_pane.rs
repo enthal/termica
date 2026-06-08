@@ -383,7 +383,7 @@ pub fn paint_sticky_header(
             // captures the press instead of leaking it to the output
             // below; the response is routed by the caller.
             let command_resp = (!capped.is_empty()).then(|| {
-                render::paint_command_label_with_selection(ui, &capped, command_selection)
+                render::paint_command_label_with_selection(ui, &capped, command_selection, faded)
             });
             let bottom = ui.next_widget_position().y;
             let strip = egui::Rect::from_min_max(
@@ -2801,6 +2801,20 @@ pub fn render_pane(
                 open_history_overlay(slot);
                 break;
             }
+            // Tab while a DIFFERENT popup is open → switch to completion:
+            // close the others here (no `break`) so the editor's Tab
+            // handler below opens the completion popup this same frame.
+            if editor_active
+                && plain
+                && !modifiers.command
+                && !modifiers.ctrl
+                && matches!(key, egui::Key::Tab)
+                && (slot.ui.find_overlay.is_some()
+                    || slot.ui.history_overlay.is_some()
+                    || slot.ui.keybindings_open)
+            {
+                close_all_popups(slot);
+            }
         }
 
         // ---- mouse wheel, hover-gated ---------------------------
@@ -3176,7 +3190,14 @@ pub fn render_pane(
     if slot.ui.keybindings_open {
         let pane_rect = ui.max_rect();
         let pane_id = slot.session.pane_id();
-        if crate::keybindings::paint(ui, pane_id, pane_rect, cfg!(target_os = "macos")) {
+        let is_macos = cfg!(target_os = "macos");
+        if crate::keybindings::paint(
+            ui,
+            pane_id,
+            pane_rect,
+            is_macos,
+            &mut slot.ui.keybindings_query,
+        ) {
             slot.ui.keybindings_open = false;
             slot.ui.needs_focus = true;
         }

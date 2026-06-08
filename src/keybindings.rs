@@ -200,9 +200,39 @@ fn paint_cap(ui: &mut egui::Ui, cap: Cap) {
     }
 }
 
-/// Paint the cheat-sheet over `pane_rect`. Returns `true` when the user
-/// asked to close it (Esc, the ✕, or a click on the dimmed backdrop).
-pub fn paint(ui: &mut egui::Ui, pane_id: u64, pane_rect: egui::Rect, is_macos: bool) -> bool {
+/// Plain-text label of a cap, for search matching ("Cmd" matches the
+/// ⌘ key even though it's drawn as a glyph).
+fn cap_text(cap: &Cap) -> &str {
+    match cap {
+        Cap::Cmd => "Cmd",
+        Cap::Ctrl => "Ctrl",
+        Cap::Shift => "Shift",
+        Cap::Alt(s) => s,
+        Cap::Key(s) => s,
+    }
+}
+
+/// Does `shortcut` match the (already-lowercased) `query`? Matches on
+/// the description or any key-cap label, substring + case-insensitive.
+pub fn shortcut_matches(shortcut: &Shortcut, query_lower: &str) -> bool {
+    if query_lower.is_empty() {
+        return true;
+    }
+    shortcut.desc.to_lowercase().contains(query_lower)
+        || shortcut.keys.iter().any(|c| cap_text(c).to_lowercase().contains(query_lower))
+}
+
+/// Paint the cheat-sheet over `pane_rect`. `query` is the live search
+/// filter (owned by the caller so it persists). Returns `true` when the
+/// user asked to close it (Esc, the ✕, or a click on the dimmed
+/// backdrop).
+pub fn paint(
+    ui: &mut egui::Ui,
+    pane_id: u64,
+    pane_rect: egui::Rect,
+    is_macos: bool,
+    query: &mut String,
+) -> bool {
     let mut close = false;
     if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
         close = true;
@@ -220,43 +250,72 @@ pub fn paint(ui: &mut egui::Ui, pane_id: u64, pane_rect: egui::Rect, is_macos: b
         close = true;
     }
 
+    let panel_w = (pane_rect.width() * 0.9).min(560.0);
+    let query_lower = query.to_lowercase();
+
     egui::Area::new(ui.id().with(("keys-panel", pane_id)))
         .order(egui::Order::Tooltip)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .show(ui.ctx(), |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.set_max_width((pane_rect.width() * 0.9).min(640.0));
+                ui.set_width(panel_w);
                 ui.horizontal(|ui| {
                     ui.heading("Keyboard shortcuts");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if crate::icons::close_button(ui, "Close (Esc)").clicked() {
                             close = true;
                         }
+                        // Search field fills the gap between heading and ✕.
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(query)
+                                .desired_width(ui.available_width())
+                                .id_salt(("keys-search", pane_id))
+                                .hint_text("Filter…"),
+                        );
+                        if !resp.has_focus() {
+                            resp.request_focus();
+                        }
                     });
                 });
                 ui.separator();
-                egui::ScrollArea::vertical().max_height(pane_rect.height() * 0.7).show(ui, |ui| {
-                    for group in shortcut_groups(is_macos) {
-                        ui.add_space(4.0);
-                        ui.label(egui::RichText::new(group.title).strong().size(13.0));
-                        for item in group.items {
-                            ui.horizontal(|ui| {
-                                // Fixed-width chord column so descriptions align.
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(190.0, ui.spacing().interact_size.y),
-                                    egui::Layout::left_to_right(egui::Align::Center),
-                                    |ui| {
-                                        ui.spacing_mut().item_spacing.x = 4.0;
-                                        for cap in item.keys {
-                                            paint_cap(ui, cap);
-                                        }
-                                    },
-                                );
-                                ui.label(item.desc);
-                            });
+                // Full-width scroll area (auto_shrink false on x) so the
+                // scrollbar sits at the right edge of the whole popup.
+                egui::ScrollArea::vertical()
+                    .max_height(pane_rect.height() * 0.7)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for group in shortcut_groups(is_macos) {
+                            let items: Vec<Shortcut> = group
+                                .items
+                                .into_iter()
+                                .filter(|s| shortcut_matches(s, &query_lower))
+                                .collect();
+                            if items.is_empty() {
+                                continue;
+                            }
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new(group.title).strong().size(13.0));
+                            for item in items {
+                                ui.horizontal(|ui| {
+                                    // Description on the LEFT; key-caps
+                                    // right-justified. In a right-to-left
+                                    // layout the first-added widget is
+                                    // rightmost, so iterate the caps in
+                                    // reverse to keep their visual order.
+                                    ui.label(item.desc);
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                            for cap in item.keys.iter().rev() {
+                                                paint_cap(ui, *cap);
+                                            }
+                                        },
+                                    );
+                                });
+                            }
                         }
-                    }
-                });
+                    });
             });
         });
 
@@ -289,6 +348,16 @@ mod tests {
         };
         assert!(find_groups(true).keys.contains(&Cap::Alt("Option")));
         assert!(find_groups(false).keys.contains(&Cap::Alt("Alt")));
+    }
+
+    #[test]
+    fn shortcut_matches_desc_keys_and_modifier_names() {
+        let s = sc(vec![Cap::Cmd, Cap::Key("T")], "New tab");
+        assert!(shortcut_matches(&s, "")); // empty → everything
+        assert!(shortcut_matches(&s, "tab")); // desc substring
+        assert!(shortcut_matches(&s, "cmd")); // ⌘ matches "cmd" by name
+        assert!(shortcut_matches(&s, "t")); // key label
+        assert!(!shortcut_matches(&s, "quit"));
     }
 
     #[test]

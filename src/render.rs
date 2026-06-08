@@ -1145,7 +1145,9 @@ pub fn paint_block_header(
 /// separately by [`paint_block_header`]; this helper handles the
 /// command line itself.
 pub fn paint_command_label(ui: &mut egui::Ui, command: &str) -> Response {
-    paint_command_label_with_selection(ui, command, None)
+    // The running-block label is the *current* command → full,
+    // unfaded syntax colours.
+    paint_command_label_with_selection(ui, command, None, false)
 }
 
 /// Same as [`paint_command_label`] but with optional selection
@@ -1159,6 +1161,7 @@ pub fn paint_command_label_with_selection(
     ui: &mut egui::Ui,
     command: &str,
     selection: Option<(BlockCursor, BlockCursor)>,
+    faded: bool,
 ) -> Response {
     let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
     let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
@@ -1229,7 +1232,8 @@ pub fn paint_command_label_with_selection(
                 }
                 let col_chars = chars_before_byte(line, clip_start.saturating_sub(row_byte_start));
                 let x = rect.min.x + col_chars as f32 * cell_w;
-                let color = fade_toward_gray(color_for_token_kind(token.kind), COMMAND_LABEL_FADE);
+                let fade = if faded { COMMAND_LABEL_FADE } else { 0.0 };
+                let color = fade_toward_gray(color_for_token_kind(token.kind), fade);
                 painter.text(
                     Pos2::new(x, y),
                     egui::Align2::LEFT_TOP,
@@ -1240,12 +1244,13 @@ pub fn paint_command_label_with_selection(
                 painted_any = true;
             }
             if !painted_any {
+                let fade = if faded { COMMAND_LABEL_FADE } else { 0.0 };
                 painter.text(
                     Pos2::new(rect.min.x, y),
                     egui::Align2::LEFT_TOP,
                     line,
                     font_id.clone(),
-                    fade_toward_gray(DEFAULT_FG, COMMAND_LABEL_FADE),
+                    fade_toward_gray(DEFAULT_FG, fade),
                 );
             }
         }
@@ -1343,14 +1348,10 @@ pub fn paint_sealed_block(
     // blend with the wash so the red shows through DARKER inside
     // each chip — the user-specified visual.
     let failed = matches!(exit, Some(n) if n != 0);
-    // Reserve the wash AND the left-border stripe shapes up front so
-    // both sit under the chip + command + snapshot. Border is reserved
-    // second → it paints above the wash but below the glyphs.
-    let (bg_idx, border_idx) = if failed {
-        (Some(ui.painter().add(egui::Shape::Noop)), Some(ui.painter().add(egui::Shape::Noop)))
-    } else {
-        (None, None)
-    };
+    // Reserve the wash shape up front so it sits UNDER the chip +
+    // command + snapshot (text stays readable over it). The left stripe
+    // is painted later, on TOP, so per-row backgrounds can't interrupt it.
+    let bg_idx = if failed { Some(ui.painter().add(egui::Shape::Noop)) } else { None };
 
     // Capture the chip's top-Y BEFORE the header paints so the
     // wash can extend up to the inter-block hairline above.
@@ -1370,7 +1371,7 @@ pub fn paint_sealed_block(
     let (cmd_sel, snap_sel) = split_selection_at_row(selection, cmd_lines);
 
     let command_response = if !command.is_empty() {
-        Some(paint_command_label_with_selection(ui, command, cmd_sel))
+        Some(paint_command_label_with_selection(ui, command, cmd_sel, true))
     } else {
         None
     };
@@ -1387,24 +1388,30 @@ pub fn paint_sealed_block(
         // the transcript," not "the failed text has a red wrapper."
         let pane_clip = ui.clip_rect();
         let bottom_y = snapshot_response.rect.bottom();
-        let top = block_top_y - BLOCK_SEPARATOR_GAP - 0.5;
-        let bottom = bottom_y + BLOCK_SEPARATOR_GAP + 0.5;
+        // Reach the inter-block hairlines: the separator is
+        // `add_space(GAP)` + hairline + `add_space(GAP)`, but egui also
+        // inserts `item_spacing.y` between each, so the hairline sits
+        // ~GAP + 2·spacing from the block edge. Span that on both sides
+        // so the red is flush to the hairline with no dark gap.
+        let sp = ui.spacing().item_spacing.y;
+        let top = block_top_y - BLOCK_SEPARATOR_GAP - 2.0 * sp;
+        let bottom = bottom_y + BLOCK_SEPARATOR_GAP + 2.0 * sp;
         let wash = Rect::from_min_max(
             Pos2::new(pane_clip.left(), top),
             Pos2::new(pane_clip.right(), bottom),
         );
         // Corner radius 0 so the wash truly is flush left/right.
         ui.painter().set(idx, egui::Shape::rect_filled(wash, 0.0, FAILED_BLOCK_BG));
-        // 3px accent stripe flush with the left pane edge. Painted as
-        // an overlay (a reserved shape index, NOT an allocated widget)
-        // so it never pushes the block's content to the right.
-        if let Some(bidx) = border_idx {
-            let border = Rect::from_min_max(
-                Pos2::new(pane_clip.left(), top),
-                Pos2::new(pane_clip.left() + FAILED_BLOCK_BORDER_W, bottom),
-            );
-            ui.painter().set(bidx, egui::Shape::rect_filled(border, 0.0, FAILED_BLOCK_BORDER));
-        }
+        // 3px accent stripe flush with the left pane edge, painted ON
+        // TOP of the content (a direct `ui.painter()` call appends after
+        // the row backgrounds) so it's an unbroken gutter rule rather
+        // than a stripe the per-row fills chop into segments. It sits in
+        // the pane's left margin and never shifts the block content.
+        let border = Rect::from_min_max(
+            Pos2::new(pane_clip.left(), top),
+            Pos2::new(pane_clip.left() + FAILED_BLOCK_BORDER_W, bottom),
+        );
+        ui.painter().rect_filled(border, 0.0, FAILED_BLOCK_BORDER);
     }
 
     SealedBlockRender {

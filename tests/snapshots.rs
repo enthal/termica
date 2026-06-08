@@ -1716,18 +1716,34 @@ fn snapshot_find_match_highlights_over_snapshot() {
 
 #[test]
 fn snapshot_keybindings_macos() {
-    let mut harness = Harness::builder().with_size(egui::Vec2::new(720.0, 760.0)).build_ui(|ui| {
-        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(720.0, 760.0));
-        let _ = termica::keybindings::paint(ui, 1, rect, true);
-    });
+    let mut q = String::new();
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(720.0, 760.0)).build_ui(move |ui| {
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(720.0, 760.0));
+            let _ = termica::keybindings::paint(ui, 1, rect, true, &mut q);
+        });
     harness.snapshot("keybindings_macos");
 }
 
 #[test]
 fn snapshot_keybindings_linux() {
-    let mut harness = Harness::builder().with_size(egui::Vec2::new(720.0, 760.0)).build_ui(|ui| {
-        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(720.0, 760.0));
-        let _ = termica::keybindings::paint(ui, 1, rect, false);
-    });
+    let mut q = String::new();
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(720.0, 760.0)).build_ui(move |ui| {
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(720.0, 760.0));
+            let _ = termica::keybindings::paint(ui, 1, rect, false, &mut q);
+        });
     harness.snapshot("keybindings_linux");
+}
+
+#[test]
+fn snapshot_keybindings_filtered() {
+    // The search field filters to matching rows (here "tab").
+    let mut q = "tab".to_string();
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(720.0, 760.0)).build_ui(move |ui| {
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(720.0, 760.0));
+            let _ = termica::keybindings::paint(ui, 1, rect, true, &mut q);
+        });
+    harness.snapshot("keybindings_filtered");
 }
