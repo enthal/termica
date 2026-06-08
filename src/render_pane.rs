@@ -3326,6 +3326,7 @@ pub fn render_pane(
                         cursor,
                         cwd.as_deref(),
                         home,
+                        slot.session.env_var_names(),
                         || history_entries,
                     );
                     slot.session.record_completion(&plan_event(&plan, &editor_text, true));
@@ -3422,6 +3423,7 @@ pub fn render_pane(
                         cursor,
                         cwd.as_deref(),
                         home,
+                        slot.session.env_var_names(),
                         || history_entries,
                     );
                     slot.session.record_completion(&plan_event(&plan, &editor_text, false));
