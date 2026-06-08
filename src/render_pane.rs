@@ -141,6 +141,12 @@ impl EditorMotion {
 /// by one or two pixels. Empirically tuned; not a unit of the font.
 pub const FOOTER_DESCENDER_PAD: f32 = 4.0;
 
+/// Empty space reserved BELOW the prompt's editor/glow, between it and
+/// the pane's bottom edge, so the focused-editor chrome floats with a
+/// margin instead of sitting flush on the bottom. Added to the footer
+/// height; the editor + chrome don't paint into it.
+pub const FOOTER_GLOW_BOTTOM_MARGIN: f32 = 6.0;
+
 /// Compute the fixed-footer height for the [`Block::Prompt`] block
 /// per [spec/04 §"Layout"](../spec/04-prompt-editor.md#layout-fixed-footer-prompt-sticky-top-header).
 ///
@@ -167,7 +173,7 @@ pub fn compute_footer_height(
     }
     let editor_rows = editor_lines.max(1);
     let chrome_h = if has_cwd { row_h + 2.0 * render::CHIP_PAD_Y } else { 0.0 };
-    chrome_h + editor_rows as f32 * row_h + FOOTER_DESCENDER_PAD
+    chrome_h + editor_rows as f32 * row_h + FOOTER_DESCENDER_PAD + FOOTER_GLOW_BOTTOM_MARGIN
 }
 
 /// The pinned region the sticky header shows is the block's cwd / exit
@@ -951,7 +957,7 @@ pub(crate) fn plan_resize(
 /// chrome — currently the failed-block accent stripe. All block content
 /// (sealed snapshots, the live grid, the editor footer) is inset by this
 /// so the 3px red stripe sits flush-left in the gutter, never over text.
-const LEFT_GUTTER: f32 = 8.0;
+const LEFT_GUTTER: f32 = 10.0;
 
 pub fn render_pane(
     ui: &mut egui::Ui,
@@ -1868,7 +1874,10 @@ pub fn render_pane(
     let mut editor_response: Option<egui::Response> = None;
     if footer_h > 0.0 {
         let chip_h = if has_prompt_cwd { row_h + 2.0 * render::CHIP_PAD_Y } else { 0.0 };
-        let editor_h = footer_h - chip_h;
+        // Exclude the bottom-margin reserve from the editor/glow height
+        // so the chrome floats above the pane bottom (the margin is the
+        // empty strip below it).
+        let editor_h = footer_h - chip_h - FOOTER_GLOW_BOTTOM_MARGIN;
         // Inset by the same left gutter as the scrolled block content so
         // the prompt's cwd chip + editor line up with the sealed blocks
         // above (which are indented for the failed-block accent stripe).
@@ -2061,7 +2070,7 @@ pub fn render_pane(
             // The chrome (glow / outline) wraps the chip+editor with a
             // little left pad so its stroke doesn't sit ON the leftmost
             // chip's edge — it lives in the gutter to the chip's left.
-            const CHROME_LEFT_PAD: f32 = 5.0;
+            const CHROME_LEFT_PAD: f32 = 4.0;
             let combined = egui::Rect::from_min_max(
                 egui::pos2(footer_origin.x - CHROME_LEFT_PAD, footer_origin.y),
                 egui::pos2(footer_origin.x + body_w, footer_origin.y + chip_h + editor_h),
@@ -3432,14 +3441,17 @@ mod tests {
         let chip_pad = 2.0 * render::CHIP_PAD_Y;
         assert_eq!(
             compute_footer_height(true, true, 1, true, 20.0),
-            40.0 + chip_pad + FOOTER_DESCENDER_PAD
+            40.0 + chip_pad + FOOTER_DESCENDER_PAD + FOOTER_GLOW_BOTTOM_MARGIN
         );
     }
 
     #[test]
     fn single_line_editor_without_cwd_yields_one_row_plus_descender_pad() {
         // No chrome row when cwd is unknown — no chip padding either.
-        assert_eq!(compute_footer_height(true, true, 1, false, 20.0), 20.0 + FOOTER_DESCENDER_PAD);
+        assert_eq!(
+            compute_footer_height(true, true, 1, false, 20.0),
+            20.0 + FOOTER_DESCENDER_PAD + FOOTER_GLOW_BOTTOM_MARGIN
+        );
     }
 
     #[test]
@@ -3447,7 +3459,7 @@ mod tests {
         let chip_pad = 2.0 * render::CHIP_PAD_Y;
         assert_eq!(
             compute_footer_height(true, true, 3, true, 20.0),
-            80.0 + chip_pad + FOOTER_DESCENDER_PAD
+            80.0 + chip_pad + FOOTER_DESCENDER_PAD + FOOTER_GLOW_BOTTOM_MARGIN
         );
     }
 
@@ -3457,7 +3469,7 @@ mod tests {
         let chip_pad = 2.0 * render::CHIP_PAD_Y;
         assert_eq!(
             compute_footer_height(true, true, 0, true, 20.0),
-            40.0 + chip_pad + FOOTER_DESCENDER_PAD
+            40.0 + chip_pad + FOOTER_DESCENDER_PAD + FOOTER_GLOW_BOTTOM_MARGIN
         );
     }
 
