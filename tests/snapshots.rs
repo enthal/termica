@@ -1407,6 +1407,34 @@ fn snapshot_completion_popup_scrolls_growing_upward_near_bottom() {
     );
 }
 
+#[test]
+fn snapshot_completion_popup_driver_rows_with_tags_and_descriptions() {
+    // Slice 2: CLI-native driver candidates merged with locals. The
+    // driver rows carry a `k8s` source tag (right edge) and a one-line
+    // description; the trailing `$PATH` local has neither. Pins the new
+    // `CompletionSource::Driver` tag + description rendering path.
+    use termica::completion::DriverTool;
+    let k8s = CompletionSource::Driver(DriverTool::Kubectl);
+    let cands = vec![
+        CompletionCandidate::with_description(
+            "pods",
+            "Pods are the smallest deployable units",
+            k8s,
+        ),
+        CompletionCandidate::with_description("podtemplates", "PodTemplate objects", k8s),
+        CompletionCandidate::simple("podman", CompletionSource::PathExecutable),
+    ];
+    let mut popup = CompletionPopup::new(0, "pod", cands).expect("non-empty candidate list");
+    popup.selected_index = 0;
+    snapshot_completion_popup(
+        "completion_popup_driver_rows",
+        popup,
+        egui::Pos2::new(24.0, 232.0),
+        10,
+        egui::Vec2::new(540.0, 260.0),
+    );
+}
+
 // ---- Sticky-top block header (4E) -------------------------------------
 //
 // The sticky-eligibility / paint-position math is unit-tested in

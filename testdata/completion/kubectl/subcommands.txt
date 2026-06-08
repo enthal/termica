@@ -1,0 +1,45 @@
+annotate	Update the annotations on a resource
+api-resources	Print the supported API resources on the server
+api-versions	Print the supported API versions on the server, in the form of "group/version"
+apply	Apply a configuration to a resource by file name or stdin
+attach	Attach to a running container
+auth	Inspect authorization
+autoscale	Auto-scale a deployment, replica set, stateful set, or replication controller
+certificate	Modify certificate resources
+cluster-info	Display cluster information
+completion	Output shell completion code for the specified shell (bash, zsh, fish, or powershell)
+config	Modify kubeconfig files
+cordon	Mark node as unschedulable
+cp	Copy files and directories to and from containers
+create	Create a resource from a file or from stdin
+debug	Create debugging sessions for troubleshooting workloads and nodes
+delete	Delete resources by file names, stdin, resources and names, or by resources and label selector
+describe	Show details of a specific resource or group of resources
+diff	Diff the live version against a would-be applied version
+drain	Drain node in preparation for maintenance
+edit	Edit a resource on the server
+events	List events
+exec	Execute a command in a container
+explain	Get documentation for a resource
+expose	Take a replication controller, service, deployment or pod and expose it as a new Kubernetes service
+get	Display one or many resources
+help	Help about any command
+kustomize	Build a kustomization target from a directory or URL
+label	Update the labels on a resource
+logs	Print the logs for a container in a pod
+options	Print the list of flags inherited by all commands
+patch	Update fields of a resource
+plugin	Provides utilities for interacting with plugins
+port-forward	Forward one or more local ports to a pod
+proxy	Run a proxy to the Kubernetes API server
+replace	Replace a resource by file name or stdin
+rollout	Manage the rollout of a resource
+run	Run a particular image on the cluster
+scale	Set a new size for a deployment, replica set, or replication controller
+set	Set specific features on objects
+taint	Update the taints on one or more nodes
+top	Display resource (CPU/memory) usage
+uncordon	Mark node as schedulable
+version	Print the client and server version information
+wait	Experimental: Wait for a specific condition on one or many resources
+:4

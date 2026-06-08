@@ -21,6 +21,7 @@ use std::thread::{self, JoinHandle};
 use alacritty_terminal::index::Point;
 
 use crate::block::{Block, BlockStack};
+use crate::completion::drivers::{CompletionDriverEngine, DriverResponse, DriverTool};
 use crate::events::EventRecorder;
 use crate::gh_probe::GhProbe;
 use crate::git_context::GitContext;
@@ -176,6 +177,11 @@ pub struct PaneSession {
     /// branch has no open PR / before the first probe returns. Drives the
     /// PR chip on the live prompt header.
     pr_context: Option<PrContext>,
+    /// CLI-native completion driver engine ([spec/04a §"Source 1"](../spec/04a-completion.md)),
+    /// lazily spawned on the first Tab in a driver-eligible command
+    /// (it needs an `egui::Context` for repaint-on-result, which only the
+    /// renderer has). Dropped (torn down) with the pane.
+    completion_driver: Option<CompletionDriverEngine>,
     /// Last git branch seen from [`Self::git_context`], to detect a
     /// branch change (e.g. `git checkout`) and re-probe the PR even when
     /// the cwd is unchanged.
@@ -251,6 +257,7 @@ impl PaneSession {
             git_context: None,
             gh_probe: GhProbe::spawn(),
             pr_context: None,
+            completion_driver: None,
             last_git_branch: None,
         })
     }
@@ -779,6 +786,30 @@ impl PaneSession {
             .recent(&crate::history::Scope::Global, limit)
             .map(|rows| rows.into_iter().map(|r| r.text).collect())
             .unwrap_or_default()
+    }
+
+    /// Fire an async CLI-native completion driver request for the current
+    /// command's arguments ([spec/04a §"Source 1"](../spec/04a-completion.md)).
+    /// Lazily spawns the per-pane engine (it needs `ctx` to repaint when a
+    /// result lands). A no-op when the pane has no known cwd — drivers run
+    /// in the pane's directory, so without one there's nothing meaningful
+    /// to complete against.
+    pub fn completion_driver_request(
+        &mut self,
+        ctx: &egui::Context,
+        target: (DriverTool, String, usize),
+    ) {
+        let Some(cwd) = self.current_cwd() else { return };
+        let engine = self
+            .completion_driver
+            .get_or_insert_with(|| CompletionDriverEngine::spawn(ctx.clone()));
+        engine.request(cwd, target);
+    }
+
+    /// Drain freshly-arrived driver candidates for the current in-flight
+    /// request, if any. The renderer merges them into the open popup.
+    pub fn completion_driver_poll(&mut self) -> Option<DriverResponse> {
+        self.completion_driver.as_ref().and_then(|engine| engine.poll())
     }
 
     /// Insert `text` into the editor as the buffer (replacing any

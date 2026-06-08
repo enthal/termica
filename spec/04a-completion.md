@@ -28,7 +28,9 @@ A single Tab keystroke fires all three sources in parallel. Results merge into o
 
 All three sources race to a 250 ms timeout. Whichever land within the timeout populate the popup; late results stream in afterward without disturbing the user's current selection. If nothing arrives by the timeout, the popup opens with source 3's local heuristics and a faint "searching…" affordance.
 
-The popup ALWAYS opens. A completion request never fails silently. Even if both sidecar and drivers crash, source 3 returns *something* — at minimum the paths under the cursor.
+> **As built (slice 2 — wait, don't flash).** The original "open instantly with locals, stream the rest in" rule flashed the *wrong* thing for a driver-eligible command: `gh <Tab>` briefly showed the cwd's **files** before the gh subcommands replaced them ~100 ms later, and `git ch<Tab>` (no local match) showed **nothing at all** because an empty local result meant the popup never opened and the driver never fired. So the lifecycle is now: a **driver-eligible** command (leading word maps to a known tool, cursor in argument position) **waits** for the driver result, then opens the popup from the driver⊕locals merge — even when there were no local matches. A command with **no** driver keeps the instant-locals behavior. On a live re-filter the previously-open popup stays visible until the refreshed result swaps in (no blink). The decision is a pure, tested function (`completion::plan_completion` → `Open` / `AwaitDriver` / `Closed`, resolved by `completion::resolve_driver`); the once-per-frame resolution lives in `render_pane`. When the driver source grows a sidecar (slices 3–5) the "stream in late without disturbing selection" wording above becomes the steady-state for *additional* late sources on top of this first result.
+
+The popup ALWAYS opens when there's anything to show. A completion request never fails silently. Even if both sidecar and drivers crash, source 3 returns *something* (the paths under the cursor) — and a driver-eligible command with neither a driver result nor a local match simply shows nothing rather than a misleading file list.
 
 ## Source 1 — CLI-native drivers
 
@@ -44,11 +46,11 @@ Modern CLIs expose a "complete this command line" endpoint independent of any sh
 | `gcloud` | (no native endpoint; sidecar only) | gcloud's completion is shell-script-only. |
 | `terraform` | `terraform <subcommand> -help-machine` (subcommands) + sidecar | partial native; sidecar fills the gap. |
 
-A small `completion::drivers` module knows about each tool and its endpoint. Adding a new tool is one match arm + a small parse function for that tool's output format (most are "candidate\tdescription" per line; aws_completer's output is whitespace-tokenized; cobra's `__complete` has a `:`-prefixed flag we ignore). The driver detection runs once at startup (or first-Tab-press) per tool: shell out to `kubectl __complete --help` etc. to confirm the endpoint exists, cache the result.
+A small `completion::drivers` module knows about each tool and its endpoint (`completion::drivers::parse`). Adding a new tool is one match arm + a small parse function for that tool's output format (most are "candidate\tdescription" per line — `parse_cobra_complete`, shared by kubectl/gh/docker; aws_completer's output is whitespace-tokenized — `parse_aws_completer`; git's is one subcommand per line — `parse_git_list_cmds`). cobra's `__complete` trailing `:N` directive line is ignored. kubectl's *resource* completion (`kubectl get <resource>`) deviates from the tab convention and pads columns with spaces, so `parse_cobra_complete` accepts a run of two or more spaces as the value/description boundary too (cobra completion values never contain a space).
 
-**Driver detection failure** is silent. If `kubectl __complete` doesn't exist on the user's machine (older kubectl, no kubectl installed, kubectl is shadowed by an alias), source 1 produces no candidates for kubectl-prefixed commands and source 2 takes over. Same logic per-tool.
+**Driver detection is implicit.** As-built, there is no separate `--help` probe: a request simply fires for any command whose leading word maps to a known tool, and if the tool isn't installed (or is shadowed), `Command::spawn` fails on the worker thread and the request yields zero candidates. This is strictly better than an explicit probe — it never runs a subprocess on the UI thread, needs no detection cache, and is self-correcting (the local sources still populate the popup). A failure is silent; source 2 / source 3 cover the gap.
 
-**Driver process lifecycle**: each driver call is a one-shot subprocess. No long-running drivers. The cost is ~30–50 ms of fork+exec; the cache makes repeats free.
+**Driver process lifecycle**: each driver call is a one-shot subprocess spawned on the per-pane worker thread, bounded by a 250 ms wall-clock deadline (`spawn` + `try_wait` poll + `kill` on timeout — no `wait-timeout` dependency). No long-running drivers. The cost is ~30–50 ms of fork+exec; a [result cache](#caching) (a deliberate fast-follow PR — see below) makes repeats free.
 
 **Per-tool cwd / env**: drivers run with `PaneSession::context().cwd` as CWD and the pane's environment. kubectl's context selection lives in `~/.kube/config` and the `KUBECONFIG` env var, both of which propagate naturally.
 
@@ -278,11 +280,15 @@ score = source_weight              // 1.0 for driver, 0.7 for sidecar, 0.5 for l
 
 Ties broken alphabetically. The constants live in `src/completion/ranking.rs` and have unit tests over hand-crafted candidate lists so future tuning doesn't accidentally regress an established preference.
 
+**As built (slice 2):** `ranking::source_weight` is the only term wired up so far — the prefix-density / recency / cwd bonuses land with the shell-sidecar slices. Drivers use weight **`1.2`**, not the nominal `1.0` above, so they sort above the already-tuned local triad (History `1.0`, `$PATH` `0.8`, path `0.6`) without re-tuning it. The full re-weighting (driver `1.0` / sidecar `0.7` / local `0.5` plus the bonus terms) is part of the sidecar work, where all three source tiers coexist.
+
 ### Source merge
 
 If two sources return the same `value`, they collapse into one row (preserving the longer description and the higher-priority source tag). This avoids "kubectl pod" appearing twice when both the kubectl driver and the user's `alias kubectl` sidecar entry produce it.
 
 ## Caching
+
+> **Status:** the driver result cache is **not** in the slice-2 PR — it's a deliberate fast-follow in its own PR. It's an optimization (it only saves the ~100 ms re-spawn on close→reopen within the TTL), and it's the one piece that needs an injectable clock for deterministic TTL tests. Slice 2 instead bounds subprocess cost with request **dedup** (an unchanged `(tool, line)` never re-fires) + worker **coalescing** (a burst of keystrokes collapses to the newest request, ~one subprocess in flight). The table below is the target design the cache PR implements.
 
 The expensive sources (drivers, sidecar) cache aggressively. The cache key is `(source, tool, cwd, partial_line)` — a kubectl driver call for `kubectl get pods` in `/home/tim` is cached separately from the same call in `/home/tim/work`.
 
@@ -342,8 +348,9 @@ The strict-layer rule ([CLAUDE.md](../CLAUDE.md)) applies to the whole completio
 
 This design is targeted at **post-MVP**. The actual implementation slices:
 
-1. **Phase 4I — MVP local completion** (current placement). Source 3 only. Paths + `$PATH` + history. The popup widget lands here. Tab works for the common cases; advanced commands fall back to `\t`-doesn't-go-to-PTY → no completion.
-2. **Post-MVP — CLI-native drivers.** Add `kubectl __complete`, `gh __complete`, cobra `__complete`, `aws_completer`, `git --list-cmds`. Source 1 enabled; popup gains source tags. About 800–1200 LOC.
+1. **Phase 4I — MVP local completion** ✅ (shipped). Source 3 only. Paths + `$PATH` + history. The popup widget lands here. Tab works for the common cases; advanced commands fall back to `\t`-doesn't-go-to-PTY → no completion.
+2. **CLI-native drivers** ✅ (shipped). `kubectl`/`gh`/`docker` (cobra `__complete`), `aws_completer`, `git --list-cmds`. Source 1 enabled; popup gains source tags; candidates stream into the open popup off-thread (per-pane worker + `egui::Context` repaint, mirroring `git_probe`). Detection is implicit (spawn-failure = silent no-op); the result cache is a separate fast-follow PR. `completion::drivers`.
+   - **2a — Driver result cache** (fast-follow). The 10 s TTL cache in [§Caching](#caching) + the injectable clock its tests need.
 3. **Post-MVP — Fish sidecar.** Cleanest of the three sidecars, so it lands first as the reference for the protocol. About 400–600 LOC including the helper script.
 4. **Post-MVP — Bash sidecar.** Vendored helper + idle-timeout lifecycle + crash recovery. About 800–1100 LOC.
 5. **Post-MVP — Zsh sidecar.** Most fragile; ships after the bash one stabilises so we have a known-good baseline. About 1000–1400 LOC including the helper.

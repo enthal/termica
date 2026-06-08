@@ -11,12 +11,21 @@ use super::{CompletionCandidate, CompletionSource};
 
 /// Per-source weight in the merged ranking. Higher is better.
 ///
-/// History wins ties with `$PATH` because the user's own typing
-/// history is a stronger signal than "this binary exists on
-/// the system." Paths come second because pathish tokens almost
-/// always know they're paths and don't compete with the others.
+/// CLI-native drivers ([`CompletionSource::Driver`]) outrank every local
+/// source: when `kubectl` itself says "these are the valid resources,"
+/// that's authoritative over a `$PATH` / path / history guess. We use
+/// `1.2` rather than spec/04a's nominal `1.0` so drivers sort above the
+/// already-tuned local triad without re-tuning it; the full spec
+/// re-weighting (with prefix-density / recency / cwd bonuses) lands with
+/// the shell-sidecar slice.
+///
+/// Among locals, History wins ties with `$PATH` because the user's own
+/// typing history is a stronger signal than "this binary exists on the
+/// system." Paths come last because pathish tokens almost always know
+/// they're paths and don't compete with the others.
 fn source_weight(s: CompletionSource) -> f32 {
     match s {
+        CompletionSource::Driver(_) => 1.2,
         CompletionSource::History => 1.0,
         CompletionSource::PathExecutable => 0.8,
         CompletionSource::Path => 0.6,
@@ -84,6 +93,29 @@ mod tests {
         let out = merge_ranked(vec![p, h], 10);
         assert_eq!(out[0].value, "git status");
         assert_eq!(out[1].value, "Gemfile");
+    }
+
+    #[test]
+    fn merge_driver_outranks_all_locals() {
+        use crate::completion::DriverTool;
+        let driver = vec![cand("pods", CompletionSource::Driver(DriverTool::Kubectl))];
+        let pe = vec![cand("podman", CompletionSource::PathExecutable)];
+        let h = vec![cand("podcast", CompletionSource::History)];
+        let out = merge_ranked(vec![pe, h, driver], 10);
+        assert_eq!(out[0].value, "pods", "driver candidate sorts above $PATH and history");
+        assert_eq!(out[0].source, CompletionSource::Driver(DriverTool::Kubectl));
+    }
+
+    #[test]
+    fn merge_dedups_driver_over_local_keeping_driver_metadata() {
+        use crate::completion::DriverTool;
+        // "git" appears from both the $PATH scan and the git driver —
+        // collapses to one row carrying the (higher-weight) driver tag.
+        let pe = vec![cand("git", CompletionSource::PathExecutable)];
+        let driver = vec![cand("git", CompletionSource::Driver(DriverTool::Git))];
+        let out = merge_ranked(vec![pe, driver], 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].source, CompletionSource::Driver(DriverTool::Git));
     }
 
     #[test]
