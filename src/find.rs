@@ -89,6 +89,21 @@ impl SearchFilter {
             SearchFilter::OutputOnly => SearchFilter::Both,
         }
     }
+
+    /// `(command_section_on, output_section_on)` — drives the drawn
+    /// block-section icon (line over rectangle), white when the section
+    /// is searched and grey when not.
+    pub fn sections(self) -> (bool, bool) {
+        match self {
+            SearchFilter::Both => (true, true),
+            SearchFilter::CommandOnly => (true, false),
+            SearchFilter::OutputOnly => (false, true),
+        }
+    }
+
+    /// Every variant, in dropdown order.
+    pub const ALL: [SearchFilter; 3] =
+        [SearchFilter::Both, SearchFilter::CommandOnly, SearchFilter::OutputOnly];
 }
 
 /// One searchable line pulled out of the block stack: which block it
@@ -523,7 +538,7 @@ pub fn paint_overlay(
         .show(ui.ctx(), |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 let top = ui.horizontal(|ui| {
-                    ui.strong("find");
+                    ui.strong("Find");
 
                     let prev_query = overlay.query.clone();
                     let resp = ui.add(
@@ -545,9 +560,8 @@ pub fn paint_overlay(
                         outcome.scroll_to_selected = true;
                     }
 
-                    // `▾` history dropdown toggle, drawn with the painter
-                    // (no Unicode glyphs per CLAUDE.md).
-                    if triangle_button(ui, ("find-dropdown", pane_id)).clicked() {
+                    // `▾` find-history dropdown toggle (drawn glyph).
+                    if crate::icons::dropdown_button(ui, "Recent searches").clicked() {
                         overlay.dropdown_open = !overlay.dropdown_open;
                     }
 
@@ -565,7 +579,7 @@ pub fn paint_overlay(
                         );
                     }
 
-                    // Toggles.
+                    // Match-case / regex toggles.
                     if ui
                         .selectable_label(overlay.case_sensitive, "Aa")
                         .on_hover_text("Match case")
@@ -582,26 +596,51 @@ pub fn paint_overlay(
                         overlay.toggle_regex();
                         outcome.scroll_to_selected = true;
                     }
-                    if ui
-                        .button(overlay.filter.label())
-                        .on_hover_text("Search commands, output, or both")
+
+                    // Section filter: a drawn block-section icon for the
+                    // current filter; click opens a dropdown of all three.
+                    let (cmd_on, out_on) = overlay.filter.sections();
+                    let filter_resp = crate::icons::block_filter_button(
+                        ui,
+                        cmd_on,
+                        out_on,
+                        &format!("Searching: {}", overlay.filter.label()),
+                    );
+                    egui::Popup::menu(&filter_resp)
+                        .id(ui.id().with(("find-filter-popup", pane_id)))
+                        .show(|ui| {
+                            ui.set_min_width(150.0);
+                            for f in SearchFilter::ALL {
+                                let (c, o) = f.sections();
+                                let row = ui.horizontal(|ui| {
+                                    let sz = egui::Vec2::splat(ui.spacing().interact_size.y);
+                                    let (r, _) = ui.allocate_exact_size(sz, egui::Sense::hover());
+                                    crate::icons::paint_block_filter_icon(ui.painter(), r, c, o);
+                                    ui.selectable_label(f == overlay.filter, f.label())
+                                });
+                                if row.inner.clicked() && overlay.filter != f {
+                                    overlay.filter = f;
+                                    overlay.want_bottom = true;
+                                    outcome.scroll_to_selected = true;
+                                }
+                            }
+                        });
+
+                    // Prev (up) / Next (down) / close — drawn icons.
+                    let nav_enabled = !overlay.matches.is_empty();
+                    if crate::icons::arrow_up_button(ui, nav_enabled, "Previous match (Enter)")
                         .clicked()
                     {
-                        overlay.cycle_filter();
-                        outcome.scroll_to_selected = true;
-                    }
-
-                    // Prev / Next (text, not glyphs).
-                    let nav_enabled = !overlay.matches.is_empty();
-                    if ui.add_enabled(nav_enabled, egui::Button::new("Prev")).clicked() {
                         overlay.prev_match();
                         outcome.scroll_to_selected = true;
                     }
-                    if ui.add_enabled(nav_enabled, egui::Button::new("Next")).clicked() {
+                    if crate::icons::arrow_down_button(ui, nav_enabled, "Next match (Shift+Enter)")
+                        .clicked()
+                    {
                         overlay.next_match();
                         outcome.scroll_to_selected = true;
                     }
-                    if ui.button("Done").clicked() {
+                    if crate::icons::close_button(ui, "Close find (Esc)").clicked() {
                         outcome.close = true;
                     }
                 });
@@ -657,25 +696,6 @@ pub fn paint_overlay(
     }
 
     outcome
-}
-
-/// A small square button with a downward triangle painted in it — the
-/// history dropdown affordance. Hand-drawn rather than a Unicode `▾`
-/// per CLAUDE.md's "no Unicode symbols for icons" rule.
-fn triangle_button(ui: &mut egui::Ui, salt: impl std::hash::Hash) -> egui::Response {
-    let size = egui::vec2(18.0, 18.0);
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-    let resp = resp.on_hover_text("Recent searches");
-    let visuals = ui.style().interact(&resp);
-    ui.painter().rect(rect, 2.0, visuals.bg_fill, visuals.bg_stroke, egui::StrokeKind::Inside);
-    let c = rect.center();
-    let w = 4.5;
-    let h = 2.5;
-    let tri =
-        vec![egui::pos2(c.x - w, c.y - h), egui::pos2(c.x + w, c.y - h), egui::pos2(c.x, c.y + h)];
-    ui.painter().add(egui::Shape::convex_polygon(tri, visuals.fg_stroke.color, egui::Stroke::NONE));
-    let _ = salt; // id_salt reserved for callers that nest these in a loop
-    resp
 }
 
 #[cfg(test)]

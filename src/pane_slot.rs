@@ -183,6 +183,11 @@ pub struct PaneUiState {
     /// match rects are only known after the scroll area lays out, so
     /// the scroll is applied one frame later. Consumed in `render_pane`.
     pub(crate) find_scroll_pending: bool,
+    /// `true` while the `Cmd+/` keyboard-shortcuts cheat-sheet popup is
+    /// open. A reference overlay (no text input); Esc / click / another
+    /// popup-open combo closes it. Mutually exclusive with the other
+    /// popups — opening any one closes the rest.
+    pub(crate) keybindings_open: bool,
     /// Editor cursor (byte index) observed on the previous frame.
     /// Used by `render_pane` to detect caret motion and reset the
     /// blink cycle to "visible" so a moved caret never lands during

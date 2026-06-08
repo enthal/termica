@@ -24,6 +24,14 @@ Single source of truth for every key combo Termica recognises as an *app-level* 
 | `Cmd+Option+Up` / `Cmd+Option+Down` | `Ctrl+Alt+Up` / `Ctrl+Alt+Down` | Jump the focused pane's scroll position to the top / bottom of the sealed-block stack. No-op in alt-screen mode. Cmd+Up / Cmd+Down alone (no Option) stay reserved for editor caret-to-doc-start / -end — the Option / Alt modifier disambiguates the scrollback jump. | Phase 4 polish |
 | `Cmd+Shift+C` | `Ctrl+Shift+C` | Copy current selection to clipboard if non-empty; otherwise no-op. | Phase 1E-k |
 | `Cmd+C` | `Ctrl+C` | Copy if selection is non-empty; otherwise SIGINT to the PTY. | spec/02:157 |
+| `Cmd+F` | `Ctrl+Shift+F` | Open the in-pane find overlay. | Phase 8 |
+| `Cmd+/` | `Ctrl+/` | Open the keyboard-shortcuts cheat-sheet (this list, platform-local; modifier key-caps are painter-drawn, ⌘ for Command). | ✅ |
+
+**Popups are mutually exclusive.** The find overlay, the `Ctrl/Cmd+R`
+history overlay, the `Tab` completion popup, and the `Cmd+/`
+cheat-sheet never show two at once: invoking one closes whichever is
+open and opens the requested one. Each is modal — while it's up,
+keystrokes route to the popup, not the editor or PTY.
 
 Mouse:
 
@@ -50,7 +58,10 @@ These chords are only active when the focused pane is in `ShellPromptEditor` and
 | `Enter` | `Enter` | Submit the command. Eager demote, then PTY write. | ✅ Phase 4C ([#54](https://github.com/enthal/termica/pull/54)) |
 | `Shift+Enter` | `Shift+Enter` | Insert a newline (multiline edit). | ✅ Phase 4B ([#53](https://github.com/enthal/termica/pull/53)) |
 | `Esc` | `Esc` | Leave editor; demote to `RawTerminal`. | ✅ Phase 4B |
-| `Cmd+A` | `Ctrl+A` | Select all editor contents. | ✅ Phase 4D-poly ([#59](https://github.com/enthal/termica/pull/59)) |
+| `Cmd+A` | `Cmd+A` | Select all editor contents. On Linux this is the platform "command" modifier; plain `Ctrl+A` is reassigned to caret-to-line-start (below). | ✅ Phase 4D-poly ([#59](https://github.com/enthal/termica/pull/59)) |
+| `Ctrl+A` | `Ctrl+A` | Caret to line start (readline / emacs tradition). Redundant with `Cmd+←` / `Home`. | ✅ |
+| `Ctrl+E` | `Ctrl+E` | Caret to line end. Redundant with `Cmd+→` / `End`. | ✅ |
+| `Ctrl+T` | `Ctrl+T` | Transpose the two characters around the caret (emacs `transpose-chars`); at line end, the last two. | ✅ |
 | `Cmd+C / V / X` | `Ctrl+C / V / X` | Copy / paste / cut from the editor's selection. Cut records one undo entry so `select → cut → undo` restores the cut text **selected** ([04 §Undo/redo](04-prompt-editor.md#undo--redo)). | ✅ Phase 4D-poly ([#59](https://github.com/enthal/termica/pull/59)) |
 | `Cmd+Z` / `Cmd+Shift+Z` | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo, scoped to the current editing session (reset on submit). Restores text **and** selection — see [04 §Undo/redo](04-prompt-editor.md#undo--redo). | ✅ Phase 4 polish |
 | Arrow ← / → | Arrow ← / → | Move caret one char (with `Shift` extends selection). | ✅ Phase 4B |
@@ -61,7 +72,7 @@ These chords are only active when the focused pane is in `ShellPromptEditor` and
 | `Ctrl+D` on empty editor | `Ctrl+D` on empty editor | Send EOF to the shell (`exit` semantics). | ⏳ Phase 4 polish |
 | `Up` / `Down` | `Up` / `Down` | Multiline-aware history walk per [04 §History walk (Up/Down)](04-prompt-editor.md#history-walk-updown). `↑` on row > 0 moves to the previous editor line; on row 0 it steps back through pane-scope history (saving `{text, cursor}` as an in-progress snapshot on first press). `↓` on row < last moves to the next line; on the last row it walks forward, restoring the snapshot — **text and caret** — at the head. Any non-arrow edit abandons the walk. Inert while the completion or `^R` overlay is open. | ✅ Phase 4J PR 5 (single-line + buffer save). Multiline + caret-restore: ⏳ |
 | `Tab` | `Tab` | Local completion popup. Sources: paths under cursor, `$PATH` executables (in command position), command history (prefix-matched). `↑`/`↓` navigate, `Tab`/`Enter` accept, `Esc` cancels, any other key dismisses + falls through to the editor. | ✅ Phase 4I slice 1 |
-| `Ctrl+R` | `Ctrl+R` | Open the history overlay. Substring filter over the `runs` table; `↑`/`↓` to walk results, `Enter` to substitute, `Esc` to cancel, `Tab` to toggle scope (`global*` ↔ `this pane*`). Modal — all keystrokes route to the overlay until it closes. | ✅ Phase 4J PR 6 |
+| `Ctrl+R` / `Cmd+R` | `Ctrl+R` | Open the history overlay. Substring filter over the `runs` table; `↑`/`↓` to walk results, `Enter` to substitute, `Esc` to cancel, `Tab` to toggle scope (`global*` ↔ `this pane*`). Modal — all keystrokes route to the overlay until it closes. `Cmd+R` is the macOS addition; both work. | ✅ Phase 4J PR 6 + |
 | `Ctrl+P` / `Ctrl+N` / `Ctrl+S` / `Ctrl+G` | same | Consumed by the editor (no PTY leak) but no-op until follow-up PRs wire emacs-style navigation. | ✅ Phase 4 polish ([#57](https://github.com/enthal/termica/pull/57)) |
 
 Mouse (editor):

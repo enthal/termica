@@ -496,6 +496,40 @@ fn pty_passthrough_allowed(event: &egui::Event, editor_active: bool, editor_empt
     editor_empty && is_eof_chord(event)
 }
 
+/// Close every per-pane popup (history / completion / find /
+/// keybindings). Popups are mutually exclusive — opening one calls
+/// this first so two never show at once. The find query history is
+/// preserved on the pane (`find_history`) before the overlay drops.
+fn close_all_popups(slot: &mut PaneSlot) {
+    if let Some(o) = slot.ui.find_overlay.take() {
+        slot.ui.find_history = o.history;
+    }
+    slot.ui.history_overlay = None;
+    slot.ui.completion_popup = None;
+    slot.ui.keybindings_open = false;
+}
+
+/// Open the `Ctrl/Cmd+R` history overlay, closing any other popup
+/// first and prefilling the search box with the editor's current text
+/// (so a half-typed command pre-narrows results — zsh-style). No-op if
+/// the history store can't be opened.
+fn open_history_overlay(slot: &mut PaneSlot) {
+    let prefill = slot.session.editor_mut().map(|e| e.text().to_string()).unwrap_or_default();
+    let Some(history) = slot.session.history_ctx().cloned() else { return };
+    let Some(mut overlay) =
+        crate::history_overlay::HistoryOverlay::open(&history, slot.session.pane_id())
+    else {
+        return;
+    };
+    if !prefill.is_empty() {
+        overlay.query = prefill;
+        let cwd = slot.session.terminal().cwd().map(|p| p.display().to_string());
+        overlay.rerank(cwd.as_deref());
+    }
+    close_all_popups(slot);
+    slot.ui.history_overlay = Some(overlay);
+}
+
 /// Route one egui event to the pane's [`PromptEditor`](crate::prompt_editor).
 /// Returns `true` when the editor consumed the event (so the caller
 /// skips the PTY encoder path); `false` lets the caller try other
@@ -540,6 +574,39 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
             true
         }
         Event::Key { key, pressed: true, modifiers, .. } => {
+            // Emacs caret/edit chords (Ctrl+A / Ctrl+E / Ctrl+T) in the
+            // command editor. Ctrl is free here — the app's own
+            // shortcuts use Cmd (macOS) / Ctrl+Shift (Linux) — so we
+            // honour the readline tradition: Ctrl+A → line start,
+            // Ctrl+E → line end, Ctrl+T → transpose. Handled BEFORE the
+            // `Cmd+A` select-all below because on Linux egui reports
+            // Ctrl as both `ctrl` and `command`; on Linux this means
+            // Ctrl+A is line-start (select-all stays on Cmd+A on macOS).
+            // These are deliberately redundant with the Cmd+←/→ moves.
+            if modifiers.ctrl && !modifiers.shift && !modifiers.alt {
+                match key {
+                    Key::A => {
+                        if let Some(editor) = slot.session.editor_mut() {
+                            editor.move_home();
+                        }
+                        return true;
+                    }
+                    Key::E => {
+                        if let Some(editor) = slot.session.editor_mut() {
+                            editor.move_end();
+                        }
+                        return true;
+                    }
+                    Key::T => {
+                        slot.session.clear_history_recall();
+                        if let Some(editor) = slot.session.editor_mut() {
+                            editor.transpose_chars();
+                        }
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
             // Cmd+A — select all. Handled BEFORE the generic
             // "any modifier → bypass" gate.
             if modifiers.command && !modifiers.alt && matches!(key, Key::A) {
@@ -641,49 +708,23 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
             if modifiers.command || modifiers.alt {
                 return false;
             }
-            // `Ctrl+R` opens the history overlay. If the editor
-            // already has text, prefill the search box with it so
-            // a partial command pre-narrows the results — same UX
-            // as zsh's incremental history-search-backward.
-            if modifiers.ctrl && !modifiers.shift && matches!(key, Key::R) {
-                // Ctrl+R replaces a live completion popup with the
-                // history overlay — having both up at once is
-                // visually confusing and the overlay is the
-                // user's clear intent.
-                slot.ui.completion_popup = None;
-                if let Some(history) = slot.session.history_ctx().cloned()
-                    && let Some(mut overlay) = crate::history_overlay::HistoryOverlay::open(
-                        &history,
-                        slot.session.pane_id(),
-                    )
-                {
-                    let prefill =
-                        slot.session.editor_mut().map(|e| e.text().to_string()).unwrap_or_default();
-                    if !prefill.is_empty() {
-                        overlay.query = prefill;
-                        let cwd = slot.session.terminal().cwd().map(|p| p.display().to_string());
-                        overlay.rerank(cwd.as_deref());
-                    }
-                    slot.ui.history_overlay = Some(overlay);
-                }
-                return true;
-            }
+            // `Ctrl+R` (history overlay) is handled by the central
+            // popup-combo interceptor in `render_pane` so it can also
+            // honour `Cmd+R` and close any other open popup first.
             // Emacs-style editing chords explicitly swallowed here so
             // they read as "editor territory, not yet wired" rather
             // than falling through. This is belt-and-braces: the
             // boundary gate ([`pty_passthrough_allowed`]) already
             // stops every non-signal chord from reaching the PTY, so
             // even chords NOT in this list (Ctrl+X/Y/Z, …) no longer
-            // leak. `Ctrl+C` is absent: the gate swallows it
-            // unconditionally (inert at an idle prompt). `Ctrl+D` is
-            // absent too: the gate lets the encoder send EOF on an
-            // empty editor.
+            // leak. `Ctrl+A`/`E`/`T` are absent — they're handled above
+            // (line-start / line-end / transpose). `Ctrl+C` is absent:
+            // the gate swallows it unconditionally (inert at an idle
+            // prompt). `Ctrl+D` is absent too: the gate lets the
+            // encoder send EOF on an empty editor.
             if modifiers.ctrl
                 && !modifiers.shift
-                && matches!(
-                    key,
-                    Key::A | Key::E | Key::K | Key::U | Key::W | Key::P | Key::N | Key::S | Key::G
-                )
+                && matches!(key, Key::K | Key::U | Key::W | Key::P | Key::N | Key::S | Key::G)
             {
                 return true;
             }
@@ -2731,6 +2772,37 @@ pub fn render_pane(
         let modes = slot.session.terminal().modes();
         let editor_active = slot.session.editor_is_active();
 
+        // ---- popup-open combos (mutually exclusive) -------------
+        //
+        // `Ctrl/Cmd+R` → history, `Cmd+/` (Ctrl+/) → keybindings
+        // cheat-sheet. These run BEFORE the modal-skip `continue`s
+        // below, so a combo for a *different* popup closes whatever is
+        // open and opens the requested one. (Find — `Cmd+F` — is staged
+        // by `match_pane_shortcut` and opened in `app.rs`, which closes
+        // the others there.) History is gated on `editor_active` so a
+        // raw-shell `Ctrl+R` still reaches the shell's own reverse-i-
+        // search; the keybindings sheet is app-level and always allowed.
+        for event in &events {
+            let egui::Event::Key { key, pressed: true, modifiers, .. } = event else { continue };
+            let plain = !modifiers.shift && !modifiers.alt;
+            if plain
+                && modifiers.command
+                && matches!(key, egui::Key::Slash | egui::Key::Questionmark)
+            {
+                close_all_popups(slot);
+                slot.ui.keybindings_open = true;
+                break;
+            }
+            if editor_active
+                && plain
+                && (modifiers.ctrl || modifiers.mac_cmd)
+                && matches!(key, egui::Key::R)
+            {
+                open_history_overlay(slot);
+                break;
+            }
+        }
+
         // ---- mouse wheel, hover-gated ---------------------------
         //
         // Non-alt-screen scrolling is handled by the outer
@@ -2803,6 +2875,12 @@ pub fn render_pane(
             // open its `TextEdit` + `ctx.input` navigation checks own
             // the keyboard; skip the editor / PTY paths so nothing leaks.
             if slot.ui.find_overlay.is_some() {
+                continue;
+            }
+            // The keybindings cheat-sheet is modal too: it owns Esc (to
+            // close) and otherwise swallows keystrokes so nothing leaks
+            // to the editor / PTY while the user is reading it.
+            if slot.ui.keybindings_open {
                 continue;
             }
             // ---- Tab completion popup interception -----------------
@@ -3091,6 +3169,16 @@ pub fn render_pane(
             slot.ui.needs_focus = true;
         } else if outcome.scroll_to_selected {
             slot.ui.find_scroll_pending = true;
+        }
+    }
+
+    // Cmd+/ keyboard-shortcuts cheat-sheet, on top of everything.
+    if slot.ui.keybindings_open {
+        let pane_rect = ui.max_rect();
+        let pane_id = slot.session.pane_id();
+        if crate::keybindings::paint(ui, pane_id, pane_rect, cfg!(target_os = "macos")) {
+            slot.ui.keybindings_open = false;
+            slot.ui.needs_focus = true;
         }
     }
 

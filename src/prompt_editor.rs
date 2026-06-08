@@ -522,6 +522,43 @@ impl PromptEditor {
         self.undo.record(OpKind::DeleteForwardChar, pre);
     }
 
+    /// Emacs `transpose-chars` (Ctrl+T): swap the two characters
+    /// straddling the caret and advance the caret past them. At the end
+    /// of the buffer/line the caret has no char after it, so the two
+    /// **preceding** characters are swapped (caret stays put). No-op
+    /// with fewer than two characters, or when either side of the swap
+    /// is a newline (we never merge lines).
+    pub fn transpose_chars(&mut self) {
+        // `mid` is the boundary between the left and right chars to swap.
+        let n = self.text.len();
+        let mid = if self.cursor == 0 {
+            // At the very start: swap the first two chars, caret → after.
+            next_char_boundary(&self.text, 0)
+        } else if self.cursor >= n {
+            // At the end: swap the last two chars, caret stays.
+            prev_char_boundary(&self.text, n)
+        } else {
+            self.cursor
+        };
+        let a = prev_char_boundary(&self.text, mid);
+        let c = next_char_boundary(&self.text, mid);
+        // Need a real char on each side of `mid`.
+        if a >= mid || mid >= c {
+            return;
+        }
+        let left = &self.text[a..mid];
+        let right = &self.text[mid..c];
+        if left == "\n" || right == "\n" {
+            return;
+        }
+        let swapped = format!("{right}{left}");
+        let pre = self.snapshot();
+        self.text.replace_range(a..c, &swapped);
+        self.cursor = c;
+        self.selection_anchor = None;
+        self.undo.record(OpKind::Other, pre);
+    }
+
     /// Delete from the cursor backward to the start of the previous
     /// word — OR, if a selection exists, delete the selection. Same
     /// boundary rule as [`Self::move_word_left`] so Option+Delete
@@ -1133,6 +1170,63 @@ mod tests {
         assert_eq!(e.text(), "ab");
         assert_eq!(e.cursor(), 2);
         assert_invariant(&e);
+    }
+
+    #[test]
+    fn transpose_swaps_chars_around_caret_and_advances() {
+        let mut e = PromptEditor::new();
+        e.insert_str("abcd");
+        e.set_cursor(2); // between b and c
+        e.transpose_chars();
+        assert_eq!(e.text(), "acbd");
+        assert_eq!(e.cursor(), 3, "caret advances past the swapped pair");
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn transpose_at_end_swaps_last_two() {
+        let mut e = PromptEditor::new();
+        e.insert_str("abc"); // caret at end (3)
+        e.transpose_chars();
+        assert_eq!(e.text(), "acb");
+        assert_eq!(e.cursor(), 3);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn transpose_at_start_swaps_first_two() {
+        let mut e = PromptEditor::new();
+        e.insert_str("abc");
+        e.set_cursor(0);
+        e.transpose_chars();
+        assert_eq!(e.text(), "bac");
+        assert_eq!(e.cursor(), 2);
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn transpose_is_multibyte_safe() {
+        let mut e = PromptEditor::new();
+        e.insert_str("aé"); // 'a' (1) + 'é' (2), caret at end (3)
+        e.transpose_chars();
+        assert_eq!(e.text(), "éa");
+        assert_invariant(&e);
+    }
+
+    #[test]
+    fn transpose_noop_on_single_char_and_across_newline() {
+        let mut e = PromptEditor::new();
+        e.insert_str("a");
+        e.transpose_chars();
+        assert_eq!(e.text(), "a", "fewer than two chars is a no-op");
+
+        // Caret straddling a newline must not merge the lines.
+        let mut e2 = PromptEditor::new();
+        e2.insert_str("a\nb");
+        e2.set_cursor(1); // between 'a' and '\n'
+        e2.transpose_chars();
+        assert_eq!(e2.text(), "a\nb", "never swaps across a newline");
+        assert_invariant(&e2);
     }
 
     #[test]

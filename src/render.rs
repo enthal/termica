@@ -202,8 +202,10 @@ pub const TOKEN_COMMENT_FG: Color32 = Color32::from_rgb(0x70, 0x70, 0x70);
 pub const TOKEN_EQUALS_FG: Color32 = Color32::from_rgb(0xf5, 0xd0, 0x3a);
 
 /// Map a [`TokenKind`](crate::shell_syntax::TokenKind) to the
-/// foreground colour the editor should paint with. `Word` falls
-/// back to [`EDITOR_FG`] — the default user-input teal.
+/// foreground colour the editor should paint with. `Word` (plain
+/// arguments) falls back to [`DEFAULT_FG`] — the same near-white as
+/// sealed-block output, so an unhighlighted argument reads as ordinary
+/// text rather than the old user-input teal.
 pub fn color_for_token_kind(kind: crate::shell_syntax::TokenKind) -> Color32 {
     use crate::shell_syntax::TokenKind;
     match kind {
@@ -215,8 +217,21 @@ pub fn color_for_token_kind(kind: crate::shell_syntax::TokenKind) -> Color32 {
         TokenKind::Flag => TOKEN_FLAG_FG,
         TokenKind::Comment => TOKEN_COMMENT_FG,
         TokenKind::Equals => TOKEN_EQUALS_FG,
-        TokenKind::Word => EDITOR_FG,
+        TokenKind::Word => DEFAULT_FG,
     }
+}
+
+/// Blend a syntax-highlight colour toward grey by `t` in `0.0..=1.0`
+/// (`0` = full colour, `1` = grey). Used to render the command label
+/// on running / sealed blocks as *desaturated* syntax highlighting —
+/// the command is history, so its colours are dimmed toward the chip
+/// grey the same way the block-header chips fade, while still showing
+/// the command / flag / string structure.
+pub fn fade_toward_gray(color: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let g = BLOCK_HEADER_FG; // the chip grey
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    Color32::from_rgb(lerp(color.r(), g.r()), lerp(color.g(), g.g()), lerp(color.b(), g.b()))
 }
 
 /// Foreground for a non-zero exit code rendered on a sealed block's
@@ -901,6 +916,15 @@ pub const BLOCK_HEADER_CHIP_STROKE: Color32 = Color32::from_rgb(0x44, 0x44, 0x44
 // → premul (0x0c, 0x03, 0x03, 0x18).
 pub const FAILED_BLOCK_BG: Color32 = Color32::from_rgba_premultiplied(0x0c, 0x03, 0x03, 0x18);
 
+/// 3px accent stripe down the left pane edge of a failed block —
+/// saturated red, opaque, painted as an overlay so it never shifts the
+/// block's content right (it sits in the pane's left margin / over the
+/// red wash). The gutter equivalent of the `exit N` chip.
+pub const FAILED_BLOCK_BORDER: Color32 = Color32::from_rgb(0xc8, 0x3a, 0x3a);
+
+/// Width of [`FAILED_BLOCK_BORDER`].
+pub const FAILED_BLOCK_BORDER_W: f32 = 3.0;
+
 /// Vertical space (top AND bottom of the hairline) inserted
 /// between sealed blocks. Picked via `pick_block_separator`,
 /// adjusted to 10 px per the user's preference between the 8px
@@ -1180,20 +1204,60 @@ pub fn paint_command_label_with_selection(
         }
     }
 
+    // Faded syntax highlighting. The command line on a running/sealed
+    // block is history chrome, so we tokenize it like the live editor
+    // and paint each token in its syntax colour blended toward the chip
+    // grey ([`fade_toward_gray`]). Plain `Word` arguments (now
+    // `DEFAULT_FG`) fade to near-grey; the command / flags / strings
+    // keep their hue, dimmed — replacing the old flat teal.
+    let tokens = crate::shell_syntax::tokenize(command);
+    let mut row_byte_start = 0usize;
     for (i, line) in lines.iter().enumerate() {
-        if line.is_empty() {
-            continue;
+        let row_byte_end = row_byte_start + line.len();
+        let y = rect.min.y + i as f32 * row_h;
+        if !line.is_empty() {
+            let mut painted_any = false;
+            for token in &tokens {
+                if token.range.end <= row_byte_start || token.range.start >= row_byte_end {
+                    continue;
+                }
+                let clip_start = token.range.start.max(row_byte_start);
+                let clip_end = token.range.end.min(row_byte_end);
+                let Some(slice) = command.get(clip_start..clip_end) else { continue };
+                if slice.is_empty() {
+                    continue;
+                }
+                let col_chars = chars_before_byte(line, clip_start.saturating_sub(row_byte_start));
+                let x = rect.min.x + col_chars as f32 * cell_w;
+                let color = fade_toward_gray(color_for_token_kind(token.kind), COMMAND_LABEL_FADE);
+                painter.text(
+                    Pos2::new(x, y),
+                    egui::Align2::LEFT_TOP,
+                    slice,
+                    font_id.clone(),
+                    color,
+                );
+                painted_any = true;
+            }
+            if !painted_any {
+                painter.text(
+                    Pos2::new(rect.min.x, y),
+                    egui::Align2::LEFT_TOP,
+                    line,
+                    font_id.clone(),
+                    fade_toward_gray(DEFAULT_FG, COMMAND_LABEL_FADE),
+                );
+            }
         }
-        painter.text(
-            Pos2::new(rect.min.x, rect.min.y + i as f32 * row_h),
-            egui::Align2::LEFT_TOP,
-            line,
-            font_id.clone(),
-            EDITOR_FG,
-        );
+        row_byte_start = row_byte_end + 1; // skip the '\n'
     }
     response
 }
+
+/// How far the running/sealed command label's syntax colours fade
+/// toward grey (0 = full colour, 1 = grey). Tuned so the command stays
+/// readable and structured but recedes as history chrome.
+const COMMAND_LABEL_FADE: f32 = 0.4;
 
 /// Paint one finished command block: a teal command-label line above
 /// its frozen `Vec<StyledLine>` snapshot. The same helper is used by
@@ -1279,7 +1343,14 @@ pub fn paint_sealed_block(
     // blend with the wash so the red shows through DARKER inside
     // each chip — the user-specified visual.
     let failed = matches!(exit, Some(n) if n != 0);
-    let bg_idx = if failed { Some(ui.painter().add(egui::Shape::Noop)) } else { None };
+    // Reserve the wash AND the left-border stripe shapes up front so
+    // both sit under the chip + command + snapshot. Border is reserved
+    // second → it paints above the wash but below the glyphs.
+    let (bg_idx, border_idx) = if failed {
+        (Some(ui.painter().add(egui::Shape::Noop)), Some(ui.painter().add(egui::Shape::Noop)))
+    } else {
+        (None, None)
+    };
 
     // Capture the chip's top-Y BEFORE the header paints so the
     // wash can extend up to the inter-block hairline above.
@@ -1307,20 +1378,33 @@ pub fn paint_sealed_block(
     let snapshot_response = paint_styled_lines(ui, snapshot, snap_sel);
 
     if let Some(idx) = bg_idx {
-        // Full-bleed wash: from the inter-block hairline above to
-        // the inter-block hairline below this block (= block_top -
-        // GAP to block_bottom + GAP). Horizontally flush to the
-        // pane edges (`ui.clip_rect`). Reads as "the failed slot
-        // is THIS strip of the transcript," not "the failed text
-        // has a red wrapper."
+        // Full-bleed wash spanning from the centre of the inter-block
+        // hairline ABOVE to the centre of the hairline BELOW, so the
+        // red reaches the block boundaries flush — no dark gap between
+        // the wash and the hairline — and adjacent washes meet exactly
+        // at the hairline. Horizontally flush to the pane edges
+        // (`ui.clip_rect`). Reads as "the failed slot is THIS strip of
+        // the transcript," not "the failed text has a red wrapper."
         let pane_clip = ui.clip_rect();
         let bottom_y = snapshot_response.rect.bottom();
+        let top = block_top_y - BLOCK_SEPARATOR_GAP - 0.5;
+        let bottom = bottom_y + BLOCK_SEPARATOR_GAP + 0.5;
         let wash = Rect::from_min_max(
-            Pos2::new(pane_clip.left(), block_top_y - BLOCK_SEPARATOR_GAP),
-            Pos2::new(pane_clip.right(), bottom_y + BLOCK_SEPARATOR_GAP),
+            Pos2::new(pane_clip.left(), top),
+            Pos2::new(pane_clip.right(), bottom),
         );
         // Corner radius 0 so the wash truly is flush left/right.
         ui.painter().set(idx, egui::Shape::rect_filled(wash, 0.0, FAILED_BLOCK_BG));
+        // 3px accent stripe flush with the left pane edge. Painted as
+        // an overlay (a reserved shape index, NOT an allocated widget)
+        // so it never pushes the block's content to the right.
+        if let Some(bidx) = border_idx {
+            let border = Rect::from_min_max(
+                Pos2::new(pane_clip.left(), top),
+                Pos2::new(pane_clip.left() + FAILED_BLOCK_BORDER_W, bottom),
+            );
+            ui.painter().set(bidx, egui::Shape::rect_filled(border, 0.0, FAILED_BLOCK_BORDER));
+        }
     }
 
     SealedBlockRender {

@@ -386,7 +386,10 @@ impl TermicaApp {
                 if let Some(slot) = self.panes.get_mut(&pane_id)
                     && !slot.session.terminal().is_alternate_screen()
                 {
+                    // Popups are mutually exclusive — close the others.
                     slot.ui.history_overlay = None;
+                    slot.ui.completion_popup = None;
+                    slot.ui.keybindings_open = false;
                     // Seed from the pane's persisted query history so a
                     // reopen after Esc still has the dropdown populated.
                     let history = slot.ui.find_history.clone();

@@ -1711,3 +1711,23 @@ fn snapshot_find_match_highlights_over_snapshot() {
         });
     harness.snapshot("find_match_highlights");
 }
+
+// ---- keybindings cheat-sheet (Cmd+/) -------------------------------------
+
+#[test]
+fn snapshot_keybindings_macos() {
+    let mut harness = Harness::builder().with_size(egui::Vec2::new(720.0, 760.0)).build_ui(|ui| {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(720.0, 760.0));
+        let _ = termica::keybindings::paint(ui, 1, rect, true);
+    });
+    harness.snapshot("keybindings_macos");
+}
+
+#[test]
+fn snapshot_keybindings_linux() {
+    let mut harness = Harness::builder().with_size(egui::Vec2::new(720.0, 760.0)).build_ui(|ui| {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(720.0, 760.0));
+        let _ = termica::keybindings::paint(ui, 1, rect, false);
+    });
+    harness.snapshot("keybindings_linux");
+}
