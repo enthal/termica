@@ -629,7 +629,12 @@ impl eframe::App for TermicaApp {
         let modal_open = self.pending_close_confirm.is_some()
             || self.quit_confirm_started_at.is_some()
             || self.about_open;
-        egui::CentralPanel::default().show(ctx, |ui| {
+        // Edge-to-edge: drop the CentralPanel's default ~8px inner
+        // margin so panes (and the failed-block left stripe) sit flush
+        // against the window edges, like a normal terminal.
+        let central_frame =
+            egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::ZERO);
+        egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
             let mut behavior = TabBehavior {
                 panes: &mut self.panes,
                 home: self.home.as_deref(),

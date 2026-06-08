@@ -320,23 +320,43 @@ pub fn paint(
                             ui.label(egui::RichText::new(group.title).strong().size(13.0));
                             ui.add_space(2.0);
                             for item in items {
-                                ui.horizontal(|ui| {
-                                    // Description on the LEFT; key-caps
-                                    // right-justified. In a right-to-left
-                                    // layout the first-added widget is
-                                    // rightmost, so iterate the caps in
-                                    // reverse to keep their visual order.
-                                    ui.label(item.desc);
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            ui.spacing_mut().item_spacing.x = 4.0;
-                                            for cap in item.keys.iter().rev() {
-                                                paint_cap(ui, *cap);
-                                            }
-                                        },
+                                // Reserve a backing shape so a hover tint
+                                // can paint UNDER the row once we know its
+                                // rect — a visual guide for the eye.
+                                let bg = ui.painter().add(egui::Shape::Noop);
+                                let resp = ui
+                                    .horizontal(|ui| {
+                                        // Description on the LEFT; key-caps
+                                        // right-justified. In a right-to-left
+                                        // layout the first-added widget is
+                                        // rightmost, so iterate the caps in
+                                        // reverse to keep their visual order.
+                                        ui.label(item.desc);
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.spacing_mut().item_spacing.x = 4.0;
+                                                for cap in item.keys.iter().rev() {
+                                                    paint_cap(ui, *cap);
+                                                }
+                                            },
+                                        );
+                                    })
+                                    .response;
+                                let row = egui::Rect::from_min_max(
+                                    egui::pos2(ui.min_rect().left(), resp.rect.top() - 1.0),
+                                    egui::pos2(ui.min_rect().right(), resp.rect.bottom() + 1.0),
+                                );
+                                if ui.rect_contains_pointer(row) {
+                                    ui.painter().set(
+                                        bg,
+                                        egui::Shape::rect_filled(
+                                            row.expand2(egui::vec2(4.0, 1.0)),
+                                            4.0,
+                                            egui::Color32::from_white_alpha(14),
+                                        ),
                                     );
-                                });
+                                }
                             }
                         }
                     });

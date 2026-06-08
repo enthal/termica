@@ -2058,8 +2058,14 @@ pub fn render_pane(
             } else {
                 None
             };
-            let combined =
-                egui::Rect::from_min_size(footer_origin, egui::vec2(body_w, chip_h + editor_h));
+            // The chrome (glow / outline) wraps the chip+editor with a
+            // little left pad so its stroke doesn't sit ON the leftmost
+            // chip's edge — it lives in the gutter to the chip's left.
+            const CHROME_LEFT_PAD: f32 = 5.0;
+            let combined = egui::Rect::from_min_max(
+                egui::pos2(footer_origin.x - CHROME_LEFT_PAD, footer_origin.y),
+                egui::pos2(footer_origin.x + body_w, footer_origin.y + chip_h + editor_h),
+            );
             // Chrome painter: layer-painter (so we're not clipped
             // to the footer's tight vertical clip — variants paint
             // a few px above + below the body, which `ui.painter()`

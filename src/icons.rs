@@ -206,23 +206,21 @@ pub fn paint_command_symbol(painter: &egui::Painter, rect: egui::Rect, color: eg
     }
 }
 
-/// Draw the macOS Option (⌥) key glyph: a short horizontal bar at the
-/// bottom-left and a longer one at the top-right, joined by a diagonal
-/// (bottom-left bar's right end up to the top-right bar's left end).
+/// Draw the macOS Option (⌥) key glyph: a long horizontal bar across
+/// the TOP-right, a diagonal from that bar's left end down to the
+/// bottom-left, and a short horizontal bar at the BOTTOM-left meeting
+/// the diagonal there.
 pub fn paint_option_symbol(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let c = rect.center();
     let e = rect.height() * 0.26;
     let stroke = egui::Stroke::new(1.3, color);
-    // Bottom-left short bar.
-    let bl_l = egui::pos2(c.x - e, c.y + e);
-    let bl_r = egui::pos2(c.x - e * 0.3, c.y + e);
-    painter.line_segment([bl_l, bl_r], stroke);
-    // Top-right long bar.
-    let tr_l = egui::pos2(c.x + e * 0.1, c.y - e);
-    let tr_r = egui::pos2(c.x + e, c.y - e);
-    painter.line_segment([tr_l, tr_r], stroke);
-    // Diagonal joining them.
-    painter.line_segment([bl_r, tr_l], stroke);
+    let a = egui::pos2(c.x - e * 0.2, c.y - e); // top bar left end / diagonal top
+    let b = egui::pos2(c.x + e, c.y - e); // top bar right end
+    let cc = egui::pos2(c.x - e, c.y + e); // diagonal bottom / bottom bar left
+    let d = egui::pos2(c.x - e * 0.2, c.y + e); // bottom bar right end
+    painter.line_segment([a, b], stroke); // top bar (right, long)
+    painter.line_segment([a, cc], stroke); // diagonal down-left
+    painter.line_segment([cc, d], stroke); // bottom bar (left, short)
 }
 
 /// Draw the Control (⌃) key glyph: an upward chevron.
