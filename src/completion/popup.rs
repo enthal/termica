@@ -33,6 +33,13 @@ pub struct CompletionPopup {
     /// scroll without the popup yanking back to the selection
     /// every frame — we only scroll on a real selection change.
     pub scroll_to_selected_pending: bool,
+    /// `true` on a freshly-opened popup so [`paint`] resets the scroll
+    /// view to the top on its first frame. egui's `ScrollArea` persists
+    /// its offset by id, so without this a reopened popup would inherit
+    /// the previous session's scroll position. Cleared after the first
+    /// paint; a background refresh (driver result swap) clears it without
+    /// scrolling so the view doesn't jump.
+    pub scroll_to_top_pending: bool,
 }
 
 impl CompletionPopup {
@@ -54,6 +61,7 @@ impl CompletionPopup {
             candidates,
             selected_index: 0,
             scroll_to_selected_pending: false,
+            scroll_to_top_pending: true,
         })
     }
 
@@ -80,25 +88,27 @@ impl CompletionPopup {
 
     /// Accept the highlighted candidate: replace the editor's
     /// `origin_byte..origin_byte + len(current_token)` range with
-    /// the candidate's `value`. Caller is responsible for
+    /// the candidate's `value`, followed by a space so the line is
+    /// ready for the next argument. Caller is responsible for
     /// dropping the popup after this returns (it's not self-
     /// destructive so callers can compose with their own popup-
     /// lifecycle logic).
     ///
-    /// Uses [`PromptEditor::set_selection`] + [`PromptEditor::insert_str`]
-    /// to keep undo coherence — the replace lands as one
-    /// `OpKind::Other` entry.
+    /// The trailing space is **suppressed for a directory** (value ends
+    /// with `/`): the user keeps completing into the path, exactly as a
+    /// shell does. This is full-term acceptance (Tab-commit / Enter /
+    /// click / single-candidate auto-accept); extending only to a common
+    /// prefix takes a different path (`replace_range` in the renderer)
+    /// and correctly gets no space.
+    ///
+    /// `replace_range` captures the editor's pre-call state (selection =
+    /// None) for the undo entry, so Cmd+Z restores the buffer WITHOUT a
+    /// phantom selection over the typed-token range.
     pub fn accept(&self, editor: &mut PromptEditor, current_token_len: usize) {
         let end = self.origin_byte.saturating_add(current_token_len).min(editor.len_bytes());
-        // `replace_range` captures the editor's pre-call state
-        // (including selection = None) for the undo entry, so
-        // Cmd+Z restores the buffer WITHOUT a phantom selection
-        // over the typed-token range. The old set_selection +
-        // insert_str dance leaked the temporary selection into
-        // the undo entry, causing the user's complaint that
-        // undoing a completion brought back the text "selected
-        // even though it was not selected before."
-        editor.replace_range(self.origin_byte, end, &self.selected().value);
+        let value = &self.selected().value;
+        let replacement = if value.ends_with('/') { value.clone() } else { format!("{value} ") };
+        editor.replace_range(self.origin_byte, end, &replacement);
     }
 
     /// Compute the readline-style smart-Tab extension.
@@ -198,6 +208,7 @@ pub fn paint(
                 ui.set_min_width(panel_w);
                 let scroll_h = (max_visible_rows as f32) * row_h;
                 let scroll_pending = std::mem::take(&mut popup.scroll_to_selected_pending);
+                let top_pending = std::mem::take(&mut popup.scroll_to_top_pending);
                 egui::ScrollArea::vertical()
                     .max_height(scroll_h)
                     .id_salt(("completion-popup-scroll", pane_id))
@@ -213,6 +224,14 @@ pub fn paint(
                                 clicked_row = Some(idx);
                             } else if response.hovered() {
                                 popup.selected_index = idx;
+                            }
+                            // On a fresh open, snap the view to the top so
+                            // a reopened popup doesn't inherit the previous
+                            // session's scroll offset (egui persists it by
+                            // id). Scroll to row 0's RECT (not the post-row
+                            // cursor, which would push row 0 off the top).
+                            if idx == 0 && top_pending {
+                                ui.scroll_to_rect(response.rect, Some(egui::Align::TOP));
                             }
                             // After painting the selected row, if
                             // a scroll was scheduled this frame
@@ -230,6 +249,28 @@ pub fn paint(
             });
         });
     clicked_row
+}
+
+/// Paint a small "searching..." affordance with an animated spinner while
+/// an asynchronous CLI-native driver result is awaited and no popup is
+/// shown yet (the [`crate::completion::CompletionPlan::AwaitDriver`] wait).
+/// Same anchor / pivot as [`paint`], so it sits exactly where the popup
+/// will appear. `egui::Spinner` requests its own repaints, so it animates
+/// without the caller scheduling frames.
+pub fn paint_searching(ctx: &egui::Context, anchor: egui::Pos2, pane_id: u64) {
+    let area_id = egui::Id::new(("completion-searching", pane_id));
+    egui::Area::new(area_id)
+        .pivot(egui::Align2::LEFT_BOTTOM)
+        .fixed_pos(egui::Pos2::new(anchor.x, anchor.y - 4.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(14.0));
+                    ui.weak("searching...");
+                });
+            });
+        });
 }
 
 /// Bottom-of-popup keybinding strip. The navigate hint uses the drawn
@@ -270,36 +311,48 @@ fn paint_row(ui: &mut egui::Ui, cand: &CompletionCandidate, selected: bool) -> e
     if selected {
         ui.painter().rect_filled(rect, 2.0, bg);
     }
-    // Display label, source tag, description — laid out left-to-right
-    // with the tag pinned to the right edge.
+    // Layout: name pinned left, source tag pinned right, description
+    // filling the gap between them. We measure the name's and tag's
+    // painted rects and clip the description to what's left, so a long
+    // description can't overlap either (the reported overlap bug).
     let painter = ui.painter();
     let display = &cand.display;
     let tag = cand.source.tag();
     let font = egui::FontId::monospace(13.0);
-    painter.text(
-        egui::Pos2::new(rect.min.x + 6.0, rect.center().y),
+    let mid_y = rect.center().y;
+    let name_rect = painter.text(
+        egui::Pos2::new(rect.min.x + 6.0, mid_y),
         egui::Align2::LEFT_CENTER,
         display,
         font.clone(),
         fg,
     );
-    if let Some(desc) = cand.description.as_deref() {
-        // Description center-right of the row.
-        painter.text(
-            egui::Pos2::new(rect.max.x - 60.0, rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            desc,
-            font.clone(),
-            dim,
-        );
-    }
-    painter.text(
-        egui::Pos2::new(rect.max.x - 6.0, rect.center().y),
+    let tag_rect = painter.text(
+        egui::Pos2::new(rect.max.x - 6.0, mid_y),
         egui::Align2::RIGHT_CENTER,
         tag,
-        font,
+        font.clone(),
         dim,
     );
+    if let Some(desc) = cand.description.as_deref() {
+        let desc_left = name_rect.max.x + 12.0;
+        let desc_right = tag_rect.min.x - 12.0;
+        if desc_right > desc_left {
+            // Clip to the gap so the description can't run under the name
+            // or the tag; left-aligned right after the name.
+            let clip = egui::Rect::from_min_max(
+                egui::Pos2::new(desc_left, rect.min.y),
+                egui::Pos2::new(desc_right, rect.max.y),
+            );
+            painter.with_clip_rect(clip).text(
+                egui::Pos2::new(desc_left, mid_y),
+                egui::Align2::LEFT_CENTER,
+                desc,
+                font,
+                dim,
+            );
+        }
+    }
     response
 }
 
@@ -351,15 +404,27 @@ mod tests {
     }
 
     #[test]
-    fn accept_replaces_typed_token_with_candidate_value() {
+    fn accept_replaces_typed_token_and_appends_trailing_space() {
         let mut e = PromptEditor::new();
         e.insert_str("ls Ca");
         // Token "Ca" starts at byte 3, length 2.
         let p = CompletionPopup::new(3, "Ca", vec![cand("Cargo.toml")]).unwrap();
         p.accept(&mut e, 2);
-        assert_eq!(e.text(), "ls Cargo.toml");
-        // Caret lands at the end of the inserted text.
+        // Trailing space so the line is ready for the next argument.
+        assert_eq!(e.text(), "ls Cargo.toml ");
+        // Caret lands at the end (after the space).
         assert_eq!(e.cursor(), e.len_bytes());
+    }
+
+    #[test]
+    fn accept_directory_value_keeps_no_trailing_space() {
+        // A directory (value ends with `/`) is NOT space-suffixed — the
+        // user keeps completing into the path.
+        let mut e = PromptEditor::new();
+        e.insert_str("cd sr");
+        let p = CompletionPopup::new(3, "sr", vec![cand("src/")]).unwrap();
+        p.accept(&mut e, 2);
+        assert_eq!(e.text(), "cd src/");
     }
 
     // ---- tab_extend (smart-Tab) -----------------------------------
@@ -436,6 +501,6 @@ mod tests {
         e.insert_str("ab");
         let p = CompletionPopup::new(0, "ab", vec![cand("hello")]).unwrap();
         p.accept(&mut e, 999);
-        assert_eq!(e.text(), "hello");
+        assert_eq!(e.text(), "hello ");
     }
 }

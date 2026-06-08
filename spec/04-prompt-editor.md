@@ -118,6 +118,7 @@ Shell-binding keys (`Ctrl+R`, `Ctrl+P`, `Ctrl+N`, `Ctrl+S`, `Ctrl+G`) are **cons
 | Double-click + drag | Extend selection by **word**: each word the pointer enters is added to (or trimmed from) the selection; the anchor is the original double-clicked word, so the selection always covers `min(anchor_start, current_start) … max(anchor_end, current_end)` |
 | Triple-click | Select the line under the pointer |
 | Triple-click + drag | Same as double-click + drag but by **line** |
+| Shift+click | Extend the existing selection to the click, keeping the anchor and the current char / word / line mode (see [§Cross-block selection](#cross-block-selection)). With no selection yet, behaves like a plain click. |
 
 The word / line range helpers (`word_range_at`, `line_range_at` in [`src/prompt_editor.rs`](../src/prompt_editor.rs)) are pure functions, unit-tested, and shared between the press handler and the drag handler so single-click → drag and double/triple-click → drag agree on what a "word" or a "line" is. The per-pane anchor range (`PaneUiState::editor_drag_anchor`) is cleared on a single click so the next drag starts in character mode again.
 
@@ -284,7 +285,7 @@ Tab is local completion. It does **not** send `\t` to the PTY.
 
 Ranking: prefer recent / same-cwd / non-zero-exit-history matches. The popup is a native egui widget with arrow-key navigation and Tab/Enter to accept.
 
-**Post-MVP**, the engine grows two more sources behind the same popup: **CLI-native drivers** (`kubectl __complete`, `gh __complete`, cobra `__complete`, `aws_completer`, `git --list-cmds`, …) and a **per-pane shell sidecar** (bash / zsh / fish loaded with the user's rc, talking to Termica over a private stdio JSON protocol). The full design — protocol, lifecycle, ranking, caching, failure modes — lives in [04a — Tab completion](04a-completion.md). Slices land as separate PRs starting with CLI-native drivers, then fish (the easiest sidecar), then bash, then zsh.
+**Post-MVP**, the engine grows two more sources behind the same popup: **CLI-native drivers** (`kubectl __complete`, `gh __complete`, cobra `__complete`, `aws_completer`, `git --list-cmds`, …) — *shipped*; candidates stream in off-thread and merge into the open popup without disturbing the user's selection — and a **per-pane shell sidecar** (bash / zsh / fish loaded with the user's rc, talking to Termica over a private stdio JSON protocol). The full design — protocol, lifecycle, ranking, caching, failure modes — lives in [04a — Tab completion](04a-completion.md). Slices land as separate PRs: CLI-native drivers (done), then fish (the easiest sidecar), then bash, then zsh.
 
 ## Syntax highlighting
 
@@ -537,6 +538,16 @@ When the user drags across a block boundary, the selection logically spans all t
 This unified rule replaces an earlier "stay in source block" carve-out. The carve-out's failure modes were two: (a) forward cross-block drag degraded to char-precision in the head block, (b) backward cross-block drag "lost" the anchor word in the source block because `PaneSelection::ordered()` flipped the endpoints and the anchor at the word's left edge became the high end of the selection, which made `block_range_for(anchor_block)` clip BEFORE the word. The far-edge rule eliminates both because the anchor cursor adapts to which end it represents in pane order.
 
 `PaneSelection` deliberately does NOT carry a `SelectionMode` field because mode lives at the gesture layer (the multi-click anchor in `PaneUiState`), not the selection-data layer. The clipped per-block ranges always describe character-precise endpoints — once a Word / Line anchor has snapped its endpoints outward, the `PaneCursor` values are already at word/line bounds.
+
+**Shift+click extend (Chrome-style).** A primary click with **Shift** held does not start a fresh selection — it **extends** the existing one to the click, keeping the original anchor and re-using the same machinery a drag does. The decision is the pure [`render_pane::press_extends_selection`]`(primary_pressed, shift_held, has_selection)`: it extends only on a Shift+click when a selection already exists to anchor to; with no selection there's nothing to extend from, so it falls through to a normal start. Because a plain click leaves a (collapsed) selection behind, the usual flow — click to place the caret, Shift+click to select to there — works.
+
+The extend **preserves the selection mode** the gesture established, because Shift+click routes through the very same extend branch as a drag, which reads the retained `PaneUiState::click_count` + `sealed_drag_anchor` (sealed blocks) / `editor_drag_anchor` (editor) / the live grid's own `SelectionMode`:
+
+- after a single click → char-precise extend (`update_pane_selection_head` / `set_cursor_extending` / `Selection::extend_to`);
+- after a double-click → **word**-granular extend, snapping the head to the Shift+clicked word via the same far-edge rule above;
+- after a triple-click → **line**-granular extend.
+
+This holds in all three selection domains and, in the sealed domain, **across block boundaries and into / out of a block's command vs. output** — Shift+click reuses `find_head_block_for_pos` + `extend_multiclick_selection_endpoints`, so the head can land in a different block (or the pinned sticky header) than the anchor. Shift+click never opens a Cmd-clickable link (link-open lives only on the fresh-start path).
 
 ## Resize: sealed blocks don't reflow
 

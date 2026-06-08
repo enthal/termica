@@ -1010,17 +1010,25 @@ fn fade_chip_color(c: Color32) -> Color32 {
     Color32::from_rgb(lerp(c.r(), g.r()), lerp(c.g(), g.g()), lerp(c.b(), g.b()))
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn paint_block_header(
-    ui: &mut egui::Ui,
-    cwd: Option<&std::path::Path>,
-    home: Option<&std::path::Path>,
-    exit: Option<i32>,
-    duration: Option<std::time::Duration>,
-    git: Option<&crate::git_context::GitContext>,
-    pr: Option<&crate::pr_context::PrContext>,
-    faded: bool,
-) -> Option<Response> {
+/// The chrome chips painted above a command block: cwd, exit code,
+/// duration, git context, and (live-prompt only) the PR chip, plus
+/// whether they render `faded` (sealed/past-tense → muted). Bundled so
+/// [`paint_block_header`] and [`paint_sealed_block`] take a single
+/// header argument instead of a long positional list; derives
+/// [`Default`] so callers set only the chips they have.
+#[derive(Default)]
+pub struct BlockHeader<'a> {
+    pub cwd: Option<&'a std::path::Path>,
+    pub home: Option<&'a std::path::Path>,
+    pub exit: Option<i32>,
+    pub duration: Option<std::time::Duration>,
+    pub git: Option<&'a crate::git_context::GitContext>,
+    pub pr: Option<&'a crate::pr_context::PrContext>,
+    pub faded: bool,
+}
+
+pub fn paint_block_header(ui: &mut egui::Ui, header: BlockHeader<'_>) -> Option<Response> {
+    let BlockHeader { cwd, home, exit, duration, git, pr, faded } = header;
     let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
     let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
     let row_h = ui.fonts_mut(|f| f.row_height(&font_id));
@@ -1336,40 +1344,35 @@ impl SealedBlockRender {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn paint_sealed_block(
     ui: &mut egui::Ui,
     command: &str,
     snapshot: &[StyledLine],
     selection: Option<(BlockCursor, BlockCursor)>,
-    cwd: Option<&std::path::Path>,
-    home: Option<&std::path::Path>,
-    exit: Option<i32>,
-    duration: std::time::Duration,
-    git: Option<&crate::git_context::GitContext>,
+    header: BlockHeader<'_>,
 ) -> SealedBlockRender {
     // Reserve a backing shape index BEFORE any paint so the
     // failed-block bg wash sits underneath the chip + command +
     // snapshot. Translucent chips ([`BLOCK_HEADER_CHIP_BG`]) then
     // blend with the wash so the red shows through DARKER inside
     // each chip — the user-specified visual.
-    let failed = matches!(exit, Some(n) if n != 0);
     // Reserve the wash shape up front so it sits UNDER the chip +
     // command + snapshot (text stays readable over it). The left stripe
     // is painted later, on TOP, so per-row backgrounds can't interrupt it.
+    let failed = matches!(header.exit, Some(n) if n != 0);
     let bg_idx = if failed { Some(ui.painter().add(egui::Shape::Noop)) } else { None };
 
     // Capture the chip's top-Y BEFORE the header paints so the
     // wash can extend up to the inter-block hairline above.
     let block_top_y = ui.next_widget_position().y;
 
-    // Sealed blocks show the git context **captured at command-start**
-    // (4G-async-context) — the branch / dirty the command actually ran
-    // under, frozen as history. NOT the pane's current git, which would
-    // be anachronistic on scroll-back. No PR chip: a finished command's
-    // CI status is meaningless (you want current), so PR is prompt-only.
-    // `faded = true`: sealed chips render muted (past-tense).
-    let header = paint_block_header(ui, cwd, home, exit, Some(duration), git, None, true);
+    // Sealed invariant, enforced here so callers can't get it wrong:
+    // chips render `faded` (past-tense, muted) and carry NO PR chip — a
+    // finished command's CI status is meaningless (you want current), so
+    // PR is a live-prompt-only affordance. Git is the context **captured
+    // at command-start** (4G-async-context), frozen as history.
+    let header = BlockHeader { faded: true, pr: None, ..header };
+    let header = paint_block_header(ui, header);
     let header_height = header.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
 
     let cmd_lines = if command.is_empty() { 0 } else { command.split('\n').count() };

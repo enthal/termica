@@ -383,7 +383,10 @@ pub fn paint_sticky_header(
             // Sticky pins a running / sealed block — no PR chip (it's a
             // live-prompt-only affordance). `faded` matches the pinned
             // block (sealed → muted, running → vivid).
-            let _ = render::paint_block_header(ui, cwd, home, exit, duration, git, None, faded);
+            let _ = render::paint_block_header(
+                ui,
+                render::BlockHeader { cwd, home, exit, duration, git, faded, ..Default::default() },
+            );
             let capped = cap_command_for_sticky(command, STICKY_MAX_CMD_LINES);
             // Interactive (not hover-only) so the foreground overlay
             // captures the press instead of leaking it to the output
@@ -455,6 +458,17 @@ fn classify_editor_motion(
     None
 }
 
+/// Should this primary press EXTEND the current selection instead of
+/// starting a fresh one? True only for a Shift+click when a selection
+/// already exists to extend from (Chrome-style: keep the anchor + the
+/// established char/word/line mode, move the head to the click). With
+/// no existing selection there's nothing to anchor to, so a Shift+click
+/// falls through to a normal start. Pure so the routing rule is unit-
+/// testable without an egui event loop.
+fn press_extends_selection(primary_pressed: bool, shift_held: bool, has_selection: bool) -> bool {
+    primary_pressed && shift_held && has_selection
+}
+
 /// Is this event the EOF chord — Ctrl+D — the one keystroke that may
 /// deliberately reach the PTY from an idle prompt editor (exit the
 /// shell)? Pure so the routing rule is unit-testable without an egui
@@ -512,6 +526,7 @@ fn close_all_popups(slot: &mut PaneSlot) {
     }
     slot.ui.history_overlay = None;
     slot.ui.completion_popup = None;
+    slot.ui.completion_pending = None;
     slot.ui.keybindings_open = false;
 }
 
@@ -953,6 +968,91 @@ pub(crate) fn plan_resize(
 /// runs for every visible pane — Phase 2A's "one pane in one tab"
 /// AND Phase 2B's "multiple panes across splits". The Behavior
 /// callback per visible pane invokes this.
+///
+/// Show a freshly-built completion `popup`, or — when `allow_autoaccept`
+/// and it has a single candidate — auto-accept it directly (with the
+/// trailing-space behavior) and show nothing, per the "one result → just
+/// accept it" rule.
+///
+/// `allow_autoaccept` is `true` ONLY for a session the user opened with
+/// `Tab`; it is `false` for a live re-filter driven by typing. Typing must
+/// never accept — the user may still be entering characters and an
+/// auto-accept would double them up; acceptance stays under their control
+/// via Tab / Enter.
+///
+/// The scroll view is reset to the top only on a *fresh* open; when this
+/// replaces an already-open popup (a live re-filter / driver-result swap)
+/// the scroll is left alone so the view doesn't jump.
+fn show_or_autoaccept(
+    slot: &mut PaneSlot,
+    mut popup: crate::completion::CompletionPopup,
+    allow_autoaccept: bool,
+) {
+    if allow_autoaccept && popup.candidates.len() == 1 {
+        let cursor = slot.session.blocks().editor_on_tail().map(|e| e.cursor()).unwrap_or(0);
+        let token_len = cursor.saturating_sub(popup.origin_byte);
+        if let Some(editor) = slot.session.editor_mut() {
+            popup.accept(editor, token_len);
+        }
+        slot.session.clear_history_recall();
+        slot.session.record_completion(&crate::events::CompletionEvent::Popup {
+            action: crate::events::PopupAction::AutoAccept,
+            candidates: 1,
+        });
+        slot.ui.completion_popup = None;
+        return;
+    }
+    // Record a popup OPEN only on a fresh open (not on every refresh
+    // keystroke), matching the scroll-reset condition.
+    let was_open = slot.ui.completion_popup.is_some();
+    if was_open {
+        // A refresh, not a fresh open — don't snap the scroll to the top.
+        popup.scroll_to_top_pending = false;
+    }
+    let candidates = popup.candidates.len();
+    slot.ui.completion_popup = Some(popup);
+    if !was_open {
+        slot.session.record_completion(&crate::events::CompletionEvent::Popup {
+            action: crate::events::PopupAction::Open,
+            candidates,
+        });
+    }
+}
+
+/// Build a [`CompletionEvent::Plan`] from a planning decision for
+/// `TERMICA_DUMP_EVENTS`. `line` is the raw editor command line.
+fn plan_event(
+    plan: &crate::completion::CompletionPlan,
+    line: &str,
+    from_tab: bool,
+) -> crate::events::CompletionEvent {
+    use crate::completion::CompletionPlan;
+    use crate::events::{CompletionDecision, CompletionEvent};
+    match plan {
+        CompletionPlan::Open(popup) => CompletionEvent::Plan {
+            decision: CompletionDecision::Open,
+            tool: None,
+            line: line.to_string(),
+            locals: popup.candidates.len(),
+            from_tab,
+        },
+        CompletionPlan::AwaitDriver { target, locals, .. } => CompletionEvent::Plan {
+            decision: CompletionDecision::AwaitDriver,
+            tool: Some(target.0),
+            line: line.to_string(),
+            locals: locals.len(),
+            from_tab,
+        },
+        CompletionPlan::Closed => CompletionEvent::Plan {
+            decision: CompletionDecision::Closed,
+            tool: None,
+            line: line.to_string(),
+            locals: 0,
+            from_tab,
+        },
+    }
+}
+
 /// Left gutter (logical px) reserved at the pane's left edge for block
 /// chrome — currently the failed-block accent stripe. All block content
 /// (sealed snapshots, the live grid, the editor footer) is inset by this
@@ -1414,11 +1514,14 @@ pub fn render_pane(
                                     command,
                                     snapshot,
                                     sel_for_this,
-                                    header.cwd.as_deref(),
-                                    home,
-                                    *exit,
-                                    *duration,
-                                    header.git.as_ref(),
+                                    render::BlockHeader {
+                                        cwd: header.cwd.as_deref(),
+                                        home,
+                                        exit: *exit,
+                                        duration: Some(*duration),
+                                        git: header.git.as_ref(),
+                                        ..Default::default()
+                                    },
                                 );
                                 let cmd_h = sealed_render
                                     .command
@@ -1465,13 +1568,13 @@ pub fn render_pane(
                                 // not the pane's live git — 4G-async-context.
                                 let hdr = render::paint_block_header(
                                     ui,
-                                    header.cwd.as_deref(),
-                                    home,
-                                    None,
-                                    running_elapsed,
-                                    header.git.as_ref(),
-                                    None,
-                                    false,
+                                    render::BlockHeader {
+                                        cwd: header.cwd.as_deref(),
+                                        home,
+                                        duration: running_elapsed,
+                                        git: header.git.as_ref(),
+                                        ..Default::default()
+                                    },
                                 );
                                 let chip_h = hdr.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
                                 let cmd_resp = (!command.is_empty())
@@ -1909,13 +2012,13 @@ pub fn render_pane(
                 ui.add_space(LEFT_GUTTER);
                 let _ = render::paint_block_header(
                     ui,
-                    header.cwd.as_deref(),
-                    home,
-                    None,
-                    None,
-                    git_ctx.as_ref(),
-                    pr_ctx.as_ref(),
-                    false,
+                    render::BlockHeader {
+                        cwd: header.cwd.as_deref(),
+                        home,
+                        git: git_ctx.as_ref(),
+                        pr: pr_ctx.as_ref(),
+                        ..Default::default()
+                    },
                 );
             });
         }
@@ -1988,6 +2091,46 @@ pub fn render_pane(
             // z-order; the position pin is `editor_rect.min` so
             // the popup's bottom edge aligns with the editor's
             // top.
+            // Resolve an awaited CLI-native driver result, if one landed
+            // this frame: merge it over the carried locals and (re)open the
+            // popup. A driver-eligible command waits here rather than
+            // flashing the local candidates first, and the popup opens from
+            // a driver result even when there were no local matches
+            // (`git ch<Tab>`). While awaiting a *refresh*, the previous
+            // popup stays visible until this swaps it.
+            if slot.ui.completion_pending.is_some()
+                && let Some(resp) = slot.session.completion_driver_poll()
+                && let Some(pending) = slot.ui.completion_pending.take()
+            {
+                let prev_selection =
+                    slot.ui.completion_popup.as_ref().map(|p| p.selected().value.clone());
+                // Auto-accept a lone result only if this session was opened
+                // by Tab — never when it's a live re-filter from typing.
+                let allow_autoaccept = pending.from_tab;
+                match crate::completion::resolve_driver(
+                    pending.origin_byte,
+                    &pending.token,
+                    pending.locals,
+                    resp.candidates,
+                ) {
+                    Some(mut popup) => {
+                        // Preserve the user's selection across an in-place
+                        // refresh (same token) so a background update never
+                        // moves the highlight; default to the top otherwise.
+                        if let Some(sel) = prev_selection
+                            && let Some(idx) = popup.candidates.iter().position(|c| c.value == sel)
+                        {
+                            popup.selected_index = idx;
+                        }
+                        // `show_or_autoaccept` keeps the scroll steady on a
+                        // refresh (popup already open) and auto-accepts a
+                        // lone candidate only for a Tab-opened session.
+                        show_or_autoaccept(slot, popup, allow_autoaccept);
+                    }
+                    None => slot.ui.completion_popup = None,
+                }
+            }
+
             if let Some(popup) = slot.ui.completion_popup.as_mut() {
                 let clicked = crate::completion::popup::paint(
                     ctx,
@@ -2006,19 +2149,34 @@ pub fn render_pane(
                     let cursor =
                         slot.session.blocks().editor_on_tail().map(|e| e.cursor()).unwrap_or(0);
                     let current_token_len = cursor.saturating_sub(popup_taken.origin_byte);
+                    let candidates = popup_taken.candidates.len();
                     if let Some(editor) = slot.session.editor_mut() {
                         popup_taken.accept(editor, current_token_len);
                     }
                     slot.session.clear_history_recall();
+                    slot.session.record_completion(&crate::events::CompletionEvent::Popup {
+                        action: crate::events::PopupAction::Accept,
+                        candidates,
+                    });
                 }
+            } else if slot.ui.completion_pending.is_some() {
+                // A driver result is awaited and no popup is shown yet —
+                // show a "searching..." spinner where the popup will appear
+                // so the (up to 2 s) wait is legible.
+                crate::completion::popup::paint_searching(
+                    ctx,
+                    editor_rect.min,
+                    slot.session.pane_id(),
+                );
             }
         } else {
             // Editor not on tail this frame — forget the cursor
             // tracker so re-opening the editor in a new prompt
             // starts a fresh blink cycle.
             slot.ui.last_cursor_byte = None;
-            // Editor gone — popup must go too.
+            // Editor gone — popup (and any awaited driver result) must go too.
             slot.ui.completion_popup = None;
+            slot.ui.completion_pending = None;
         }
 
         // Focused-editor chrome. Dispatched via the
@@ -2187,6 +2345,10 @@ pub fn render_pane(
     // WHICH widget got the press; that comes from per-widget
     // `Response::is_pointer_button_down_on()`.
     let primary_just_pressed = ctx.input(|i| i.pointer.primary_pressed());
+    // Shift held at press time turns a click into a selection EXTEND
+    // (Chrome-style): keep the existing anchor + selection mode and move
+    // the head to the click, rather than starting a fresh selection.
+    let shift_held = ctx.input(|i| i.modifiers.shift);
 
     /// Translate a pointer pixel position inside the editor rect to
     /// a byte index in the editor's text. Out-of-rows clamps to end.
@@ -2423,7 +2585,16 @@ pub fn render_pane(
             origin_cursor.col = origin_cursor.col.min(row_len);
         }
 
-        if primary_just_pressed {
+        // Shift+click EXTENDS the existing pane selection (across blocks
+        // and into / out of command vs output) instead of starting a new
+        // one — falling through to the shared extend branch below, which
+        // honours the retained char / word / line mode.
+        let shift_extend = press_extends_selection(
+            primary_just_pressed,
+            shift_held,
+            slot.session.pane_selection().is_some(),
+        );
+        if primary_just_pressed && !shift_extend {
             // -------- START a selection in the press block ----
             // Anchor + head both land in the origin block;
             // multi-click expands within that block.
@@ -2569,7 +2740,10 @@ pub fn render_pane(
             .unwrap_or_default();
         let byte = editor_byte_for_pos(rect, pos, &editor_text, cell_w, row_h);
 
-        if primary_just_pressed {
+        // Shift+click extends the editor selection from its caret /
+        // anchor (the editor always has a caret to anchor to), honouring
+        // the retained char / word / line mode — fall through to EXTEND.
+        if primary_just_pressed && !shift_held {
             // Press in the editor ends any sealed-block selection.
             slot.session.clear_pane_selection();
             slot.ui.sealed_drag_anchor = None;
@@ -2622,7 +2796,12 @@ pub fn render_pane(
         let press_pt = to_point(pos);
         let link_under_press = links_in_view.iter().find(|l| l.contains(press_pt)).cloned();
 
-        if primary_just_pressed {
+        // Shift+click extends the live-grid selection (in whatever
+        // char / word / line mode it was started) to the click instead
+        // of starting fresh.
+        let shift_extend_grid =
+            press_extends_selection(primary_just_pressed, shift_held, selection.is_some());
+        if primary_just_pressed && !shift_extend_grid {
             if modifier_held && let Some(link) = link_under_press {
                 open_url(&link.url);
             } else {
@@ -2640,10 +2819,12 @@ pub fn render_pane(
                     slot.session.start_selection(press_pt, mode);
                 }
             }
-        } else if rendered.response.dragged() {
+        } else if rendered.response.dragged() || shift_extend_grid {
             // EXTEND. Egui's `dragged()` is the canonical
             // "this widget is being dragged" signal once the
-            // drag threshold is met.
+            // drag threshold is met; `shift_extend_grid` is the
+            // discrete Shift+click extend. Both keep the mode the
+            // selection was started in.
             slot.session.extend_selection(press_pt);
         }
     }
@@ -2992,7 +3173,24 @@ pub fn render_pane(
                     let mut handled = true;
                     match key {
                         Key::Escape => {
+                            let candidates = slot
+                                .ui
+                                .completion_popup
+                                .as_ref()
+                                .map(|p| p.candidates.len())
+                                .unwrap_or(0);
+                            slot.session.record_completion(
+                                &crate::events::CompletionEvent::Popup {
+                                    action: crate::events::PopupAction::Dismiss,
+                                    candidates,
+                                },
+                            );
+                            // Clear pending too: during a live refresh the
+                            // stale popup and an in-flight driver request
+                            // coexist; without this the next frame would
+                            // reopen the dismissed popup.
                             slot.ui.completion_popup = None;
+                            slot.ui.completion_pending = None;
                         }
                         Key::Enter => {
                             // Enter always commits the selected
@@ -3005,10 +3203,17 @@ pub fn render_pane(
                                     .map(|e| e.cursor())
                                     .unwrap_or(0);
                                 let current_token_len = cursor.saturating_sub(popup.origin_byte);
+                                let candidates = popup.candidates.len();
                                 if let Some(editor) = slot.session.editor_mut() {
                                     popup.accept(editor, current_token_len);
                                 }
                                 slot.session.clear_history_recall();
+                                slot.session.record_completion(
+                                    &crate::events::CompletionEvent::Popup {
+                                        action: crate::events::PopupAction::Accept,
+                                        candidates,
+                                    },
+                                );
                             }
                         }
                         Key::Tab => {
@@ -3033,6 +3238,7 @@ pub fn render_pane(
                             let current_token_len = cursor.saturating_sub(popup_ref.origin_byte);
                             let extension = popup_ref.tab_extend(current_token_len).to_string();
                             let selected_full = popup_ref.selected().value.clone();
+                            let candidates = popup_ref.candidates.len();
                             if extension == selected_full {
                                 if let Some(popup) = slot.ui.completion_popup.take()
                                     && let Some(editor) = slot.session.editor_mut()
@@ -3040,13 +3246,21 @@ pub fn render_pane(
                                     popup.accept(editor, current_token_len);
                                 }
                                 slot.session.clear_history_recall();
+                                slot.session.record_completion(
+                                    &crate::events::CompletionEvent::Popup {
+                                        action: crate::events::PopupAction::Accept,
+                                        candidates,
+                                    },
+                                );
                             } else if extension.len() > current_token_len {
                                 if let Some(editor) = slot.session.editor_mut() {
                                     let origin = popup_ref.origin_byte;
                                     editor.replace_range(origin, cursor, &extension);
                                 }
                                 slot.session.clear_history_recall();
-                                // Popup stays; live filter next frame.
+                                // Popup stays; live filter next frame. (No
+                                // accept event — this only extends to a
+                                // shared prefix.)
                             } else {
                                 // No further extension possible —
                                 // the visible candidates diverge
@@ -3061,6 +3275,12 @@ pub fn render_pane(
                                     popup.accept(editor, current_token_len);
                                 }
                                 slot.session.clear_history_recall();
+                                slot.session.record_completion(
+                                    &crate::events::CompletionEvent::Popup {
+                                        action: crate::events::PopupAction::Accept,
+                                        candidates,
+                                    },
+                                );
                             }
                         }
                         Key::ArrowDown => {
@@ -3087,10 +3307,11 @@ pub fn render_pane(
                     }
                 } else if editor_active
                     && slot.ui.completion_popup.is_none()
+                    && slot.ui.completion_pending.is_none()
                     && matches!(key, Key::Tab)
                     && no_mods
                 {
-                    // Tab in editor with no popup → open the popup.
+                    // Tab in editor with nothing open → plan completion.
                     let editor_text;
                     let cursor;
                     {
@@ -3100,17 +3321,44 @@ pub fn render_pane(
                     }
                     let cwd = slot.session.terminal().cwd().map(|p| p.to_path_buf());
                     let history_entries = slot.session.history_for_completion(200);
-                    let popup = crate::completion::open_completion_at(
+                    let plan = crate::completion::plan_completion(
                         &editor_text,
                         cursor,
                         cwd.as_deref(),
                         home,
                         || history_entries,
                     );
-                    if popup.is_some() {
-                        slot.ui.completion_popup = popup;
+                    slot.session.record_completion(&plan_event(&plan, &editor_text, true));
+                    match plan {
+                        // No driver for this command → open the local list now
+                        // (or auto-accept if it's the only match — this is
+                        // an explicit Tab press, so auto-accept is allowed).
+                        crate::completion::CompletionPlan::Open(popup) => {
+                            show_or_autoaccept(slot, popup, true);
+                        }
+                        // Driver-eligible (kubectl/gh/docker/aws/git): fire it
+                        // and WAIT — don't flash local files. The per-frame
+                        // resolution opens the popup when the result lands,
+                        // even if there were no local matches (`git ch`).
+                        // `from_tab: true` lets a lone result auto-accept.
+                        crate::completion::CompletionPlan::AwaitDriver {
+                            origin_byte,
+                            token,
+                            locals,
+                            target,
+                        } => {
+                            slot.ui.completion_pending =
+                                Some(crate::completion::PendingCompletion {
+                                    origin_byte,
+                                    token,
+                                    locals,
+                                    from_tab: true,
+                                });
+                            slot.session.completion_driver_request(ctx, target);
+                        }
+                        crate::completion::CompletionPlan::Closed => {}
                     }
-                    // Consume Tab whether or not the popup opened.
+                    // Consume Tab whether or not anything opened.
                     continue;
                 }
             }
@@ -3150,25 +3398,67 @@ pub fn render_pane(
         // dismiss. Otherwise recompute the candidate list with
         // the new buffer state. `selected_index` resets to 0
         // (preserving it across refilter is a polish item).
-        if slot.ui.completion_popup.is_some() {
+        if slot.ui.completion_popup.is_some() || slot.ui.completion_pending.is_some() {
             let editor_state_after: Option<(String, usize)> =
                 slot.session.blocks().editor_on_tail().map(|e| (e.text().to_string(), e.cursor()));
             let buffer_changed = editor_state_before != editor_state_after;
             if buffer_changed && let Some((editor_text, cursor)) = editor_state_after {
-                let origin = slot.ui.completion_popup.as_ref().map(|p| p.origin_byte).unwrap_or(0);
+                let origin = slot
+                    .ui
+                    .completion_popup
+                    .as_ref()
+                    .map(|p| p.origin_byte)
+                    .or_else(|| slot.ui.completion_pending.as_ref().map(|p| p.origin_byte))
+                    .unwrap_or(0);
                 if cursor < origin {
+                    // Backspaced through the token start — dismiss both.
                     slot.ui.completion_popup = None;
+                    slot.ui.completion_pending = None;
                 } else {
                     let cwd = slot.session.terminal().cwd().map(|p| p.to_path_buf());
                     let history_entries = slot.session.history_for_completion(200);
-                    let new_popup = crate::completion::open_completion_at(
+                    let plan = crate::completion::plan_completion(
                         &editor_text,
                         cursor,
                         cwd.as_deref(),
                         home,
                         || history_entries,
                     );
-                    slot.ui.completion_popup = new_popup;
+                    slot.session.record_completion(&plan_event(&plan, &editor_text, false));
+                    match plan {
+                        crate::completion::CompletionPlan::Open(popup) => {
+                            slot.ui.completion_pending = None;
+                            // Live re-filter from typing → never auto-accept,
+                            // even if narrowed to one (the user may still be
+                            // typing; they accept via Tab / Enter).
+                            show_or_autoaccept(slot, popup, false);
+                        }
+                        crate::completion::CompletionPlan::AwaitDriver {
+                            origin_byte,
+                            token,
+                            locals,
+                            target,
+                        } => {
+                            // Keep any open popup VISIBLE (stale) while the
+                            // refreshed driver result is in flight; the
+                            // per-frame resolution swaps it in when it lands,
+                            // so the list never blinks out between keystrokes.
+                            // `from_tab: false` — a typing-driven refresh must
+                            // not auto-accept a lone result.
+                            slot.ui.completion_pending =
+                                Some(crate::completion::PendingCompletion {
+                                    origin_byte,
+                                    token,
+                                    locals,
+                                    from_tab: false,
+                                });
+                            slot.session.completion_driver_request(ctx, target);
+                        }
+                        crate::completion::CompletionPlan::Closed => {
+                            slot.ui.completion_popup = None;
+                            slot.ui.completion_pending = None;
+                        }
+                    }
                 }
             }
         }
@@ -3360,6 +3650,30 @@ pub fn render_pane(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- press_extends_selection (Shift+click extend) -----------------
+
+    #[test]
+    fn shift_click_with_selection_extends() {
+        assert!(press_extends_selection(true, true, true));
+    }
+
+    #[test]
+    fn shift_click_without_selection_starts_fresh() {
+        // Nothing to anchor to → normal start, not extend.
+        assert!(!press_extends_selection(true, true, false));
+    }
+
+    #[test]
+    fn plain_click_never_extends() {
+        assert!(!press_extends_selection(true, false, true));
+    }
+
+    #[test]
+    fn shift_without_a_press_is_not_an_extend() {
+        // Shift held mid-drag (no fresh press) isn't a Shift+click.
+        assert!(!press_extends_selection(false, true, true));
+    }
 
     // ---- plan_resize (resize debounce, #1 banner-storm fix) -----------
 

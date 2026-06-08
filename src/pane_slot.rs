@@ -167,6 +167,15 @@ pub struct PaneUiState {
     /// non-navigation keystroke. See [`crate::completion`] +
     /// [spec/04a](../spec/04a-completion.md).
     pub completion_popup: Option<crate::completion::CompletionPopup>,
+    /// `Some` while a CLI-native driver result is awaited before the popup
+    /// (re)opens — the "wait, don't flash locals" state ([spec/04a §"Source
+    /// priority"](../spec/04a-completion.md)). Carries the origin / token /
+    /// local candidates to merge when the driver result lands. A driver
+    /// command sets this instead of opening a locals-only popup; the
+    /// per-frame poll resolves it into [`Self::completion_popup`]. While
+    /// awaiting a *refresh*, any already-open `completion_popup` stays
+    /// visible so the list never blinks out between keystrokes.
+    pub completion_pending: Option<crate::completion::PendingCompletion>,
     /// `Some` while the `Cmd/Ctrl+F` find overlay is open (Phase 8).
     /// Holds the query, the `Aa` / `.*` / filter toggles, the ordered
     /// match list + current selection, and this pane's query history.

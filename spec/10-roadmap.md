@@ -250,6 +250,9 @@ sealed chunks. Shipped on branch `feat/in-pane-search`.
 In rough priority order; each is its own future PR / Issue, none committed.
 
 - **Tab completion engine** (CLI-native drivers + per-pane shell sidecar for bash / zsh / fish) per [04a](04a-completion.md). Supersedes the earlier "OSC request/response shell-completion bridge" stub — the same goal, cleaner mechanism (private stdio JSON sidecar, not an OSC channel over the PTY). Implementation slices: drivers → fish sidecar → bash sidecar → zsh sidecar, in that order.
+  - ✅ **CLI-native drivers** (shipped). `kubectl`/`gh`/`docker` (cobra `__complete`), `aws_completer`, `git --list-cmds` stream into the popup off-thread (per-pane worker + `egui::Context` repaint, mirroring `git_probe`); detection is implicit (spawn-failure = silent no-op). `completion::drivers`.
+  - ✅ **Driver result cache** (shipped). 10 s TTL `(tool, cwd, line)` cache + injectable `Clock` ([04a §Caching](04a-completion.md#caching)); a re-open within the window is instant, no subprocess. `completion::drivers::cache`.
+  - Remaining: fish sidecar → bash sidecar → zsh sidecar.
 - **Workspace search** across panes and persisted sessions.
 - **Command palette** (Cmd/Ctrl+P).
 - **Multi-window** (egui multi-viewport).

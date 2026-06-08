@@ -378,7 +378,7 @@ Post-MVP: detect nested-shell entry, send a fresh bootstrap into the nested shel
 
 ## Debug surface
 
-Setting `TERMICA_DUMP_EVENTS=<path>` in the environment before launching Termica turns on the lifecycle-event recorder (Phase 3G). The named file is opened with create-or-truncate semantics; every pane writes its spawn, lifecycle events, mode transitions, and PTY-exit to the same file in arrival order. Timestamps are seconds since the recorder started, so a recording is comparable to itself regardless of when it ran.
+Setting `TERMICA_DUMP_EVENTS=<path>` in the environment before launching Termica turns on the lifecycle-event recorder (Phase 3G). The named file is opened with create-or-truncate semantics; every pane writes its spawn, lifecycle events, mode transitions, PTY-exit, and tab-**completion** events to the same file in arrival order. Timestamps are seconds since the recorder started, so a recording is comparable to itself regardless of when it ran.
 
 **Format selection is by file extension:**
 
@@ -397,6 +397,10 @@ The format is fixed at recorder construction; a single Termica process writes on
 {"t":0.512,"pane":0,"kind":"lifecycle","event":"Precmd","cwd":"/Users/tim"}
 {"t":3.401,"pane":0,"kind":"lifecycle","event":"Preexec","command":"ls -la"}
 {"t":3.452,"pane":0,"kind":"lifecycle","event":"CommandFinished","exit":0}
+{"t":4.700,"pane":0,"kind":"completion","event":"plan","decision":"AwaitDriver","tool":"Kubectl","line":"kubectl get ","locals":0,"from_tab":true}
+{"t":4.701,"pane":0,"kind":"completion","event":"driver_request","tool":"Kubectl","line":"kubectl get ","cache_hit":false}
+{"t":4.760,"pane":0,"kind":"completion","event":"driver_result","tool":"Kubectl","candidates":17,"cache_hit":false}
+{"t":4.760,"pane":0,"kind":"completion","event":"popup","action":"Open","candidates":17}
 {"t":4.812,"pane":0,"kind":"pty_exit"}
 ```
 
@@ -408,6 +412,7 @@ Per-`kind` fields:
 | `transition` | `from`, `to` (mode names), `reason` (reason name) |
 | `lifecycle` | `event` (variant name) + variant-specific fields: `shell` + `version` for `IntegrationReady`; `command` for `Preexec`; `exit` for `CommandFinished`; `cwd` for `Precmd` / `Cwd`; `reason` for `IntegrationError` / `CommandAborted`; `vars` (object) for `PromptVars` |
 | `pty_exit` | none |
+| `completion` | `event` discriminator + per-event fields ([04a §"Source 1"](04a-completion.md)): **`plan`** → `decision` (`Open`/`AwaitDriver`/`Closed`), `tool` (driver name or `null`), `line`, `locals`, `from_tab`; **`driver_request`** → `tool`, `line`, `cache_hit`; **`driver_result`** → `tool`, `candidates`, `cache_hit` (`candidates":0` ⇒ absent tool / timeout / no match); **`popup`** → `action` (`Open`/`Accept`/`AutoAccept`/`Dismiss`), `candidates`. A dead `<Tab>` is legible end-to-end: e.g. a `plan decision=AwaitDriver` followed by `driver_result candidates=0` and **no** `popup` line means the driver subprocess returned nothing (timeout / absent tool). |
 
 ### Human-readable example
 
@@ -421,6 +426,10 @@ Per-`kind` fields:
 [t=3.401s] pane=0 lifecycle Preexec { command: "ls -la" }
 [t=3.452s] pane=0 lifecycle CommandFinished { exit: 0 }
 [t=3.453s] pane=0 lifecycle Precmd { cwd: "/Users/tim" }
+[t=4.700s] pane=0 completion plan decision=AwaitDriver tool=Kubectl line="kubectl get " locals=0 from_tab=true
+[t=4.701s] pane=0 completion driver_request tool=Kubectl line="kubectl get " cache_hit=false
+[t=4.760s] pane=0 completion driver_result tool=Kubectl candidates=17 cache_hit=false
+[t=4.760s] pane=0 completion popup action=Open candidates=17
 ```
 
 This is the diagnostic surface for debugging integration failures and is the primary tool for the test infrastructure ([09](09-testing.md)). Each line is a single record; `tail -f $TERMICA_DUMP_EVENTS` while reproducing a bug gives a real-time view of the state machine. Opening the file is best-effort: if the path is invalid or unwritable, Termica reports on stderr at startup and disables the recorder for the session.

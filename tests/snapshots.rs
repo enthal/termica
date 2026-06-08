@@ -481,11 +481,11 @@ fn snapshot_paint_sealed_block_echo() {
                 "echo hello",
                 &snapshot,
                 None,
-                None,
-                None,
-                Some(0),
-                std::time::Duration::from_millis(123),
-                None,
+                render::BlockHeader {
+                    exit: Some(0),
+                    duration: Some(std::time::Duration::from_millis(123)),
+                    ..Default::default()
+                },
             );
         });
     harness.snapshot("paint_sealed_block_echo");
@@ -503,11 +503,11 @@ fn snapshot_paint_sealed_block_ls_output() {
                 "ls",
                 &snapshot,
                 None,
-                None,
-                None,
-                Some(0),
-                std::time::Duration::from_millis(1_500),
-                None,
+                render::BlockHeader {
+                    exit: Some(0),
+                    duration: Some(std::time::Duration::from_millis(1_500)),
+                    ..Default::default()
+                },
             );
         });
     harness.snapshot("paint_sealed_block_ls_output");
@@ -525,11 +525,11 @@ fn snapshot_paint_sealed_block_multiline_command() {
                 "for i in 1 2; do\n  echo $i\ndone",
                 &snapshot,
                 None,
-                None,
-                None,
-                Some(0),
-                std::time::Duration::from_millis(34),
-                None,
+                render::BlockHeader {
+                    exit: Some(0),
+                    duration: Some(std::time::Duration::from_millis(34)),
+                    ..Default::default()
+                },
             );
         });
     harness.snapshot("paint_sealed_block_multiline_command");
@@ -729,13 +729,11 @@ fn snapshot_paint_block_header_cwd_only() {
         Harness::builder().with_size(egui::Vec2::new(700.0, 40.0)).build_ui(move |ui| {
             let _ = render::paint_block_header(
                 ui,
-                Some(cwd.as_path()),
-                Some(home.as_path()),
-                None,
-                None,
-                None,
-                None,
-                false,
+                render::BlockHeader {
+                    cwd: Some(cwd.as_path()),
+                    home: Some(home.as_path()),
+                    ..Default::default()
+                },
             );
         });
     harness.snapshot("paint_block_header_cwd_only");
@@ -749,13 +747,12 @@ fn snapshot_paint_block_header_zero_exit_hides_exit_chip() {
         Harness::builder().with_size(egui::Vec2::new(700.0, 40.0)).build_ui(move |ui| {
             let _ = render::paint_block_header(
                 ui,
-                Some(cwd.as_path()),
-                Some(home.as_path()),
-                Some(0),
-                None,
-                None,
-                None,
-                false,
+                render::BlockHeader {
+                    cwd: Some(cwd.as_path()),
+                    home: Some(home.as_path()),
+                    exit: Some(0),
+                    ..Default::default()
+                },
             );
         });
     harness.snapshot("paint_block_header_zero_exit");
@@ -771,13 +768,11 @@ fn snapshot_paint_block_header_substitutes_home_with_tilde() {
         Harness::builder().with_size(egui::Vec2::new(700.0, 40.0)).build_ui(move |ui| {
             let _ = render::paint_block_header(
                 ui,
-                Some(cwd.as_path()),
-                Some(home.as_path()),
-                None,
-                None,
-                None,
-                None,
-                false,
+                render::BlockHeader {
+                    cwd: Some(cwd.as_path()),
+                    home: Some(home.as_path()),
+                    ..Default::default()
+                },
             );
         });
     harness.snapshot("paint_block_header_tilde_substitution");
@@ -791,13 +786,12 @@ fn snapshot_paint_block_header_nonzero_exit_shows_red_annotation() {
         Harness::builder().with_size(egui::Vec2::new(700.0, 40.0)).build_ui(move |ui| {
             let _ = render::paint_block_header(
                 ui,
-                Some(cwd.as_path()),
-                Some(home.as_path()),
-                Some(127),
-                None,
-                None,
-                None,
-                false,
+                render::BlockHeader {
+                    cwd: Some(cwd.as_path()),
+                    home: Some(home.as_path()),
+                    exit: Some(127),
+                    ..Default::default()
+                },
             );
         });
     harness.snapshot("paint_block_header_nonzero_exit");
@@ -813,13 +807,13 @@ fn snapshot_paint_block_header_with_duration() {
         Harness::builder().with_size(egui::Vec2::new(700.0, 40.0)).build_ui(move |ui| {
             let _ = render::paint_block_header(
                 ui,
-                Some(cwd.as_path()),
-                Some(home.as_path()),
-                Some(1),
-                Some(std::time::Duration::from_secs(125)),
-                None,
-                None,
-                false,
+                render::BlockHeader {
+                    cwd: Some(cwd.as_path()),
+                    home: Some(home.as_path()),
+                    exit: Some(1),
+                    duration: Some(std::time::Duration::from_secs(125)),
+                    ..Default::default()
+                },
             );
         });
     harness.snapshot("paint_block_header_with_duration");
@@ -837,13 +831,12 @@ fn snapshot_paint_block_header_with_git_branch_clean() {
         Harness::builder().with_size(egui::Vec2::new(700.0, 40.0)).build_ui(move |ui| {
             let _ = render::paint_block_header(
                 ui,
-                Some(cwd.as_path()),
-                Some(home.as_path()),
-                None,
-                None,
-                Some(&git),
-                None,
-                false,
+                render::BlockHeader {
+                    cwd: Some(cwd.as_path()),
+                    home: Some(home.as_path()),
+                    git: Some(&git),
+                    ..Default::default()
+                },
             );
         });
     harness.snapshot("paint_block_header_git_branch_clean");
@@ -870,13 +863,12 @@ fn snapshot_paint_block_header_with_git_dirty_and_sync() {
         Harness::builder().with_size(egui::Vec2::new(700.0, 40.0)).build_ui(move |ui| {
             let _ = render::paint_block_header(
                 ui,
-                Some(cwd.as_path()),
-                Some(home.as_path()),
-                None,
-                None,
-                Some(&git),
-                None,
-                false,
+                render::BlockHeader {
+                    cwd: Some(cwd.as_path()),
+                    home: Some(home.as_path()),
+                    git: Some(&git),
+                    ..Default::default()
+                },
             );
         });
     harness.snapshot("paint_block_header_git_dirty_and_sync");
@@ -904,13 +896,13 @@ fn snapshot_paint_block_header_with_pr_chip_pending() {
         Harness::builder().with_size(egui::Vec2::new(760.0, 40.0)).build_ui(move |ui| {
             let _ = render::paint_block_header(
                 ui,
-                Some(cwd.as_path()),
-                Some(home.as_path()),
-                None,
-                None,
-                Some(&git),
-                Some(&pr),
-                false,
+                render::BlockHeader {
+                    cwd: Some(cwd.as_path()),
+                    home: Some(home.as_path()),
+                    git: Some(&git),
+                    pr: Some(&pr),
+                    ..Default::default()
+                },
             );
         });
     harness.snapshot("paint_block_header_pr_chip_pending");
@@ -929,13 +921,13 @@ fn snapshot_paint_block_header_with_pr_chip_passing() {
         Harness::builder().with_size(egui::Vec2::new(760.0, 40.0)).build_ui(move |ui| {
             let _ = render::paint_block_header(
                 ui,
-                Some(cwd.as_path()),
-                Some(home.as_path()),
-                None,
-                None,
-                Some(&git),
-                Some(&pr),
-                false,
+                render::BlockHeader {
+                    cwd: Some(cwd.as_path()),
+                    home: Some(home.as_path()),
+                    git: Some(&git),
+                    pr: Some(&pr),
+                    ..Default::default()
+                },
             );
         });
     harness.snapshot("paint_block_header_pr_chip_passing");
@@ -953,11 +945,13 @@ fn snapshot_paint_sealed_block_with_header_and_failed_exit() {
                 "blarg",
                 &snapshot,
                 None,
-                Some(cwd.as_path()),
-                Some(home.as_path()),
-                Some(127),
-                std::time::Duration::from_millis(42),
-                None,
+                render::BlockHeader {
+                    cwd: Some(cwd.as_path()),
+                    home: Some(home.as_path()),
+                    exit: Some(127),
+                    duration: Some(std::time::Duration::from_millis(42)),
+                    ..Default::default()
+                },
             );
         });
     harness.snapshot("paint_sealed_block_with_header_and_failed_exit");
@@ -988,11 +982,14 @@ fn snapshot_paint_sealed_block_with_captured_git() {
                 "cargo build",
                 &snapshot,
                 None,
-                Some(cwd.as_path()),
-                Some(home.as_path()),
-                Some(0),
-                std::time::Duration::from_secs(12),
-                Some(&git),
+                render::BlockHeader {
+                    cwd: Some(cwd.as_path()),
+                    home: Some(home.as_path()),
+                    exit: Some(0),
+                    duration: Some(std::time::Duration::from_secs(12)),
+                    git: Some(&git),
+                    ..Default::default()
+                },
             );
         });
     harness.snapshot("paint_sealed_block_with_captured_git");
@@ -1013,11 +1010,11 @@ fn snapshot_paint_sealed_block_with_selection_spans_command_and_output() {
                 "ls",
                 &snapshot,
                 sel,
-                None,
-                None,
-                Some(0),
-                std::time::Duration::from_millis(200),
-                None,
+                render::BlockHeader {
+                    exit: Some(0),
+                    duration: Some(std::time::Duration::from_millis(200)),
+                    ..Default::default()
+                },
             );
         });
     harness.snapshot("paint_sealed_block_with_selection");
@@ -1036,11 +1033,11 @@ fn snapshot_paint_sealed_block_with_selection_in_command_only() {
                 "echo hello",
                 &snapshot,
                 sel,
-                None,
-                None,
-                Some(0),
-                std::time::Duration::from_millis(200),
-                None,
+                render::BlockHeader {
+                    exit: Some(0),
+                    duration: Some(std::time::Duration::from_millis(200)),
+                    ..Default::default()
+                },
             );
         });
     harness.snapshot("paint_sealed_block_with_selection_in_command_only");
@@ -1407,6 +1404,34 @@ fn snapshot_completion_popup_scrolls_growing_upward_near_bottom() {
         egui::Pos2::new(24.0, 408.0),
         6,
         egui::Vec2::new(540.0, 420.0),
+    );
+}
+
+#[test]
+fn snapshot_completion_popup_driver_rows_with_tags_and_descriptions() {
+    // Slice 2: CLI-native driver candidates merged with locals. The
+    // driver rows carry a `k8s` source tag (right edge) and a one-line
+    // description; the trailing `$PATH` local has neither. Pins the new
+    // `CompletionSource::Driver` tag + description rendering path.
+    use termica::completion::DriverTool;
+    let k8s = CompletionSource::Driver(DriverTool::Kubectl);
+    let cands = vec![
+        CompletionCandidate::with_description(
+            "pods",
+            "Pods are the smallest deployable units",
+            k8s,
+        ),
+        CompletionCandidate::with_description("podtemplates", "PodTemplate objects", k8s),
+        CompletionCandidate::simple("podman", CompletionSource::PathExecutable),
+    ];
+    let mut popup = CompletionPopup::new(0, "pod", cands).expect("non-empty candidate list");
+    popup.selected_index = 0;
+    snapshot_completion_popup(
+        "completion_popup_driver_rows",
+        popup,
+        egui::Pos2::new(24.0, 232.0),
+        10,
+        egui::Vec2::new(540.0, 260.0),
     );
 }
 

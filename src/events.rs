@@ -42,9 +42,54 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
 
+use crate::completion::DriverTool;
 use crate::integration::ShellSpec;
 use crate::markers::LifecycleEvent;
 use crate::shell::TransitionRecord;
+
+/// A tab-completion event for `TERMICA_DUMP_EVENTS` diagnostics. Lets a
+/// dead `<Tab>` be traced end-to-end: did the plan fire and choose which
+/// branch, was the driver served from cache or spawned, how many
+/// candidates came back, did the popup open / accept / dismiss. The schema
+/// is normative in `spec/03-shell-integration.md`.
+#[derive(Debug, Clone)]
+pub enum CompletionEvent {
+    /// The Tab / typing planning decision and its context.
+    Plan {
+        decision: CompletionDecision,
+        /// The driver tool, when the decision is `AwaitDriver`.
+        tool: Option<DriverTool>,
+        line: String,
+        /// Number of local (path / `$PATH`) candidates found.
+        locals: usize,
+        /// `true` for an explicit Tab; `false` for a typing-driven refilter.
+        from_tab: bool,
+    },
+    /// A driver request was issued — served from cache or spawned.
+    DriverRequest { tool: DriverTool, line: String, cache_hit: bool },
+    /// A driver result arrived. `candidates == 0` means absent tool /
+    /// timeout / no match (and is NOT cached).
+    DriverResult { tool: DriverTool, candidates: usize, cache_hit: bool },
+    /// A popup lifecycle action.
+    Popup { action: PopupAction, candidates: usize },
+}
+
+/// Which [`CompletionEvent::Plan`] branch fired.
+#[derive(Debug, Clone, Copy)]
+pub enum CompletionDecision {
+    Open,
+    AwaitDriver,
+    Closed,
+}
+
+/// A [`CompletionEvent::Popup`] action.
+#[derive(Debug, Clone, Copy)]
+pub enum PopupAction {
+    Open,
+    Accept,
+    AutoAccept,
+    Dismiss,
+}
 
 /// File-backed recorder for `--dump-events` diagnostics. Shared
 /// across all panes (one file per Termica process). All writes
@@ -179,6 +224,20 @@ impl EventRecorder {
         }
     }
 
+    /// Record a tab-[`CompletionEvent`].
+    pub fn record_completion(&self, pane_id: u64, event: &CompletionEvent) {
+        match self.format {
+            Format::Text => {
+                self.write_line(&completion_text(self.t_seconds(), pane_id, event));
+            }
+            Format::JsonLines => {
+                let mut obj = self.jsonl_envelope(pane_id, "completion");
+                completion_to_json(event, &mut obj);
+                self.write_jsonl(&serde_json::Value::Object(obj));
+            }
+        }
+    }
+
     /// Record a PTY-exit notification.
     pub fn record_pty_exit(&self, pane_id: u64) {
         match self.format {
@@ -218,6 +277,66 @@ impl EventRecorder {
 /// the per-event jitter floor.
 fn round_ts(t: f64) -> f64 {
     (t * 1000.0).round() / 1000.0
+}
+
+fn opt_tool(tool: &Option<DriverTool>) -> String {
+    tool.map(|t| format!("{t:?}")).unwrap_or_else(|| "-".to_string())
+}
+
+/// Human-readable text line for a [`CompletionEvent`].
+fn completion_text(t: f64, pane_id: u64, event: &CompletionEvent) -> String {
+    let body = match event {
+        CompletionEvent::Plan { decision, tool, line, locals, from_tab } => format!(
+            "plan decision={decision:?} tool={} line={line:?} locals={locals} from_tab={from_tab}",
+            opt_tool(tool),
+        ),
+        CompletionEvent::DriverRequest { tool, line, cache_hit } => {
+            format!("driver_request tool={tool:?} line={line:?} cache_hit={cache_hit}")
+        }
+        CompletionEvent::DriverResult { tool, candidates, cache_hit } => {
+            format!("driver_result tool={tool:?} candidates={candidates} cache_hit={cache_hit}")
+        }
+        CompletionEvent::Popup { action, candidates } => {
+            format!("popup action={action:?} candidates={candidates}")
+        }
+    };
+    format!("[t={t:.3}s] pane={pane_id} completion {body}\n")
+}
+
+/// Populate a JSON object with a [`CompletionEvent`]'s variant fields, per
+/// the schema in `spec/03-shell-integration.md`.
+fn completion_to_json(
+    event: &CompletionEvent,
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    use serde_json::json;
+    match event {
+        CompletionEvent::Plan { decision, tool, line, locals, from_tab } => {
+            obj.insert("event".into(), json!("plan"));
+            obj.insert("decision".into(), json!(format!("{decision:?}")));
+            obj.insert("tool".into(), json!(tool.map(|t| format!("{t:?}"))));
+            obj.insert("line".into(), json!(line));
+            obj.insert("locals".into(), json!(locals));
+            obj.insert("from_tab".into(), json!(from_tab));
+        }
+        CompletionEvent::DriverRequest { tool, line, cache_hit } => {
+            obj.insert("event".into(), json!("driver_request"));
+            obj.insert("tool".into(), json!(format!("{tool:?}")));
+            obj.insert("line".into(), json!(line));
+            obj.insert("cache_hit".into(), json!(cache_hit));
+        }
+        CompletionEvent::DriverResult { tool, candidates, cache_hit } => {
+            obj.insert("event".into(), json!("driver_result"));
+            obj.insert("tool".into(), json!(format!("{tool:?}")));
+            obj.insert("candidates".into(), json!(candidates));
+            obj.insert("cache_hit".into(), json!(cache_hit));
+        }
+        CompletionEvent::Popup { action, candidates } => {
+            obj.insert("event".into(), json!("popup"));
+            obj.insert("action".into(), json!(format!("{action:?}")));
+            obj.insert("candidates".into(), json!(candidates));
+        }
+    }
 }
 
 /// Populate a JSON object with the lifecycle event's variant tag and
@@ -698,5 +817,66 @@ mod tests {
             ts.clone()
         };
         assert_eq!(ts, sorted, "timestamps must be monotonic");
+    }
+
+    #[test]
+    fn completion_events_text_format() {
+        let path = tmp_path_with_ext("log");
+        let rec = EventRecorder::new(&path).expect("open recorder");
+        rec.record_completion(
+            0,
+            &CompletionEvent::Plan {
+                decision: CompletionDecision::AwaitDriver,
+                tool: Some(DriverTool::Kubectl),
+                line: "kubectl get ".into(),
+                locals: 0,
+                from_tab: true,
+            },
+        );
+        rec.record_completion(
+            0,
+            &CompletionEvent::DriverResult {
+                tool: DriverTool::Kubectl,
+                candidates: 0,
+                cache_hit: false,
+            },
+        );
+        drop(rec);
+        let body = read_to_string(&path);
+        assert!(
+            body.contains("completion plan decision=AwaitDriver tool=Kubectl"),
+            "missing plan line: {body:?}"
+        );
+        assert!(
+            body.contains("driver_result tool=Kubectl candidates=0 cache_hit=false"),
+            "missing driver_result line: {body:?}"
+        );
+    }
+
+    #[test]
+    fn completion_events_jsonl_fields() {
+        let path = tmp_path_with_ext("jsonl");
+        let rec = EventRecorder::new(&path).expect("open recorder");
+        rec.record_completion(
+            0,
+            &CompletionEvent::DriverRequest {
+                tool: DriverTool::Gh,
+                line: "gh pr ".into(),
+                cache_hit: true,
+            },
+        );
+        rec.record_completion(
+            0,
+            &CompletionEvent::Popup { action: PopupAction::Open, candidates: 5 },
+        );
+        drop(rec);
+        let rows = parse_jsonl(&read_to_string(&path));
+        assert_eq!(rows[0]["kind"], "completion");
+        assert_eq!(rows[0]["event"], "driver_request");
+        assert_eq!(rows[0]["tool"], "Gh");
+        assert_eq!(rows[0]["cache_hit"], true);
+        assert_eq!(rows[1]["event"], "popup");
+        assert_eq!(rows[1]["action"], "Open");
+        assert_eq!(rows[1]["candidates"], 5);
     }
 }
