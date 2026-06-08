@@ -2074,12 +2074,19 @@ pub fn render_pane(
                 None
             };
             // The chrome (glow / outline) wraps the chip+editor with a
-            // little left pad so its stroke doesn't sit ON the leftmost
-            // chip's edge — it lives in the gutter to the chip's left.
+            // little pad on each side so its stroke doesn't sit ON the
+            // chip edge (left) or fall off the pane's right edge (right)
+            // — on the rightmost pane `pane_clip.right()` IS the window
+            // edge, so a flush right edge gets clipped. Both sides float
+            // a few px inside the pane.
             const CHROME_LEFT_PAD: f32 = 4.0;
+            const CHROME_RIGHT_PAD: f32 = 6.0;
             let combined = egui::Rect::from_min_max(
                 egui::pos2(footer_origin.x - CHROME_LEFT_PAD, footer_origin.y),
-                egui::pos2(footer_origin.x + body_w, footer_origin.y + chip_h + editor_h),
+                egui::pos2(
+                    pane_clip.right() - CHROME_RIGHT_PAD,
+                    footer_origin.y + chip_h + editor_h,
+                ),
             );
             // Chrome painter: layer-painter (so we're not clipped
             // to the footer's tight vertical clip — variants paint
