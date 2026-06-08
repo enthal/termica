@@ -141,6 +141,12 @@ impl EditorMotion {
 /// by one or two pixels. Empirically tuned; not a unit of the font.
 pub const FOOTER_DESCENDER_PAD: f32 = 4.0;
 
+/// Empty space reserved BELOW the prompt's editor/glow, between it and
+/// the pane's bottom edge, so the focused-editor chrome floats with a
+/// margin instead of sitting flush on the bottom. Added to the footer
+/// height; the editor + chrome don't paint into it.
+pub const FOOTER_GLOW_BOTTOM_MARGIN: f32 = 10.0;
+
 /// Compute the fixed-footer height for the [`Block::Prompt`] block
 /// per [spec/04 §"Layout"](../spec/04-prompt-editor.md#layout-fixed-footer-prompt-sticky-top-header).
 ///
@@ -167,7 +173,7 @@ pub fn compute_footer_height(
     }
     let editor_rows = editor_lines.max(1);
     let chrome_h = if has_cwd { row_h + 2.0 * render::CHIP_PAD_Y } else { 0.0 };
-    chrome_h + editor_rows as f32 * row_h + FOOTER_DESCENDER_PAD
+    chrome_h + editor_rows as f32 * row_h + FOOTER_DESCENDER_PAD + FOOTER_GLOW_BOTTOM_MARGIN
 }
 
 /// The pinned region the sticky header shows is the block's cwd / exit
@@ -386,7 +392,7 @@ pub fn paint_sticky_header(
             // captures the press instead of leaking it to the output
             // below; the response is routed by the caller.
             let command_resp = (!capped.is_empty()).then(|| {
-                render::paint_command_label_with_selection(ui, &capped, command_selection)
+                render::paint_command_label_with_selection(ui, &capped, command_selection, faded)
             });
             let bottom = ui.next_widget_position().y;
             let strip = egui::Rect::from_min_max(
@@ -510,6 +516,41 @@ fn pty_passthrough_allowed(event: &egui::Event, editor_active: bool, editor_empt
     editor_empty && is_eof_chord(event)
 }
 
+/// Close every per-pane popup (history / completion / find /
+/// keybindings). Popups are mutually exclusive — opening one calls
+/// this first so two never show at once. The find query history is
+/// preserved on the pane (`find_history`) before the overlay drops.
+fn close_all_popups(slot: &mut PaneSlot) {
+    if let Some(o) = slot.ui.find_overlay.take() {
+        slot.ui.find_history = o.history;
+    }
+    slot.ui.history_overlay = None;
+    slot.ui.completion_popup = None;
+    slot.ui.completion_pending = None;
+    slot.ui.keybindings_open = false;
+}
+
+/// Open the `Ctrl/Cmd+R` history overlay, closing any other popup
+/// first and prefilling the search box with the editor's current text
+/// (so a half-typed command pre-narrows results — zsh-style). No-op if
+/// the history store can't be opened.
+fn open_history_overlay(slot: &mut PaneSlot) {
+    let prefill = slot.session.editor_mut().map(|e| e.text().to_string()).unwrap_or_default();
+    let Some(history) = slot.session.history_ctx().cloned() else { return };
+    let Some(mut overlay) =
+        crate::history_overlay::HistoryOverlay::open(&history, slot.session.pane_id())
+    else {
+        return;
+    };
+    if !prefill.is_empty() {
+        overlay.query = prefill;
+        let cwd = slot.session.terminal().cwd().map(|p| p.display().to_string());
+        overlay.rerank(cwd.as_deref());
+    }
+    close_all_popups(slot);
+    slot.ui.history_overlay = Some(overlay);
+}
+
 /// Route one egui event to the pane's [`PromptEditor`](crate::prompt_editor).
 /// Returns `true` when the editor consumed the event (so the caller
 /// skips the PTY encoder path); `false` lets the caller try other
@@ -554,6 +595,39 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
             true
         }
         Event::Key { key, pressed: true, modifiers, .. } => {
+            // Emacs caret/edit chords (Ctrl+A / Ctrl+E / Ctrl+T) in the
+            // command editor. Ctrl is free here — the app's own
+            // shortcuts use Cmd (macOS) / Ctrl+Shift (Linux) — so we
+            // honour the readline tradition: Ctrl+A → line start,
+            // Ctrl+E → line end, Ctrl+T → transpose. Handled BEFORE the
+            // `Cmd+A` select-all below because on Linux egui reports
+            // Ctrl as both `ctrl` and `command`; on Linux this means
+            // Ctrl+A is line-start (select-all stays on Cmd+A on macOS).
+            // These are deliberately redundant with the Cmd+←/→ moves.
+            if modifiers.ctrl && !modifiers.shift && !modifiers.alt {
+                match key {
+                    Key::A => {
+                        if let Some(editor) = slot.session.editor_mut() {
+                            editor.move_home();
+                        }
+                        return true;
+                    }
+                    Key::E => {
+                        if let Some(editor) = slot.session.editor_mut() {
+                            editor.move_end();
+                        }
+                        return true;
+                    }
+                    Key::T => {
+                        slot.session.clear_history_recall();
+                        if let Some(editor) = slot.session.editor_mut() {
+                            editor.transpose_chars();
+                        }
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
             // Cmd+A — select all. Handled BEFORE the generic
             // "any modifier → bypass" gate.
             if modifiers.command && !modifiers.alt && matches!(key, Key::A) {
@@ -655,50 +729,23 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
             if modifiers.command || modifiers.alt {
                 return false;
             }
-            // `Ctrl+R` opens the history overlay. If the editor
-            // already has text, prefill the search box with it so
-            // a partial command pre-narrows the results — same UX
-            // as zsh's incremental history-search-backward.
-            if modifiers.ctrl && !modifiers.shift && matches!(key, Key::R) {
-                // Ctrl+R replaces a live completion popup with the
-                // history overlay — having both up at once is
-                // visually confusing and the overlay is the
-                // user's clear intent.
-                slot.ui.completion_popup = None;
-                slot.ui.completion_pending = None;
-                if let Some(history) = slot.session.history_ctx().cloned()
-                    && let Some(mut overlay) = crate::history_overlay::HistoryOverlay::open(
-                        &history,
-                        slot.session.pane_id(),
-                    )
-                {
-                    let prefill =
-                        slot.session.editor_mut().map(|e| e.text().to_string()).unwrap_or_default();
-                    if !prefill.is_empty() {
-                        overlay.query = prefill;
-                        let cwd = slot.session.terminal().cwd().map(|p| p.display().to_string());
-                        overlay.rerank(cwd.as_deref());
-                    }
-                    slot.ui.history_overlay = Some(overlay);
-                }
-                return true;
-            }
+            // `Ctrl+R` (history overlay) is handled by the central
+            // popup-combo interceptor in `render_pane` so it can also
+            // honour `Cmd+R` and close any other open popup first.
             // Emacs-style editing chords explicitly swallowed here so
             // they read as "editor territory, not yet wired" rather
             // than falling through. This is belt-and-braces: the
             // boundary gate ([`pty_passthrough_allowed`]) already
             // stops every non-signal chord from reaching the PTY, so
             // even chords NOT in this list (Ctrl+X/Y/Z, …) no longer
-            // leak. `Ctrl+C` is absent: the gate swallows it
-            // unconditionally (inert at an idle prompt). `Ctrl+D` is
-            // absent too: the gate lets the encoder send EOF on an
-            // empty editor.
+            // leak. `Ctrl+A`/`E`/`T` are absent — they're handled above
+            // (line-start / line-end / transpose). `Ctrl+C` is absent:
+            // the gate swallows it unconditionally (inert at an idle
+            // prompt). `Ctrl+D` is absent too: the gate lets the
+            // encoder send EOF on an empty editor.
             if modifiers.ctrl
                 && !modifiers.shift
-                && matches!(
-                    key,
-                    Key::A | Key::E | Key::K | Key::U | Key::W | Key::P | Key::N | Key::S | Key::G
-                )
+                && matches!(key, Key::K | Key::U | Key::W | Key::P | Key::N | Key::S | Key::G)
             {
                 return true;
             }
@@ -1005,6 +1052,12 @@ fn plan_event(
         },
     }
 }
+
+/// Left gutter (logical px) reserved at the pane's left edge for block
+/// chrome — currently the failed-block accent stripe. All block content
+/// (sealed snapshots, the live grid, the editor footer) is inset by this
+/// so the 3px red stripe sits flush-left in the gutter, never over text.
+const LEFT_GUTTER: f32 = 10.0;
 
 pub fn render_pane(
     ui: &mut egui::Ui,
@@ -1395,347 +1448,371 @@ pub fn render_pane(
     let git_ctx = slot.session.git_context().cloned();
     let pr_ctx = slot.session.pr_context().copied();
     let scroll_inner = scroll_area.show(ui, |ui| {
-        // Scrollback-jump-to-top (Cmd+Option+Up / Ctrl+Alt+Up): snap
-        // the next-widget-position (= top of content) to the TOP
-        // edge of the viewport BEFORE the spacer + blocks are laid
-        // out. Counterpart to the bottom-snap call at the end of
-        // this closure. No-op in alt-screen mode because no content
-        // is laid out there.
-        if force_to_top && !in_alt_screen {
-            ui.scroll_to_cursor(Some(egui::Align::TOP));
-        }
-        // Top spacer bottom-aligns short content (computed
-        // above). In alt-screen mode `content_h` is 0 and the
-        // alt-screen paint_terminal below claims the whole pane,
-        // so the spacer is harmless there too.
-        if top_spacer > 0.0 {
-            ui.add_space(top_spacer);
-        }
-        if in_alt_screen {
-            // Don't paint blocks or the editor — let
-            // paint_terminal below claim the full pane.
-        } else {
-            // ---- Block stack: command labels + snapshots ----------
-            //
-            // Walk every block. For `Sealed`: paint the command line
-            // first (teal — the user's typed command, which kernel-
-            // echo-suppression hid from the snapshot), then the
-            // frozen `Vec<StyledLine>` snapshot of the output, then
-            // a thin separator gap. For `Running` (only at the tail
-            // by invariant): paint the command label — the live
-            // `Term` painted after the loop carries the output as
-            // it streams in. For `Prompt` (only at the tail): paint
-            // nothing here; the live `Term` shows the shell's idle
-            // area (empty with `PS1=''`) and the editor overlay
-            // paints on top after `paint_terminal`.
-            //
-            // Phase 4G renders a dim cwd header line above each
-            // block; sealed blocks add a red "exit N" annotation
-            // for non-zero exits. Git branch / dirty / live
-            // duration chips defer to Phase 5's async-probe surface.
-            for block in slot.session.blocks().iter() {
-                match block {
-                    crate::block::Block::Sealed {
-                        id,
-                        command,
-                        snapshot,
-                        header,
-                        exit,
-                        duration,
-                        ..
-                    } => {
-                        let total_rows =
-                            (if command.is_empty() { 0 } else { command.split('\n').count() })
-                                + snapshot.len();
-                        let sel_for_this =
-                            pane_sel.as_ref().and_then(|s| s.block_range_for(*id, total_rows));
-                        let block_top = ui.next_widget_position().y;
-                        let sealed_render = render::paint_sealed_block(
-                            ui,
-                            command,
-                            snapshot,
-                            sel_for_this,
-                            render::BlockHeader {
-                                cwd: header.cwd.as_deref(),
-                                home,
-                                exit: *exit,
-                                duration: Some(*duration),
-                                git: header.git.as_ref(),
-                                ..Default::default()
-                            },
-                        );
-                        let cmd_h =
-                            sealed_render.command.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
-                        block_extents.push(BlockExtent {
-                            id: *id,
-                            top: block_top,
-                            bottom: sealed_render.bounding_rect().bottom(),
-                            sticky_h: sealed_render.header_height
-                                + capped_command_height(
-                                    cmd_h,
-                                    sealed_render.command_lines,
-                                    STICKY_MAX_CMD_LINES,
-                                ),
-                        });
-                        sealed_block_renders.push((*id, sealed_render));
-                        // Block separator — picked via
-                        // `cargo run --example pick_block_separator`
-                        // (variant `h10-18`). 10px gap + a barely-
-                        // there 1px hairline at alpha 0x18 + another
-                        // 10px gap. Total ~21px of "breath" between
-                        // blocks with the hairline centered.
-                        ui.add_space(render::BLOCK_SEPARATOR_GAP);
-                        let avail_w = ui.available_width();
-                        let (sep_rect, _) =
-                            ui.allocate_exact_size(egui::vec2(avail_w, 1.0), egui::Sense::hover());
-                        ui.painter().line_segment(
-                            [sep_rect.left_center(), sep_rect.right_center()],
-                            egui::Stroke::new(1.0, render::BLOCK_SEPARATOR_HAIRLINE),
-                        );
-                        ui.add_space(render::BLOCK_SEPARATOR_GAP);
-                    }
-                    crate::block::Block::Running { id, command, header, .. } => {
-                        let block_top = ui.next_widget_position().y;
-                        // Live ticking duration (4G-live-duration): the
-                        // running command's elapsed time, refreshed each
-                        // frame via the repaint scheduled above.
-                        // Running shows the git context captured at
-                        // command-start (frozen like its cwd / duration),
-                        // not the pane's live git — 4G-async-context.
-                        let hdr = render::paint_block_header(
-                            ui,
-                            render::BlockHeader {
-                                cwd: header.cwd.as_deref(),
-                                home,
-                                duration: running_elapsed,
-                                git: header.git.as_ref(),
-                                ..Default::default()
-                            },
-                        );
-                        let chip_h = hdr.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
-                        let cmd_resp =
-                            (!command.is_empty()).then(|| render::paint_command_label(ui, command));
-                        let cmd_lines =
-                            if command.is_empty() { 0 } else { command.split('\n').count() };
-                        let cmd_h = cmd_resp.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
-                        block_extents.push(BlockExtent {
-                            id: *id,
-                            top: block_top,
-                            bottom: ui.next_widget_position().y,
-                            sticky_h: chip_h
-                                + capped_command_height(cmd_h, cmd_lines, STICKY_MAX_CMD_LINES),
-                        });
-                    }
-                    crate::block::Block::Prompt { .. } => {
-                        // The `Prompt` block's chrome lives in
-                        // the fixed footer below the scroll area
-                        // (Phase 4D); the editor itself paints
-                        // there too. Nothing to draw here.
-                    }
+        egui::Frame::NONE
+            .inner_margin(egui::Margin { left: LEFT_GUTTER as i8, ..egui::Margin::ZERO })
+            .show(ui, |ui| {
+                // Scrollback-jump-to-top (Cmd+Option+Up / Ctrl+Alt+Up): snap
+                // the next-widget-position (= top of content) to the TOP
+                // edge of the viewport BEFORE the spacer + blocks are laid
+                // out. Counterpart to the bottom-snap call at the end of
+                // this closure. No-op in alt-screen mode because no content
+                // is laid out there.
+                if force_to_top && !in_alt_screen {
+                    ui.scroll_to_cursor(Some(egui::Align::TOP));
                 }
-            }
-
-            // ---- Phase 8 find highlights + scroll-to-match --------
-            //
-            // Paint translucent amber over every match in this pane's
-            // sealed blocks (current match brighter), then bring the
-            // current match into view. Both run here, after the block
-            // loop, because they need the per-block painted rects
-            // (`sealed_block_renders`) which only exist post-paint.
-            if !find_hl_by_block.is_empty() {
-                for (id, sr) in &sealed_block_renders {
-                    let Some(hl) = find_hl_by_block.get(id) else { continue };
-                    if let Some(cmd) = &sr.command {
-                        render::paint_match_highlights(
-                            ui.painter(),
-                            cmd.rect.min,
-                            cell_w,
-                            row_h,
-                            &hl.command,
-                        );
+                // Top spacer bottom-aligns short content (computed
+                // above). In alt-screen mode `content_h` is 0 and the
+                // alt-screen paint_terminal below claims the whole pane,
+                // so the spacer is harmless there too.
+                if top_spacer > 0.0 {
+                    ui.add_space(top_spacer);
+                }
+                if in_alt_screen {
+                    // Don't paint blocks or the editor — let
+                    // paint_terminal below claim the full pane.
+                } else {
+                    // ---- Block stack: command labels + snapshots ----------
+                    //
+                    // Walk every block. For `Sealed`: paint the command line
+                    // first (teal — the user's typed command, which kernel-
+                    // echo-suppression hid from the snapshot), then the
+                    // frozen `Vec<StyledLine>` snapshot of the output, then
+                    // a thin separator gap. For `Running` (only at the tail
+                    // by invariant): paint the command label — the live
+                    // `Term` painted after the loop carries the output as
+                    // it streams in. For `Prompt` (only at the tail): paint
+                    // nothing here; the live `Term` shows the shell's idle
+                    // area (empty with `PS1=''`) and the editor overlay
+                    // paints on top after `paint_terminal`.
+                    //
+                    // Phase 4G renders a dim cwd header line above each
+                    // block; sealed blocks add a red "exit N" annotation
+                    // for non-zero exits. Git branch / dirty / live
+                    // duration chips defer to Phase 5's async-probe surface.
+                    for block in slot.session.blocks().iter() {
+                        match block {
+                            crate::block::Block::Sealed {
+                                id,
+                                command,
+                                snapshot,
+                                header,
+                                exit,
+                                duration,
+                                ..
+                            } => {
+                                let total_rows = (if command.is_empty() {
+                                    0
+                                } else {
+                                    command.split('\n').count()
+                                }) + snapshot.len();
+                                let sel_for_this = pane_sel
+                                    .as_ref()
+                                    .and_then(|s| s.block_range_for(*id, total_rows));
+                                let block_top = ui.next_widget_position().y;
+                                let sealed_render = render::paint_sealed_block(
+                                    ui,
+                                    command,
+                                    snapshot,
+                                    sel_for_this,
+                                    render::BlockHeader {
+                                        cwd: header.cwd.as_deref(),
+                                        home,
+                                        exit: *exit,
+                                        duration: Some(*duration),
+                                        git: header.git.as_ref(),
+                                        ..Default::default()
+                                    },
+                                );
+                                let cmd_h = sealed_render
+                                    .command
+                                    .as_ref()
+                                    .map(|r| r.rect.height())
+                                    .unwrap_or(0.0);
+                                block_extents.push(BlockExtent {
+                                    id: *id,
+                                    top: block_top,
+                                    bottom: sealed_render.bounding_rect().bottom(),
+                                    sticky_h: sealed_render.header_height
+                                        + capped_command_height(
+                                            cmd_h,
+                                            sealed_render.command_lines,
+                                            STICKY_MAX_CMD_LINES,
+                                        ),
+                                });
+                                sealed_block_renders.push((*id, sealed_render));
+                                // Block separator — picked via
+                                // `cargo run --example pick_block_separator`
+                                // (variant `h10-18`). 10px gap + a barely-
+                                // there 1px hairline at alpha 0x18 + another
+                                // 10px gap. Total ~21px of "breath" between
+                                // blocks with the hairline centered.
+                                ui.add_space(render::BLOCK_SEPARATOR_GAP);
+                                let avail_w = ui.available_width();
+                                let (sep_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(avail_w, 1.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().line_segment(
+                                    [sep_rect.left_center(), sep_rect.right_center()],
+                                    egui::Stroke::new(1.0, render::BLOCK_SEPARATOR_HAIRLINE),
+                                );
+                                ui.add_space(render::BLOCK_SEPARATOR_GAP);
+                            }
+                            crate::block::Block::Running { id, command, header, .. } => {
+                                let block_top = ui.next_widget_position().y;
+                                // Live ticking duration (4G-live-duration): the
+                                // running command's elapsed time, refreshed each
+                                // frame via the repaint scheduled above.
+                                // Running shows the git context captured at
+                                // command-start (frozen like its cwd / duration),
+                                // not the pane's live git — 4G-async-context.
+                                let hdr = render::paint_block_header(
+                                    ui,
+                                    render::BlockHeader {
+                                        cwd: header.cwd.as_deref(),
+                                        home,
+                                        duration: running_elapsed,
+                                        git: header.git.as_ref(),
+                                        ..Default::default()
+                                    },
+                                );
+                                let chip_h = hdr.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
+                                let cmd_resp = (!command.is_empty())
+                                    .then(|| render::paint_command_label(ui, command));
+                                let cmd_lines = if command.is_empty() {
+                                    0
+                                } else {
+                                    command.split('\n').count()
+                                };
+                                let cmd_h =
+                                    cmd_resp.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
+                                block_extents.push(BlockExtent {
+                                    id: *id,
+                                    top: block_top,
+                                    bottom: ui.next_widget_position().y,
+                                    sticky_h: chip_h
+                                        + capped_command_height(
+                                            cmd_h,
+                                            cmd_lines,
+                                            STICKY_MAX_CMD_LINES,
+                                        ),
+                                });
+                            }
+                            crate::block::Block::Prompt { .. } => {
+                                // The `Prompt` block's chrome lives in
+                                // the fixed footer below the scroll area
+                                // (Phase 4D); the editor itself paints
+                                // there too. Nothing to draw here.
+                            }
+                        }
                     }
-                    render::paint_match_highlights(
-                        ui.painter(),
-                        sr.snapshot.rect.min,
-                        cell_w,
-                        row_h,
-                        &hl.output,
-                    );
-                }
-            }
-            if find_scrolling
-                && let Some(m) = &find_selected_match
-                && let Some((_, sr)) = sealed_block_renders.iter().find(|(id, _)| *id == m.block_id)
-            {
-                let origin = match m.kind {
-                    crate::find::LineKind::Command => sr.command.as_ref().map(|r| r.rect.min),
-                    crate::find::LineKind::Output => Some(sr.snapshot.rect.min),
-                };
-                if let Some(o) = origin {
-                    let y = o.y + m.row as f32 * row_h;
-                    // Extend the target rect UP by the height of this
-                    // block's sticky-top header (the pinned chrome +
-                    // capped command). An output match scrolled flush to
-                    // the viewport top would otherwise land *behind* that
-                    // pinned header; raising the rect's top makes egui
-                    // scroll a header's-worth further so the match clears
-                    // it. Command matches need no margin — when their
-                    // block pins, the command IS the pinned header.
-                    let header_margin = if matches!(m.kind, crate::find::LineKind::Output) {
-                        block_extents
-                            .iter()
-                            .find(|e| e.id == m.block_id)
-                            .map(|e| e.sticky_h)
-                            .unwrap_or(0.0)
-                    } else {
-                        0.0
-                    };
-                    let rect = egui::Rect::from_min_max(
-                        egui::pos2(o.x + m.col_start as f32 * cell_w, y - header_margin),
-                        egui::pos2(o.x + m.col_end as f32 * cell_w, y + row_h),
-                    );
-                    // `None` align scrolls the *minimum* to make the
-                    // (header-padded) match rect visible — a no-op when
-                    // it's already fully in view (egui's "already in view
-                    // → delta 0" branch), so a keystroke / Prev / Next
-                    // that doesn't move the match doesn't re-scroll. The
-                    // default animation plays from the CURRENT offset
-                    // (we no longer reset to the top), so it's a short
-                    // glide, not a jump from the top of scrollback.
-                    ui.scroll_to_rect(rect, None);
-                }
-            }
-        } // end of `if !in_alt_screen { ... }`
 
-        // ---- Live terminal ------------------------------------
-        //
-        // Pre-compute hover geometry so the hit-test happens in
-        // the same frame as the paint — no one-frame lag on the
-        // Cmd-hover underline.
-        let display_offset = slot.session.terminal().display_offset() as i32;
-        let grid_rows = slot.session.terminal().grid().screen_lines();
-        let grid_cols = slot.session.terminal().grid().columns();
-        let origin = ui.next_widget_position();
-        let geom = selection::GridGeometry {
-            origin_x: origin.x,
-            origin_y: origin.y,
-            cell_w,
-            row_h,
-            display_offset,
-            screen_lines: grid_rows,
-            cols: grid_cols,
-        };
+                    // ---- Phase 8 find highlights + scroll-to-match --------
+                    //
+                    // Paint translucent amber over every match in this pane's
+                    // sealed blocks (current match brighter), then bring the
+                    // current match into view. Both run here, after the block
+                    // loop, because they need the per-block painted rects
+                    // (`sealed_block_renders`) which only exist post-paint.
+                    if !find_hl_by_block.is_empty() {
+                        for (id, sr) in &sealed_block_renders {
+                            let Some(hl) = find_hl_by_block.get(id) else { continue };
+                            if let Some(cmd) = &sr.command {
+                                render::paint_match_highlights(
+                                    ui.painter(),
+                                    cmd.rect.min,
+                                    cell_w,
+                                    row_h,
+                                    &hl.command,
+                                );
+                            }
+                            render::paint_match_highlights(
+                                ui.painter(),
+                                sr.snapshot.rect.min,
+                                cell_w,
+                                row_h,
+                                &hl.output,
+                            );
+                        }
+                    }
+                    if find_scrolling
+                        && let Some(m) = &find_selected_match
+                        && let Some((_, sr)) =
+                            sealed_block_renders.iter().find(|(id, _)| *id == m.block_id)
+                    {
+                        let origin = match m.kind {
+                            crate::find::LineKind::Command => {
+                                sr.command.as_ref().map(|r| r.rect.min)
+                            }
+                            crate::find::LineKind::Output => Some(sr.snapshot.rect.min),
+                        };
+                        if let Some(o) = origin {
+                            let y = o.y + m.row as f32 * row_h;
+                            // Extend the target rect UP by the height of this
+                            // block's sticky-top header (the pinned chrome +
+                            // capped command). An output match scrolled flush to
+                            // the viewport top would otherwise land *behind* that
+                            // pinned header; raising the rect's top makes egui
+                            // scroll a header's-worth further so the match clears
+                            // it. Command matches need no margin — when their
+                            // block pins, the command IS the pinned header.
+                            let header_margin = if matches!(m.kind, crate::find::LineKind::Output) {
+                                block_extents
+                                    .iter()
+                                    .find(|e| e.id == m.block_id)
+                                    .map(|e| e.sticky_h)
+                                    .unwrap_or(0.0)
+                            } else {
+                                0.0
+                            };
+                            let rect = egui::Rect::from_min_max(
+                                egui::pos2(o.x + m.col_start as f32 * cell_w, y - header_margin),
+                                egui::pos2(o.x + m.col_end as f32 * cell_w, y + row_h),
+                            );
+                            // `None` align scrolls the *minimum* to make the
+                            // (header-padded) match rect visible — a no-op when
+                            // it's already fully in view (egui's "already in view
+                            // → delta 0" branch), so a keystroke / Prev / Next
+                            // that doesn't move the match doesn't re-scroll. The
+                            // default animation plays from the CURRENT offset
+                            // (we no longer reset to the top), so it's a short
+                            // glide, not a jump from the top of scrollback.
+                            ui.scroll_to_rect(rect, None);
+                        }
+                    }
+                } // end of `if !in_alt_screen { ... }`
 
-        let grid_ref = slot.session.terminal().grid();
-        let mut links_in_view = links::scan_visible_links(grid_ref);
-        let cwd = slot.session.terminal().cwd().map(|p| p.to_path_buf());
-        let path_spans = paths::scan_visible_paths(grid_ref, cwd.as_deref(), home);
-        links_in_view.extend(path_spans);
-
-        let hover_link: Option<LinkSpan> = pointer_pos.and_then(|pos| {
-            let in_grid = pos.x >= origin.x
-                && pos.x < origin.x + grid_cols as f32 * cell_w
-                && pos.y >= origin.y
-                && pos.y < origin.y + grid_rows as f32 * row_h;
-            if !in_grid {
-                return None;
-            }
-            let pt = pixel_to_grid_point(pos.x, pos.y, geom);
-            links_in_view.iter().find(|l| l.contains(pt)).cloned()
-        });
-        let highlighted_link = if modifier_held { hover_link.as_ref() } else { None };
-
-        // Hide the live `Term`'s cursor when the editor is
-        // active — otherwise the user sees TWO cursors (the
-        // shell's one and the editor's overlay). The editor's
-        // cursor is the real input caret in this mode.
-        let hide_term_cursor = slot.session.editor_is_active();
-        // Use the `will_paint_live_term` decision computed
-        // before the closure (see comment up there for the
-        // full reasoning). The two paths must agree: the
-        // bottom-align spacer's `content_h` only includes the
-        // grid height when we actually paint it.
-        let rendered = if will_paint_live_term {
-            // `slot.ui.focused` reflects the previous frame's
-            // focus state — close enough for cursor-tint, which
-            // would otherwise force two paint passes per frame.
-            // A one-frame lag on the focus tint is invisible.
-            //
-            // `include_history = !in_alt_screen`: outside alt-screen
-            // mode, render the entire grid (history + viewport) so
-            // a running command's output stays end-to-end visible
-            // — the outer ScrollArea handles navigation. In alt-
-            // screen mode there's no scrollback to include and the
-            // running program owns the screen at fixed size.
-            // Cell-cursor focus state per spec/02 (cross-ref to
-            // spec/04's caret-visibility rule): the bright `CURSOR_COLOR`
-            // is reserved for "this is where your next keypress
-            // lands." Both pane focus AND OS window foreground must
-            // be true; otherwise we render the dim/hollow color.
-            let cell_cursor_focused = slot.ui.focused && ctx.input(|i| i.focused);
-            render::paint_terminal(
-                ui,
-                slot.session.terminal(),
-                selection.as_ref(),
-                highlighted_link,
-                hide_term_cursor,
-                cell_cursor_focused,
-                !in_alt_screen,
-            )
-        } else {
-            // Synthetic empty `TerminalRender` for the editor-
-            // active case. `Sense::hover()` — NOT click/drag — so
-            // the placeholder cannot accidentally claim focus.
-            // Focus belongs to the editor footer (built below)
-            // and `focus_response` selects it explicitly; if this
-            // widget were focusable, egui's auto-id machinery
-            // could route focus here instead and the caret would
-            // never appear in the footer.
-            let origin = ui.next_widget_position();
-            let (_rect, response) =
-                ui.allocate_exact_size(egui::Vec2::new(1.0, 1.0), egui::Sense::hover());
-            render::TerminalRender {
-                response,
-                geometry: selection::GridGeometry {
+                // ---- Live terminal ------------------------------------
+                //
+                // Pre-compute hover geometry so the hit-test happens in
+                // the same frame as the paint — no one-frame lag on the
+                // Cmd-hover underline.
+                let display_offset = slot.session.terminal().display_offset() as i32;
+                let grid_rows = slot.session.terminal().grid().screen_lines();
+                let grid_cols = slot.session.terminal().grid().columns();
+                let origin = ui.next_widget_position();
+                let geom = selection::GridGeometry {
                     origin_x: origin.x,
                     origin_y: origin.y,
                     cell_w,
                     row_h,
-                    display_offset: 0,
-                    screen_lines: 0,
-                    cols: 0,
-                },
-            }
-        };
+                    display_offset,
+                    screen_lines: grid_rows,
+                    cols: grid_cols,
+                };
 
-        // Extend the running block's extent to the bottom of the live
-        // terminal output just painted (4E sticky headers). The block
-        // loop only saw the running block's header + command label;
-        // its streaming output is the live grid painted here, BELOW
-        // that. Without this the sticky header releases at the command-
-        // label bottom instead of the true content bottom, so scrolling
-        // up through a running command's output loses the pin partway
-        // — the symptom is "sticky for a bit, then scrolls past,"
-        // unlike a sealed block whose snapshot bottom is the real
-        // bottom. Only the tail can be `Running`, so its extent is the
-        // last one pushed.
-        if matches!(slot.session.blocks().last(), Some(crate::block::Block::Running { .. }))
-            && let Some(last) = block_extents.last_mut()
-        {
-            last.bottom = last.bottom.max(rendered.response.rect.bottom());
-        }
+                let grid_ref = slot.session.terminal().grid();
+                let mut links_in_view = links::scan_visible_links(grid_ref);
+                let cwd = slot.session.terminal().cwd().map(|p| p.to_path_buf());
+                let path_spans = paths::scan_visible_paths(grid_ref, cwd.as_deref(), home);
+                links_in_view.extend(path_spans);
 
-        // If the user just submitted a command, snap to the bottom
-        // of the now-laid-out content. `scroll_to_cursor` aligns the
-        // *next* widget position (which is past everything we've
-        // added above) with the requested edge of the viewport —
-        // equivalent to "scroll all the way down" but using a
-        // finite, well-defined offset that egui clamps correctly.
-        if force_to_bottom {
-            ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
-        }
+                let hover_link: Option<LinkSpan> = pointer_pos.and_then(|pos| {
+                    let in_grid = pos.x >= origin.x
+                        && pos.x < origin.x + grid_cols as f32 * cell_w
+                        && pos.y >= origin.y
+                        && pos.y < origin.y + grid_rows as f32 * row_h;
+                    if !in_grid {
+                        return None;
+                    }
+                    let pt = pixel_to_grid_point(pos.x, pos.y, geom);
+                    links_in_view.iter().find(|l| l.contains(pt)).cloned()
+                });
+                let highlighted_link = if modifier_held { hover_link.as_ref() } else { None };
 
-        (rendered, links_in_view, highlighted_link.cloned())
+                // Hide the live `Term`'s cursor when the editor is
+                // active — otherwise the user sees TWO cursors (the
+                // shell's one and the editor's overlay). The editor's
+                // cursor is the real input caret in this mode.
+                let hide_term_cursor = slot.session.editor_is_active();
+                // Use the `will_paint_live_term` decision computed
+                // before the closure (see comment up there for the
+                // full reasoning). The two paths must agree: the
+                // bottom-align spacer's `content_h` only includes the
+                // grid height when we actually paint it.
+                let rendered = if will_paint_live_term {
+                    // `slot.ui.focused` reflects the previous frame's
+                    // focus state — close enough for cursor-tint, which
+                    // would otherwise force two paint passes per frame.
+                    // A one-frame lag on the focus tint is invisible.
+                    //
+                    // `include_history = !in_alt_screen`: outside alt-screen
+                    // mode, render the entire grid (history + viewport) so
+                    // a running command's output stays end-to-end visible
+                    // — the outer ScrollArea handles navigation. In alt-
+                    // screen mode there's no scrollback to include and the
+                    // running program owns the screen at fixed size.
+                    // Cell-cursor focus state per spec/02 (cross-ref to
+                    // spec/04's caret-visibility rule): the bright `CURSOR_COLOR`
+                    // is reserved for "this is where your next keypress
+                    // lands." Both pane focus AND OS window foreground must
+                    // be true; otherwise we render the dim/hollow color.
+                    let cell_cursor_focused = slot.ui.focused && ctx.input(|i| i.focused);
+                    render::paint_terminal(
+                        ui,
+                        slot.session.terminal(),
+                        selection.as_ref(),
+                        highlighted_link,
+                        hide_term_cursor,
+                        cell_cursor_focused,
+                        !in_alt_screen,
+                    )
+                } else {
+                    // Synthetic empty `TerminalRender` for the editor-
+                    // active case. `Sense::hover()` — NOT click/drag — so
+                    // the placeholder cannot accidentally claim focus.
+                    // Focus belongs to the editor footer (built below)
+                    // and `focus_response` selects it explicitly; if this
+                    // widget were focusable, egui's auto-id machinery
+                    // could route focus here instead and the caret would
+                    // never appear in the footer.
+                    let origin = ui.next_widget_position();
+                    let (_rect, response) =
+                        ui.allocate_exact_size(egui::Vec2::new(1.0, 1.0), egui::Sense::hover());
+                    render::TerminalRender {
+                        response,
+                        geometry: selection::GridGeometry {
+                            origin_x: origin.x,
+                            origin_y: origin.y,
+                            cell_w,
+                            row_h,
+                            display_offset: 0,
+                            screen_lines: 0,
+                            cols: 0,
+                        },
+                    }
+                };
+
+                // Extend the running block's extent to the bottom of the live
+                // terminal output just painted (4E sticky headers). The block
+                // loop only saw the running block's header + command label;
+                // its streaming output is the live grid painted here, BELOW
+                // that. Without this the sticky header releases at the command-
+                // label bottom instead of the true content bottom, so scrolling
+                // up through a running command's output loses the pin partway
+                // — the symptom is "sticky for a bit, then scrolls past,"
+                // unlike a sealed block whose snapshot bottom is the real
+                // bottom. Only the tail can be `Running`, so its extent is the
+                // last one pushed.
+                if matches!(slot.session.blocks().last(), Some(crate::block::Block::Running { .. }))
+                    && let Some(last) = block_extents.last_mut()
+                {
+                    last.bottom = last.bottom.max(rendered.response.rect.bottom());
+                }
+
+                // If the user just submitted a command, snap to the bottom
+                // of the now-laid-out content. `scroll_to_cursor` aligns the
+                // *next* widget position (which is past everything we've
+                // added above) with the requested edge of the viewport —
+                // equivalent to "scroll all the way down" but using a
+                // finite, well-defined offset that egui clamps correctly.
+                if force_to_bottom {
+                    ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+                }
+
+                (rendered, links_in_view, highlighted_link.cloned())
+            })
+            .inner
     });
     let scroll_viewport = scroll_inner.inner_rect;
     let (rendered, links_in_view, highlighted_link) = scroll_inner.inner;
@@ -1900,8 +1977,14 @@ pub fn render_pane(
     let mut editor_response: Option<egui::Response> = None;
     if footer_h > 0.0 {
         let chip_h = if has_prompt_cwd { row_h + 2.0 * render::CHIP_PAD_Y } else { 0.0 };
-        let editor_h = footer_h - chip_h;
-        let footer_origin = ui.next_widget_position();
+        // Exclude the bottom-margin reserve from the editor/glow height
+        // so the chrome floats above the pane bottom (the margin is the
+        // empty strip below it).
+        let editor_h = footer_h - chip_h - FOOTER_GLOW_BOTTOM_MARGIN;
+        // Inset by the same left gutter as the scrolled block content so
+        // the prompt's cwd chip + editor line up with the sealed blocks
+        // above (which are indented for the failed-block accent stripe).
+        let footer_origin = ui.next_widget_position() + egui::vec2(LEFT_GUTTER, 0.0);
 
         // Caret visibility per spec/04 "When is the caret shown?":
         // mode-is-editor + pane keyboard focus + OS window foreground.
@@ -1921,17 +2004,23 @@ pub fn render_pane(
         {
             // The live prompt shows current git + the PR chip (number +
             // live CI color) — the "now, about to act" state. Vivid (not
-            // faded).
-            let _ = render::paint_block_header(
-                ui,
-                render::BlockHeader {
-                    cwd: header.cwd.as_deref(),
-                    home,
-                    git: git_ctx.as_ref(),
-                    pr: pr_ctx.as_ref(),
-                    ..Default::default()
-                },
-            );
+            // faded). Indent by the same `LEFT_GUTTER` as the editor and
+            // the sealed-block chips above — `paint_block_header`
+            // otherwise allocates at the ui's left edge, leaving the
+            // prompt chip hard-left while the editor / glow were inset.
+            ui.horizontal(|ui| {
+                ui.add_space(LEFT_GUTTER);
+                let _ = render::paint_block_header(
+                    ui,
+                    render::BlockHeader {
+                        cwd: header.cwd.as_deref(),
+                        home,
+                        git: git_ctx.as_ref(),
+                        pr: pr_ctx.as_ref(),
+                        ..Default::default()
+                    },
+                );
+            });
         }
 
         // Allocate the editor strip and paint into it. The widget
@@ -2142,8 +2231,21 @@ pub fn render_pane(
             } else {
                 None
             };
-            let combined =
-                egui::Rect::from_min_size(footer_origin, egui::vec2(body_w, chip_h + editor_h));
+            // The chrome (glow / outline) wraps the chip+editor with a
+            // little pad on each side so its stroke doesn't sit ON the
+            // chip edge (left) or fall off the pane's right edge (right)
+            // — on the rightmost pane `pane_clip.right()` IS the window
+            // edge, so a flush right edge gets clipped. Both sides float
+            // a few px inside the pane.
+            const CHROME_LEFT_PAD: f32 = 4.0;
+            const CHROME_RIGHT_PAD: f32 = 6.0;
+            let combined = egui::Rect::from_min_max(
+                egui::pos2(footer_origin.x - CHROME_LEFT_PAD, footer_origin.y),
+                egui::pos2(
+                    pane_clip.right() - CHROME_RIGHT_PAD,
+                    footer_origin.y + chip_h + editor_h,
+                ),
+            );
             // Chrome painter: layer-painter (so we're not clipped
             // to the footer's tight vertical clip — variants paint
             // a few px above + below the body, which `ui.painter()`
@@ -2813,6 +2915,57 @@ pub fn render_pane(
     // bold via the Behavior.
     slot.ui.focused = focus_response.has_focus();
 
+    // ---- popup-switch combos (run even without grid focus) ------
+    //
+    // When a popup is open its `TextEdit` holds egui focus, so the
+    // pane's grid loses `had_focus_at_frame_start` and the main
+    // keyboard block below is skipped. The combos that *switch
+    // between* popups must still fire, so they live here, gated on
+    // "pane had focus OR a popup is open in this pane". Each closes
+    // whatever is open and opens the requested one:
+    //   - `Cmd+/` (Ctrl+/) → keybindings sheet
+    //   - `Cmd+F` (Ctrl+Shift+F) → find (staged; opened in app.rs)
+    //   - `Ctrl/Cmd+R` → history
+    // Tab is deliberately NOT handled here — it's left for each
+    // popup's own use (e.g. history scope toggle).
+    let any_popup_open = slot.ui.find_overlay.is_some()
+        || slot.ui.history_overlay.is_some()
+        || slot.ui.keybindings_open
+        || slot.ui.completion_popup.is_some();
+    if !modal_open && (had_focus_at_frame_start || any_popup_open) {
+        let is_macos = cfg!(target_os = "macos");
+        let editor_active = slot.session.editor_is_active();
+        let events: Vec<egui::Event> = ctx.input(|i| i.events.clone());
+        for event in &events {
+            let egui::Event::Key { key, pressed: true, modifiers, .. } = event else { continue };
+            let plain = !modifiers.shift && !modifiers.alt;
+            if plain
+                && modifiers.command
+                && matches!(key, egui::Key::Slash | egui::Key::Questionmark)
+            {
+                close_all_popups(slot);
+                slot.ui.keybindings_open = true;
+                break;
+            }
+            if matches!(
+                match_pane_shortcut(*key, *modifiers, is_macos),
+                Some(crate::pane_slot::PaneAction::OpenFind)
+            ) {
+                // app.rs's OpenFind closes the other popups + opens find.
+                slot.ui.pending_action = Some(crate::pane_slot::PaneAction::OpenFind);
+                break;
+            }
+            if editor_active
+                && plain
+                && (modifiers.ctrl || modifiers.mac_cmd)
+                && matches!(key, egui::Key::R)
+            {
+                open_history_overlay(slot);
+                break;
+            }
+        }
+    }
+
     // ---- keyboard input, focus-gated ----------------------------
     //
     // Use `had_focus_at_frame_start` rather than
@@ -2912,6 +3065,12 @@ pub fn render_pane(
         let modes = slot.session.terminal().modes();
         let editor_active = slot.session.editor_is_active();
 
+        // (Popup-switch combos — `Cmd+/`, `Cmd+F`, `Ctrl/Cmd+R` — are
+        // handled earlier, OUTSIDE the grid-focus gate, so they fire
+        // even while a popup's TextEdit holds focus. `Cmd+R` opening
+        // history from scratch is in `apply_event_to_editor`'s sibling
+        // path. Tab is intentionally left to each popup's own use.)
+
         // ---- mouse wheel, hover-gated ---------------------------
         //
         // Non-alt-screen scrolling is handled by the outer
@@ -2984,6 +3143,12 @@ pub fn render_pane(
             // open its `TextEdit` + `ctx.input` navigation checks own
             // the keyboard; skip the editor / PTY paths so nothing leaks.
             if slot.ui.find_overlay.is_some() {
+                continue;
+            }
+            // The keybindings cheat-sheet is modal too: it owns Esc (to
+            // close) and otherwise swallows keystrokes so nothing leaks
+            // to the editor / PTY while the user is reading it.
+            if slot.ui.keybindings_open {
                 continue;
             }
             // ---- Tab completion popup interception -----------------
@@ -3384,6 +3549,23 @@ pub fn render_pane(
         }
     }
 
+    // Cmd+/ keyboard-shortcuts cheat-sheet, on top of everything.
+    if slot.ui.keybindings_open {
+        let pane_rect = ui.max_rect();
+        let pane_id = slot.session.pane_id();
+        let is_macos = cfg!(target_os = "macos");
+        if crate::keybindings::paint(
+            ui,
+            pane_id,
+            pane_rect,
+            is_macos,
+            &mut slot.ui.keybindings_query,
+        ) {
+            slot.ui.keybindings_open = false;
+            slot.ui.needs_focus = true;
+        }
+    }
+
     // ---- blank-pane watermark overlay ---------------------------
     //
     // Painted last, on top of the terminal's opaque fill, so the faint
@@ -3586,14 +3768,17 @@ mod tests {
         let chip_pad = 2.0 * render::CHIP_PAD_Y;
         assert_eq!(
             compute_footer_height(true, true, 1, true, 20.0),
-            40.0 + chip_pad + FOOTER_DESCENDER_PAD
+            40.0 + chip_pad + FOOTER_DESCENDER_PAD + FOOTER_GLOW_BOTTOM_MARGIN
         );
     }
 
     #[test]
     fn single_line_editor_without_cwd_yields_one_row_plus_descender_pad() {
         // No chrome row when cwd is unknown — no chip padding either.
-        assert_eq!(compute_footer_height(true, true, 1, false, 20.0), 20.0 + FOOTER_DESCENDER_PAD);
+        assert_eq!(
+            compute_footer_height(true, true, 1, false, 20.0),
+            20.0 + FOOTER_DESCENDER_PAD + FOOTER_GLOW_BOTTOM_MARGIN
+        );
     }
 
     #[test]
@@ -3601,7 +3786,7 @@ mod tests {
         let chip_pad = 2.0 * render::CHIP_PAD_Y;
         assert_eq!(
             compute_footer_height(true, true, 3, true, 20.0),
-            80.0 + chip_pad + FOOTER_DESCENDER_PAD
+            80.0 + chip_pad + FOOTER_DESCENDER_PAD + FOOTER_GLOW_BOTTOM_MARGIN
         );
     }
 
@@ -3611,7 +3796,7 @@ mod tests {
         let chip_pad = 2.0 * render::CHIP_PAD_Y;
         assert_eq!(
             compute_footer_height(true, true, 0, true, 20.0),
-            40.0 + chip_pad + FOOTER_DESCENDER_PAD
+            40.0 + chip_pad + FOOTER_DESCENDER_PAD + FOOTER_GLOW_BOTTOM_MARGIN
         );
     }
 

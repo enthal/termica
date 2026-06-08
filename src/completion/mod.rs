@@ -107,6 +107,18 @@ fn local_candidates_at(
     let pathish = local::token_is_pathish(token);
     let cmd_pos = local::is_command_position(editor_text, cursor);
 
+    // ---- $VAR env-var name source (exclusive) ---------------------
+    //
+    // A `$`-prefixed token with no `/` is an environment-variable
+    // reference being typed: `$` lists every var, `$HO` narrows to
+    // `$HOME` / `$HOSTNAME`, … This is exclusive — a `$foo` token is
+    // neither a path nor a command, so the other sources don't run.
+    if let Some(var_prefix) = local::env_var_prefix(token) {
+        let names: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
+        let cands = local::complete_env_vars(var_prefix, &names);
+        return (token_start, token.to_string(), cands);
+    }
+
     let mut sources: Vec<Vec<CompletionCandidate>> = Vec::new();
 
     // ---- Path source ----------------------------------------------
@@ -667,6 +679,9 @@ pub enum CompletionSource {
     /// A previous command from `runs` history, prefix-matching the
     /// typed token.
     History,
+    /// An environment-variable name, completing a `$`-prefixed token
+    /// (`$` → all vars, `$HO` → `$HOME`, `$HOSTNAME`, …).
+    EnvVar,
     /// A candidate from a CLI-native completion driver — the tool's own
     /// `__complete` endpoint ([`drivers`]). Carries the tool so the popup
     /// can tag the row (`k8s` / `gh` / …) and the ranker can weight it.
@@ -680,6 +695,7 @@ impl CompletionSource {
             CompletionSource::Path => "path",
             CompletionSource::PathExecutable => "$PATH",
             CompletionSource::History => "history",
+            CompletionSource::EnvVar => "env",
             CompletionSource::Driver(tool) => tool.tag(),
         }
     }

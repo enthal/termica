@@ -104,15 +104,21 @@ Shortcuts use **Cmd** on macOS and **Ctrl+Shift** on Linux.
 | Clear scrollback | Cmd+K | Ctrl+Shift+K |
 | Scroll through scrollback | Cmd+Option+↑ / ↓ | Ctrl+Alt+↑ / ↓ |
 | Find in pane | Cmd+F | Ctrl+Shift+F |
+| Keyboard shortcuts | Cmd+/ | Ctrl+/ |
 | Quit | Cmd+Q | Ctrl+Shift+Q |
+
+Press **Cmd+/** (**Ctrl+/** on Linux) any time for the full,
+platform-local cheat-sheet.
 
 At the prompt:
 
 | Action | Key |
 | --- | --- |
 | Recall previous / next command | ↑ / ↓ |
-| Fuzzy-search history | Ctrl+R |
+| History search | Cmd+R or Ctrl+R |
 | Tab completion | Tab |
+| Caret to line start / end | Ctrl+A / Ctrl+E |
+| Transpose characters | Ctrl+T |
 
 ## How it works
 

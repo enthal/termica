@@ -202,7 +202,7 @@ pub fn paint_overlay(
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.set_width(panel_w);
                 ui.horizontal(|ui| {
-                    ui.strong("Ctrl-R");
+                    ui.strong("History");
                     ui.label(format!("scope: {scope_text}"));
                     // Push the keybinding hint to the right edge so
                     // the leading title isn't crowded against it.

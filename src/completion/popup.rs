@@ -273,14 +273,25 @@ pub fn paint_searching(ctx: &egui::Context, anchor: egui::Pos2, pane_id: u64) {
         });
 }
 
-/// Bottom-of-popup keybinding strip. Per CLAUDE.md
-/// "no Unicode pictographic icons in widget code" — Unicode
-/// arrows (`↑`/`↓`) render as tofu on some font setups. Plain
-/// text "Up/Down" is the v1 stand-in until an `icons.rs` module
-/// (planned in [spec/06 §Iconography](../../spec/06-workspace-and-tiles.md#iconography))
-/// supplies real triangle glyphs via `egui::Painter`.
+/// Bottom-of-popup keybinding strip. The navigate hint uses the drawn
+/// up/down arrow glyphs from [`crate::icons`] (Unicode `↑`/`↓` render
+/// as tofu on some font setups — CLAUDE.md "no Unicode symbols for
+/// icons").
 fn paint_keybind_hint(ui: &mut egui::Ui) {
-    ui.weak("[Tab / Enter] accept   [Up / Down] navigate   [Esc] cancel");
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.weak("Tab / Enter accept");
+        ui.weak("·");
+        let color = ui.visuals().weak_text_color();
+        let h = ui.text_style_height(&egui::TextStyle::Body);
+        for down in [false, true] {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(h * 0.7, h), egui::Sense::hover());
+            crate::icons::paint_arrow_glyph(ui.painter(), rect, color, down);
+        }
+        ui.weak("navigate");
+        ui.weak("·");
+        ui.weak("Esc cancel");
+    });
 }
 
 fn paint_row(ui: &mut egui::Ui, cand: &CompletionCandidate, selected: bool) -> egui::Response {

@@ -386,7 +386,10 @@ impl TermicaApp {
                 if let Some(slot) = self.panes.get_mut(&pane_id)
                     && !slot.session.terminal().is_alternate_screen()
                 {
+                    // Popups are mutually exclusive — close the others.
                     slot.ui.history_overlay = None;
+                    slot.ui.completion_popup = None;
+                    slot.ui.keybindings_open = false;
                     // Seed from the pane's persisted query history so a
                     // reopen after Esc still has the dropdown populated.
                     let history = slot.ui.find_history.clone();
@@ -626,7 +629,12 @@ impl eframe::App for TermicaApp {
         let modal_open = self.pending_close_confirm.is_some()
             || self.quit_confirm_started_at.is_some()
             || self.about_open;
-        egui::CentralPanel::default().show(ctx, |ui| {
+        // Edge-to-edge: drop the CentralPanel's default ~8px inner
+        // margin so panes (and the failed-block left stripe) sit flush
+        // against the window edges, like a normal terminal.
+        let central_frame =
+            egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::ZERO);
+        egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
             let mut behavior = TabBehavior {
                 panes: &mut self.panes,
                 home: self.home.as_deref(),

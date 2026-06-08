@@ -26,6 +26,9 @@ use super::{CompletionCandidate, CompletionSource};
 fn source_weight(s: CompletionSource) -> f32 {
     match s {
         CompletionSource::Driver(_) => 1.2,
+        // Env-var completion is exclusive (its own popup), so this
+        // weight only matters if it ever shares a merge; rank it high.
+        CompletionSource::EnvVar => 1.0,
         CompletionSource::History => 1.0,
         CompletionSource::PathExecutable => 0.8,
         CompletionSource::Path => 0.6,
