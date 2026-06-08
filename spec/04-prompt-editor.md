@@ -285,7 +285,7 @@ Tab is local completion. It does **not** send `\t` to the PTY.
 
 Ranking: prefer recent / same-cwd / non-zero-exit-history matches. The popup is a native egui widget with arrow-key navigation and Tab/Enter to accept.
 
-**Post-MVP**, the engine grows two more sources behind the same popup: **CLI-native drivers** (`kubectl __complete`, `gh __complete`, cobra `__complete`, `aws_completer`, `git --list-cmds`, …) and a **per-pane shell sidecar** (bash / zsh / fish loaded with the user's rc, talking to Termica over a private stdio JSON protocol). The full design — protocol, lifecycle, ranking, caching, failure modes — lives in [04a — Tab completion](04a-completion.md). Slices land as separate PRs starting with CLI-native drivers, then fish (the easiest sidecar), then bash, then zsh.
+**Post-MVP**, the engine grows two more sources behind the same popup: **CLI-native drivers** (`kubectl __complete`, `gh __complete`, cobra `__complete`, `aws_completer`, `git --list-cmds`, …) — *shipped*; candidates stream in off-thread and merge into the open popup without disturbing the user's selection — and a **per-pane shell sidecar** (bash / zsh / fish loaded with the user's rc, talking to Termica over a private stdio JSON protocol). The full design — protocol, lifecycle, ranking, caching, failure modes — lives in [04a — Tab completion](04a-completion.md). Slices land as separate PRs: CLI-native drivers (done), then fish (the easiest sidecar), then bash, then zsh.
 
 ## Syntax highlighting
 

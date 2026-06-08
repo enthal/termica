@@ -665,6 +665,7 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
                 // visually confusing and the overlay is the
                 // user's clear intent.
                 slot.ui.completion_popup = None;
+                slot.ui.completion_pending = None;
                 if let Some(history) = slot.session.history_ctx().cloned()
                     && let Some(mut overlay) = crate::history_overlay::HistoryOverlay::open(
                         &history,
@@ -920,6 +921,43 @@ pub(crate) fn plan_resize(
 /// runs for every visible pane — Phase 2A's "one pane in one tab"
 /// AND Phase 2B's "multiple panes across splits". The Behavior
 /// callback per visible pane invokes this.
+///
+/// Show a freshly-built completion `popup`, or — when `allow_autoaccept`
+/// and it has a single candidate — auto-accept it directly (with the
+/// trailing-space behavior) and show nothing, per the "one result → just
+/// accept it" rule.
+///
+/// `allow_autoaccept` is `true` ONLY for a session the user opened with
+/// `Tab`; it is `false` for a live re-filter driven by typing. Typing must
+/// never accept — the user may still be entering characters and an
+/// auto-accept would double them up; acceptance stays under their control
+/// via Tab / Enter.
+///
+/// The scroll view is reset to the top only on a *fresh* open; when this
+/// replaces an already-open popup (a live re-filter / driver-result swap)
+/// the scroll is left alone so the view doesn't jump.
+fn show_or_autoaccept(
+    slot: &mut PaneSlot,
+    mut popup: crate::completion::CompletionPopup,
+    allow_autoaccept: bool,
+) {
+    if allow_autoaccept && popup.candidates.len() == 1 {
+        let cursor = slot.session.blocks().editor_on_tail().map(|e| e.cursor()).unwrap_or(0);
+        let token_len = cursor.saturating_sub(popup.origin_byte);
+        if let Some(editor) = slot.session.editor_mut() {
+            popup.accept(editor, token_len);
+        }
+        slot.session.clear_history_recall();
+        slot.ui.completion_popup = None;
+        return;
+    }
+    if slot.ui.completion_popup.is_some() {
+        // A refresh, not a fresh open — don't snap the scroll to the top.
+        popup.scroll_to_top_pending = false;
+    }
+    slot.ui.completion_popup = Some(popup);
+}
+
 pub fn render_pane(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -1916,6 +1954,46 @@ pub fn render_pane(
             // z-order; the position pin is `editor_rect.min` so
             // the popup's bottom edge aligns with the editor's
             // top.
+            // Resolve an awaited CLI-native driver result, if one landed
+            // this frame: merge it over the carried locals and (re)open the
+            // popup. A driver-eligible command waits here rather than
+            // flashing the local candidates first, and the popup opens from
+            // a driver result even when there were no local matches
+            // (`git ch<Tab>`). While awaiting a *refresh*, the previous
+            // popup stays visible until this swaps it.
+            if slot.ui.completion_pending.is_some()
+                && let Some(resp) = slot.session.completion_driver_poll()
+                && let Some(pending) = slot.ui.completion_pending.take()
+            {
+                let prev_selection =
+                    slot.ui.completion_popup.as_ref().map(|p| p.selected().value.clone());
+                // Auto-accept a lone result only if this session was opened
+                // by Tab — never when it's a live re-filter from typing.
+                let allow_autoaccept = pending.from_tab;
+                match crate::completion::resolve_driver(
+                    pending.origin_byte,
+                    &pending.token,
+                    pending.locals,
+                    resp.candidates,
+                ) {
+                    Some(mut popup) => {
+                        // Preserve the user's selection across an in-place
+                        // refresh (same token) so a background update never
+                        // moves the highlight; default to the top otherwise.
+                        if let Some(sel) = prev_selection
+                            && let Some(idx) = popup.candidates.iter().position(|c| c.value == sel)
+                        {
+                            popup.selected_index = idx;
+                        }
+                        // `show_or_autoaccept` keeps the scroll steady on a
+                        // refresh (popup already open) and auto-accepts a
+                        // lone candidate only for a Tab-opened session.
+                        show_or_autoaccept(slot, popup, allow_autoaccept);
+                    }
+                    None => slot.ui.completion_popup = None,
+                }
+            }
+
             if let Some(popup) = slot.ui.completion_popup.as_mut() {
                 let clicked = crate::completion::popup::paint(
                     ctx,
@@ -1945,8 +2023,9 @@ pub fn render_pane(
             // tracker so re-opening the editor in a new prompt
             // starts a fresh blink cycle.
             slot.ui.last_cursor_byte = None;
-            // Editor gone — popup must go too.
+            // Editor gone — popup (and any awaited driver result) must go too.
             slot.ui.completion_popup = None;
+            slot.ui.completion_pending = None;
         }
 
         // Focused-editor chrome. Dispatched via the
@@ -2867,7 +2946,12 @@ pub fn render_pane(
                     let mut handled = true;
                     match key {
                         Key::Escape => {
+                            // Clear pending too: during a live refresh the
+                            // stale popup and an in-flight driver request
+                            // coexist; without this the next frame would
+                            // reopen the dismissed popup.
                             slot.ui.completion_popup = None;
+                            slot.ui.completion_pending = None;
                         }
                         Key::Enter => {
                             // Enter always commits the selected
@@ -2962,10 +3046,11 @@ pub fn render_pane(
                     }
                 } else if editor_active
                     && slot.ui.completion_popup.is_none()
+                    && slot.ui.completion_pending.is_none()
                     && matches!(key, Key::Tab)
                     && no_mods
                 {
-                    // Tab in editor with no popup → open the popup.
+                    // Tab in editor with nothing open → plan completion.
                     let editor_text;
                     let cursor;
                     {
@@ -2975,17 +3060,42 @@ pub fn render_pane(
                     }
                     let cwd = slot.session.terminal().cwd().map(|p| p.to_path_buf());
                     let history_entries = slot.session.history_for_completion(200);
-                    let popup = crate::completion::open_completion_at(
+                    match crate::completion::plan_completion(
                         &editor_text,
                         cursor,
                         cwd.as_deref(),
                         home,
                         || history_entries,
-                    );
-                    if popup.is_some() {
-                        slot.ui.completion_popup = popup;
+                    ) {
+                        // No driver for this command → open the local list now
+                        // (or auto-accept if it's the only match — this is
+                        // an explicit Tab press, so auto-accept is allowed).
+                        crate::completion::CompletionPlan::Open(popup) => {
+                            show_or_autoaccept(slot, popup, true);
+                        }
+                        // Driver-eligible (kubectl/gh/docker/aws/git): fire it
+                        // and WAIT — don't flash local files. The per-frame
+                        // resolution opens the popup when the result lands,
+                        // even if there were no local matches (`git ch`).
+                        // `from_tab: true` lets a lone result auto-accept.
+                        crate::completion::CompletionPlan::AwaitDriver {
+                            origin_byte,
+                            token,
+                            locals,
+                            target,
+                        } => {
+                            slot.ui.completion_pending =
+                                Some(crate::completion::PendingCompletion {
+                                    origin_byte,
+                                    token,
+                                    locals,
+                                    from_tab: true,
+                                });
+                            slot.session.completion_driver_request(ctx, target);
+                        }
+                        crate::completion::CompletionPlan::Closed => {}
                     }
-                    // Consume Tab whether or not the popup opened.
+                    // Consume Tab whether or not anything opened.
                     continue;
                 }
             }
@@ -3025,25 +3135,65 @@ pub fn render_pane(
         // dismiss. Otherwise recompute the candidate list with
         // the new buffer state. `selected_index` resets to 0
         // (preserving it across refilter is a polish item).
-        if slot.ui.completion_popup.is_some() {
+        if slot.ui.completion_popup.is_some() || slot.ui.completion_pending.is_some() {
             let editor_state_after: Option<(String, usize)> =
                 slot.session.blocks().editor_on_tail().map(|e| (e.text().to_string(), e.cursor()));
             let buffer_changed = editor_state_before != editor_state_after;
             if buffer_changed && let Some((editor_text, cursor)) = editor_state_after {
-                let origin = slot.ui.completion_popup.as_ref().map(|p| p.origin_byte).unwrap_or(0);
+                let origin = slot
+                    .ui
+                    .completion_popup
+                    .as_ref()
+                    .map(|p| p.origin_byte)
+                    .or_else(|| slot.ui.completion_pending.as_ref().map(|p| p.origin_byte))
+                    .unwrap_or(0);
                 if cursor < origin {
+                    // Backspaced through the token start — dismiss both.
                     slot.ui.completion_popup = None;
+                    slot.ui.completion_pending = None;
                 } else {
                     let cwd = slot.session.terminal().cwd().map(|p| p.to_path_buf());
                     let history_entries = slot.session.history_for_completion(200);
-                    let new_popup = crate::completion::open_completion_at(
+                    match crate::completion::plan_completion(
                         &editor_text,
                         cursor,
                         cwd.as_deref(),
                         home,
                         || history_entries,
-                    );
-                    slot.ui.completion_popup = new_popup;
+                    ) {
+                        crate::completion::CompletionPlan::Open(popup) => {
+                            slot.ui.completion_pending = None;
+                            // Live re-filter from typing → never auto-accept,
+                            // even if narrowed to one (the user may still be
+                            // typing; they accept via Tab / Enter).
+                            show_or_autoaccept(slot, popup, false);
+                        }
+                        crate::completion::CompletionPlan::AwaitDriver {
+                            origin_byte,
+                            token,
+                            locals,
+                            target,
+                        } => {
+                            // Keep any open popup VISIBLE (stale) while the
+                            // refreshed driver result is in flight; the
+                            // per-frame resolution swaps it in when it lands,
+                            // so the list never blinks out between keystrokes.
+                            // `from_tab: false` — a typing-driven refresh must
+                            // not auto-accept a lone result.
+                            slot.ui.completion_pending =
+                                Some(crate::completion::PendingCompletion {
+                                    origin_byte,
+                                    token,
+                                    locals,
+                                    from_tab: false,
+                                });
+                            slot.session.completion_driver_request(ctx, target);
+                        }
+                        crate::completion::CompletionPlan::Closed => {
+                            slot.ui.completion_popup = None;
+                            slot.ui.completion_pending = None;
+                        }
+                    }
                 }
             }
         }

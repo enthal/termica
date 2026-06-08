@@ -31,10 +31,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod drivers;
 pub mod local;
 pub mod popup;
 pub mod ranking;
 
+pub use drivers::DriverTool;
 pub use popup::CompletionPopup;
 
 use std::path::{Path, PathBuf};
@@ -75,6 +77,25 @@ pub fn open_completion_at(
     home: Option<&Path>,
     history_lookup: impl FnOnce() -> Vec<String>,
 ) -> Option<CompletionPopup> {
+    let (origin, token, candidates) =
+        local_candidates_at(editor_text, cursor, cwd, home, history_lookup);
+    CompletionPopup::new(origin, token, candidates)
+}
+
+/// The local sources' contribution as raw parts: `(origin_byte, token,
+/// candidates)`, with `candidates` possibly **empty**. Unlike
+/// [`open_completion_at`] this never collapses an empty result to `None`,
+/// because the driver-aware flow ([`plan_completion`]) needs the origin /
+/// token / locals even when the locals are empty (so a driver result can
+/// still open a popup — `git ch<Tab>` has no local match but a real
+/// `checkout` candidate).
+fn local_candidates_at(
+    editor_text: &str,
+    cursor: usize,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+    history_lookup: impl FnOnce() -> Vec<String>,
+) -> (usize, String, Vec<CompletionCandidate>) {
     // Quote / escape-aware: an opening quote bounds the token (so a
     // quoted filename with spaces completes), `token` is the unescaped
     // literal to match, and `quote` drives how the substituted value is
@@ -157,7 +178,85 @@ pub fn open_completion_at(
     // of its own.
 
     let merged = ranking::merge_ranked(sources, 200);
-    CompletionPopup::new(token_start, token, merged)
+    (token_start, token.to_string(), merged)
+}
+
+/// What a `Tab` (or a live re-filter) should do, given the editor state.
+/// Pure decision so the popup lifecycle is testable without the renderer
+/// — the bugs this fixes lived in untested render glue ([the async-UI
+/// testing note](../../CLAUDE.md)).
+#[derive(Debug, Clone)]
+pub enum CompletionPlan {
+    /// Open the popup immediately with these local candidates (non-empty).
+    /// Used when the command has no CLI-native driver.
+    Open(CompletionPopup),
+    /// The command is driver-eligible: fire `target` and **wait** for the
+    /// result before (re)opening the popup, rather than flashing the local
+    /// candidates first. `locals` is carried so the driver result can be
+    /// merged against it when it lands ([`resolve_driver`]). Holds even
+    /// when `locals` is empty.
+    AwaitDriver {
+        origin_byte: usize,
+        token: String,
+        locals: Vec<CompletionCandidate>,
+        target: (DriverTool, String, usize),
+    },
+    /// Nothing to show (no driver, no local candidates).
+    Closed,
+}
+
+/// The carried state of an awaited driver result (see
+/// [`CompletionPlan::AwaitDriver`]). Stored on the pane while a driver
+/// subprocess is in flight; [`resolve_driver`] turns it plus the driver
+/// candidates into the popup when the result lands.
+#[derive(Debug, Clone)]
+pub struct PendingCompletion {
+    pub origin_byte: usize,
+    pub token: String,
+    pub locals: Vec<CompletionCandidate>,
+    /// `true` when this completion session was opened by an explicit `Tab`
+    /// press, so a lone result may auto-accept. `false` for a live
+    /// re-filter driven by typing — there the user stays in control and
+    /// must press Tab / Enter to accept, even if the list narrows to one
+    /// (otherwise the completion would double up the chars they're still
+    /// typing).
+    pub from_tab: bool,
+}
+
+/// Decide what to do for the editor state at `cursor`. A driver-eligible
+/// command always yields [`CompletionPlan::AwaitDriver`] (even with no
+/// local matches); otherwise the local candidates open immediately, or
+/// [`CompletionPlan::Closed`] when there are none.
+pub fn plan_completion(
+    editor_text: &str,
+    cursor: usize,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+    history_lookup: impl FnOnce() -> Vec<String>,
+) -> CompletionPlan {
+    let (origin, token, locals) =
+        local_candidates_at(editor_text, cursor, cwd, home, history_lookup);
+    if let Some(target) = drivers::parse::driver_target(editor_text, cursor) {
+        return CompletionPlan::AwaitDriver { origin_byte: origin, token, locals, target };
+    }
+    match CompletionPopup::new(origin, token, locals) {
+        Some(popup) => CompletionPlan::Open(popup),
+        None => CompletionPlan::Closed,
+    }
+}
+
+/// Build the popup for a resolved driver result: merge the driver
+/// candidates over the carried locals and rank them. `None` when the
+/// merged list is empty (driver returned nothing and there were no
+/// locals — e.g. the tool isn't installed and the token matched no file).
+pub fn resolve_driver(
+    origin_byte: usize,
+    token: &str,
+    locals: Vec<CompletionCandidate>,
+    driver: Vec<CompletionCandidate>,
+) -> Option<CompletionPopup> {
+    let merged = ranking::merge_ranked(vec![locals, driver], 200);
+    CompletionPopup::new(origin_byte, token, merged)
 }
 
 /// Resolve a path-token's `dir_part` into a real filesystem path
@@ -370,6 +469,84 @@ mod tests {
         assert!(resolve_dir_with("$", None, None, fake_env_lookup).is_none());
     }
 
+    // ---- driver-aware planner (slice-2 lifecycle bug fixes) ---------
+
+    #[test]
+    fn plan_driver_command_with_empty_locals_awaits_driver_not_closed() {
+        // `git ch` in an empty dir: no local match, but git IS a driver.
+        // Pre-fix this produced no popup at all (locals empty → Closed →
+        // driver never fired). Now it must AwaitDriver so the driver's
+        // `checkout`/`cherry` can open the popup.
+        let dir = tempfile::tempdir().unwrap();
+        let plan = plan_completion("git ch", 6, Some(dir.path()), None, Vec::new);
+        match plan {
+            CompletionPlan::AwaitDriver { target, locals, .. } => {
+                assert_eq!(target.0, DriverTool::Git);
+                assert!(locals.is_empty(), "no file in cwd starts with 'ch'");
+            }
+            other => panic!("expected AwaitDriver, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_driver_command_does_not_open_locals_first() {
+        // `gh ` with a file in cwd: pre-fix opened a popup of FILES
+        // instantly (then flashed driver results over them). Now it must
+        // AwaitDriver, carrying the files as locals to merge later —
+        // never an `Open` of files.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"").unwrap();
+        let plan = plan_completion("gh ", 3, Some(dir.path()), None, Vec::new);
+        match plan {
+            CompletionPlan::AwaitDriver { target, locals, .. } => {
+                assert_eq!(target.0, DriverTool::Gh);
+                assert!(
+                    locals.iter().any(|c| c.display.ends_with("notes.txt")),
+                    "files are carried as locals, not shown as the popup"
+                );
+            }
+            other => panic!("expected AwaitDriver (not Open-with-files), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_non_driver_command_opens_locals_immediately() {
+        // `ls ` (not a driver) with a file → open the local list now,
+        // no waiting.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"").unwrap();
+        let plan = plan_completion("ls ", 3, Some(dir.path()), None, Vec::new);
+        match plan {
+            CompletionPlan::Open(popup) => {
+                assert!(popup.candidates.iter().any(|c| c.display.ends_with("notes.txt")));
+            }
+            other => panic!("expected Open, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_non_driver_no_local_match_is_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = plan_completion("ls zzz_no_such", 14, Some(dir.path()), None, Vec::new);
+        assert!(matches!(plan, CompletionPlan::Closed), "no driver, no match → nothing");
+    }
+
+    #[test]
+    fn resolve_driver_merges_driver_over_locals() {
+        let locals = vec![CompletionCandidate::simple("notes.txt", CompletionSource::Path)];
+        let driver = vec![CompletionCandidate::simple(
+            "checkout",
+            CompletionSource::Driver(DriverTool::Git),
+        )];
+        let popup = resolve_driver(4, "ch", locals, driver).expect("merged popup");
+        assert_eq!(popup.candidates[0].value, "checkout", "driver ranks above locals");
+    }
+
+    #[test]
+    fn resolve_driver_empty_everything_is_none() {
+        assert!(resolve_driver(0, "", vec![], vec![]).is_none());
+    }
+
     #[test]
     fn open_completion_at_no_history_no_match_returns_none() {
         // Empty buffer, command position, history empty, no
@@ -490,6 +667,10 @@ pub enum CompletionSource {
     /// A previous command from `runs` history, prefix-matching the
     /// typed token.
     History,
+    /// A candidate from a CLI-native completion driver — the tool's own
+    /// `__complete` endpoint ([`drivers`]). Carries the tool so the popup
+    /// can tag the row (`k8s` / `gh` / …) and the ranker can weight it.
+    Driver(DriverTool),
 }
 
 impl CompletionSource {
@@ -499,6 +680,7 @@ impl CompletionSource {
             CompletionSource::Path => "path",
             CompletionSource::PathExecutable => "$PATH",
             CompletionSource::History => "history",
+            CompletionSource::Driver(tool) => tool.tag(),
         }
     }
 }
