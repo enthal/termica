@@ -19,9 +19,25 @@
 #![forbid(unsafe_code)]
 
 use eframe::egui;
-use egui_kittest::Harness;
+use egui_kittest::{Harness, SnapshotOptions};
 use termica::render;
 use termica::terminal::TerminalState;
+
+/// Snapshot options for views that contain **drawn icon glyphs**
+/// (`icons.rs`: the find/completion arrows, the ⌘/⌥/^ key caps, the
+/// filter and dropdown triangles). Thin vector strokes rasterize ~1px
+/// differently across GPU backends — Metal on macOS vs lavapipe on the
+/// CI Linux runner — so an otherwise-identical render trips
+/// egui_kittest's default zero-pixel tolerance (observed: exactly 1
+/// pixel on the completion-popup keybind hint). Allow a small pixel
+/// budget: enough to absorb sub-pixel AA on a handful of glyph edges,
+/// far below any real regression (a wrong or missing glyph/row moves
+/// hundreds of pixels). Text- and cell-only snapshots keep the strict
+/// default, since egui's CPU glyph rasterizer is cross-platform
+/// deterministic.
+fn drawn_glyph_snapshot_options() -> SnapshotOptions {
+    SnapshotOptions::new().failed_pixel_count_threshold(16)
+}
 
 /// Build a sealed-block snapshot from synthetic bytes: feed bytes
 /// into a fresh `TerminalState`, then take a `snapshot_lines_all()`.
@@ -1308,7 +1324,8 @@ fn snapshot_completion_popup(
         let ctx = ui.ctx().clone();
         let _ = termica::completion::popup::paint(&ctx, &mut popup, anchor, 1, max_rows);
     });
-    harness.snapshot(name);
+    // Drawn ↑/↓ keybind-hint glyphs — tolerate cross-platform AA.
+    harness.snapshot_options(name, &drawn_glyph_snapshot_options());
 }
 
 #[test]
@@ -1675,7 +1692,7 @@ fn snapshot_find_overlay_with_matches() {
             let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 200.0));
             let _ = termica::find::paint_overlay(ui, &mut overlay, 1, rect);
         });
-    harness.snapshot("find_overlay_with_matches");
+    harness.snapshot_options("find_overlay_with_matches", &drawn_glyph_snapshot_options());
 }
 
 #[test]
@@ -1689,7 +1706,10 @@ fn snapshot_find_overlay_commands_filter_case_sensitive() {
             let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 200.0));
             let _ = termica::find::paint_overlay(ui, &mut overlay, 1, rect);
         });
-    harness.snapshot("find_overlay_commands_filter_case_sensitive");
+    harness.snapshot_options(
+        "find_overlay_commands_filter_case_sensitive",
+        &drawn_glyph_snapshot_options(),
+    );
 }
 
 #[test]
@@ -1702,7 +1722,7 @@ fn snapshot_find_overlay_regex_error() {
             let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 200.0));
             let _ = termica::find::paint_overlay(ui, &mut overlay, 1, rect);
         });
-    harness.snapshot("find_overlay_regex_error");
+    harness.snapshot_options("find_overlay_regex_error", &drawn_glyph_snapshot_options());
 }
 
 #[test]
@@ -1715,7 +1735,7 @@ fn snapshot_find_overlay_history_dropdown() {
             let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 360.0));
             let _ = termica::find::paint_overlay(ui, &mut overlay, 1, rect);
         });
-    harness.snapshot("find_overlay_history_dropdown");
+    harness.snapshot_options("find_overlay_history_dropdown", &drawn_glyph_snapshot_options());
 }
 
 #[test]
@@ -1747,7 +1767,7 @@ fn snapshot_keybindings_macos() {
             let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(720.0, 760.0));
             let _ = termica::keybindings::paint(ui, 1, rect, true, &mut q);
         });
-    harness.snapshot("keybindings_macos");
+    harness.snapshot_options("keybindings_macos", &drawn_glyph_snapshot_options());
 }
 
 #[test]
@@ -1758,7 +1778,7 @@ fn snapshot_keybindings_linux() {
             let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(720.0, 760.0));
             let _ = termica::keybindings::paint(ui, 1, rect, false, &mut q);
         });
-    harness.snapshot("keybindings_linux");
+    harness.snapshot_options("keybindings_linux", &drawn_glyph_snapshot_options());
 }
 
 #[test]
@@ -1770,5 +1790,5 @@ fn snapshot_keybindings_filtered() {
             let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(720.0, 760.0));
             let _ = termica::keybindings::paint(ui, 1, rect, true, &mut q);
         });
-    harness.snapshot("keybindings_filtered");
+    harness.snapshot_options("keybindings_filtered", &drawn_glyph_snapshot_options());
 }
