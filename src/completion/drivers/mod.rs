@@ -56,8 +56,11 @@ use parse::{aws_completer_env, cobra_complete_args, parse_for};
 
 /// Hard wall-clock cap on a single driver subprocess. A tool that hangs
 /// (no cluster reachable, a credential prompt) is killed and yields no
-/// candidates — the popup keeps its instant local rows.
-const DRIVER_TIMEOUT: Duration = Duration::from_millis(250);
+/// candidates — the popup keeps its instant local rows. Set at 2 s so a
+/// real-but-slow endpoint (e.g. `kubectl --context <remote> get` round-
+/// tripping to a cold cluster) still completes; the popup shows a
+/// "searching…" spinner during the wait so the delay is legible.
+const DRIVER_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// Poll granularity while waiting for a driver subprocess to exit.
 const DRIVER_POLL: Duration = Duration::from_millis(5);
@@ -135,6 +138,9 @@ pub struct DriverResponse {
     pub id: DriverRequestId,
     pub tool: DriverTool,
     pub candidates: Vec<CompletionCandidate>,
+    /// `true` when this response was served from the result cache rather
+    /// than a fresh subprocess. Diagnostic only (drives `TERMICA_DUMP_EVENTS`).
+    pub from_cache: bool,
 }
 
 /// Spawns driver subprocesses and returns their raw stdout. Behind a
@@ -273,7 +279,10 @@ impl CompletionDriverEngine {
     /// do NOT dedup on `(tool, line)`: a persistent dedup would suppress a
     /// re-open of the *same* command after its one response was already
     /// consumed. Worker-side coalescing bounds concurrency instead.
-    pub fn request(&mut self, cwd: PathBuf, target: (DriverTool, String, usize)) {
+    /// Returns `true` when the request was a **cache hit** (served without
+    /// spawning), `false` on a miss that went to the worker — surfaced so
+    /// the caller can record it for `TERMICA_DUMP_EVENTS`.
+    pub fn request(&mut self, cwd: PathBuf, target: (DriverTool, String, usize)) -> bool {
         let (tool, line, point) = target;
         let id = DriverRequestId(self.next_id);
         self.next_id = self.next_id.wrapping_add(1);
@@ -285,15 +294,17 @@ impl CompletionDriverEngine {
             // Cache hit: serve immediately, skip the worker. The next
             // `poll` (same render frame) returns this and the popup opens
             // with no subprocess and no flicker.
-            self.ready = Some(DriverResponse { id, tool, candidates: candidates.clone() });
+            self.ready =
+                Some(DriverResponse { id, tool, candidates: candidates.clone(), from_cache: true });
             self.inflight_key = None;
-            return;
+            return true;
         }
         // Miss: remember the key so `poll` can cache the worker's response.
         self.inflight_key = Some(key);
         // A send error means the worker died; nothing to do — the popup
         // keeps its local candidates. Never a panic.
         let _ = self.request_tx.send(DriverRequest { id, tool, cwd, line, point });
+        false
     }
 
     /// Return the freshest result for the in-flight request — a cache hit
@@ -344,7 +355,7 @@ fn run_worker(
             Some(stdout) => parse_for(req.tool, &stdout, &req.line),
             None => Vec::new(),
         };
-        let resp = DriverResponse { id: req.id, tool: req.tool, candidates };
+        let resp = DriverResponse { id: req.id, tool: req.tool, candidates, from_cache: false };
         if result_tx.send(resp).is_err() {
             break; // pane dropped — stop working.
         }

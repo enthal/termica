@@ -22,7 +22,7 @@ use alacritty_terminal::index::Point;
 
 use crate::block::{Block, BlockStack};
 use crate::completion::drivers::{CompletionDriverEngine, DriverResponse, DriverTool};
-use crate::events::EventRecorder;
+use crate::events::{CompletionEvent, EventRecorder};
 use crate::gh_probe::GhProbe;
 use crate::git_context::GitContext;
 use crate::git_probe::GitProbe;
@@ -800,16 +800,34 @@ impl PaneSession {
         target: (DriverTool, String, usize),
     ) {
         let Some(cwd) = self.current_cwd() else { return };
+        let (tool, line) = (target.0, target.1.clone());
         let engine = self
             .completion_driver
             .get_or_insert_with(|| CompletionDriverEngine::spawn(ctx.clone()));
-        engine.request(cwd, target);
+        let cache_hit = engine.request(cwd, target);
+        self.record_completion(&CompletionEvent::DriverRequest { tool, line, cache_hit });
     }
 
     /// Drain freshly-arrived driver candidates for the current in-flight
     /// request, if any. The renderer merges them into the open popup.
     pub fn completion_driver_poll(&mut self) -> Option<DriverResponse> {
-        self.completion_driver.as_mut().and_then(|engine| engine.poll())
+        let resp = self.completion_driver.as_mut().and_then(|engine| engine.poll());
+        if let Some(r) = &resp {
+            self.record_completion(&CompletionEvent::DriverResult {
+                tool: r.tool,
+                candidates: r.candidates.len(),
+                cache_hit: r.from_cache,
+            });
+        }
+        resp
+    }
+
+    /// Emit a tab-[`CompletionEvent`] to `TERMICA_DUMP_EVENTS`, if enabled.
+    /// Best-effort and side-effect-free otherwise.
+    pub fn record_completion(&self, event: &CompletionEvent) {
+        if let Some(rec) = self.recorder.as_ref() {
+            rec.record_completion(self.pane_id(), event);
+        }
     }
 
     /// Insert `text` into the editor as the buffer (replacing any

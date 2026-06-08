@@ -948,14 +948,62 @@ fn show_or_autoaccept(
             popup.accept(editor, token_len);
         }
         slot.session.clear_history_recall();
+        slot.session.record_completion(&crate::events::CompletionEvent::Popup {
+            action: crate::events::PopupAction::AutoAccept,
+            candidates: 1,
+        });
         slot.ui.completion_popup = None;
         return;
     }
-    if slot.ui.completion_popup.is_some() {
+    // Record a popup OPEN only on a fresh open (not on every refresh
+    // keystroke), matching the scroll-reset condition.
+    let was_open = slot.ui.completion_popup.is_some();
+    if was_open {
         // A refresh, not a fresh open — don't snap the scroll to the top.
         popup.scroll_to_top_pending = false;
     }
+    let candidates = popup.candidates.len();
     slot.ui.completion_popup = Some(popup);
+    if !was_open {
+        slot.session.record_completion(&crate::events::CompletionEvent::Popup {
+            action: crate::events::PopupAction::Open,
+            candidates,
+        });
+    }
+}
+
+/// Build a [`CompletionEvent::Plan`] from a planning decision for
+/// `TERMICA_DUMP_EVENTS`. `line` is the raw editor command line.
+fn plan_event(
+    plan: &crate::completion::CompletionPlan,
+    line: &str,
+    from_tab: bool,
+) -> crate::events::CompletionEvent {
+    use crate::completion::CompletionPlan;
+    use crate::events::{CompletionDecision, CompletionEvent};
+    match plan {
+        CompletionPlan::Open(popup) => CompletionEvent::Plan {
+            decision: CompletionDecision::Open,
+            tool: None,
+            line: line.to_string(),
+            locals: popup.candidates.len(),
+            from_tab,
+        },
+        CompletionPlan::AwaitDriver { target, locals, .. } => CompletionEvent::Plan {
+            decision: CompletionDecision::AwaitDriver,
+            tool: Some(target.0),
+            line: line.to_string(),
+            locals: locals.len(),
+            from_tab,
+        },
+        CompletionPlan::Closed => CompletionEvent::Plan {
+            decision: CompletionDecision::Closed,
+            tool: None,
+            line: line.to_string(),
+            locals: 0,
+            from_tab,
+        },
+    }
 }
 
 pub fn render_pane(
@@ -2012,11 +2060,25 @@ pub fn render_pane(
                     let cursor =
                         slot.session.blocks().editor_on_tail().map(|e| e.cursor()).unwrap_or(0);
                     let current_token_len = cursor.saturating_sub(popup_taken.origin_byte);
+                    let candidates = popup_taken.candidates.len();
                     if let Some(editor) = slot.session.editor_mut() {
                         popup_taken.accept(editor, current_token_len);
                     }
                     slot.session.clear_history_recall();
+                    slot.session.record_completion(&crate::events::CompletionEvent::Popup {
+                        action: crate::events::PopupAction::Accept,
+                        candidates,
+                    });
                 }
+            } else if slot.ui.completion_pending.is_some() {
+                // A driver result is awaited and no popup is shown yet —
+                // show a "searching..." spinner where the popup will appear
+                // so the (up to 2 s) wait is legible.
+                crate::completion::popup::paint_searching(
+                    ctx,
+                    editor_rect.min,
+                    slot.session.pane_id(),
+                );
             }
         } else {
             // Editor not on tail this frame — forget the cursor
@@ -2946,6 +3008,18 @@ pub fn render_pane(
                     let mut handled = true;
                     match key {
                         Key::Escape => {
+                            let candidates = slot
+                                .ui
+                                .completion_popup
+                                .as_ref()
+                                .map(|p| p.candidates.len())
+                                .unwrap_or(0);
+                            slot.session.record_completion(
+                                &crate::events::CompletionEvent::Popup {
+                                    action: crate::events::PopupAction::Dismiss,
+                                    candidates,
+                                },
+                            );
                             // Clear pending too: during a live refresh the
                             // stale popup and an in-flight driver request
                             // coexist; without this the next frame would
@@ -2964,10 +3038,17 @@ pub fn render_pane(
                                     .map(|e| e.cursor())
                                     .unwrap_or(0);
                                 let current_token_len = cursor.saturating_sub(popup.origin_byte);
+                                let candidates = popup.candidates.len();
                                 if let Some(editor) = slot.session.editor_mut() {
                                     popup.accept(editor, current_token_len);
                                 }
                                 slot.session.clear_history_recall();
+                                slot.session.record_completion(
+                                    &crate::events::CompletionEvent::Popup {
+                                        action: crate::events::PopupAction::Accept,
+                                        candidates,
+                                    },
+                                );
                             }
                         }
                         Key::Tab => {
@@ -2992,6 +3073,7 @@ pub fn render_pane(
                             let current_token_len = cursor.saturating_sub(popup_ref.origin_byte);
                             let extension = popup_ref.tab_extend(current_token_len).to_string();
                             let selected_full = popup_ref.selected().value.clone();
+                            let candidates = popup_ref.candidates.len();
                             if extension == selected_full {
                                 if let Some(popup) = slot.ui.completion_popup.take()
                                     && let Some(editor) = slot.session.editor_mut()
@@ -2999,13 +3081,21 @@ pub fn render_pane(
                                     popup.accept(editor, current_token_len);
                                 }
                                 slot.session.clear_history_recall();
+                                slot.session.record_completion(
+                                    &crate::events::CompletionEvent::Popup {
+                                        action: crate::events::PopupAction::Accept,
+                                        candidates,
+                                    },
+                                );
                             } else if extension.len() > current_token_len {
                                 if let Some(editor) = slot.session.editor_mut() {
                                     let origin = popup_ref.origin_byte;
                                     editor.replace_range(origin, cursor, &extension);
                                 }
                                 slot.session.clear_history_recall();
-                                // Popup stays; live filter next frame.
+                                // Popup stays; live filter next frame. (No
+                                // accept event — this only extends to a
+                                // shared prefix.)
                             } else {
                                 // No further extension possible —
                                 // the visible candidates diverge
@@ -3020,6 +3110,12 @@ pub fn render_pane(
                                     popup.accept(editor, current_token_len);
                                 }
                                 slot.session.clear_history_recall();
+                                slot.session.record_completion(
+                                    &crate::events::CompletionEvent::Popup {
+                                        action: crate::events::PopupAction::Accept,
+                                        candidates,
+                                    },
+                                );
                             }
                         }
                         Key::ArrowDown => {
@@ -3060,13 +3156,15 @@ pub fn render_pane(
                     }
                     let cwd = slot.session.terminal().cwd().map(|p| p.to_path_buf());
                     let history_entries = slot.session.history_for_completion(200);
-                    match crate::completion::plan_completion(
+                    let plan = crate::completion::plan_completion(
                         &editor_text,
                         cursor,
                         cwd.as_deref(),
                         home,
                         || history_entries,
-                    ) {
+                    );
+                    slot.session.record_completion(&plan_event(&plan, &editor_text, true));
+                    match plan {
                         // No driver for this command → open the local list now
                         // (or auto-accept if it's the only match — this is
                         // an explicit Tab press, so auto-accept is allowed).
@@ -3154,13 +3252,15 @@ pub fn render_pane(
                 } else {
                     let cwd = slot.session.terminal().cwd().map(|p| p.to_path_buf());
                     let history_entries = slot.session.history_for_completion(200);
-                    match crate::completion::plan_completion(
+                    let plan = crate::completion::plan_completion(
                         &editor_text,
                         cursor,
                         cwd.as_deref(),
                         home,
                         || history_entries,
-                    ) {
+                    );
+                    slot.session.record_completion(&plan_event(&plan, &editor_text, false));
+                    match plan {
                         crate::completion::CompletionPlan::Open(popup) => {
                             slot.ui.completion_pending = None;
                             // Live re-filter from typing → never auto-accept,
