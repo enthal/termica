@@ -251,6 +251,28 @@ pub fn paint(
     clicked_row
 }
 
+/// Paint a small "searching..." affordance with an animated spinner while
+/// an asynchronous CLI-native driver result is awaited and no popup is
+/// shown yet (the [`crate::completion::CompletionPlan::AwaitDriver`] wait).
+/// Same anchor / pivot as [`paint`], so it sits exactly where the popup
+/// will appear. `egui::Spinner` requests its own repaints, so it animates
+/// without the caller scheduling frames.
+pub fn paint_searching(ctx: &egui::Context, anchor: egui::Pos2, pane_id: u64) {
+    let area_id = egui::Id::new(("completion-searching", pane_id));
+    egui::Area::new(area_id)
+        .pivot(egui::Align2::LEFT_BOTTOM)
+        .fixed_pos(egui::Pos2::new(anchor.x, anchor.y - 4.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(14.0));
+                    ui.weak("searching...");
+                });
+            });
+        });
+}
+
 /// Bottom-of-popup keybinding strip. Per CLAUDE.md
 /// "no Unicode pictographic icons in widget code" — Unicode
 /// arrows (`↑`/`↓`) render as tofu on some font setups. Plain
