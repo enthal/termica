@@ -20,10 +20,9 @@
 //! on the idle repaint cadence.
 //!
 //! - **Coalesced**: a burst of keystrokes collapses — the worker takes
-//!   only the newest queued request before each subprocess, and
-//!   [`CompletionDriverEngine::request`] dedups an unchanged
-//!   `(tool, line)`. Together these bound concurrency to ~one subprocess
-//!   in flight without any timer.
+//!   only the newest queued request before each subprocess. The renderer
+//!   only fires on a fresh Tab or an actual buffer change, so this bounds
+//!   concurrency to ~one subprocess in flight without any timer.
 //! - **Superseded responses dropped**: [`CompletionDriverEngine::poll`]
 //!   keeps only the response matching the newest in-flight request id.
 //! - **Detection is implicit**: there is no separate probe for "is
@@ -34,13 +33,15 @@
 //! - **Cancellable on teardown**: dropping the engine drops the request
 //!   `Sender`; the worker's `recv` returns `Err` and the thread exits.
 //!
-//! Result caching ([spec/04a §"Caching"](../../../spec/04a-completion.md#caching))
-//! is a deliberate fast-follow in its own PR — it is an optimization that
-//! needs an injectable clock, and dedup + coalescing already prevent a
-//! subprocess fork-bomb while typing.
+//! - **Cached**: parsed results are kept in a 10 s TTL [`cache`] keyed by
+//!   `(tool, cwd, line)`, so a re-open of the same command within the
+//!   window is served synchronously by [`CompletionDriverEngine::request`]
+//!   with no subprocess. TTL is measured against an injected [`Clock`]
+//!   (monotonic ms) so the logic is deterministic in tests.
 
 #![forbid(unsafe_code)]
 
+pub mod cache;
 pub mod parse;
 
 use std::path::PathBuf;
@@ -50,6 +51,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use super::CompletionCandidate;
+use cache::{DRIVER_CACHE_TTL_MS, DriverCacheKey, DriverResultCache};
 use parse::{aws_completer_env, cobra_complete_args, parse_for};
 
 /// Hard wall-clock cap on a single driver subprocess. A tool that hangs
@@ -59,6 +61,31 @@ const DRIVER_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Poll granularity while waiting for a driver subprocess to exit.
 const DRIVER_POLL: Duration = Duration::from_millis(5);
+
+/// Monotonic-millisecond clock behind the result cache's TTL. Injected so
+/// the engine's cache behavior is deterministic in tests — production uses
+/// [`SystemClock`]; tests use a fake that advances on demand. Only the
+/// *difference* between readings matters, never the absolute value.
+pub trait Clock: Send {
+    fn now_ms(&self) -> u64;
+}
+
+/// Production [`Clock`]: elapsed milliseconds since the engine was spawned.
+struct SystemClock {
+    base: Instant,
+}
+
+impl SystemClock {
+    fn new() -> Self {
+        Self { base: Instant::now() }
+    }
+}
+
+impl Clock for SystemClock {
+    fn now_ms(&self) -> u64 {
+        self.base.elapsed().as_millis() as u64
+    }
+}
 
 /// Which CLI-native tool a request targets. `Copy` so it rides inside
 /// [`super::CompletionSource::Driver`] without disturbing that enum's
@@ -186,7 +213,17 @@ pub struct CompletionDriverEngine {
     /// Newest request id; responses with an older id (superseded by a
     /// later keystroke) are discarded on [`Self::poll`].
     inflight: Option<DriverRequestId>,
+    /// The cache key of the in-flight (cache-miss) request, so [`Self::poll`]
+    /// can store the worker's response under it.
+    inflight_key: Option<DriverCacheKey>,
+    /// A response synthesized from a cache hit, returned by the next
+    /// [`Self::poll`] without ever touching the worker.
+    ready: Option<DriverResponse>,
     next_id: u64,
+    /// 10 s TTL result cache so a re-open of the same command is instant
+    /// instead of re-spawning the subprocess ([spec/04a §Caching]).
+    cache: DriverResultCache,
+    clock: Box<dyn Clock>,
     /// Held so the worker's lifetime is tied to this struct. Not joined
     /// on drop (same rationale as the git probe); the worker exits when
     /// the request `Sender` drops.
@@ -198,43 +235,89 @@ impl CompletionDriverEngine {
     /// `ctx` is cloned into the worker so it can wake the UI when a
     /// result lands.
     pub fn spawn(ctx: egui::Context) -> Self {
-        Self::spawn_with_runner(ctx, Box::new(CommandDriverRunner))
+        Self::spawn_with(ctx, Box::new(CommandDriverRunner), Box::new(SystemClock::new()))
     }
 
-    /// Spawn with an injected runner (the test seam).
-    fn spawn_with_runner(ctx: egui::Context, runner: Box<dyn DriverRunner>) -> Self {
+    /// Spawn with an injected runner and clock (the test seam).
+    fn spawn_with(
+        ctx: egui::Context,
+        runner: Box<dyn DriverRunner>,
+        clock: Box<dyn Clock>,
+    ) -> Self {
         let (request_tx, request_rx) = mpsc::channel::<DriverRequest>();
         let (result_tx, result_rx) = mpsc::channel::<DriverResponse>();
         let worker = thread::spawn(move || run_worker(request_rx, result_tx, runner, ctx));
-        Self { request_tx, result_rx, inflight: None, next_id: 0, _worker: worker }
+        Self {
+            request_tx,
+            result_rx,
+            inflight: None,
+            inflight_key: None,
+            ready: None,
+            next_id: 0,
+            cache: DriverResultCache::default(),
+            clock,
+            _worker: worker,
+        }
     }
 
-    /// Fire a driver request for `(tool, line, point)` in `cwd`. Every call
-    /// sends and bumps the in-flight id; the renderer only calls this on a
+    /// Fire a driver request for `(tool, line, point)` in `cwd`.
+    ///
+    /// A fresh result for `(tool, cwd, line)` within the cache TTL is
+    /// served immediately (stashed for the next [`Self::poll`]) without
+    /// spawning. Otherwise the request goes to the worker and its key is
+    /// remembered so `poll` can cache the response.
+    ///
+    /// Every miss bumps the in-flight id; the renderer only calls this on a
     /// fresh Tab or an actual buffer change (never nav-only frames), so
     /// there are no redundant identical fires to suppress. We deliberately
     /// do NOT dedup on `(tool, line)`: a persistent dedup would suppress a
     /// re-open of the *same* command after its one response was already
-    /// consumed, leaving the popup permanently un-openable until the line
-    /// changed. Worker-side coalescing bounds concurrency instead.
+    /// consumed. Worker-side coalescing bounds concurrency instead.
     pub fn request(&mut self, cwd: PathBuf, target: (DriverTool, String, usize)) {
         let (tool, line, point) = target;
         let id = DriverRequestId(self.next_id);
         self.next_id = self.next_id.wrapping_add(1);
         self.inflight = Some(id);
+
+        let key = DriverCacheKey { tool, cwd: cwd.clone(), line: line.clone() };
+        let now = self.clock.now_ms();
+        if let Some(candidates) = self.cache.get(&key, now, DRIVER_CACHE_TTL_MS) {
+            // Cache hit: serve immediately, skip the worker. The next
+            // `poll` (same render frame) returns this and the popup opens
+            // with no subprocess and no flicker.
+            self.ready = Some(DriverResponse { id, tool, candidates: candidates.clone() });
+            self.inflight_key = None;
+            return;
+        }
+        // Miss: remember the key so `poll` can cache the worker's response.
+        self.inflight_key = Some(key);
         // A send error means the worker died; nothing to do — the popup
         // keeps its local candidates. Never a panic.
         let _ = self.request_tx.send(DriverRequest { id, tool, cwd, line, point });
     }
 
-    /// Drain the result channel and return the freshest response for the
-    /// current in-flight request, discarding stale superseded ones.
-    pub fn poll(&self) -> Option<DriverResponse> {
+    /// Return the freshest result for the in-flight request — a cache hit
+    /// stashed by [`Self::request`], or the worker's latest response
+    /// (stale superseded ones discarded). A non-empty worker response is
+    /// cached under the in-flight key on the way out so the next re-open is
+    /// instant. Empty results are not cached: an absent tool re-fails
+    /// cheaply and a transient timeout is free to retry.
+    pub fn poll(&mut self) -> Option<DriverResponse> {
+        if let Some(ready) = self.ready.take() {
+            return Some(ready);
+        }
         let mut latest = None;
         while let Ok(resp) = self.result_rx.try_recv() {
             if Some(resp.id) == self.inflight {
                 latest = Some(resp);
             }
+        }
+        if let Some(resp) = &latest
+            && !resp.candidates.is_empty()
+            && let Some(key) = self.inflight_key.take()
+        {
+            let now = self.clock.now_ms();
+            self.cache.put(key, now, resp.candidates.clone(), DRIVER_CACHE_TTL_MS);
         }
         latest
     }
@@ -276,6 +359,9 @@ mod tests {
     use super::*;
     use crate::completion::CompletionSource;
 
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
     /// A fake runner returning canned stdout (or `None` to simulate a
     /// missing tool / timeout), so the worker round-trip is deterministic
     /// — no processes, no clocks.
@@ -288,10 +374,53 @@ mod tests {
         }
     }
 
+    /// Like [`FakeRunner`] but counts invocations, so a test can prove a
+    /// cache hit did NOT spawn.
+    struct CountingRunner {
+        stdout: Option<String>,
+        calls: Arc<AtomicUsize>,
+    }
+    impl DriverRunner for CountingRunner {
+        fn run(&self, _req: &DriverRequest) -> Option<String> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.stdout.clone()
+        }
+    }
+
+    /// A controllable monotonic clock for deterministic TTL tests (no
+    /// `Instant::now`). `set` advances it; the engine reads it via [`Clock`].
+    #[derive(Clone)]
+    struct FakeClock(Arc<AtomicU64>);
+    impl FakeClock {
+        fn new(ms: u64) -> Self {
+            Self(Arc::new(AtomicU64::new(ms)))
+        }
+        fn set(&self, ms: u64) {
+            self.0.store(ms, Ordering::Relaxed);
+        }
+    }
+    impl Clock for FakeClock {
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Block-poll until the worker's response lands (the fake runner is
+    /// instant, so this returns after a few spins; no sleeps / clocks).
+    fn poll_until(engine: &mut CompletionDriverEngine) -> DriverResponse {
+        for _ in 0..1_000_000 {
+            if let Some(resp) = engine.poll() {
+                return resp;
+            }
+        }
+        panic!("worker never responded");
+    }
+
     fn engine(stdout: Option<String>) -> CompletionDriverEngine {
-        CompletionDriverEngine::spawn_with_runner(
+        CompletionDriverEngine::spawn_with(
             egui::Context::default(),
             Box::new(FakeRunner { stdout }),
+            Box::new(FakeClock::new(0)),
         )
     }
 
@@ -331,5 +460,78 @@ mod tests {
         assert_ne!(e.inflight, first, "a repeat request still bumps the in-flight id");
         let r2 = e.result_rx.recv().expect("second response");
         assert_ne!(r1.id, r2.id, "the repeat produced a distinct, fresh response");
+    }
+
+    #[test]
+    fn cache_hit_serves_without_spawning() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut e = CompletionDriverEngine::spawn_with(
+            egui::Context::default(),
+            Box::new(CountingRunner { stdout: Some("x\t\n".into()), calls: calls.clone() }),
+            Box::new(FakeClock::new(1_000)),
+        );
+        // Pre-warm the cache (same-module access to the private field).
+        let key =
+            DriverCacheKey { tool: DriverTool::Git, cwd: "/r".into(), line: "git che".into() };
+        e.cache.put(
+            key,
+            1_000,
+            vec![CompletionCandidate::simple(
+                "checkout",
+                CompletionSource::Driver(DriverTool::Git),
+            )],
+            DRIVER_CACHE_TTL_MS,
+        );
+        e.request(PathBuf::from("/r"), (DriverTool::Git, "git che".into(), 7));
+        let resp = e.poll().expect("cache hit is served immediately");
+        assert_eq!(resp.candidates[0].value, "checkout");
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "no subprocess on a cache hit");
+    }
+
+    #[test]
+    fn miss_caches_then_hits_then_reexpires() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let clock = FakeClock::new(0);
+        let mut e = CompletionDriverEngine::spawn_with(
+            egui::Context::default(),
+            Box::new(CountingRunner { stdout: Some("checkout\t\n".into()), calls: calls.clone() }),
+            Box::new(clock.clone()),
+        );
+        let target = (DriverTool::Git, "git che".to_string(), 7);
+
+        // 1) Cold cache → miss → worker runs; `poll` caches the response.
+        e.request(PathBuf::from("/r"), target.clone());
+        assert_eq!(poll_until(&mut e).candidates[0].value, "checkout");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // 2) Same command within TTL → cache hit, no second subprocess.
+        clock.set(5_000);
+        e.request(PathBuf::from("/r"), target.clone());
+        assert_eq!(e.poll().expect("served from cache").candidates[0].value, "checkout");
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "no second subprocess within TTL");
+
+        // 3) Past the TTL → miss → re-spawn.
+        clock.set(20_000);
+        e.request(PathBuf::from("/r"), target);
+        assert_eq!(poll_until(&mut e).candidates[0].value, "checkout");
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "re-spawned after expiry");
+    }
+
+    #[test]
+    fn empty_result_is_not_cached() {
+        // A missing tool (runner returns None → empty candidates) must not
+        // be cached, so a later retry still attempts the subprocess.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut e = CompletionDriverEngine::spawn_with(
+            egui::Context::default(),
+            Box::new(CountingRunner { stdout: None, calls: calls.clone() }),
+            Box::new(FakeClock::new(0)),
+        );
+        let target = (DriverTool::Kubectl, "kubectl get ".to_string(), 12);
+        e.request(PathBuf::from("/r"), target.clone());
+        assert!(poll_until(&mut e).candidates.is_empty());
+        e.request(PathBuf::from("/r"), target);
+        assert!(poll_until(&mut e).candidates.is_empty());
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "empty results re-fire (not cached)");
     }
 }

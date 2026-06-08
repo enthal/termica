@@ -809,7 +809,7 @@ impl PaneSession {
     /// Drain freshly-arrived driver candidates for the current in-flight
     /// request, if any. The renderer merges them into the open popup.
     pub fn completion_driver_poll(&mut self) -> Option<DriverResponse> {
-        self.completion_driver.as_ref().and_then(|engine| engine.poll())
+        self.completion_driver.as_mut().and_then(|engine| engine.poll())
     }
 
     /// Insert `text` into the editor as the buffer (replacing any

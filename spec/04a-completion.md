@@ -288,7 +288,7 @@ If two sources return the same `value`, they collapse into one row (preserving t
 
 ## Caching
 
-> **Status:** the driver result cache is **not** in the slice-2 PR — it's a deliberate fast-follow in its own PR. It's an optimization (it only saves the ~100 ms re-spawn on close→reopen within the TTL), and it's the one piece that needs an injectable clock for deterministic TTL tests. Slice 2 instead bounds subprocess cost with request **dedup** (an unchanged `(tool, line)` never re-fires) + worker **coalescing** (a burst of keystrokes collapses to the newest request, ~one subprocess in flight). The table below is the target design the cache PR implements.
+> **Status (as built):** the **driver result cache shipped** in its own fast-follow PR (`completion::drivers::cache`). Key `(tool, cwd, line)`, 10 s TTL, pane-scoped (dropped on pane close), keyed pure-functionally on monotonic milliseconds from an injected `Clock` (`SystemClock` in prod; a fake that advances on demand in tests, so the TTL logic needs no `Instant::now`). A hit is served synchronously by `CompletionDriverEngine::request` (stashed for the same frame's `poll`) with **no subprocess**; a non-empty miss response is stored by `poll` on its way out. **Empty results are not cached** — an absent tool re-fails cheaply and a transient timeout stays free to retry. Expired entries are swept on insert so the map can't grow unbounded. The other rows below (`$PATH`, history, sidecar) remain target design for later slices. `(source, …)` in the key prose is conceptual; the driver cache key is `(tool, cwd, line)`. Explicit refresh (Cmd+Shift+R) is not yet wired — a future polish.
 
 The expensive sources (drivers, sidecar) cache aggressively. The cache key is `(source, tool, cwd, partial_line)` — a kubectl driver call for `kubectl get pods` in `/home/tim` is cached separately from the same call in `/home/tim/work`.
 
@@ -350,7 +350,7 @@ This design is targeted at **post-MVP**. The actual implementation slices:
 
 1. **Phase 4I — MVP local completion** ✅ (shipped). Source 3 only. Paths + `$PATH` + history. The popup widget lands here. Tab works for the common cases; advanced commands fall back to `\t`-doesn't-go-to-PTY → no completion.
 2. **CLI-native drivers** ✅ (shipped). `kubectl`/`gh`/`docker` (cobra `__complete`), `aws_completer`, `git --list-cmds`. Source 1 enabled; popup gains source tags; candidates stream into the open popup off-thread (per-pane worker + `egui::Context` repaint, mirroring `git_probe`). Detection is implicit (spawn-failure = silent no-op); the result cache is a separate fast-follow PR. `completion::drivers`.
-   - **2a — Driver result cache** (fast-follow). The 10 s TTL cache in [§Caching](#caching) + the injectable clock its tests need.
+   - **2a — Driver result cache** ✅ (shipped). The 10 s TTL cache in [§Caching](#caching) + the injectable `Clock` its tests need. `completion::drivers::cache`.
 3. **Post-MVP — Fish sidecar.** Cleanest of the three sidecars, so it lands first as the reference for the protocol. About 400–600 LOC including the helper script.
 4. **Post-MVP — Bash sidecar.** Vendored helper + idle-timeout lifecycle + crash recovery. About 800–1100 LOC.
 5. **Post-MVP — Zsh sidecar.** Most fragile; ships after the bash one stabilises so we have a known-good baseline. About 1000–1400 LOC including the helper.
