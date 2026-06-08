@@ -984,6 +984,16 @@ impl PaneSession {
         &self.terminal
     }
 
+    /// Names of the environment variables the shell was spawned with,
+    /// sorted + de-duplicated. The source for `$VAR` tab-completion — it
+    /// reflects the *child shell's* environment (inherited + Termica's
+    /// `TERMICA_*` / `TERM*` built-ins), not the GUI process's own
+    /// `std::env::vars()`. Spawn-time snapshot; runtime `export`s aren't
+    /// reflected (see [`crate::pty::PtySession::env_var_names`]).
+    pub fn env_var_names(&self) -> &[String] {
+        self.pty.env_var_names()
+    }
+
     /// Borrow the underlying terminal state mutably. Used by the
     /// update loop for VT-state operations that don't go through the
     /// PTY — currently only [`TerminalState::scroll_display`] (mouse

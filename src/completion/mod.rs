@@ -75,10 +75,11 @@ pub fn open_completion_at(
     cursor: usize,
     cwd: Option<&Path>,
     home: Option<&Path>,
+    env_var_names: &[String],
     history_lookup: impl FnOnce() -> Vec<String>,
 ) -> Option<CompletionPopup> {
     let (origin, token, candidates) =
-        local_candidates_at(editor_text, cursor, cwd, home, history_lookup);
+        local_candidates_at(editor_text, cursor, cwd, home, env_var_names, history_lookup);
     CompletionPopup::new(origin, token, candidates)
 }
 
@@ -94,6 +95,7 @@ fn local_candidates_at(
     cursor: usize,
     cwd: Option<&Path>,
     home: Option<&Path>,
+    env_var_names: &[String],
     history_lookup: impl FnOnce() -> Vec<String>,
 ) -> (usize, String, Vec<CompletionCandidate>) {
     // Quote / escape-aware: an opening quote bounds the token (so a
@@ -114,8 +116,11 @@ fn local_candidates_at(
     // `$HOME` / `$HOSTNAME`, … This is exclusive — a `$foo` token is
     // neither a path nor a command, so the other sources don't run.
     if let Some(var_prefix) = local::env_var_prefix(token) {
-        let names: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
-        let cands = local::complete_env_vars(var_prefix, &names);
+        // Source the names from the *shell's* environment (passed in by
+        // the caller — what Termica spawned the child with), not the GUI
+        // process's own `std::env::vars()`, which omits `TERMICA_*` and
+        // anything else set only on the child.
+        let cands = local::complete_env_vars(var_prefix, env_var_names);
         return (token_start, token.to_string(), cands);
     }
 
@@ -244,10 +249,11 @@ pub fn plan_completion(
     cursor: usize,
     cwd: Option<&Path>,
     home: Option<&Path>,
+    env_var_names: &[String],
     history_lookup: impl FnOnce() -> Vec<String>,
 ) -> CompletionPlan {
     let (origin, token, locals) =
-        local_candidates_at(editor_text, cursor, cwd, home, history_lookup);
+        local_candidates_at(editor_text, cursor, cwd, home, env_var_names, history_lookup);
     if let Some(target) = drivers::parse::driver_target(editor_text, cursor) {
         return CompletionPlan::AwaitDriver { origin_byte: origin, token, locals, target };
     }
@@ -490,7 +496,7 @@ mod tests {
         // driver never fired). Now it must AwaitDriver so the driver's
         // `checkout`/`cherry` can open the popup.
         let dir = tempfile::tempdir().unwrap();
-        let plan = plan_completion("git ch", 6, Some(dir.path()), None, Vec::new);
+        let plan = plan_completion("git ch", 6, Some(dir.path()), None, &[], Vec::new);
         match plan {
             CompletionPlan::AwaitDriver { target, locals, .. } => {
                 assert_eq!(target.0, DriverTool::Git);
@@ -508,7 +514,7 @@ mod tests {
         // never an `Open` of files.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("notes.txt"), b"").unwrap();
-        let plan = plan_completion("gh ", 3, Some(dir.path()), None, Vec::new);
+        let plan = plan_completion("gh ", 3, Some(dir.path()), None, &[], Vec::new);
         match plan {
             CompletionPlan::AwaitDriver { target, locals, .. } => {
                 assert_eq!(target.0, DriverTool::Gh);
@@ -527,7 +533,7 @@ mod tests {
         // no waiting.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("notes.txt"), b"").unwrap();
-        let plan = plan_completion("ls ", 3, Some(dir.path()), None, Vec::new);
+        let plan = plan_completion("ls ", 3, Some(dir.path()), None, &[], Vec::new);
         match plan {
             CompletionPlan::Open(popup) => {
                 assert!(popup.candidates.iter().any(|c| c.display.ends_with("notes.txt")));
@@ -539,7 +545,7 @@ mod tests {
     #[test]
     fn plan_non_driver_no_local_match_is_closed() {
         let dir = tempfile::tempdir().unwrap();
-        let plan = plan_completion("ls zzz_no_such", 14, Some(dir.path()), None, Vec::new);
+        let plan = plan_completion("ls zzz_no_such", 14, Some(dir.path()), None, &[], Vec::new);
         assert!(matches!(plan, CompletionPlan::Closed), "no driver, no match → nothing");
     }
 
@@ -564,8 +570,27 @@ mod tests {
         // Empty buffer, command position, history empty, no
         // executables match the empty token (correctly — we don't
         // dump $PATH on a bare Tab). Result: no popup.
-        let p = open_completion_at("", 0, None, None, Vec::new);
+        let p = open_completion_at("", 0, None, None, &[], Vec::new);
         assert!(p.is_none());
+    }
+
+    #[test]
+    fn env_var_completion_uses_supplied_env_not_process() {
+        // Regression (PR #141 follow-up): `$VAR` completion must reflect
+        // the *child shell's* environment — what Termica spawned it with,
+        // including `TERMICA_*` — not the GUI process's own
+        // `std::env::vars()`. The supplied names stand in for the shell
+        // env; pre-fix the source was hard-wired to the process env and a
+        // var present only in the child never appeared.
+        let env =
+            ["TERMICA_SESSION_ID".to_string(), "TERMICA_SHELL".to_string(), "PATH".to_string()];
+        let text = "echo $TERMI";
+        let popup = open_completion_at(text, text.len(), None, None, &env, Vec::new)
+            .expect("popup for $TERMI");
+        let values: Vec<&str> = popup.candidates.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"$TERMICA_SESSION_ID"), "got {values:?}");
+        assert!(values.contains(&"$TERMICA_SHELL"), "got {values:?}");
+        assert!(!values.contains(&"$PATH"), "PATH doesn't match the $TERMI prefix: {values:?}");
     }
 
     // ---- quote-aware completion (Bug 2 + Bug 3) ------------------
@@ -580,7 +605,7 @@ mod tests {
         std::fs::write(dir.path().join("my file.txt"), b"").unwrap();
         std::fs::write(dir.path().join("other.txt"), b"").unwrap();
         let text = "ls \"my fi";
-        let popup = open_completion_at(text, text.len(), Some(dir.path()), None, Vec::new)
+        let popup = open_completion_at(text, text.len(), Some(dir.path()), None, &[], Vec::new)
             .expect("quoted token should produce a popup");
         assert_eq!(popup.origin_byte, 4, "replace region starts after the opening quote");
         let cand = popup
@@ -599,7 +624,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("my file.txt"), b"").unwrap();
         let text = "ls my\\ fi";
-        let popup = open_completion_at(text, text.len(), Some(dir.path()), None, Vec::new)
+        let popup = open_completion_at(text, text.len(), Some(dir.path()), None, &[], Vec::new)
             .expect("escaped-space token should produce a popup");
         assert!(
             popup.candidates.iter().any(|c| c.display.ends_with("my file.txt")),
@@ -615,8 +640,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("my file.txt"), b"").unwrap();
         let text = "ls my";
-        let popup =
-            open_completion_at(text, text.len(), Some(dir.path()), None, Vec::new).expect("popup");
+        let popup = open_completion_at(text, text.len(), Some(dir.path()), None, &[], Vec::new)
+            .expect("popup");
         let cand =
             popup.candidates.iter().find(|c| c.display.ends_with("my file.txt")).expect("match");
         assert!(!cand.display.contains('\\'), "menu shows the plain, human-readable name");

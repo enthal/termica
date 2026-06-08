@@ -82,6 +82,15 @@ pub struct PtySession {
     child: Box<dyn Child + Send + Sync>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     reader: Option<Box<dyn Read + Send>>,
+    /// Sorted, de-duplicated names of the environment variables the child
+    /// was spawned with — the inherited parent env, the built-ins set
+    /// here (`TERM`, `TERM_PROGRAM`, …) and the caller's `config.env`
+    /// (`TERMICA_*`, …). This is the source for `$VAR` tab-completion, so
+    /// it reflects the *shell's* environment rather than the GUI
+    /// process's own `std::env::vars()`. It is the env at spawn time;
+    /// runtime `export`s the shell makes later are not reflected (a future
+    /// async env probe would cover those).
+    env_var_names: Vec<String>,
 }
 
 impl PtySession {
@@ -102,6 +111,12 @@ impl PtySession {
             cmd.arg(arg);
         }
 
+        // Collect the names of every variable we put into the child's
+        // environment, in the same order they're applied below. This is
+        // the source for `$VAR` tab-completion — sorted + de-duplicated
+        // once everything's been applied (see `env_var_names`).
+        let mut env_var_names: Vec<String> = Vec::new();
+
         // Inherit the parent process's environment. `portable_pty`'s
         // CommandBuilder starts EMPTY by default — without this loop
         // the child has no $PATH, no $HOME, no $LANG, and (worst of
@@ -110,6 +125,12 @@ impl PtySession {
         // the canonical example) fall back to a "dumb" definition
         // where many escape sequences are simply ignored.
         for (k, v) in std::env::vars_os() {
+            // A non-UTF-8 var name can't be a `$NAME` shell token, so it's
+            // irrelevant to completion — but it's still a real inherited
+            // var, so pass it through to the child regardless.
+            if let Some(k) = k.to_str() {
+                env_var_names.push(k.to_string());
+            }
             cmd.env(k, v);
         }
 
@@ -120,6 +141,7 @@ impl PtySession {
         // — that env var describes the terminal the child is talking
         // to (us), not the one Termica itself was launched from.
         cmd.env("TERM", "xterm-256color");
+        env_var_names.push("TERM".to_string());
 
         // Helpful self-identification for any code that branches on
         // who's hosting it (Apple's `/etc/zshrc_Apple_Terminal`
@@ -128,7 +150,9 @@ impl PtySession {
         // the OSC 7 emission directly so we don't depend on Apple's
         // gated path.
         cmd.env("TERM_PROGRAM", "Termica");
+        env_var_names.push("TERM_PROGRAM".to_string());
         cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        env_var_names.push("TERM_PROGRAM_VERSION".to_string());
 
         // Integration is now driven by the caller via
         // `crate::integration::managed_spawn_for()`, which decides
@@ -141,7 +165,14 @@ impl PtySession {
         // built-in values.
         for (k, v) in &config.env {
             cmd.env(k, v);
+            env_var_names.push(k.clone());
         }
+
+        // Sort + de-duplicate so completion sees each name once (a
+        // `config.env` override repeats an inherited name) and in a
+        // stable order.
+        env_var_names.sort();
+        env_var_names.dedup();
 
         if let Some(cwd) = &config.cwd {
             cmd.cwd(cwd);
@@ -165,7 +196,15 @@ impl PtySession {
             .map_err(|e| PtyError::Os(format!("try_clone_reader: {e}")))?;
         let killer = child.clone_killer();
 
-        Ok(Self { master: pair.master, writer, child, killer, reader: Some(reader) })
+        Ok(Self { master: pair.master, writer, child, killer, reader: Some(reader), env_var_names })
+    }
+
+    /// Sorted, de-duplicated names of the environment variables the child
+    /// shell was spawned with (inherited + built-ins + `config.env`). The
+    /// source for `$VAR` tab-completion — reflects the shell's
+    /// environment, not the GUI process's own `std::env::vars()`.
+    pub fn env_var_names(&self) -> &[String] {
+        &self.env_var_names
     }
 
     /// Move the slave-output reader out of this session. The consumer
@@ -405,5 +444,27 @@ mod tests {
         .expect("spawn");
         let s = drain_to_string(&mut session);
         assert!(s.contains("TERM=screen-256color"), "expected explicit override, got: {s:?}");
+    }
+
+    #[test]
+    fn spawn_captures_env_var_names_including_config_and_builtins() {
+        // The shell's env-var names (for `$VAR` completion) are sourced
+        // from the resolved spawn environment, not the GUI's own
+        // `std::env::vars()`. So a name set ONLY via `config.env` — like
+        // Termica's `TERMICA_SESSION_ID` — must be captured, as must the
+        // built-in `TERM_PROGRAM`. Inherited names (PATH) are present too.
+        let session = PtySession::spawn(&PtyConfig {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "true".into()],
+            env: vec![("TERMICA_SESSION_ID".into(), "abc-123".into())],
+            ..PtyConfig::default()
+        })
+        .expect("spawn");
+        let names = session.env_var_names();
+        assert!(names.contains(&"TERMICA_SESSION_ID".to_string()), "config.env name missing");
+        assert!(names.contains(&"TERM_PROGRAM".to_string()), "built-in name missing");
+        assert!(names.contains(&"PATH".to_string()), "inherited name missing");
+        // Sorted + de-duplicated.
+        assert!(names.windows(2).all(|w| w[0] < w[1]), "names must be sorted & unique: {names:?}");
     }
 }
