@@ -163,19 +163,31 @@ pub fn shortcut_groups(is_macos: bool) -> Vec<ShortcutGroup> {
 /// Background of a drawn key-cap.
 const CAP_BG: egui::Color32 = egui::Color32::from_rgb(0x2c, 0x2c, 0x2c);
 
+/// How to render a key-cap: a drawn modifier glyph, or a text label.
+enum CapDraw {
+    Cmd,
+    Ctrl,
+    Option,
+    Text(String),
+}
+
 /// Paint one key-cap (a small rounded rect with the modifier glyph or
-/// the key label). Advances layout by allocating the cap's space.
+/// the key label). Glyph caps (⌘ / ⌃ / ⌥) are square; text caps size to
+/// their label. Advances layout by allocating the cap's space.
 fn paint_cap(ui: &mut egui::Ui, cap: Cap) {
     let h = ui.spacing().interact_size.y;
-    let label = match cap {
-        Cap::Cmd => None,
-        Cap::Ctrl => Some("Ctrl".to_string()),
-        Cap::Shift => Some("Shift".to_string()),
-        Cap::Alt(s) => Some(s.to_string()),
-        Cap::Key(s) => Some(s.to_string()),
+    let draw = match cap {
+        Cap::Cmd => CapDraw::Cmd,
+        Cap::Ctrl => CapDraw::Ctrl,
+        Cap::Shift => CapDraw::Text("Shift".to_string()),
+        Cap::Alt("Option") => CapDraw::Option,
+        Cap::Alt(s) => CapDraw::Text(s.to_string()),
+        Cap::Key(s) => CapDraw::Text(s.to_string()),
     };
-    let text_w = label.as_ref().map(|s| 7.0 * s.chars().count() as f32).unwrap_or(0.0);
-    let w = (text_w + 12.0).max(h);
+    let w = match &draw {
+        CapDraw::Text(s) => (7.0 * s.chars().count() as f32 + 12.0).max(h),
+        _ => h, // square chip for a drawn glyph
+    };
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
     let painter = ui.painter();
     painter.rect(
@@ -186,9 +198,11 @@ fn paint_cap(ui: &mut egui::Ui, cap: Cap) {
         egui::StrokeKind::Inside,
     );
     let fg = ui.visuals().strong_text_color();
-    match label {
-        None => crate::icons::paint_command_symbol(painter, rect, fg),
-        Some(s) => {
+    match draw {
+        CapDraw::Cmd => crate::icons::paint_command_symbol(painter, rect, fg),
+        CapDraw::Ctrl => crate::icons::paint_control_symbol(painter, rect, fg),
+        CapDraw::Option => crate::icons::paint_option_symbol(painter, rect, fg),
+        CapDraw::Text(s) => {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -250,7 +264,9 @@ pub fn paint(
         close = true;
     }
 
-    let panel_w = (pane_rect.width() * 0.9).min(560.0);
+    // Narrow enough that the description and its key-caps stay close
+    // (easy to track left↔right), not a wide bar with a blank middle.
+    let panel_w = (pane_rect.width() * 0.7).clamp(360.0, 440.0);
     let query_lower = query.to_lowercase();
 
     egui::Area::new(ui.id().with(("keys-panel", pane_id)))
@@ -258,7 +274,10 @@ pub fn paint(
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .show(ui.ctx(), |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
+                // Both min AND max so the floating Area can't let the
+                // `auto_shrink(false)` scroll area expand to the screen.
                 ui.set_width(panel_w);
+                ui.set_max_width(panel_w);
                 ui.horizontal(|ui| {
                     ui.heading("Keyboard shortcuts");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -278,12 +297,13 @@ pub fn paint(
                     });
                 });
                 ui.separator();
-                // Full-width scroll area (auto_shrink false on x) so the
-                // scrollbar sits at the right edge of the whole popup.
                 egui::ScrollArea::vertical()
                     .max_height(pane_rect.height() * 0.7)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        // A little breathing room between rows.
+                        ui.spacing_mut().item_spacing.y = 5.0;
+                        let mut first_group = true;
                         for group in shortcut_groups(is_macos) {
                             let items: Vec<Shortcut> = group
                                 .items
@@ -293,8 +313,12 @@ pub fn paint(
                             if items.is_empty() {
                                 continue;
                             }
-                            ui.add_space(6.0);
+                            // Extra space ABOVE each group heading (none
+                            // before the first).
+                            ui.add_space(if first_group { 2.0 } else { 12.0 });
+                            first_group = false;
                             ui.label(egui::RichText::new(group.title).strong().size(13.0));
+                            ui.add_space(2.0);
                             for item in items {
                                 ui.horizontal(|ui| {
                                     // Description on the LEFT; key-caps

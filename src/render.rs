@@ -221,17 +221,22 @@ pub fn color_for_token_kind(kind: crate::shell_syntax::TokenKind) -> Color32 {
     }
 }
 
-/// Blend a syntax-highlight colour toward grey by `t` in `0.0..=1.0`
-/// (`0` = full colour, `1` = grey). Used to render the command label
-/// on running / sealed blocks as *desaturated* syntax highlighting —
-/// the command is history, so its colours are dimmed toward the chip
-/// grey the same way the block-header chips fade, while still showing
-/// the command / flag / string structure.
+/// **Desaturate** a syntax-highlight colour by `t` in `0.0..=1.0`
+/// (`0` = full colour, `1` = neutral grey) while **preserving its
+/// brightness**. Used to render the sealed command label as barely-
+/// tinted syntax highlighting: the structure (command / flag / string)
+/// stays just-perceptibly coloured, but at the same luminance as full
+/// colour so it never gets dim or hard to read on the dark background.
+///
+/// We blend each channel toward the colour's own luminance grey
+/// (Rec. 601), not toward a fixed grey — that's what keeps brightness
+/// constant while only chroma drops.
 pub fn fade_toward_gray(color: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
-    let g = BLOCK_HEADER_FG; // the chip grey
-    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
-    Color32::from_rgb(lerp(color.r(), g.r()), lerp(color.g(), g.g()), lerp(color.b(), g.b()))
+    let (r, g, b) = (color.r() as f32, color.g() as f32, color.b() as f32);
+    let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+    let mix = |c: f32| (c + (luma - c) * t).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(mix(r), mix(g), mix(b))
 }
 
 /// Foreground for a non-zero exit code rendered on a sealed block's
@@ -1259,10 +1264,11 @@ pub fn paint_command_label_with_selection(
     response
 }
 
-/// How far the running/sealed command label's syntax colours fade
-/// toward grey (0 = full colour, 1 = grey). Tuned so the command stays
-/// readable and structured but recedes as history chrome.
-const COMMAND_LABEL_FADE: f32 = 0.4;
+/// How far the sealed command label's syntax colours desaturate
+/// (0 = full colour, 1 = neutral). High — the tints stay just barely
+/// visible — but brightness is preserved by [`fade_toward_gray`] so the
+/// text never goes dim or hard to read.
+const COMMAND_LABEL_FADE: f32 = 0.72;
 
 /// Paint one finished command block: a teal command-label line above
 /// its frozen `Vec<StyledLine>` snapshot. The same helper is used by
@@ -1388,14 +1394,17 @@ pub fn paint_sealed_block(
         // the transcript," not "the failed text has a red wrapper."
         let pane_clip = ui.clip_rect();
         let bottom_y = snapshot_response.rect.bottom();
-        // Reach the inter-block hairlines: the separator is
-        // `add_space(GAP)` + hairline + `add_space(GAP)`, but egui also
-        // inserts `item_spacing.y` between each, so the hairline sits
-        // ~GAP + 2·spacing from the block edge. Span that on both sides
-        // so the red is flush to the hairline with no dark gap.
+        // Reach the inter-block hairline CENTRE exactly — no more, no
+        // less. The separator is `add_space(GAP)` then (after one
+        // `item_spacing`) the 1px hairline, so its centre sits at
+        // `GAP + spacing + 0.5` from the block edge. Spanning to exactly
+        // there means adjacent error washes meet ON the hairline instead
+        // of overlapping past it (which doubled the alpha into a
+        // brighter band).
         let sp = ui.spacing().item_spacing.y;
-        let top = block_top_y - BLOCK_SEPARATOR_GAP - 2.0 * sp;
-        let bottom = bottom_y + BLOCK_SEPARATOR_GAP + 2.0 * sp;
+        let reach = BLOCK_SEPARATOR_GAP + sp + 0.5;
+        let top = block_top_y - reach;
+        let bottom = bottom_y + reach;
         let wash = Rect::from_min_max(
             Pos2::new(pane_clip.left(), top),
             Pos2::new(pane_clip.right(), bottom),

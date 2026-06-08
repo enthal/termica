@@ -183,7 +183,7 @@ pub fn block_filter_button(
 /// for icons").
 pub fn paint_command_symbol(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let c = rect.center();
-    let ext = rect.height() * 0.34; // glyph half-extent (loop far edge = a + r)
+    let ext = rect.height() * 0.30; // glyph half-extent (loop far edge = a + r)
     let r = ext * 0.30; // loop radius
     let a = ext - r; // loop-centre offset → outer edge at `ext`
     let inner = a - r; // straight edges, tangent to the loops
@@ -204,4 +204,34 @@ pub fn paint_command_symbol(painter: &egui::Painter, rect: egui::Rect, color: eg
     for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
         painter.circle_stroke(egui::pos2(c.x + sx * a, c.y + sy * a), r, stroke);
     }
+}
+
+/// Draw the macOS Option (⌥) key glyph: a short horizontal bar at the
+/// bottom-left and a longer one at the top-right, joined by a diagonal
+/// (bottom-left bar's right end up to the top-right bar's left end).
+pub fn paint_option_symbol(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let c = rect.center();
+    let e = rect.height() * 0.26;
+    let stroke = egui::Stroke::new(1.3, color);
+    // Bottom-left short bar.
+    let bl_l = egui::pos2(c.x - e, c.y + e);
+    let bl_r = egui::pos2(c.x - e * 0.3, c.y + e);
+    painter.line_segment([bl_l, bl_r], stroke);
+    // Top-right long bar.
+    let tr_l = egui::pos2(c.x + e * 0.1, c.y - e);
+    let tr_r = egui::pos2(c.x + e, c.y - e);
+    painter.line_segment([tr_l, tr_r], stroke);
+    // Diagonal joining them.
+    painter.line_segment([bl_r, tr_l], stroke);
+}
+
+/// Draw the Control (⌃) key glyph: an upward chevron.
+pub fn paint_control_symbol(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let c = rect.center();
+    let w = rect.height() * 0.24;
+    let h = rect.height() * 0.16;
+    let stroke = egui::Stroke::new(1.4, color);
+    let tip = egui::pos2(c.x, c.y - h);
+    painter.line_segment([egui::pos2(c.x - w, c.y + h), tip], stroke);
+    painter.line_segment([egui::pos2(c.x + w, c.y + h), tip], stroke);
 }
