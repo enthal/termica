@@ -145,7 +145,7 @@ pub const FOOTER_DESCENDER_PAD: f32 = 4.0;
 /// the pane's bottom edge, so the focused-editor chrome floats with a
 /// margin instead of sitting flush on the bottom. Added to the footer
 /// height; the editor + chrome don't paint into it.
-pub const FOOTER_GLOW_BOTTOM_MARGIN: f32 = 6.0;
+pub const FOOTER_GLOW_BOTTOM_MARGIN: f32 = 10.0;
 
 /// Compute the fixed-footer height for the [`Block::Prompt`] block
 /// per [spec/04 §"Layout"](../spec/04-prompt-editor.md#layout-fixed-footer-prompt-sticky-top-header).
@@ -1901,17 +1901,23 @@ pub fn render_pane(
         {
             // The live prompt shows current git + the PR chip (number +
             // live CI color) — the "now, about to act" state. Vivid (not
-            // faded).
-            let _ = render::paint_block_header(
-                ui,
-                header.cwd.as_deref(),
-                home,
-                None,
-                None,
-                git_ctx.as_ref(),
-                pr_ctx.as_ref(),
-                false,
-            );
+            // faded). Indent by the same `LEFT_GUTTER` as the editor and
+            // the sealed-block chips above — `paint_block_header`
+            // otherwise allocates at the ui's left edge, leaving the
+            // prompt chip hard-left while the editor / glow were inset.
+            ui.horizontal(|ui| {
+                ui.add_space(LEFT_GUTTER);
+                let _ = render::paint_block_header(
+                    ui,
+                    header.cwd.as_deref(),
+                    home,
+                    None,
+                    None,
+                    git_ctx.as_ref(),
+                    pr_ctx.as_ref(),
+                    false,
+                );
+            });
         }
 
         // Allocate the editor strip and paint into it. The widget
