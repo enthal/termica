@@ -55,6 +55,36 @@ function termica_emit_int
     termica_emit_raw $type $argv[2]
 end
 
+# Emit the shell's current variable NAMES for Termica's `$VAR`
+# tab-completion. NAMES ONLY — never values (they routinely hold secrets).
+# Lets completion see the LIVE shell (variables defined after spawn, etc.),
+# not just the spawn-time environment snapshot. Change-gated via
+# `__termica_last_vars_sig` (excluded from the report, with our other
+# `__termica*` internals) so a steady prompt loop is cheap.
+set -g __termica_last_vars_sig ""
+function termica_emit_vars
+    # `set --names` lists every fish variable name; they're identifier-
+    # shaped. Sort for a stable change signature.
+    set -l names (set --names | sort -u)
+    set -l sig (string join " " $names)
+    test "$sig" = "$__termica_last_vars_sig"; and return 0
+    set -g __termica_last_vars_sig $sig
+    set -l json "["
+    set -l first 1
+    for n in $names
+        string match -q '__termica*' -- $n; and continue
+        if test $first -eq 1
+            set first 0
+        else
+            set json "$json,"
+        end
+        set -l esc (termica_escape_json $n)
+        set json "$json\"$esc\""
+    end
+    set json "$json]"
+    termica_emit_raw shell_vars $json
+end
+
 # ----- lifecycle handlers ------------------------------------------------
 
 function termica_preexec --on-event fish_preexec
@@ -70,6 +100,8 @@ end
 
 function termica_prompt_hook --on-event fish_prompt
     termica_emit_string precmd "$PWD"
+    # Live `$VAR`-completion source (change-gated, names only).
+    termica_emit_vars
 end
 
 # ----- bootstrap sequence ------------------------------------------------

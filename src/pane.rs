@@ -186,6 +186,23 @@ pub struct PaneSession {
     /// branch change (e.g. `git checkout`) and re-probe the PR even when
     /// the cwd is unchanged.
     last_git_branch: Option<String>,
+    /// Live variable names reported by the shell via the `shell_vars`
+    /// marker (emitted from the precmd hook, change-gated shell-side).
+    /// `Some` once the shell has reported at least once; supersedes the
+    /// spawn-time [`crate::pty::PtySession::env_var_names`] snapshot as the
+    /// `$VAR`-completion source because it reflects the LIVE shell —
+    /// non-exported parameters (`HISTFILE`, …) and runtime `export`s
+    /// included. `None` before the first report (and when integration is
+    /// absent), so completion falls back to the spawn snapshot.
+    shell_var_names: Option<Vec<String>>,
+}
+
+/// Choose the `$VAR`-completion name source: the shell's live report
+/// (`shell`) when it has arrived, else the spawn-time `snapshot`. Pure so
+/// the precedence is testable without spawning a shell. Kept as a borrow
+/// (no allocation) — the caller already owns both slices.
+fn effective_var_names<'a>(shell: Option<&'a [String]>, snapshot: &'a [String]) -> &'a [String] {
+    shell.unwrap_or(snapshot)
 }
 
 impl PaneSession {
@@ -259,6 +276,7 @@ impl PaneSession {
             pr_context: None,
             completion_driver: None,
             last_git_branch: None,
+            shell_var_names: None,
         })
     }
 
@@ -413,6 +431,13 @@ impl PaneSession {
             }
             if matches!(event, crate::markers::LifecycleEvent::CommandFinished { .. }) {
                 command_finished = true;
+            }
+            // Live `$VAR`-completion source: the shell just reported its
+            // current variable names (precmd hook, change-gated shell-side).
+            // Supersede the spawn-time snapshot. Cloned out before
+            // `observe_event` consumes the event below.
+            if let crate::markers::LifecycleEvent::ShellVars { names } = &event {
+                self.shell_var_names = Some(names.clone());
             }
             // Multi-line continuation: if the shell's parser saw an
             // incomplete command after submit and emitted `PS2` (as
@@ -984,14 +1009,15 @@ impl PaneSession {
         &self.terminal
     }
 
-    /// Names of the environment variables the shell was spawned with,
-    /// sorted + de-duplicated. The source for `$VAR` tab-completion — it
-    /// reflects the *child shell's* environment (inherited + Termica's
-    /// `TERMICA_*` / `TERM*` built-ins), not the GUI process's own
-    /// `std::env::vars()`. Spawn-time snapshot; runtime `export`s aren't
-    /// reflected (see [`crate::pty::PtySession::env_var_names`]).
+    /// Variable names for `$VAR` tab-completion. Prefers the LIVE names
+    /// the shell reports via the `shell_vars` marker (which include
+    /// non-exported parameters like `HISTFILE` and runtime `export`s);
+    /// before the shell has reported — or when integration is absent —
+    /// falls back to the spawn-time environment snapshot
+    /// ([`crate::pty::PtySession::env_var_names`], inherited + built-ins +
+    /// `TERMICA_*`).
     pub fn env_var_names(&self) -> &[String] {
-        self.pty.env_var_names()
+        effective_var_names(self.shell_var_names.as_deref(), self.pty.env_var_names())
     }
 
     /// Borrow the underlying terminal state mutably. Used by the
@@ -1342,6 +1368,19 @@ mod tests {
 
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn effective_var_names_prefers_shell_report_then_falls_back_to_snapshot() {
+        let snapshot = vec!["HOME".to_string(), "PATH".to_string()];
+        // No shell report yet → use the spawn snapshot.
+        assert_eq!(effective_var_names(None, &snapshot), &snapshot[..]);
+        // Shell has reported (its list supersedes — includes non-exported
+        // params the snapshot can't have) → use it, even if shorter/empty.
+        let shell = vec!["HISTFILE".to_string()];
+        assert_eq!(effective_var_names(Some(&shell), &snapshot), &shell[..]);
+        let empty: Vec<String> = vec![];
+        assert_eq!(effective_var_names(Some(&empty), &snapshot), &empty[..]);
+    }
 
     fn sh_c(cmd: &str) -> PtyConfig {
         PtyConfig {

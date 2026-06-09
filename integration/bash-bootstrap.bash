@@ -57,6 +57,33 @@ termica_emit_int() {
     termica_emit_raw "$type" "$n"
 }
 
+# Emit the shell's current variable NAMES for Termica's `$VAR`
+# tab-completion. NAMES ONLY — never values (they routinely hold secrets).
+# This is what lets completion see the LIVE shell: non-exported variables
+# and anything `export`ed after spawn, neither of which is in the
+# spawn-time environment snapshot. Change-gated so a steady prompt loop
+# costs nothing beyond building the list; state in `__termica_last_vars_sig`
+# (excluded from the report, with our other `__termica*` internals).
+__termica_last_vars_sig=""
+termica_emit_vars() {
+    # `compgen -v` lists every shell variable name (exported or not); they
+    # are all identifier-shaped. Sort for a stable change signature.
+    local names sig json first=1 n
+    names="$(compgen -v 2>/dev/null | LC_ALL=C sort -u)"
+    sig="$names"
+    [[ "$sig" == "$__termica_last_vars_sig" ]] && return 0
+    __termica_last_vars_sig="$sig"
+    json="["
+    while IFS= read -r n; do
+        [[ -z "$n" ]] && continue
+        case "$n" in __termica*) continue ;; esac
+        if (( first )); then first=0; else json+=","; fi
+        json+="\"$(termica_escape_json "$n")\""
+    done <<< "$names"
+    json+="]"
+    termica_emit_raw "shell_vars" "$json"
+}
+
 # ----- lifecycle hooks ---------------------------------------------------
 
 termica_preexec() {
@@ -72,6 +99,8 @@ termica_precmd() {
     local exit_status=$?
     termica_emit_int "command_finished" "$exit_status"
     termica_emit_string "precmd" "$PWD"
+    # Live `$VAR`-completion source (change-gated, names only).
+    termica_emit_vars
 }
 
 # Idempotent hook installation. bash-preexec exposes hook arrays
