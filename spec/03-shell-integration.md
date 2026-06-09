@@ -181,20 +181,31 @@ Procedure:
 
 4. Our wrapper .zshrc:
      a. Sets a TERMICA_BOOTSTRAPPED guard against double-load.
-     b. Immediately `unset ZDOTDIR` so user code never sees the
-        mutation.
+     b. Remembers the wrapper ZDOTDIR, then immediately `unset ZDOTDIR`
+        so user code never sees the mutation.
      c. Defines Termica helpers (DCS-JSON emit, JSON escape).
      d. Sources `~/.zshenv` if it exists (zsh would normally have
         done this but it sourced our empty wrapper .zshenv instead).
      e. Re-evaluates effective ZDOTDIR — the user's .zshenv may have
         set it. From here on, user config lives at
         `${ZDOTDIR:-$HOME}/.zshrc`.
-     f. Sources `$ZDOTDIR/.zshrc` if it exists (similarly skipped by
+     f. **Repairs HISTFILE** if a file sourced *before* our .zshrc pinned
+        it inside the wrapper dir. `/etc/zshrc` (read at step 3, while
+        ZDOTDIR still pointed at the wrapper) sets
+        `HISTFILE=${ZDOTDIR:-$HOME}/.zsh_history`, capturing the wrapper
+        temp dir. Left uncorrected, the shell's native history (up-arrow,
+        `!!`, `fc`) reads/writes a throwaway temp file Termica deletes on
+        pane close — silent history loss, and the user's real
+        `~/.zsh_history` (shared with their other terminals) is never
+        touched. If HISTFILE points inside the remembered wrapper ZDOTDIR,
+        it's rebased onto the real `${ZDOTDIR:-$HOME}`. The user's own
+        `.zshrc` (next step) can still override it.
+     g. Sources `$ZDOTDIR/.zshrc` if it exists (similarly skipped by
         zsh because of our ZDOTDIR override).
-     g. Defines preexec / precmd hook functions and calls
+     h. Defines preexec / precmd hook functions and calls
         `termica_ensure_hooks` — idempotent reassertion after any
         prompt framework (oh-my-zsh, p10k, etc.) has had its say.
-     h. Emits `integration_ready` over DCS-JSON.
+     i. Emits `integration_ready` over DCS-JSON.
 
 5. The pane transitions out of Bootstrapping. The first real prompt
    is now drawn and the pane is in RawTerminal.

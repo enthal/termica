@@ -29,6 +29,12 @@ if [[ -n "${TERMICA_BOOTSTRAPPED:-}" ]]; then
 fi
 TERMICA_BOOTSTRAPPED=1
 
+# Remember the wrapper ZDOTDIR before we drop it. Files that zsh sourced
+# BEFORE this one (notably macOS's `/etc/zshrc`) ran while ZDOTDIR still
+# pointed here, so anything they derived from `${ZDOTDIR:-$HOME}` captured
+# the wrapper temp dir. We repair the one that matters — HISTFILE — below.
+local __termica_wrapper_zdotdir="$ZDOTDIR"
+
 # Drop our ZDOTDIR mutation immediately so user code that inspects
 # ZDOTDIR sees its real value (typically unset → $HOME). Note: zsh
 # already finished sourcing `/etc/zshenv` and our `$ZDOTDIR/.zshenv`
@@ -148,6 +154,21 @@ termica_ensure_hooks() {
 #    changed it. From here on, user config lives at
 #    `${ZDOTDIR:-$HOME}/.zshrc`.
 local __termica_user_zdotdir="${ZDOTDIR:-$HOME}"
+
+# 2b. Repair HISTFILE if a startup file sourced before us pinned it inside
+#     the wrapper temp dir. macOS's `/etc/zshrc` does exactly this:
+#         HISTFILE=${ZDOTDIR:-$HOME}/.zsh_history
+#     evaluated while ZDOTDIR still pointed at our wrapper. Left as-is, the
+#     shell's NATIVE history (up-arrow, `!!`, `fc`, the `history` builtin)
+#     would read and write a throwaway temp file that Termica deletes when
+#     the pane closes — silently losing history and never touching the
+#     user's real `~/.zsh_history`, which their other terminals share.
+#     Rebase it onto the user's real config home (preserving any subpath).
+#     The user's own `.zshrc`, sourced next, can still override HISTFILE.
+if [[ -n "$__termica_wrapper_zdotdir" && "$HISTFILE" == "$__termica_wrapper_zdotdir"/* ]]; then
+    HISTFILE="$__termica_user_zdotdir/${HISTFILE#$__termica_wrapper_zdotdir/}"
+fi
+unset __termica_wrapper_zdotdir
 
 # 3. Source the user's real .zshrc. Same skip-and-recover dance:
 #    zsh would normally have sourced `$ZDOTDIR/.zshrc` automatically,
