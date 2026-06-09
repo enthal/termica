@@ -357,6 +357,12 @@ fn lifecycle_to_json(event: &LifecycleEvent, obj: &mut serde_json::Map<String, s
             obj.insert("event".into(), json!("Preexec"));
             obj.insert("command".into(), json!(command));
         }
+        LifecycleEvent::ShellVars { names } => {
+            obj.insert("event".into(), json!("ShellVars"));
+            // Record the count, not the names — the dump is for tracing
+            // event flow, and the full list would bloat it every prompt.
+            obj.insert("count".into(), json!(names.len()));
+        }
         LifecycleEvent::CommandFinished { exit } => {
             obj.insert("event".into(), json!("CommandFinished"));
             obj.insert("exit".into(), json!(exit));

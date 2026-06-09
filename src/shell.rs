@@ -290,6 +290,12 @@ impl PromptController {
                 // Routed to the status header consumer; no mode
                 // transition. Phase 5 wires this up.
             }
+            LifecycleEvent::ShellVars { .. } => {
+                // Routed to the pane's `$VAR`-completion source
+                // (`PaneSession`); never a mode transition. Mode safety:
+                // a variable-name report says nothing about whether
+                // we're at a prompt.
+            }
             LifecycleEvent::CommandAborted { .. } => {
                 // Treated like a CommandFinished with no exit: close
                 // the pending block.

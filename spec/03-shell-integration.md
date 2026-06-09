@@ -53,8 +53,20 @@ Defined `type` values:
 | `cwd` | path string | Optional standalone cwd update outside the normal precmd flow (e.g. on prompt-side updates that don't go through precmd). |
 | `prompt_vars` | object | Optional structured prompt metadata (git branch, virtualenv, etc.) for the native status header. |
 | `command_aborted` | reason string | User cancelled input before execution (Ctrl-C on empty editor, etc.). |
+| `shell_vars` | array of name strings | From the precmd hook (change-gated). The shell's current variable **names** — the source for `$VAR` tab completion. |
 
 `prompt_vars` is intentionally open-ended — the shell sends whatever it can cheaply derive; Termica consumes the keys it knows about (`cwd`, `git_branch`, `git_dirty`, `venv`, etc.) and ignores the rest.
+
+#### `shell_vars` — live `$VAR`-completion source
+
+The precmd hook emits the names of the shell's currently-defined variables (zsh `${(k)parameters}`, bash `compgen -v`, fish `set --names`), filtered to shell-identifier-shaped names and excluding the integration's own `__termica*` internals. This drives `$VAR` tab completion, so it reflects the **live shell** — including **non-exported** parameters (`HISTFILE`, `PS1`, …) and anything `export`ed after spawn — none of which appear in the spawn-time environment snapshot ([`PtySession::env_var_names`](../src/pty.rs)) that completion falls back to before the first report.
+
+Two invariants are normative:
+
+- **Names only, never values.** Values routinely hold secrets (API tokens, AWS credentials); they must never enter the byte stream, Termica's memory, scrollback, or persistence. The payload is an array of bare names.
+- **Change-gated.** The hook tracks a signature of the last-emitted name set and emits only when it changes, so a steady prompt loop (the common case) costs nothing beyond building the list. `ShellVars` is inert for the pane-mode machine — a variable-name report never triggers a mode transition.
+
+Consumed by [`PaneSession`](../src/pane.rs): the reported names supersede the spawn snapshot as the completion source ([`PaneSession::env_var_names`](../src/pane.rs)).
 
 ### Parser requirements
 

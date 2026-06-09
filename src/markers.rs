@@ -41,6 +41,14 @@ pub enum LifecycleEvent {
     /// `{"type":"preexec","value":"<command>"}` — about to execute
     /// the command. Emitted by the shell-side preexec hook.
     Preexec { command: String },
+    /// `{"type":"shell_vars","value":["NAME",...]}` — the names of the
+    /// shell's currently-defined variables (parameters), emitted from the
+    /// precmd hook and change-gated shell-side. Feeds `$VAR` tab
+    /// completion so it reflects the LIVE shell — including non-exported
+    /// parameters (`HISTFILE`, `PS1`, …) and runtime `export`s — which the
+    /// spawn-time environment snapshot can't see. Names only, never
+    /// values (values routinely hold secrets). See [spec/03 §shell_vars].
+    ShellVars { names: Vec<String> },
     /// `{"type":"command_finished","value":<exit_int>}` — the
     /// foreground command returned with this exit code.
     CommandFinished { exit: i32 },
@@ -125,6 +133,14 @@ fn parse_message(value: &serde_json::Value) -> Option<LifecycleEvent> {
         "preexec" => {
             let command = value?.as_str()?.to_string();
             Some(LifecycleEvent::Preexec { command })
+        }
+        "shell_vars" => {
+            // Value is an array of variable-name strings. Non-string
+            // elements are skipped defensively rather than failing the
+            // whole message.
+            let names =
+                value?.as_array()?.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+            Some(LifecycleEvent::ShellVars { names })
         }
         "command_finished" => {
             // Accept both integer and numeric-string forms.
@@ -234,6 +250,33 @@ mod tests {
     fn preexec_command_string() {
         let b = body(r#"{"type":"preexec","session":"x","value":"ls -la"}"#);
         assert_eq!(parse_dcs_body(&b), Some(LifecycleEvent::Preexec { command: "ls -la".into() }));
+    }
+
+    #[test]
+    fn shell_vars_array_of_names() {
+        let b = body(r#"{"type":"shell_vars","session":"x","value":["HOME","HISTFILE","PATH"]}"#);
+        assert_eq!(
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::ShellVars {
+                names: vec!["HOME".into(), "HISTFILE".into(), "PATH".into()]
+            })
+        );
+    }
+
+    #[test]
+    fn shell_vars_empty_array() {
+        let b = body(r#"{"type":"shell_vars","session":"x","value":[]}"#);
+        assert_eq!(parse_dcs_body(&b), Some(LifecycleEvent::ShellVars { names: vec![] }));
+    }
+
+    #[test]
+    fn shell_vars_skips_non_string_elements() {
+        // Defensive: a malformed element doesn't poison the whole list.
+        let b = body(r#"{"type":"shell_vars","session":"x","value":["A",3,"B"]}"#);
+        assert_eq!(
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::ShellVars { names: vec!["A".into(), "B".into()] })
+        );
     }
 
     #[test]

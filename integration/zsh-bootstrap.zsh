@@ -82,6 +82,40 @@ termica_emit_int() {
     termica_emit_raw "$type" "$n"
 }
 
+# Emit the shell's current variable NAMES for Termica's `$VAR`
+# tab-completion. NAMES ONLY — never values, which routinely hold secrets
+# (API tokens, AWS creds). This is what lets completion see the LIVE shell:
+# non-exported parameters like `HISTFILE` / `PS1`, and anything `export`ed
+# after spawn, none of which are in the spawn-time environment snapshot.
+#
+# Change-gated: emits only when the name set differs from the last
+# emission, so a steady prompt loop (same vars every prompt) costs nothing
+# beyond building the list. State is held in `__termica_last_vars_sig`
+# (excluded from the report, along with our other `__termica*` internals,
+# so it never perturbs the signature).
+__termica_last_vars_sig=""
+termica_emit_vars() {
+    setopt local_options extended_glob
+    # `${(k)parameters}` is every parameter name. Keep only shell-
+    # identifier-shaped names (drops zsh specials like `?`, `#`, `argv`)
+    # and drop our own `__termica*` internals.
+    local -a names
+    names=(${(M)${(@k)parameters}:#[A-Za-z_][A-Za-z0-9_]#})
+    names=(${names:#__termica*})
+    local sig="${(j: :)${(o)names}}"
+    [[ "$sig" == "$__termica_last_vars_sig" ]] && return 0
+    __termica_last_vars_sig="$sig"
+    # Build a JSON array of the (sorted) names. Names are identifiers, but
+    # escape defensively through the same helper the other emitters use.
+    local json="[" first=1 n
+    for n in ${(o)names}; do
+        if (( first )); then first=0; else json+=","; fi
+        json+="\"$(termica_escape_json "$n")\""
+    done
+    json+="]"
+    termica_emit_raw "shell_vars" "$json"
+}
+
 # ----- lifecycle hooks ---------------------------------------------------
 
 termica_preexec() {
@@ -95,6 +129,8 @@ termica_precmd() {
     local exit_status=$?
     termica_emit_int "command_finished" "$exit_status"
     termica_emit_string "precmd" "$PWD"
+    # Live `$VAR`-completion source (change-gated, names only).
+    termica_emit_vars
 }
 
 # Idempotent hook installation. Registers our hooks if (and only if)
