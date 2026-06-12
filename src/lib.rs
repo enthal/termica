@@ -58,6 +58,7 @@ pub mod render;
 pub mod selection;
 pub mod shell;
 pub mod shell_syntax;
+pub mod submit_framing;
 pub mod terminal;
 pub mod visual_picker;
 pub mod watermark;
