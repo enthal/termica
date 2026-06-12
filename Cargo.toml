@@ -131,6 +131,14 @@ directories = "5"
 # with `case_insensitive` wired to the overlay's `Aa` toggle.
 regex = "1"
 
+# Phase 9 (9A): scrollback chunk compression. Sealed chunks are
+# zstd-compressed on seal (spec/08 §"Chunk format"); live chunks stay
+# raw. The chunk codec owns the framing; zstd compresses only the
+# record body, never the 16-byte header. C library, like rusqlite's
+# bundled SQLite — acceptable precedent for a native dep, and zstd is
+# the format the spec names.
+zstd = "0.13"
+
 # macOS-only: we need `EventLoopBuilderExtMacOS::with_default_menu(false)`
 # to disable winit's default app menubar. Its Quit item invokes
 # `[NSApplication terminate:]` directly, which bypasses our key

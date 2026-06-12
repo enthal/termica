@@ -129,7 +129,7 @@ The strict tests-first rule from [CLAUDE.md](../CLAUDE.md) applies to **the enti
 
 **Design pivot ([discussion preceded the spec rewrite](https://github.com/enthal/termica/pulls)):** the original Phase 4 was sketched as "drop an editor widget into the existing single-grid pane." Empirical UX prototyping revealed that a block model — each command is its own self-contained block with header chrome + output area, stacked vertically — is the right shape and pulls Phase 7's command-block work forward. See [04 §"Visual structure: the block model"](04-prompt-editor.md#visual-structure-the-block-model) and [02 §"The block model"](02-terminal-engine.md#the-block-model-one-live-term-many-sealed-snapshots).
 
-Implementation choice: **one live `Term` for the bottom block (`Running` or `Prompt`); sealed blocks are frozen `Vec<StyledLine>` snapshots.** Sealed blocks do not reflow on resize. Selection is pane-coordinate (`PaneCursor { block_id, line, col }`), not grid-coordinate; copy concatenates block contents and skips chrome.
+Implementation choice: **one live `Term` for the bottom block (`Running` or `Prompt`); sealed blocks are frozen snapshots stored as width-independent logical lines.** Sealed blocks reflow on resize (re-wrapped to the current width on render — see [spec/04 §"Resize"](04-prompt-editor.md#resize-everything-reflows) and [spec/08 §"Logical lines"](08-persistence.md#logical-lines-not-grid-rows)). Selection is pane-coordinate in **logical-line** space (`PaneCursor { block_id, line, col }`), not grid-coordinate, so it survives resize; copy concatenates block contents and skips chrome.
 
 Sub-PRs:
 
@@ -224,15 +224,20 @@ and Tantivy global search stay post-MVP.
 **Acceptance:** ✅ find-in-pane works on the in-memory scrollback +
 sealed chunks. Shipped on branch `feat/in-pane-search`.
 
-### Phase 9 — Scrollback persistence + restore
+### Phase 9 — Scrollback persistence + restore ⏳
 
-- `termica-persist`: chunk file format (header + length-prefixed records + style spans); zstd on seal; `scrollback_chunk` table; layout blob storage.
-- Async writer task; SQLite WAL.
-- Restore on launch: layout + transcripts; PTY is `Dead` until user restarts shell.
-- `Persistence::gc()` retention enforcer.
-- Property tests for chunk round-trip and crash injection.
+Design settled in [spec/08](08-persistence.md) (this pass): one DB `termica.sqlite`; chunks store **logical lines** (width-independent, reflowed on render — reverses the old "sealed blocks don't reflow" decision); explicit growth bounds on every axis incl. an in-memory residency window; Cmd-K is a non-destructive watermark; concurrent processes are arbitrated by a per-session advisory lock that doubles as crash detection.
 
-**Acceptance:** kill the app, relaunch, the workspace comes back. Transcripts up to ≤1 second pre-crash are present.
+Sliced so each PR is independently reviewable and tests-first (the whole phase is strict-layer):
+
+- ⏳ **9A — Chunk format** (this branch): `src/persist/chunk.rs` — header + logical-line records + run-length style runs + Termica-owned color encoding; encode/decode round-trip + property tests. Pure bytes; no DB, no UI. Includes grid-rows → logical-lines un-wrap.
+- **9B — Reflow on render**: pure `wrap_logical_line(width)` (wide-char aware); wire sealed blocks to re-wrap at the current pane width, closing the live/sealed reflow gap. Selection coordinates move to logical space.
+- **9C — SQLite v3 migration**: `workspace` / `window` / `tab` / `pane` / `session` / `scrollback_chunk` tables; switch the app DB path to `termica.sqlite`; migration fixture test.
+- **9D — Writer + seal pipeline**: per-pane background writer thread; `current.chunk` append of stabilized rows; finalize-to-logical-lines at seal; zstd on seal; SQLite WAL batching.
+- **9E — Memory residency + gc**: residency window with the evict-only-after-durable invariant + re-page on scroll; `Persistence::gc()` enforcing every growth cap; orphan-chunk reconciliation.
+- **9F — Restore + ownership**: layout restore; per-pane `Dead` + "Restart shell"; per-session advisory lock so a second process never adopts a live session; crash-injection + cross-OS concurrency tests.
+
+**Acceptance:** kill the app, relaunch, the workspace comes back (reflowed to the current window size). Transcripts up to ≤1 second pre-crash are present. Two concurrent processes never corrupt or steal each other's sessions.
 
 ### Phase 10 — Polish (and stop)
 

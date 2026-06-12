@@ -51,6 +51,7 @@ pub mod osc;
 pub mod pane;
 pub mod pane_selection;
 pub mod paths;
+pub mod persist;
 pub mod pr_context;
 pub mod prompt_editor;
 pub mod pty;
