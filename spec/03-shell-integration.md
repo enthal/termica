@@ -255,26 +255,31 @@ The wrapper rcfile is regenerated on every Termica launch (Termica owns the path
 
 **Bash `/etc/bashrc`.** Same TBD as zsh's `/etc/zshrc` — not sourced in v1.
 
-### fish — managed startup with `--init-command`
+### fish — managed startup, run **non-interactively**
 
-fish provides `--init-command 'shell code'` (`-C` short form) which runs before the first prompt. The mechanism is clean:
+Unlike zsh and bash, fish's line editor (the `reader`) **cannot be disabled** while the shell is interactive — there is no `unsetopt zle` / `--noediting` equivalent. Run interactively (`fish -i`), fish draws its own prompt and echoes/redraws the submitted command in raw mode; both leak into the command block, and `EchoSuppressor` (which expects a clean cooked-mode `command\r\n`) can't drop fish's raw-mode redraw. So Termica runs fish **non-interactively** and supplies the line-editing role itself, the same division of labour as zsh (`unsetopt zle`) and bash (`--noediting`):
 
 ```text
-1. Spawn `fish --no-config --init-command "$BOOTSTRAP" -i`.
+1. Spawn `fish --no-config -c "$BOOTSTRAP"`  (note: NO -i).
 
-2. fish runs the init command, which:
+2. The bootstrap:
      a. Defines Termica helpers (fish syntax, not POSIX).
-     b. Sources `~/.config/fish/config.fish` if it exists.
-     c. Sources each `~/.config/fish/conf.d/*.fish` in the order fish
-        would have loaded them.
-     d. Defines event handlers via `function … --on-event fish_preexec`
-        (and `fish_postexec`, `fish_prompt`).
-     e. Emits `integration_ready`.
-
-3. As with bash, the Bootstrapping window is near-zero.
+     b. Sources `~/.config/fish/config.fish` and each
+        `~/.config/fish/conf.d/*.fish` (fish's `--no-config` skips these).
+     c. `status job-control full` so Ctrl+C interrupts the running
+        command's process group, not the bootstrap loop.
+     d. Emits `integration_ready`, then the first `precmd` + `shell_vars`.
+     e. Runs a **read-eval loop**: read one finished command line from
+        stdin, emit `preexec`, `eval` it, emit `command_finished` +
+        `precmd` + `shell_vars`. This is the non-interactive equivalent of
+        fish's interactive prompt cycle — the `fish_preexec` / `fish_prompt`
+        events don't fire in a non-interactive shell, so the loop emits the
+        markers itself.
 ```
 
-fish's event system is first-class; no DEBUG-trap acrobatics. The only fish-specific worry is JSON-escaping in fish syntax (different quoting rules), which gets its own helper.
+Because fish is non-interactive, the tty stays in its default cooked mode: the kernel echoes each submitted command as `command\r\n`, which `EchoSuppressor` drops exactly as for zsh/bash — no leaked prompt, no duplicated echo.
+
+Two fish-specific notes: (1) fish's own `read` builtin runs the line editor on a tty (a `read>` prompt + per-keystroke echo), so the loop reads each line with a one-shot POSIX `sh` (`IFS= read -r line`) instead — a dumb cooked-mode read with EOF signalled via exit status. (2) JSON-escaping uses fish's different quoting rules, handled by a dedicated helper. **Known limitation (v1):** the loop reads one line per command, so a multi-line command built with Shift+Enter is split; sentinel-framed multi-line delivery is a follow-up.
 
 ### Failure modes and timeouts
 
