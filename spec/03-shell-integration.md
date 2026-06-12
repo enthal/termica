@@ -281,6 +281,8 @@ Because fish is non-interactive, the tty stays in its default cooked mode: the k
 
 Two fish-specific notes: (1) fish's own `read` builtin runs the line editor on a tty (a `read>` prompt + per-keystroke echo), so the loop reads each line with a one-shot POSIX `sh` (`IFS= read -r line`) instead — a dumb cooked-mode read with EOF signalled via exit status. (2) JSON-escaping uses fish's different quoting rules, handled by a dedicated helper. **Known limitation (v1):** the loop reads one line per command, so a multi-line command built with Shift+Enter is split; sentinel-framed multi-line delivery is a follow-up.
 
+**Ctrl+C.** While a command runs, Termica sends `SIGINT` to the foreground process group. Without help that signal would also kill the non-interactive bootstrap loop — and, being the pane's only process, take the pane (and a single-tab window) down with it. The bootstrap installs a no-op `--on-signal SIGINT` handler so fish **catches** `SIGINT` and keeps looping, while the running child — which resets to the default `SIGINT` disposition on `exec` — still dies (exit 130), exactly like Ctrl+C at an interactive prompt. (zsh/bash get this for free: their interactive line editor traps `SIGINT` at the prompt.) `status job-control full` additionally separates child process groups so background jobs / `fg` / `bg` have a chance to work.
+
 ### Failure modes and timeouts
 
 The `Bootstrapping` window has a fixed timeout: **3 seconds**.
