@@ -157,12 +157,21 @@ termica_emit_vars
 # echo is dropped by Termica's `EchoSuppressor`) and signals EOF
 # (Ctrl+D) via its exit status so we can leave the loop and exit fish.
 #
-# (v1 handles single-line commands; a multi-line command built with
-# Shift+Enter in the editor is a known follow-up — it needs sentinel
-# framing so the loop reads it as one unit instead of line-by-line.)
+# Termica sends each command **base64-encoded** (one tty line, no embedded
+# newlines), so a multi-line command (Shift+Enter, a `for`…`end` block, a
+# trailing `&&`) arrives intact on a single line and `eval`s as one unit —
+# instead of being split line-by-line by the cooked-mode tty. Decode with
+# `base64 -d` (portable across macOS/Linux) and `string collect
+# --allow-empty` to keep a multi-line value (and the empty command) as a
+# single argument. base64's alphabet has no tty-special bytes, so the
+# kernel echo is dropped by `EchoSuppressor` exactly like plain text.
 while true
-    set -l __termica_cmd (sh -c 'IFS= read -r line; rc=$?; printf %s "$line"; exit $rc')
+    set -l __termica_b64 (sh -c 'IFS= read -r line; rc=$?; printf %s "$line"; exit $rc')
     test $status -ne 0; and break
+    # NOTE: `printf '%s'` WITHOUT `--`: fish's `printf` does not treat `--`
+    # as end-of-options, it prints it literally (corrupting the base64).
+    # The payload is base64 (`A–Za–z0–9+/=`), so it never starts with `-`.
+    set -l __termica_cmd (printf '%s' "$__termica_b64" | base64 -d 2>/dev/null | string collect --allow-empty)
     termica_emit_string preexec "$__termica_cmd"
     eval $__termica_cmd
     set -l __termica_status $status

@@ -195,6 +195,13 @@ pub struct PaneSession {
     /// included. `None` before the first report (and when integration is
     /// absent), so completion falls back to the spawn snapshot.
     shell_var_names: Option<Vec<String>>,
+    /// Which managed shell this pane runs. Drives shell-specific command
+    /// submission framing ([`crate::submit_framing`]) — notably base64 for
+    /// fish, whose non-interactive read-eval loop needs the whole command
+    /// on one tty line. Defaults to `Zsh` (verbatim framing) for the bare
+    /// [`Self::spawn`] path used by tests; [`Self::spawn_managed`] sets the
+    /// real shell.
+    shell: ShellSpec,
 }
 
 /// Choose the `$VAR`-completion name source: the shell's live report
@@ -277,6 +284,7 @@ impl PaneSession {
             completion_driver: None,
             last_git_branch: None,
             shell_var_names: None,
+            shell: ShellSpec::Zsh,
         })
     }
 
@@ -313,6 +321,7 @@ impl PaneSession {
         let args: Vec<String> = argv[1..].to_vec();
         let config = PtyConfig { program, args, env, cwd, rows, cols };
         let mut session = Self::spawn(rows, cols, &config, session_id, pane_id, recorder)?;
+        session.shell = shell;
         session.history = history;
         // Tie the wrapper TempDir's lifetime to the pane session.
         // When the pane closes, the directory under $TMPDIR is
@@ -953,8 +962,10 @@ impl PaneSession {
         // Continuation restore can put the right cumulative text
         // back into the editor.
         self.last_submitted = Some(text);
-        let mut bytes = to_send.into_bytes();
-        bytes.push(b'\r');
+        // Frame per shell: zsh/bash get the command verbatim; fish gets it
+        // base64-encoded onto one tty line so its single-line read-eval
+        // loop receives a multi-line command intact ([`crate::submit_framing`]).
+        let bytes = crate::submit_framing::submission_bytes(&to_send, self.shell);
         self.terminal.prime_echo_suppression(&bytes);
         self.pty.write(&bytes)?;
         Ok(())
