@@ -64,4 +64,12 @@ fn fish_runs_base64_multiline_command_as_one_unit() {
         stdout.contains("LOOP1") && stdout.contains("LOOP2"),
         "the multi-line for-loop iterated; stdout:\n{stdout}"
     );
+
+    // The preexec marker must PRESERVE the newlines (as escaped `\n`), so
+    // history records the multi-line command faithfully rather than
+    // flattening it to spaces. (`\\n` here is a literal backslash-n.)
+    assert!(
+        stdout.contains("for i in 1 2\\necho LOOP$i\\nend"),
+        "preexec must keep the command's newlines escaped, not collapse them; stdout:\n{stdout}"
+    );
 }

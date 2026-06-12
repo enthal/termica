@@ -31,15 +31,22 @@ set -g TERMICA_BOOTSTRAPPED 1
 # ----- helpers -----------------------------------------------------------
 
 # Escape a string for JSON-string embedding.
+#
+# `string collect` after every substitution is REQUIRED: fish's command
+# substitution `(...)` splits its output on newlines, so without it the
+# newlines in a multi-line command would be dropped by the FIRST
+# substitution below (and re-joined with spaces by `printf`) before the
+# `\n`-escaping step ever ran — silently flattening a multi-line command
+# in the `preexec` marker (and thus in history).
 function termica_escape_json
     set -l s $argv[1]
     # Order matters: escape backslash first, then quote, then control chars.
-    set s (string replace -a '\\' '\\\\' -- $s)
-    set s (string replace -a '"' '\\"' -- $s)
-    set s (string replace -a \n '\\n' -- $s)
-    set s (string replace -a \r '\\r' -- $s)
-    set s (string replace -a \t '\\t' -- $s)
-    echo -n -- $s
+    set s (string replace -a '\\' '\\\\' -- $s | string collect)
+    set s (string replace -a '"' '\\"' -- $s | string collect)
+    set s (string replace -a \n '\\n' -- $s | string collect)
+    set s (string replace -a \r '\\r' -- $s | string collect)
+    set s (string replace -a \t '\\t' -- $s | string collect)
+    printf '%s' $s
 end
 
 function termica_emit_raw
