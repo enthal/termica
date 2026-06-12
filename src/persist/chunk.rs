@@ -16,12 +16,16 @@
 //! 2. **A Termica-owned color encoding** — [`ChunkColor`] decouples the
 //!    stored bytes from `alacritty_terminal`'s `Color` enum, so an
 //!    upstream change to that type cannot silently break stored chunks.
-//! 3. **The grid → logical transform** — [`unwrap_rows`] joins soft-
-//!    wrapped grid rows into logical lines, drops wide-char spacer
-//!    cells, strips the `WRAPLINE` marker, and trims trailing padding.
+//! 3. **The reflow transform, both directions** — [`unwrap_rows`] joins
+//!    soft-wrapped grid rows into logical lines (drops wide-char spacer
+//!    cells, strips `WRAPLINE`, trims trailing padding); its inverse
+//!    [`wrap_logical_line`] re-wraps a logical line into grid rows for a
+//!    given width (wide-char aware). The two are round-trip inverses:
+//!    `unwrap_rows(wrap_logical_line(l, w)) == [l]`.
 //!
-//! Wrapping back to grid rows at a given width (`wrap_logical_line`) is
-//! the *render* direction and lands in 9B; this slice is pure storage.
+//! Wiring these into the renderer (sealed blocks re-wrap to the current
+//! pane width) and moving selection into logical space is the next
+//! slice (9B-render); this slice is the pure transforms + storage.
 //!
 //! ## Wire format
 //!
@@ -486,6 +490,77 @@ fn trim_trailing_default(cells: &mut Vec<StyledCell>) {
     }
 }
 
+/// Wrap one logical line into grid rows for a terminal `cols` columns
+/// wide — the render half of reflow, the inverse of the join performed
+/// by [`unwrap_rows`]. This is what lets a sealed block, stored once as
+/// width-independent logical lines, paint correctly at whatever width
+/// the pane currently is.
+///
+/// The output is grid-shaped, exactly as alacritty would have produced
+/// it: soft-wrapped rows carry [`Flags::WRAPLINE`] on their last cell,
+/// and a double-width cell ([`Flags::WIDE_CHAR`]) is followed by a
+/// [`Flags::WIDE_CHAR_SPACER`] for its phantom second column. A wide
+/// char that would land in the final column is pushed to the next row,
+/// leaving a [`Flags::LEADING_WIDE_CHAR_SPACER`] behind — the same
+/// dance a real terminal does. Because the output is grid-shaped,
+/// feeding it back through [`unwrap_rows`] reproduces the input:
+/// `unwrap_rows(&wrap_logical_line(&l, w)) == vec![l]`.
+///
+/// An empty logical line wraps to a single empty row (a blank line is
+/// one visual row). `cols` is clamped to at least 1; at pathologically
+/// narrow widths a wide char overflows its row rather than looping.
+pub fn wrap_logical_line(line: &StyledLine, cols: usize) -> Vec<StyledLine> {
+    let cols = cols.max(1);
+    if line.cells.is_empty() {
+        return vec![StyledLine::default()];
+    }
+
+    let mut rows: Vec<StyledLine> = Vec::new();
+    let mut cur: Vec<StyledCell> = Vec::new();
+    let mut col = 0usize;
+
+    for cell in &line.cells {
+        let width = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+
+        // Wrap if this cell won't fit — but never wrap an empty row
+        // (guards against a cell wider than the whole terminal looping
+        // forever at a degenerate width).
+        if !cur.is_empty() && col + width > cols {
+            // A wide char with exactly one free column: leave a leading
+            // spacer in it so the char starts the next row intact.
+            if width == 2 && col + 1 == cols {
+                cur.push(StyledCell {
+                    c: ' ',
+                    fg: cell.fg,
+                    bg: cell.bg,
+                    flags: Flags::LEADING_WIDE_CHAR_SPACER,
+                });
+            }
+            if let Some(last) = cur.last_mut() {
+                last.flags.insert(Flags::WRAPLINE);
+            }
+            rows.push(StyledLine { cells: std::mem::take(&mut cur) });
+            col = 0;
+        }
+
+        cur.push(cell.clone());
+        col += 1;
+        if width == 2 {
+            cur.push(StyledCell {
+                c: ' ',
+                fg: cell.fg,
+                bg: cell.bg,
+                flags: Flags::WIDE_CHAR_SPACER,
+            });
+            col += 1;
+        }
+    }
+
+    // Final row never soft-wraps, so it carries no WRAPLINE.
+    rows.push(StyledLine { cells: cur });
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -869,5 +944,107 @@ mod tests {
         assert_eq!(decode_chunk(&bytes).unwrap(), logical);
         assert_eq!(logical[0].text_chars().collect::<String>(), "hello world");
         assert_eq!(logical[1].text_chars().collect::<String>(), "next line");
+    }
+
+    // ---- wrap: logical lines -> grid rows ---------------------------
+
+    /// A double-width (CJK) cell carrying the `WIDE_CHAR` flag.
+    fn wide(c: char) -> StyledCell {
+        styled(c, fg_default(), bg_default(), Flags::WIDE_CHAR)
+    }
+
+    #[test]
+    fn wrap_is_noop_when_line_fits() {
+        let l = line("abc");
+        assert_eq!(wrap_logical_line(&l, 3), vec![l.clone()]);
+        assert_eq!(wrap_logical_line(&l, 80), vec![l]);
+    }
+
+    #[test]
+    fn wrap_splits_at_width_and_marks_wrapline() {
+        let rows = wrap_logical_line(&line("abcde"), 3);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].text_chars().collect::<String>(), "abc");
+        assert_eq!(rows[1].text_chars().collect::<String>(), "de");
+        assert!(rows[0].cells.last().unwrap().flags.contains(Flags::WRAPLINE));
+        assert!(!rows[1].cells.last().unwrap().flags.contains(Flags::WRAPLINE));
+    }
+
+    #[test]
+    fn wrap_into_three_rows() {
+        let rows = wrap_logical_line(&line("abcdefg"), 3);
+        let texts: Vec<String> = rows.iter().map(|r| r.text_chars().collect()).collect();
+        assert_eq!(texts, vec!["abc", "def", "g"]);
+    }
+
+    #[test]
+    fn wrap_wide_char_fits_with_trailing_spacer() {
+        let l = StyledLine { cells: vec![cell('a'), wide('日'), cell('b')] };
+        let rows = wrap_logical_line(&l, 4);
+        assert_eq!(rows.len(), 1);
+        // a, 日, spacer, b
+        assert_eq!(rows[0].cells.len(), 4);
+        assert_eq!(rows[0].cells[1].c, '日');
+        assert!(rows[0].cells[2].flags.contains(Flags::WIDE_CHAR_SPACER));
+    }
+
+    #[test]
+    fn wrap_wide_char_forced_to_next_row_inserts_leading_spacer() {
+        let l = StyledLine { cells: vec![cell('a'), wide('日')] };
+        let rows = wrap_logical_line(&l, 2);
+        assert_eq!(rows.len(), 2);
+        let last0 = rows[0].cells.last().unwrap();
+        assert!(last0.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER));
+        assert!(last0.flags.contains(Flags::WRAPLINE));
+        assert_eq!(rows[1].cells[0].c, '日');
+    }
+
+    #[test]
+    fn wrap_empty_line_is_single_blank_row() {
+        assert_eq!(wrap_logical_line(&StyledLine::default(), 10), vec![StyledLine::default()]);
+    }
+
+    #[test]
+    fn wrap_then_unwrap_is_identity() {
+        let cases = vec![
+            line("abcde"),
+            line("a"),
+            StyledLine::default(),
+            StyledLine { cells: vec![cell('a'), wide('日'), cell('b'), wide('本')] },
+        ];
+        for l in cases {
+            for w in [1usize, 2, 3, 5, 80] {
+                let rows = wrap_logical_line(&l, w);
+                assert_eq!(unwrap_rows(&rows), vec![l.clone()], "line {l:?} at width {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn property_wrap_unwrap_identity() {
+        let mut rng = Rng(0x0fed_face_dead_beef);
+        let palette = ['a', 'b', ' ', '日', '🦀', 'Z'];
+        // No WRAPLINE / spacer flags — those are wrap artifacts, never
+        // present in a logical line.
+        let flag_pool =
+            [Flags::empty(), Flags::BOLD, Flags::UNDERLINE, Flags::WIDE_CHAR, Flags::ITALIC];
+
+        for _ in 0..300 {
+            let n = rng.below(20) as usize;
+            let mut cells = Vec::with_capacity(n);
+            for _ in 0..n {
+                let c = palette[rng.below(palette.len() as u64) as usize];
+                let flags = flag_pool[rng.below(flag_pool.len() as u64) as usize];
+                cells.push(StyledCell { c, fg: fg_default(), bg: bg_default(), flags });
+            }
+            // A valid logical line has no trailing default-blank padding.
+            trim_trailing_default(&mut cells);
+            let logical = StyledLine { cells };
+
+            for w in [1usize, 2, 3, 4, 7, 13, 80] {
+                let rows = wrap_logical_line(&logical, w);
+                assert_eq!(unwrap_rows(&rows), vec![logical.clone()], "width {w}");
+            }
+        }
     }
 }
