@@ -1023,7 +1023,14 @@ fn init_event_recorder() -> Option<Arc<EventRecorder>> {
 /// doesn't duplicate rows.
 fn init_history_store(home: Option<&std::path::Path>) -> Option<Arc<Mutex<HistoryStore>>> {
     let dirs = directories::ProjectDirs::from("", "", "termica")?;
-    let path = dirs.data_dir().join("history.sqlite");
+    // One database for everything durable that is not a chunk file —
+    // layout, sessions, runs, the chunk index. The pre-1.0 builds
+    // shipped this as `history.sqlite` (runs-only); the rename is a
+    // one-time manual `mv` on the developer's own machines, NOT an
+    // in-app migration, so we simply open `termica.sqlite`. A missing
+    // file is created fresh and `runs` re-seeds from shell history on
+    // the next start (see spec/08-persistence.md §"One database").
+    let path = dirs.data_dir().join("termica.sqlite");
     let store = match HistoryStore::open(&path) {
         Ok(s) => s,
         Err(e) => {

@@ -157,7 +157,7 @@ The replay loop uses `INSERT OR IGNORE` against this index. Returns `Ok(Option<i
 
 ### Schema state vs. this document
 
-The schema above is the *target*. In code today the ladder is at **v2** and only the `runs` table (plus its replay index) exists — that is all Phase 4J needed. The `workspace` / `window` / `tab` / `pane` / `session` / `scrollback_chunk` tables land together as the **v3** migration, in the Phase 9 slice that first writes layout and the chunk index. The ladder grows forward-only; v3 adds tables and never rewrites v1/v2, so existing `runs` data is untouched.
+The schema above is the *target*. The ladder is at **v3**: v1 created `runs`, v2 added the replay index (all Phase 4J needed), and v3 — the Phase 9C slice — added the `workspace` / `window` / `tab` / `pane` / `session` / `scrollback_chunk` tables and the chunk index. The ladder grows forward-only; v3 only *adds* tables and never rewrites v1/v2, so existing `runs` data is untouched. (The tables are created empty — the writer that populates them, and the restore that reads them, land in 9D–9F.)
 
 ### Shell-history-file replay
 

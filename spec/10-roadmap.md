@@ -230,9 +230,9 @@ Design settled in [spec/08](08-persistence.md) (this pass): one DB `termica.sqli
 
 Sliced so each PR is independently reviewable and tests-first (the whole phase is strict-layer):
 
-- ⏳ **9A — Chunk format** (this branch): `src/persist/chunk.rs` — header + logical-line records + run-length style runs + Termica-owned color encoding; encode/decode round-trip + property tests. Pure bytes; no DB, no UI. Includes grid-rows → logical-lines un-wrap.
-- **9B — Reflow on render**: pure `wrap_logical_line(width)` (wide-char aware); wire sealed blocks to re-wrap at the current pane width, closing the live/sealed reflow gap. Selection coordinates move to logical space.
-- **9C — SQLite v3 migration**: `workspace` / `window` / `tab` / `pane` / `session` / `scrollback_chunk` tables; switch the app DB path to `termica.sqlite`; migration fixture test.
+- ✅ **9A — Chunk format**: `src/persist/chunk.rs` — header + logical-line records + run-length style runs + Termica-owned color encoding; encode/decode round-trip + property tests. Pure bytes; no DB, no UI. Includes grid-rows → logical-lines un-wrap.
+- ✅ **9B — Reflow on render**: pure `wrap_logical_line(width)` (wide-char aware); wire sealed blocks to re-wrap at the current pane width, closing the live/sealed reflow gap. Selection coordinates move to logical space.
+- ✅ **9C — SQLite v3 migration**: `workspace` / `window` / `tab` / `pane` / `session` / `scrollback_chunk` tables; switch the app DB path to `termica.sqlite`; migration fixture test.
 - **9D — Writer + seal pipeline**: per-pane background writer thread; `current.chunk` append of stabilized rows; finalize-to-logical-lines at seal; zstd on seal; SQLite WAL batching.
 - **9E — Memory residency + gc**: residency window with the evict-only-after-durable invariant + re-page on scroll; `Persistence::gc()` enforcing every growth cap; orphan-chunk reconciliation.
 - **9F — Restore + ownership**: layout restore; per-pane `Dead` + "Restart shell"; per-session advisory lock so a second process never adopts a live session; crash-injection + cross-OS concurrency tests.

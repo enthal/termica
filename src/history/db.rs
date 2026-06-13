@@ -1,4 +1,8 @@
-//! SQLite-backed `runs` table — Phase 4J's storage layer.
+//! SQLite-backed persistence store — the single `termica.sqlite`
+//! database. Started life (Phase 4J) holding only the `runs` table;
+//! the Phase 9 v3 migration adds the layout / session / scrollback-
+//! index tables ([spec/08-persistence.md]). The forward-only
+//! migration ladder lives here.
 //!
 //! Open / migrate / capture / query. No UI dependencies — pure
 //! engine code with strict-layer tests against an in-memory
@@ -13,7 +17,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// Read on open via `PRAGMA user_version` and compared against
 /// the embedded constant; mismatching versions trigger the
 /// migration ladder.
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 /// One row in `runs`. `pane_id` / `app_run_id` / `cwd` are `None`
 /// for entries replayed from a shell-history file (those formats
@@ -94,11 +98,86 @@ impl HistoryStore {
             match v {
                 1 => self.apply_v1()?,
                 2 => self.apply_v2()?,
+                3 => self.apply_v3()?,
                 _ => unreachable!("no migration for v{v}"),
             }
         }
         self.conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
+    }
+
+    fn apply_v3(&self) -> rusqlite::Result<()> {
+        // Phase 9 persistence: the layout / session / scrollback-index
+        // tables. v3 only ADDS tables — it never rewrites the v1 `runs`
+        // table or its v2 replay index, so existing history is
+        // untouched. The schema mirrors [spec/08-persistence.md §Schema
+        // v1]; that document calls this the "v1" target schema, but in
+        // the live ladder it lands as the third migration step (the
+        // `runs` table predates it). `start_line` / `end_line` in
+        // `scrollback_chunk` are LOGICAL-line indices (width-independent,
+        // stable across resize); the chunk's visual height is re-derived
+        // by re-wrapping on load and is deliberately not stored.
+        // FK clauses are declarative — `foreign_keys` is left OFF so a
+        // chunk row can outlive a rolled-back session row (chunk-on-disk
+        // wins; see §"Why no foreign-key cascades").
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS workspace (
+                id          INTEGER PRIMARY KEY,
+                name        TEXT NOT NULL,
+                created_at  INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS window (
+                id           INTEGER PRIMARY KEY,
+                workspace_id INTEGER NOT NULL REFERENCES workspace(id),
+                title        TEXT,
+                layout_blob  BLOB NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS tab (
+                id         INTEGER PRIMARY KEY,
+                window_id  INTEGER NOT NULL REFERENCES window(id),
+                name       TEXT,
+                ord        INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS pane (
+                id            INTEGER PRIMARY KEY,
+                tab_id        INTEGER NOT NULL REFERENCES tab(id),
+                title         TEXT,
+                cwd           TEXT,
+                shell_kind    TEXT NOT NULL,
+                created_at    INTEGER NOT NULL,
+                last_open     INTEGER NOT NULL,
+                cleared_before_line INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS session (
+                id          INTEGER PRIMARY KEY,
+                pane_id     INTEGER NOT NULL REFERENCES pane(id),
+                started_at  INTEGER NOT NULL,
+                ended_at    INTEGER,
+                exit_code   INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS scrollback_chunk (
+                id           INTEGER PRIMARY KEY,
+                session_id   INTEGER NOT NULL REFERENCES session(id),
+                pane_id      INTEGER NOT NULL REFERENCES pane(id),
+                path         TEXT NOT NULL,
+                start_line   INTEGER NOT NULL,
+                end_line     INTEGER NOT NULL,
+                emit_cols    INTEGER NOT NULL,
+                start_time   INTEGER NOT NULL,
+                end_time     INTEGER NOT NULL,
+                compressed   INTEGER NOT NULL,
+                byte_size    INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_scrollback_chunk_pane ON scrollback_chunk(pane_id, start_line);
+            ",
+        )
     }
 
     fn apply_v2(&self) -> rusqlite::Result<()> {
@@ -300,6 +379,75 @@ mod tests {
         s.migrate().expect("re-migrate is a no-op");
         let v: u32 = s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    /// The schema-version pin. Bumping the ladder is a deliberate
+    /// act; this literal catches an accidental change to the constant
+    /// without a matching migration arm + fixture test.
+    #[test]
+    fn schema_version_is_three() {
+        assert_eq!(SCHEMA_VERSION, 3);
+    }
+
+    /// Every v3 table the Phase 9 persistence layer adds is present
+    /// and empty on a fresh store. A `COUNT(*)` against each is the
+    /// "did the migration create it" probe (same shape as the runs
+    /// probe above).
+    #[test]
+    fn fresh_store_has_layout_session_and_chunk_tables() {
+        let s = store();
+        for t in ["workspace", "window", "tab", "pane", "session", "scrollback_chunk"] {
+            let n: i64 = s
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap_or_else(|e| panic!("table `{t}` should exist after migrate: {e}"));
+            assert_eq!(n, 0, "table `{t}` starts empty");
+        }
+    }
+
+    /// Frozen-fixture migration test (strict layer, per
+    /// [spec/08 §Testing]): hand-build a v2 database with a real
+    /// `runs` row, run the ladder, and assert it advances to v3,
+    /// creates the new tables, and leaves the pre-existing row
+    /// untouched. Forward-only migrations never rewrite earlier data.
+    #[test]
+    fn migrate_v2_fixture_to_v3_adds_tables_and_preserves_runs() {
+        let conn = Connection::open_in_memory().unwrap();
+        // The exact v1 + v2 schema as it shipped, stamped at v2, with
+        // one row of data. No HistoryStore methods are used to build
+        // it — this is a frozen snapshot of the old on-disk shape.
+        conn.execute_batch(
+            "
+            CREATE TABLE runs (
+                id INTEGER PRIMARY KEY, text TEXT NOT NULL, started_at INTEGER NOT NULL,
+                finished_at INTEGER, exit_code INTEGER, cwd TEXT, app_run_id TEXT,
+                pane_id INTEGER, source TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX idx_runs_replay_unique
+                ON runs(source, text, started_at) WHERE source != 'termica';
+            INSERT INTO runs (text, started_at, source) VALUES ('echo hi', 123, 'zsh');
+            PRAGMA user_version = 2;
+            ",
+        )
+        .unwrap();
+        let store = HistoryStore { conn };
+
+        store.migrate().expect("v2 -> v3 migration applies cleanly");
+
+        let v: u32 = store.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 3, "ladder advances the fixture to v3");
+        for t in ["workspace", "window", "tab", "pane", "session", "scrollback_chunk"] {
+            let n: i64 = store
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap_or_else(|e| panic!("v3 adds table `{t}`: {e}"));
+            assert_eq!(n, 0);
+        }
+        let text: String = store
+            .conn
+            .query_row("SELECT text FROM runs WHERE started_at = 123", [], |r| r.get(0))
+            .expect("the pre-existing v2 runs row survives the migration");
+        assert_eq!(text, "echo hi");
     }
 
     #[test]
