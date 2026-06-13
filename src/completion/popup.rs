@@ -192,8 +192,25 @@ pub fn paint(
 ) -> Option<usize> {
     let area_id = egui::Id::new(("completion-popup", pane_id));
     let row_h = 18.0;
-    let panel_w = 380.0;
     let mut clicked_row: Option<usize> = None;
+
+    // Column model: shared per-column widths so every row's cells line up
+    // into a table, plus the monospace advance to turn char offsets into
+    // pixels. The popup width grows to fit the widest row + the tag (capped
+    // — a very wide table clips its rightmost columns rather than running
+    // off-screen).
+    let gap = 2usize;
+    let layout = ColumnLayout::compute(&popup.candidates);
+    let font = egui::FontId::monospace(13.0);
+    // Monospace advance: every glyph is the same width, so one `M` measures
+    // the column step. `glyph_width` mutates the font cache, hence
+    // `fonts_mut` (the same call render_pane uses for the grid cell width).
+    let char_w = ctx.fonts_mut(|f| f.glyph_width(&font, 'M')).max(1.0);
+    let max_tag =
+        popup.candidates.iter().map(|c| c.source.tag().chars().count()).max().unwrap_or(0);
+    let content_w =
+        6.0 + (layout.total_chars(gap) as f32) * char_w + ((max_tag + 3) as f32) * char_w + 8.0;
+    let panel_w = content_w.clamp(380.0, 820.0);
 
     egui::Area::new(area_id)
         // Pivot at LEFT_BOTTOM means the bottom-left corner of
@@ -215,7 +232,7 @@ pub fn paint(
                     .show(ui, |ui| {
                         for (idx, cand) in popup.candidates.iter().enumerate() {
                             let selected = idx == popup.selected_index;
-                            let response = paint_row(ui, cand, selected);
+                            let response = paint_row(ui, cand, selected, &layout, char_w, gap);
                             // Click on a row = accept that row.
                             // Hover updates the selected_index so
                             // the row visibly highlights as the
@@ -294,7 +311,76 @@ fn paint_keybind_hint(ui: &mut egui::Ui) {
     });
 }
 
-fn paint_row(ui: &mut egui::Ui, cand: &CompletionCandidate, selected: bool) -> egui::Response {
+/// Split a completion description into its whitespace-aligned columns: a
+/// run of **2+ spaces** is a column separator (a single space stays inside
+/// a cell, so a normal prose description is one cell), each cell trimmed,
+/// empties from uneven padding dropped. This is what lets a tabular
+/// completion (e.g. kubectl's `name  shortnames  apiversion  …`) line up.
+fn split_columns(desc: &str) -> Vec<&str> {
+    desc.split("  ").map(str::trim).filter(|s| !s.is_empty()).collect()
+}
+
+/// Per-column maximum widths (in characters) across a popup's candidates,
+/// so each row can paint its cells at shared tab-stops. Column 0 is the
+/// candidate **name** (`display`); columns 1.. are the description's
+/// [`split_columns`] cells. Pure + tested — the paint just reads offsets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ColumnLayout {
+    widths: Vec<usize>,
+}
+
+impl ColumnLayout {
+    /// Measure every candidate and keep the widest cell per column.
+    pub(crate) fn compute(candidates: &[CompletionCandidate]) -> Self {
+        let mut widths: Vec<usize> = Vec::new();
+        let bump = |i: usize, w: usize, widths: &mut Vec<usize>| {
+            if i < widths.len() {
+                widths[i] = widths[i].max(w);
+            } else {
+                widths.push(w);
+            }
+        };
+        for c in candidates {
+            bump(0, c.display.chars().count(), &mut widths);
+            if let Some(d) = &c.description {
+                for (k, cell) in split_columns(d).into_iter().enumerate() {
+                    bump(k + 1, cell.chars().count(), &mut widths);
+                }
+            }
+        }
+        ColumnLayout { widths }
+    }
+
+    /// Number of columns (name + description cells).
+    #[cfg(test)]
+    pub(crate) fn ncols(&self) -> usize {
+        self.widths.len()
+    }
+
+    /// Start offset of column `i` in characters, with `gap` blank chars
+    /// between adjacent columns. Column 0 starts at 0.
+    pub(crate) fn col_start(&self, i: usize, gap: usize) -> usize {
+        self.widths.iter().take(i).map(|w| w + gap).sum()
+    }
+
+    /// Total width of all columns including the inter-column gaps, in
+    /// characters. `0` when there are no columns.
+    pub(crate) fn total_chars(&self, gap: usize) -> usize {
+        if self.widths.is_empty() {
+            return 0;
+        }
+        self.widths.iter().sum::<usize>() + gap * (self.widths.len() - 1)
+    }
+}
+
+fn paint_row(
+    ui: &mut egui::Ui,
+    cand: &CompletionCandidate,
+    selected: bool,
+    layout: &ColumnLayout,
+    char_w: f32,
+    gap: usize,
+) -> egui::Response {
     let visuals = ui.visuals();
     let bg = if selected { visuals.selection.bg_fill } else { egui::Color32::TRANSPARENT };
     let fg = if selected { visuals.selection.stroke.color } else { visuals.text_color() };
@@ -311,22 +397,15 @@ fn paint_row(ui: &mut egui::Ui, cand: &CompletionCandidate, selected: bool) -> e
     if selected {
         ui.painter().rect_filled(rect, 2.0, bg);
     }
-    // Layout: name pinned left, source tag pinned right, description
-    // filling the gap between them. We measure the name's and tag's
-    // painted rects and clip the description to what's left, so a long
-    // description can't overlap either (the reported overlap bug).
+    // Layout: the candidate name is column 0; the description's cells are
+    // columns 1.., each painted at a shared tab-stop (`layout`) so rows
+    // line up into a table. The source tag stays pinned at the right edge.
     let painter = ui.painter();
-    let display = &cand.display;
     let tag = cand.source.tag();
     let font = egui::FontId::monospace(13.0);
     let mid_y = rect.center().y;
-    let name_rect = painter.text(
-        egui::Pos2::new(rect.min.x + 6.0, mid_y),
-        egui::Align2::LEFT_CENTER,
-        display,
-        font.clone(),
-        fg,
-    );
+    let left = rect.min.x + 6.0;
+
     let tag_rect = painter.text(
         egui::Pos2::new(rect.max.x - 6.0, mid_y),
         egui::Align2::RIGHT_CENTER,
@@ -334,21 +413,32 @@ fn paint_row(ui: &mut egui::Ui, cand: &CompletionCandidate, selected: bool) -> e
         font.clone(),
         dim,
     );
+    // Clip every cell to the area before the tag, so a too-wide table can
+    // never paint under the tag (it scrolls/clips instead of overlapping).
+    let cells_right = tag_rect.min.x - 8.0;
+    let cell_clip = egui::Rect::from_min_max(
+        egui::Pos2::new(rect.min.x, rect.min.y),
+        egui::Pos2::new(cells_right.max(rect.min.x), rect.max.y),
+    );
+    let cell_painter = painter.with_clip_rect(cell_clip);
+
+    // Column 0: the name (insertable value), in the normal text color.
+    cell_painter.text(
+        egui::Pos2::new(left, mid_y),
+        egui::Align2::LEFT_CENTER,
+        &cand.display,
+        font.clone(),
+        fg,
+    );
+    // Columns 1..: the description cells, dim, at their tab-stops.
     if let Some(desc) = cand.description.as_deref() {
-        let desc_left = name_rect.max.x + 12.0;
-        let desc_right = tag_rect.min.x - 12.0;
-        if desc_right > desc_left {
-            // Clip to the gap so the description can't run under the name
-            // or the tag; left-aligned right after the name.
-            let clip = egui::Rect::from_min_max(
-                egui::Pos2::new(desc_left, rect.min.y),
-                egui::Pos2::new(desc_right, rect.max.y),
-            );
-            painter.with_clip_rect(clip).text(
-                egui::Pos2::new(desc_left, mid_y),
+        for (k, cell) in split_columns(desc).into_iter().enumerate() {
+            let x = left + (layout.col_start(k + 1, gap) as f32) * char_w;
+            cell_painter.text(
+                egui::Pos2::new(x, mid_y),
                 egui::Align2::LEFT_CENTER,
-                desc,
-                font,
+                cell,
+                font.clone(),
                 dim,
             );
         }
@@ -363,6 +453,65 @@ mod tests {
 
     fn cand(value: &str) -> CompletionCandidate {
         CompletionCandidate::simple(value, CompletionSource::Path)
+    }
+
+    fn cand_desc(value: &str, desc: &str) -> CompletionCandidate {
+        CompletionCandidate::with_description(value, desc, CompletionSource::Path)
+    }
+
+    // ---- column layout (tabular completions) ------------------------
+
+    #[test]
+    fn split_columns_splits_on_two_or_more_spaces_only() {
+        // 2+ spaces = a column boundary; a single space stays inside a cell.
+        assert_eq!(
+            split_columns("ds    apps/v1   true  DaemonSet"),
+            ["ds", "apps/v1", "true", "DaemonSet"]
+        );
+        assert_eq!(split_columns("Switch branches"), ["Switch branches"]);
+        assert_eq!(split_columns(""), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn column_layout_keeps_widest_cell_per_column() {
+        // Column 0 is the name; columns 1.. are the description cells.
+        let cands = vec![
+            cand_desc("daemonsets", "ds      apps/v1   true   DaemonSet"),
+            cand_desc("deployments", "deploy  apps/v1   true   Deployment"),
+            cand_desc("deviceclasses", "resource.k8s.io/v1   false  DeviceClass"),
+        ];
+        let layout = ColumnLayout::compute(&cands);
+        // col0 = max name = "deviceclasses" (13). col1 = max(ds, deploy,
+        // resource.k8s.io/v1) = 18. The third row has fewer cells; that's fine.
+        assert_eq!(layout.ncols(), 5);
+        assert_eq!(layout.col_start(0, 2), 0);
+        assert_eq!(
+            layout.col_start(1, 2),
+            13 + 2,
+            "descriptions start after the widest name + gap"
+        );
+        assert_eq!(layout.col_start(2, 2), 13 + 2 + 18 + 2);
+    }
+
+    #[test]
+    fn column_layout_single_description_is_two_columns() {
+        // A normal (non-tabular) completion: name + one-cell description.
+        let cands = vec![cand_desc("checkout", "Switch branches")];
+        let layout = ColumnLayout::compute(&cands);
+        assert_eq!(layout.ncols(), 2);
+        assert_eq!(layout.total_chars(2), 8 + 2 + "Switch branches".len());
+    }
+
+    #[test]
+    fn column_layout_no_descriptions_is_one_column() {
+        let cands = vec![cand("alpha"), cand("longer-name")];
+        let layout = ColumnLayout::compute(&cands);
+        assert_eq!(layout.ncols(), 1);
+        assert_eq!(
+            layout.total_chars(2),
+            "longer-name".len(),
+            "no inter-column gap for one column"
+        );
     }
 
     #[test]

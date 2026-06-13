@@ -116,27 +116,20 @@ pub fn parse_for(tool: DriverTool, stdout: &str, line: &str) -> Vec<CompletionCa
 /// tab-only split would swallow the whole padded row as the value. We
 /// reuse the same [`split_value_desc`] heuristic as the cobra drivers; a
 /// completion *value* may contain single spaces (a filename), which the
-/// 2+-space rule preserves. The description's internal whitespace runs are
-/// collapsed so a wide padded row renders as compact text in the popup.
+/// 2+-space rule preserves. The description keeps its 2+-space column
+/// separators intact — the popup aligns them into a table
+/// ([`crate::completion::popup`]), so flattening them here would destroy
+/// the column structure.
 pub fn parse_fish_complete(stdout: &str) -> Vec<CompletionCandidate> {
     let source = CompletionSource::Driver(DriverTool::FishComplete);
     stdout
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(|line| match split_value_desc(line) {
-            (value, Some(desc)) => {
-                CompletionCandidate::with_description(value, collapse_whitespace(desc), source)
-            }
+            (value, Some(desc)) => CompletionCandidate::with_description(value, desc, source),
             (value, None) => CompletionCandidate::simple(value, source),
         })
         .collect()
-}
-
-/// Collapse every run of whitespace to a single space. Used to tame the
-/// wide column-padding in a tool's completion description (e.g. kubectl's
-/// `name      shortnames      apiversion …`) so it reads as plain text.
-fn collapse_whitespace(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The completion target for a **fish pane**, which is **shell-driven, not
@@ -413,11 +406,12 @@ mod tests {
         let cands = parse_fish_complete(stdout);
         assert_eq!(cands[0].value, "daemonsets", "value is the first column only");
         assert_eq!(cands[1].value, "deployments");
-        assert_eq!(
-            cands[0].description.as_deref(),
-            Some("ds apps/v1 true DaemonSet"),
-            "padded columns collapse to single-spaced description"
-        );
+        // The description keeps its 2+-space column separators — the popup
+        // turns them into an aligned table, so they must survive parsing.
+        let desc = cands[0].description.as_deref().unwrap();
+        assert!(desc.starts_with("ds"), "description starts at the second column");
+        assert!(desc.contains("  "), "column separators (2+ spaces) preserved");
+        assert!(desc.contains("apps/v1") && desc.ends_with("DaemonSet"));
     }
 
     #[test]
