@@ -267,14 +267,19 @@ pub fn plan_completion(
 
 /// Pick the async completion target for the editor state, by shell.
 ///
-/// In a **fish** pane, fish's `complete -C` is a superset of the
-/// per-tool CLI drivers (it covers built-ins, installed completions, and
-/// the user's aliases / `complete` functions), so we route *any*
-/// argument-position completion to the fish sidecar and never also fire a
-/// per-tool driver. Every other shell keeps the per-tool driver path,
-/// which fires only for the handful of commands with a known `__complete`
-/// endpoint. Command-position completion (the command name itself) stays
-/// with the local `$PATH` source in both cases.
+/// In a **fish** pane, fish's `complete -C` is a superset of the per-tool
+/// CLI drivers (it covers built-ins, installed completions, and the user's
+/// aliases / `complete` functions), so we route *any* completion — in both
+/// command and argument position — to the fish sidecar and never also fire
+/// a per-tool driver. Routing the command **name** to fish is what lets
+/// aliases / functions / abbreviations complete (the local `$PATH` source
+/// only knows on-disk executables); the driver result merges with the
+/// local sources so a command on both collapses to one row.
+///
+/// Every other shell keeps the per-tool driver path, which fires only for
+/// the handful of commands with a known `__complete` endpoint and only in
+/// argument position; there, the command name stays with the local `$PATH`
+/// source.
 fn driver_target_for_shell(
     editor_text: &str,
     cursor: usize,
@@ -282,7 +287,7 @@ fn driver_target_for_shell(
 ) -> Option<(DriverTool, String, usize)> {
     match shell {
         ShellSpec::Fish => {
-            let (line, point) = drivers::parse::arg_segment(editor_text, cursor)?;
+            let (line, point) = drivers::parse::fish_segment(editor_text, cursor)?;
             Some((DriverTool::FishComplete, line, point))
         }
         ShellSpec::Zsh | ShellSpec::Bash => drivers::parse::driver_target(editor_text, cursor),
@@ -626,15 +631,29 @@ mod tests {
     }
 
     #[test]
-    fn plan_fish_pane_command_position_stays_local() {
-        // Typing the command name itself in a fish pane uses the local
-        // `$PATH` source, not the sidecar.
+    fn plan_fish_pane_command_position_routes_to_sidecar() {
+        // Typing the command NAME in a fish pane awaits the sidecar too —
+        // that's what lets aliases / functions / abbreviations complete,
+        // which the local `$PATH` source can't see. (A zsh pane would stay
+        // local here, since `frobni` maps to no per-tool driver.)
         let dir = tempfile::tempdir().unwrap();
         let plan =
             plan_completion("frobni", 6, Some(dir.path()), None, &[], ShellSpec::Fish, Vec::new);
+        match plan {
+            CompletionPlan::AwaitDriver { target, .. } => {
+                assert_eq!(target.0, DriverTool::FishComplete);
+                assert_eq!(target.1, "frobni");
+            }
+            other => {
+                panic!("expected AwaitDriver(FishComplete) for the command name, got {other:?}")
+            }
+        }
+
+        // But an empty editor must NOT fire `complete -C ""`.
+        let empty = plan_completion("", 0, Some(dir.path()), None, &[], ShellSpec::Fish, Vec::new);
         assert!(
-            !matches!(plan, CompletionPlan::AwaitDriver { .. }),
-            "command-position completion is local, got {plan:?}"
+            !matches!(empty, CompletionPlan::AwaitDriver { .. }),
+            "empty editor must not flood the sidecar, got {empty:?}"
         );
     }
 

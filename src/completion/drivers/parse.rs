@@ -128,21 +128,25 @@ pub fn parse_fish_complete(stdout: &str) -> Vec<CompletionCandidate> {
         .collect()
 }
 
-/// Like [`driver_target`] but **shell-driven, not command-driven**: fires
-/// for *any* command in argument position, since a shell sidecar
-/// (`complete -C`) completes everything the shell knows, not just a fixed
-/// set of CLI tools. Returns `(line, point)` — the current command segment
-/// up to the cursor and the cursor's byte offset within it (always
-/// `line.len()`). `None` in command position (let the local `$PATH` source
-/// handle the command name) or when the segment has no command word yet.
-pub fn arg_segment(editor_text: &str, cursor: usize) -> Option<(String, usize)> {
-    if local::is_command_position(editor_text, cursor) {
+/// The completion target for a **fish pane**, which is **shell-driven, not
+/// command-driven** and fires in **both command and argument position**:
+/// fish's `complete -C` completes the command *name* too — including the
+/// user's aliases, functions, and abbreviations, which the local `$PATH`
+/// source can't see — as well as arguments. Returns `(line, point)`: the
+/// current command segment up to the cursor and the cursor's byte offset
+/// within it (always `line.len()`).
+///
+/// `None` only when the segment is **empty** — an empty editor, or right
+/// after a sequencer (`| `, `; `) — so we never fire `complete -C ""` and
+/// flood the popup with every command on the system. The driver result is
+/// merged with the local sources (the `$PATH` executables at command
+/// position, files at argument position), so a command that's both on
+/// `$PATH` and known to fish collapses to one row ([`super::super::ranking`]).
+pub fn fish_segment(editor_text: &str, cursor: usize) -> Option<(String, usize)> {
+    let segment = current_command_segment(editor_text, cursor);
+    if segment.is_empty() {
         return None;
     }
-    let segment = current_command_segment(editor_text, cursor);
-    // Require a leading command word; a segment that is pure whitespace
-    // (e.g. `| `) has nothing to complete an argument *of*.
-    segment.split_whitespace().next()?;
     Some((segment.to_string(), segment.len()))
 }
 
@@ -404,30 +408,39 @@ mod tests {
     }
 
     #[test]
-    fn arg_segment_fires_for_any_command_in_arg_position() {
-        // Unlike driver_target, arg_segment fires for an *unknown* command
-        // — the shell sidecar completes anything.
+    fn fish_segment_fires_for_any_command_in_arg_position() {
+        // Like the per-tool drivers but for an *unknown* command — the
+        // shell sidecar completes anything.
         let text = "frobnicate --wi";
-        let (line, point) = arg_segment(text, text.len()).expect("fires for any command");
+        let (line, point) = fish_segment(text, text.len()).expect("fires for any command");
         assert_eq!(line, "frobnicate --wi");
         assert_eq!(point, text.len());
     }
 
     #[test]
-    fn arg_segment_none_in_command_position() {
-        assert!(arg_segment("frobni", 6).is_none(), "command name is the local source's job");
+    fn fish_segment_fires_in_command_position() {
+        // The key difference from the per-tool `driver_target`: fish
+        // completes the command NAME too (aliases, functions,
+        // abbreviations the local `$PATH` source can't see), so it fires
+        // while the user is still typing the command word.
+        let (line, point) = fish_segment("hel", 3).expect("fires on the command name");
+        assert_eq!(line, "hel");
+        assert_eq!(point, 3);
     }
 
     #[test]
-    fn arg_segment_uses_segment_after_pipe() {
+    fn fish_segment_uses_segment_after_pipe() {
         let text = "echo hi | grep -";
-        let (line, _) = arg_segment(text, text.len()).expect("fires after pipe");
+        let (line, _) = fish_segment(text, text.len()).expect("fires after pipe");
         assert_eq!(line, "grep -", "segment after the pipe, leading space trimmed");
     }
 
     #[test]
-    fn arg_segment_none_for_empty_segment() {
-        // After a bare pipe there's no command word to complete an arg of.
-        assert!(arg_segment("echo hi | ", 10).is_none());
+    fn fish_segment_none_for_empty_segment() {
+        // Empty editor, or right after a sequencer: nothing typed yet, so
+        // don't fire `complete -C ""` and flood the popup.
+        assert!(fish_segment("", 0).is_none(), "empty editor");
+        assert!(fish_segment("echo hi | ", 10).is_none(), "right after a pipe");
+        assert!(fish_segment("echo hi ; ", 10).is_none(), "right after a semicolon");
     }
 }
