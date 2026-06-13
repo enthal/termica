@@ -133,6 +133,12 @@ impl Persistence {
     pub fn root(&self) -> &Path {
         &self.root
     }
+
+    /// A clone of the shared store handle, for the background writer to
+    /// insert `scrollback_chunk` rows through.
+    pub fn store_handle(&self) -> Arc<Mutex<HistoryStore>> {
+        Arc::clone(&self.store)
+    }
 }
 
 #[cfg(test)]

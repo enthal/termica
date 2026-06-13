@@ -262,20 +262,18 @@ Because storage is logical, the chunk is the *same bytes* whether displayed at w
 
 ## Consistency model
 
-The hard question: SQLite and chunk files can diverge under a crash. We use a write-ahead pattern that makes this safe:
+The hard question: SQLite and chunk files can diverge under a crash. The unit of persistence is **one sealed block = one chunk**, and the write path makes the two stores converge:
 
-1. Live (unsealed) chunks live in `<data-dir>/scrollback/<session>/<pane>/current.chunk`.
-2. As the `Running` block streams output, rows that have **stabilized** — scrolled out of the live viewport into scrollback, so they can no longer be overwritten by `\r` or cursor moves — append to `current.chunk`; an fsync periodicity (default 1s, configurable) bounds loss of the still-on-screen tail. Stabilized rows are stored row-shaped (with their `WRAPLINE` markers intact) in the live `current.chunk`; the un-wrap into logical lines happens when the chunk is **finalized at seal**, the one moment the line structure is complete. (Rationale: an actively-written line is not yet a stable logical line, so logical-lineifying mid-stream would be wrong; rows already in scrollback are immutable and safe to persist immediately.)
-3. When `current.chunk` exceeds the seal threshold (default 8 MiB) or a session ends:
-   1. Finalize: un-wrap the stabilized rows into logical lines and write them, in the chunk format above, to a temp file, then atomically rename it to `NNNNNNNN.chunk` (rename is the commit point — a crash leaves either the old `current.chunk` or the complete sealed chunk, never a torn one).
-   2. Optionally compress to `NNNNNNNN.chunk.zst` (off the UI thread).
-   3. Insert the `scrollback_chunk` row in SQLite (with the logical-line range and `emit_cols`).
-   4. Open a new `current.chunk`.
-4. On startup, for each pane: query the highest `scrollback_chunk` row, then scan for an unsealed `current.chunk` newer than that; if present, seal it offline (no row insert if duplicates would result).
+1. A block seals when its command finishes (`CommandFinished`). The seal already un-wraps the grid into logical lines (§"Logical lines, not grid rows"); that snapshot is handed to a per-pane background writer thread.
+2. The writer keeps a running cursor over the pane's cumulative *logical* lines, so block N's chunk covers `[cursor, cursor + N_lines)` — a width-independent range. For each sealed block it:
+   1. Encodes the logical lines (chunk format above), zstd-compressed (off the UI thread).
+   2. Writes a temp dotfile, then atomically renames it to `NNNNNNNN.chunk.zst` (rename is the commit point — a crash leaves either no file or the complete chunk, never a torn one). The sequence number `NNNNNNNN` increments per written chunk; a block with no output writes nothing and does not advance the sequence or the cursor.
+   3. Inserts the `scrollback_chunk` row (logical-line range, `emit_cols`, byte size, `compressed`) under the WAL writer lock. The stored `path` is relative to the data dir, so the index survives the data dir moving.
+3. On startup, the chunk files on disk are the source of truth: if SQLite is missing a row but a chunk file exists, recover the row (chunk wins). If a row points at a missing chunk, drop the row with a warning and surface a "scrollback chunk missing" marker at that position.
 
-If SQLite is missing a row but a chunk exists on disk: recover the row (chunk wins). If a row exists pointing at a missing chunk: log a warning, drop the row, surface a "scrollback chunk missing" marker in the transcript at that position.
+**Crash granularity.** Durability is per *finished* command: a command's output becomes durable when it seals. The in-flight `Running` block is held in memory and is **not** yet persisted, so a crash mid-command loses that one block's output-so-far (every earlier, finished block is safe). This is the deliberate trade for a much smaller writer: it reuses the existing seal snapshot wholesale and needs no mid-stream stabilized-row tracking.
 
-The contract: **we never lose more than `fsync_period` seconds of unsealed content** to a crash. With `fsync_period = 1s`, that's bounded and explicit.
+> **Future hardening — `current.chunk`.** To bound mid-command loss to ~1s regardless of block length, a later slice may stream *stabilized* rows (rows that have scrolled out of the live viewport, so `\r`/cursor moves can no longer touch them) into a live `current.chunk`, row-shaped with `WRAPLINE` intact, fsync'd on a period (default 1s), and un-wrapped into logical lines only at seal (the one moment the line structure is complete). Sealing then finalizes `current.chunk` instead of encoding from memory. This is intentionally deferred; the block-granular model above is what ships first.
 
 ## Restore semantics
 
@@ -342,17 +340,18 @@ This makes "is this session continuable?" answerable by *trying to take its lock
 The UI thread never blocks on disk:
 
 ```
-PTY read task ──► transcript line ──► in-memory ring buffer ──► seal threshold
-                                                                  │
-                                                                  ▼
-                                                          background writer
-                                                          (per-pane thread)
-                                                                  │
-                                                                  ▼
-                                                          chunk file + SQLite row
+block seals (CommandFinished) ──► SealedSnapshot (logical lines) ──► channel
+                                                                       │
+                                                                       ▼
+                                                               background writer
+                                                               (per-pane thread)
+                                                                       │
+                                                                       ▼
+                                                          encode + zstd ─► chunk file
+                                                                       └─► SQLite index row
 ```
 
-The writer is a background **thread** per the same pattern as the git/gh probes ([spec/00 §"Do not block the UI on probes"](00-overview.md)) — Termica is thread-based, not `tokio`-based, and persistence introduces no async runtime. The SQLite connection runs in WAL mode with a single writer; readers are concurrent. Writes batch into transactions every `write_batch_period` (default 250 ms).
+The seal returns the block's `SealedSnapshot` from `BlockStack::observe_lifecycle_event`; the pane forwards it over an `mpsc` channel to the writer, so the UI thread's only cost is a channel send. The writer is a background **thread** per the same pattern as the git/gh probes ([spec/00 §"Do not block the UI on probes"](00-overview.md)) — Termica is thread-based, not `tokio`-based, and persistence introduces no async runtime. The thread is owned by the pane (`PaneSession`); dropping the pane drops the channel sender, the writer's `recv()` returns `Err`, and the thread exits — RAII teardown, no join. The SQLite connection runs in WAL mode with a single writer; readers are concurrent.
 
 ## Testing
 

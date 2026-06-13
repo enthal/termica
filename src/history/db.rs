@@ -376,6 +376,47 @@ impl HistoryStore {
         Ok((pane_id, session_id))
     }
 
+    /// Insert one `scrollback_chunk` index row, returning its id. The
+    /// chunk *bytes* live in the file at `path` (relative to the data
+    /// dir); this row is the small, queryable index pointing at it.
+    /// `start_line` / `end_line` are cumulative LOGICAL-line offsets
+    /// (width-independent); `compressed` records whether the file is
+    /// zstd-compressed. See [spec/08 §scrollback_chunk].
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_scrollback_chunk(
+        &self,
+        session_id: i64,
+        pane_id: i64,
+        path: &str,
+        start_line: i64,
+        end_line: i64,
+        emit_cols: i64,
+        start_time: i64,
+        end_time: i64,
+        compressed: bool,
+        byte_size: i64,
+    ) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO scrollback_chunk
+                 (session_id, pane_id, path, start_line, end_line,
+                  emit_cols, start_time, end_time, compressed, byte_size)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                session_id,
+                pane_id,
+                path,
+                start_line,
+                end_line,
+                emit_cols,
+                start_time,
+                end_time,
+                compressed as i64,
+                byte_size
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
     /// Read-only access to the underlying connection, for tests that
     /// need to assert raw row state the typed API doesn't expose.
     #[cfg(test)]

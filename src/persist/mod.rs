@@ -16,3 +16,4 @@
 
 pub mod chunk;
 pub mod store;
+pub mod writer;

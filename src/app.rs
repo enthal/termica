@@ -125,7 +125,7 @@ pub struct TermicaApp {
     /// disables dump-events entirely with zero per-pane cost.
     event_recorder: Option<Arc<EventRecorder>>,
     /// Per-process command-history store. `Some` once the on-disk
-    /// SQLite at `<data-dir>/history.sqlite` opens successfully;
+    /// SQLite at `<data-dir>/termica.sqlite` opens successfully;
     /// `None` if the data dir couldn't be resolved or the DB
     /// failed to open — in which case the app degrades gracefully
     /// to "no persisted history" and continues running.
@@ -142,6 +142,11 @@ pub struct TermicaApp {
     /// are infrequent compared to PTY traffic.
     #[allow(dead_code)]
     pub(crate) history: Option<Arc<Mutex<HistoryStore>>>,
+    /// Persistence root (`<data-dir>`) — where scrollback chunk files
+    /// live (`<root>/scrollback/…`). `Some` exactly when `history` is
+    /// (both come from the same `init_history_store`); paired with the
+    /// store to build a [`crate::persist::store::Persistence`] per pane.
+    persist_root: Option<std::path::PathBuf>,
     /// Per-process UUID tagging every captured submit in the
     /// `runs` table. The `↑`/`↓` recall filters by this so a fresh
     /// pane never inherits a closed pane's typing — see
@@ -191,7 +196,10 @@ impl TermicaApp {
     pub fn new_with_options(opts: TermicaAppOptions) -> Self {
         let home = home::home_dir();
         let event_recorder = init_event_recorder();
-        let history = init_history_store(home.as_deref());
+        let (history, persist_root) = match init_history_store(home.as_deref()) {
+            Some((store, root)) => (Some(store), Some(root)),
+            None => (None, None),
+        };
         let app_run_id = uuid::Uuid::new_v4().to_string();
         let mut app = Self {
             panes: HashMap::new(),
@@ -211,6 +219,7 @@ impl TermicaApp {
             about_open: false,
             event_recorder,
             history,
+            persist_root,
             app_run_id,
             chrome_variant: Arc::new(Mutex::new(opts.initial_chrome_variant)),
             picker_viewport_open: Arc::new(AtomicBool::new(opts.open_chrome_picker)),
@@ -232,11 +241,21 @@ impl TermicaApp {
         Some(crate::history::HistoryContext { store, app_run_id: self.app_run_id.clone() })
     }
 
+    /// Build a per-pane [`Persistence`] handle from the shared store +
+    /// data-dir root. `None` in degraded mode (no DB) — panes spawn
+    /// without scrollback persistence and the app stays usable.
+    fn persist(&self) -> Option<crate::persist::store::Persistence> {
+        let store = self.history.clone()?;
+        let root = self.persist_root.clone()?;
+        Some(crate::persist::store::Persistence::new(root, store))
+    }
+
     fn bootstrap(&mut self) {
         let pane_id = self.mint_pane_id();
         let shell = resolve_shell_from_env();
         let recorder = self.event_recorder.clone();
         let history = self.history_ctx();
+        let persist = self.persist();
         // First pane's starting cwd. Resolved per
         // spec/06 "Startup cwd and positional argument" — caller
         // (typically `run()`) computes it via `resolve_startup_cwd`
@@ -253,6 +272,7 @@ impl TermicaApp {
             pane_id.0,
             recorder,
             history,
+            persist,
         )
         .expect("spawn initial pane");
         self.panes.insert(pane_id, PaneSlot { session, ui: PaneUiState::default() });
@@ -459,14 +479,16 @@ impl TermicaApp {
         let shell = resolve_shell_from_env();
         let recorder = self.event_recorder.clone();
         let history = self.history_ctx();
-        let session =
-            match PaneSession::spawn_managed(24, 80, shell, cwd, pane_id.0, recorder, history) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("termica: failed to spawn new pane: {e}");
-                    return;
-                }
-            };
+        let persist = self.persist();
+        let session = match PaneSession::spawn_managed(
+            24, 80, shell, cwd, pane_id.0, recorder, history, persist,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("termica: failed to spawn new pane: {e}");
+                return;
+            }
+        };
         self.panes.insert(pane_id, PaneSlot { session, ui: PaneUiState::default() });
 
         let pane_tile = self.tree.tiles.insert_pane(pane_id);
@@ -1021,7 +1043,9 @@ fn init_event_recorder() -> Option<Arc<EventRecorder>> {
 /// Replay is idempotent (see [`crate::history::replay`]) so the
 /// "run on every startup" model is safe: re-reading the same file
 /// doesn't duplicate rows.
-fn init_history_store(home: Option<&std::path::Path>) -> Option<Arc<Mutex<HistoryStore>>> {
+fn init_history_store(
+    home: Option<&std::path::Path>,
+) -> Option<(Arc<Mutex<HistoryStore>>, std::path::PathBuf)> {
     let dirs = directories::ProjectDirs::from("", "", "termica")?;
     // One database for everything durable that is not a chunk file —
     // layout, sessions, runs, the chunk index. The pre-1.0 builds
@@ -1030,7 +1054,8 @@ fn init_history_store(home: Option<&std::path::Path>) -> Option<Arc<Mutex<Histor
     // in-app migration, so we simply open `termica.sqlite`. A missing
     // file is created fresh and `runs` re-seeds from shell history on
     // the next start (see spec/08-persistence.md §"One database").
-    let path = dirs.data_dir().join("termica.sqlite");
+    let data_dir = dirs.data_dir().to_path_buf();
+    let path = data_dir.join("termica.sqlite");
     let store = match HistoryStore::open(&path) {
         Ok(s) => s,
         Err(e) => {
@@ -1041,7 +1066,9 @@ fn init_history_store(home: Option<&std::path::Path>) -> Option<Arc<Mutex<Histor
     if let Some(h) = home {
         let _stats = replay_into(&store, &ReplayPaths::from_home(h));
     }
-    Some(Arc::new(Mutex::new(store)))
+    // The data dir is also the persistence root: chunk files live under
+    // `<data-dir>/scrollback/…` (9D), index rows in the DB above.
+    Some((Arc::new(Mutex::new(store)), data_dir))
 }
 
 /// Walk the tile tree DFS, collecting `(PaneId, TileId)` for every

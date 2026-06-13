@@ -117,6 +117,25 @@ impl Block {
     }
 }
 
+/// What a seal produced, handed up to the caller so it can be
+/// persisted. The block stack stays free of I/O and threads: it
+/// *returns* this value from [`BlockStack::observe_lifecycle_event`]
+/// and the pane forwards it to the background chunk writer (9D). The
+/// `lines` are the same width-independent logical lines stored in the
+/// resulting `Block::Sealed` (a clone — a future optimization may
+/// share them via `Arc`); the writer encodes them straight into a
+/// chunk file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SealedSnapshot {
+    pub block_id: BlockId,
+    pub lines: Vec<StyledLine>,
+    /// Pane width when the block sealed. Diagnostic only — logical
+    /// lines re-wrap to any width — but recorded in `scrollback_chunk`.
+    pub emit_cols: u32,
+    pub start_time_ms: i64,
+    pub end_time_ms: i64,
+}
+
 /// The per-pane vertical stack of [`Block`]s. The last element is
 /// always the **live tail**: either a `Prompt` (the shell is idle)
 /// or a `Running` (a command is executing). Older blocks are always
@@ -232,19 +251,26 @@ impl BlockStack {
     /// Other lifecycle events (`IntegrationReady`, `PromptVars`,
     /// `IntegrationError`, `CommandAborted`) are the controller's
     /// concern, not the stack's; they leave the stack alone.
+    /// Returns the [`SealedSnapshot`] of a block that just sealed (only
+    /// the `CommandFinished` path produces one), for the pane to forward
+    /// to the chunk writer; `None` for every other event.
     pub fn observe_lifecycle_event(
         &mut self,
         event: &LifecycleEvent,
         terminal: &mut TerminalState,
         frame: u64,
-    ) {
+    ) -> Option<SealedSnapshot> {
         match event {
-            LifecycleEvent::Preexec { command } => self.start_running(command.clone()),
+            LifecycleEvent::Preexec { command } => {
+                self.start_running(command.clone());
+                None
+            }
             LifecycleEvent::CommandFinished { exit } => self.seal_running(*exit, terminal, frame),
             LifecycleEvent::Precmd { cwd } | LifecycleEvent::Cwd { cwd } => {
                 self.update_tail_cwd(cwd.clone());
+                None
             }
-            _ => {}
+            _ => None,
         }
     }
 
@@ -340,17 +366,27 @@ impl BlockStack {
     ///
     /// Order matters: snapshot first, then reset. Otherwise the
     /// sealed snapshot is empty.
-    fn seal_running(&mut self, exit: i32, terminal: &mut TerminalState, frame: u64) {
+    fn seal_running(
+        &mut self,
+        exit: i32,
+        terminal: &mut TerminalState,
+        frame: u64,
+    ) -> Option<SealedSnapshot> {
+        use alacritty_terminal::grid::Dimensions;
+
         let now_ms = self.event_clock_ms;
-        let Some(tail) = self.blocks.last() else { return };
+        let tail = self.blocks.last()?;
         let Block::Running { id, header, command, started_at_ms } = tail else {
-            return;
+            return None;
         };
         let id = *id;
         let header = header.clone();
         let command = command.clone();
         let started_ms = *started_at_ms;
 
+        // Pane width at seal, before the reset clears the grid. Logical
+        // lines are width-independent; this is recorded for diagnostics.
+        let emit_cols = terminal.grid().columns() as u32;
         // Store the sealed output as width-independent LOGICAL lines
         // (un-wrapped from the grid rows), not fixed-width grid rows, so
         // the block can reflow to the current pane width on render
@@ -359,6 +395,17 @@ impl BlockStack {
         terminal.reset_for_new_block();
         // Real wall-clock duration; clamp negative clock skew to zero.
         let duration = Duration::from_millis(now_ms.saturating_sub(started_ms).max(0) as u64);
+
+        // What the writer persists. Cloning the lines keeps the block
+        // stack and the writer decoupled (the Sealed block keeps its own
+        // copy for rendering); a future optimization may share via `Arc`.
+        let produced = SealedSnapshot {
+            block_id: id,
+            lines: snapshot.clone(),
+            emit_cols,
+            start_time_ms: started_ms,
+            end_time_ms: now_ms,
+        };
 
         let sealed = Block::Sealed {
             id,
@@ -381,6 +428,7 @@ impl BlockStack {
             started_at_frame: frame,
             editor: PromptEditor::new(),
         });
+        Some(produced)
     }
 
     /// Mutable access to the editor on the live tail block, if any.
@@ -913,6 +961,62 @@ mod tests {
             }
             other => panic!("expected Sealed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn seal_returns_snapshot_for_the_writer() {
+        // The pane forwards this returned snapshot to the background
+        // chunk writer (9D). It must carry the same logical lines stored
+        // in the Sealed block, the emit width, and the wall-clock span.
+        let mut term = TerminalState::new(5, 10);
+        let mut stack = fresh_stack();
+        stack.set_event_clock_ms(1000);
+        stack.observe_lifecycle_event(
+            &LifecycleEvent::Preexec { command: "x".into() },
+            &mut term,
+            1,
+        );
+        term.feed(b"0123456789abcde"); // 15 chars @ width 10 -> 1 logical line
+        stack.set_event_clock_ms(2500);
+        let produced = stack
+            .observe_lifecycle_event(&LifecycleEvent::CommandFinished { exit: 0 }, &mut term, 2)
+            .expect("CommandFinished returns a SealedSnapshot");
+
+        assert_eq!(produced.lines.len(), 1, "soft-wrapped output is one logical line");
+        let text: String = produced.lines[0].text_chars().collect();
+        assert_eq!(text, "0123456789abcde");
+        assert_eq!(produced.emit_cols, 10, "emit width = the grid width at seal");
+        assert_eq!((produced.start_time_ms, produced.end_time_ms), (1000, 2500));
+
+        // And it matches what the Sealed block kept for rendering.
+        match stack.iter().next().unwrap() {
+            Block::Sealed { snapshot, .. } => assert_eq!(&produced.lines, snapshot),
+            other => panic!("expected Sealed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_finish_events_return_no_snapshot() {
+        // Only CommandFinished produces a snapshot; Preexec / Cwd / etc.
+        // return None so the pane has nothing to forward.
+        let mut term = TerminalState::new(5, 10);
+        let mut stack = fresh_stack();
+        assert!(
+            stack
+                .observe_lifecycle_event(
+                    &LifecycleEvent::Preexec { command: "x".into() },
+                    &mut term,
+                    1
+                )
+                .is_none(),
+            "Preexec produces no snapshot"
+        );
+        assert!(
+            stack
+                .observe_lifecycle_event(&LifecycleEvent::Cwd { cwd: "/tmp".into() }, &mut term, 2)
+                .is_none(),
+            "Cwd produces no snapshot"
+        );
     }
 
     /// The whole-Term-snapshot-then-reset model: after `CommandFinished`,

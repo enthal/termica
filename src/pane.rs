@@ -195,6 +195,12 @@ pub struct PaneSession {
     /// included. `None` before the first report (and when integration is
     /// absent), so completion falls back to the spawn snapshot.
     shell_var_names: Option<Vec<String>>,
+    /// Background scrollback writer (9D). `Some` when persistence is
+    /// available (managed spawn with an open `termica.sqlite`); each
+    /// sealed block's snapshot is forwarded to it for durable chunk
+    /// writing. `None` on the low-level `spawn` path and in degraded
+    /// mode. Dropped with the pane → its thread exits (RAII teardown).
+    chunk_writer: Option<crate::persist::writer::ChunkWriter>,
 }
 
 /// Choose the `$VAR`-completion name source: the shell's live report
@@ -277,6 +283,7 @@ impl PaneSession {
             completion_driver: None,
             last_git_branch: None,
             shell_var_names: None,
+            chunk_writer: None,
         })
     }
 
@@ -293,6 +300,7 @@ impl PaneSession {
     /// reads `false` (i.e. the bootstrap has emitted
     /// `integration_ready` or `Bootstrapping` has timed out into
     /// `Degraded`).
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_managed(
         rows: u16,
         cols: u16,
@@ -301,6 +309,7 @@ impl PaneSession {
         pane_id: u64,
         recorder: Option<Arc<EventRecorder>>,
         history: Option<HistoryContext>,
+        persist: Option<crate::persist::store::Persistence>,
     ) -> Result<Self, PtyError> {
         let session_id = new_session_id();
         let ManagedSpawn { argv, pty_bootstrap, env, wrapper_dir } =
@@ -311,9 +320,31 @@ impl PaneSession {
         }
         let program = argv[0].clone();
         let args: Vec<String> = argv[1..].to_vec();
+        // Capture the starting cwd as a string before `cwd` moves into
+        // the PtyConfig — the persisted `pane` row records it.
+        let cwd_str = cwd.as_ref().map(|p| p.display().to_string());
         let config = PtyConfig { program, args, env, cwd, rows, cols };
         let mut session = Self::spawn(rows, cols, &config, session_id, pane_id, recorder)?;
         session.history = history;
+        // Persistence (9D): allocate this session's pane + session rows
+        // and its on-disk scrollback directory, then spawn the background
+        // chunk writer. Best-effort — a failure here leaves the pane fully
+        // usable, just without durable scrollback (same posture as
+        // history). `None` persist (degraded mode / low-level spawn) skips
+        // it entirely.
+        if let Some(persist) = persist {
+            match persist.begin_session(cwd_str.as_deref(), shell.name(), wall_clock_ms()) {
+                Ok(record) => {
+                    session.chunk_writer = Some(crate::persist::writer::ChunkWriter::spawn(
+                        record.dir,
+                        persist.store_handle(),
+                        record.session,
+                        record.pane_row,
+                    ));
+                }
+                Err(e) => eprintln!("termica: persistence begin_session failed: {e}"),
+            }
+        }
         // Tie the wrapper TempDir's lifetime to the pane session.
         // When the pane closes, the directory under $TMPDIR is
         // recursively removed.
@@ -542,7 +573,15 @@ impl PaneSession {
             // here is last frame's probe result — the state just before
             // the command ran, which is exactly what we want.
             self.blocks.set_current_git(self.git_context.clone());
-            self.blocks.observe_lifecycle_event(&event, &mut self.terminal, self.frame);
+            // A `CommandFinished` seals the running block; forward its
+            // snapshot (logical lines) to the background writer for
+            // durable chunk persistence (9D). Other events return `None`.
+            if let Some(sealed) =
+                self.blocks.observe_lifecycle_event(&event, &mut self.terminal, self.frame)
+                && let Some(writer) = &self.chunk_writer
+            {
+                writer.submit(sealed);
+            }
             self.controller.observe_event(event, self.frame);
             self.record_pending_transitions();
         }
