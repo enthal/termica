@@ -321,6 +321,95 @@ impl TermicaApp {
     }
 
     fn bootstrap(&mut self) {
+        // 9F: try to restore a saved workspace first (panes come back in
+        // `Dead` mode showing their persisted scrollback). Falls through
+        // to a fresh single pane if there's nothing to restore, the
+        // layout is unreadable, or another process still owns it.
+        if self.try_restore_workspace() {
+            return;
+        }
+        self.bootstrap_fresh();
+    }
+
+    /// Rebuild the saved tile layout, recreating each pane in `Dead`
+    /// mode with its persisted scrollback. Returns `false` (so the
+    /// caller spawns a fresh pane) when there's no saved layout, it
+    /// can't be parsed, it has no panes, or any pane's session is still
+    /// locked by a live process (don't steal it).
+    fn try_restore_workspace(&mut self) -> bool {
+        let Some(persist) = self.persist() else { return false };
+        let Some(store) = self.history.clone() else { return false };
+
+        let blob = match store.lock() {
+            Ok(s) => s.latest_layout().ok().flatten(),
+            Err(_) => None,
+        };
+        let Some(blob) = blob else { return false };
+        let layout = match crate::persist::layout::SavedLayout::from_blob(&blob) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("termica: layout parse failed, starting fresh: {e}");
+                return false;
+            }
+        };
+        let leaves = layout.pane_ids();
+        if leaves.is_empty() {
+            return false;
+        }
+        if !leaves.iter().all(|p| layout.db_pane_by_app.contains_key(&p.0)) {
+            eprintln!("termica: saved layout has unmapped panes; starting fresh");
+            return false;
+        }
+
+        // Liveness: if any pane's latest session is still lock-held, the
+        // workspace belongs to a live process — don't adopt it.
+        for &db_pane in layout.db_pane_by_app.values() {
+            let Some(sid) =
+                store.lock().ok().and_then(|s| s.latest_session_for_pane(db_pane).ok().flatten())
+            else {
+                continue;
+            };
+            // `matches!` evaluates and immediately drops any acquired
+            // guard — we only want the verdict, not to hold the lock.
+            if matches!(
+                crate::persist::lock::SessionLock::try_acquire(&persist.session_dir(sid)),
+                Ok(None)
+            ) {
+                return false; // held by a live process -> don't steal it
+            }
+        }
+
+        // Build a Dead pane per leaf, reusing the saved app PaneIds so the
+        // tree's leaves resolve.
+        let mut max_app_id = 0u64;
+        for pane_id in &leaves {
+            let db_pane = layout.db_pane_by_app[&pane_id.0];
+            let blocks = crate::persist::restore::restore_blocks_for_pane(&persist, db_pane);
+            let stack = crate::block::BlockStack::with_restored_sealed(blocks);
+            let cwd = store
+                .lock()
+                .ok()
+                .and_then(|s| s.pane_cwd(db_pane).ok().flatten())
+                .map(std::path::PathBuf::from);
+            let session = PaneSession::restored(
+                MIN_ROWS.max(24),
+                MIN_COLS.max(80),
+                stack,
+                pane_id.0,
+                db_pane,
+                cwd,
+            );
+            self.panes.insert(*pane_id, PaneSlot { session, ui: PaneUiState::default() });
+            max_app_id = max_app_id.max(pane_id.0);
+        }
+        self.tree = layout.tree;
+        self.next_pane_id = max_app_id + 1;
+        true
+    }
+
+    /// Spawn a single fresh managed pane and a one-tab tree — the
+    /// no-restore startup path.
+    fn bootstrap_fresh(&mut self) {
         let pane_id = self.mint_pane_id();
         let shell = resolve_shell_from_env();
         let recorder = self.event_recorder.clone();

@@ -18,5 +18,6 @@ pub mod chunk;
 pub mod gc;
 pub mod layout;
 pub mod lock;
+pub mod restore;
 pub mod store;
 pub mod writer;

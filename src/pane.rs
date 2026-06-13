@@ -77,7 +77,11 @@ pub struct PaneView {
 /// the kernel takes to deliver EOF, which we don't want on window
 /// close. The thread will exit once its read returns 0.
 pub struct PaneSession {
-    pty: PtySession,
+    /// The live PTY. `None` for a **restored** pane (9F): a pane rebuilt
+    /// from persisted scrollback has no shell until "Restart" spawns one.
+    /// All PTY-touching paths (`write`, `resize`, `drain`) guard on this;
+    /// `drain` early-returns when it's `None`.
+    pty: Option<PtySession>,
     terminal: TerminalState,
     bytes_rx: mpsc::Receiver<Vec<u8>>,
     bytes_received: u64,
@@ -267,7 +271,7 @@ impl PaneSession {
         });
 
         Ok(Self {
-            pty,
+            pty: Some(pty),
             terminal,
             bytes_rx: rx,
             bytes_received: 0,
@@ -304,6 +308,71 @@ impl PaneSession {
             persist_pane_row: None,
             persist_session: None,
         })
+    }
+
+    /// Construct a **restored** pane (9F): no live PTY, a `BlockStack`
+    /// pre-populated with the persisted scrollback, and the controller
+    /// already in `Dead`. The renderer draws the sealed blocks above an
+    /// empty live grid; "Restart" later spawns a real shell into it
+    /// (9F-restart). `pane_row_id` is the durable `pane` row this was
+    /// restored from, kept so a re-quit re-saves the layout.
+    pub fn restored(
+        rows: u16,
+        cols: u16,
+        blocks: BlockStack,
+        pane_id: u64,
+        pane_row_id: i64,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Self {
+        // No PTY: a disconnected byte channel + an immediately-returning
+        // reader thread stand in for the live reader so the struct's
+        // ownership shape is unchanged. `drain()` early-returns on a
+        // `None` pty, so this channel is never actually read.
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        drop(tx); // rx is now disconnected
+        let handle = thread::spawn(|| {});
+        // Start past bootstrap, then drive straight to `Dead`.
+        let mut controller = PromptController::new_no_bootstrap(0);
+        controller.observe_pty_exit(0);
+        let mut terminal = TerminalState::new(rows, cols);
+        // Recover the last-known cwd so the tab title reads the path.
+        if let Some(cwd) = cwd {
+            terminal.seed_cwd(cwd);
+        }
+        Self {
+            pty: None,
+            terminal,
+            bytes_rx: rx,
+            bytes_received: 0,
+            selection: None,
+            exited: false,
+            _reader: handle,
+            controller,
+            blocks,
+            session_id: String::new(),
+            frame: 0,
+            last_alt_screen: false,
+            last_transition_at: 0,
+            wrapper_dir: None,
+            pane_id,
+            recorder: None,
+            last_submitted: None,
+            pane_selection: None,
+            history: None,
+            capture_state: CaptureState::default(),
+            recall: RecallState::default(),
+            git_probe: GitProbe::spawn(),
+            git_context: None,
+            gh_probe: GhProbe::spawn(),
+            pr_context: None,
+            completion_driver: None,
+            last_git_branch: None,
+            shell_var_names: None,
+            chunk_writer: None,
+            session_lock: None,
+            persist_pane_row: Some(pane_row_id),
+            persist_session: None,
+        }
     }
 
     /// Spawn a managed shell session per spec/03: build a
@@ -391,7 +460,9 @@ impl PaneSession {
             // hooks → emits integration_ready), then waits for normal
             // user input. The `PromptController` observes
             // `IntegrationReady` and transitions out of Bootstrapping.
-            session.pty.write(bootstrap.as_bytes())?;
+            if let Some(pty) = session.pty.as_mut() {
+                pty.write(bootstrap.as_bytes())?;
+            }
         }
 
         Ok(session)
@@ -408,6 +479,12 @@ impl PaneSession {
     /// exited panes to close on the next frame via
     /// [`Self::is_exited`].
     pub fn drain(&mut self) -> usize {
+        // A restored pane (9F) has no live PTY: nothing to drain, and we
+        // must NOT let the disconnected byte channel latch `exited` (which
+        // would auto-close the pane). It stays `Dead` until "Restart".
+        if self.pty.is_none() {
+            return 0;
+        }
         let mut consumed = 0usize;
         loop {
             match self.bytes_rx.try_recv() {
@@ -439,8 +516,10 @@ impl PaneSession {
         // reply is moot — drop it silently rather than surfacing an
         // error from this per-frame drain.
         let responses = self.terminal.drain_pty_responses();
-        if !responses.is_empty() {
-            let _ = self.pty.write(&responses);
+        if !responses.is_empty()
+            && let Some(pty) = self.pty.as_mut()
+        {
+            let _ = pty.write(&responses);
         }
 
         // Advance the per-pane frame counter. Used by the controller
@@ -1031,7 +1110,9 @@ impl PaneSession {
         let mut bytes = to_send.into_bytes();
         bytes.push(b'\r');
         self.terminal.prime_echo_suppression(&bytes);
-        self.pty.write(&bytes)?;
+        if let Some(pty) = self.pty.as_mut() {
+            pty.write(&bytes)?;
+        }
         Ok(())
     }
 
@@ -1064,7 +1145,10 @@ impl PaneSession {
         if self.controller.is_bootstrapping() {
             return Ok(());
         }
-        self.pty.write(bytes)
+        match self.pty.as_mut() {
+            Some(pty) => pty.write(bytes),
+            None => Ok(()), // restored pane, no shell to write to
+        }
     }
 
     /// Resize the PTY and adjust the terminal's grid. Both must
@@ -1073,7 +1157,11 @@ impl PaneSession {
     /// kernel-side PTY size is updated so terminal-mode programs
     /// (vim, less, ...) see the new size on their next `read`.
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), PtyError> {
-        self.pty.resize(rows, cols)?;
+        // Resize the grid regardless (sealed blocks reflow to the current
+        // width); only push SIGWINCH when there's a live PTY.
+        if let Some(pty) = self.pty.as_mut() {
+            pty.resize(rows, cols)?;
+        }
         self.terminal.resize(rows, cols);
         Ok(())
     }
@@ -1092,7 +1180,8 @@ impl PaneSession {
     /// ([`crate::pty::PtySession::env_var_names`], inherited + built-ins +
     /// `TERMICA_*`).
     pub fn env_var_names(&self) -> &[String] {
-        effective_var_names(self.shell_var_names.as_deref(), self.pty.env_var_names())
+        let spawn_names = self.pty.as_ref().map(|p| p.env_var_names()).unwrap_or(&[]);
+        effective_var_names(self.shell_var_names.as_deref(), spawn_names)
     }
 
     /// Borrow the underlying terminal state mutably. Used by the
@@ -1567,6 +1656,30 @@ mod tests {
     // every drained lifecycle event must reach it. Unit-level state
     // machine coverage lives in `src/block.rs`; these tests prove
     // the wiring at the `PaneSession::drain` boundary.
+
+    #[test]
+    fn restored_pane_is_dead_with_no_pty_and_seeded_cwd() {
+        use crate::block::BlockStack;
+        let session = PaneSession::restored(
+            24,
+            80,
+            BlockStack::new(0),
+            7,
+            42,
+            Some(std::path::PathBuf::from("/work/proj")),
+        );
+        // Dead, not exited (so the app won't auto-close it), no PTY.
+        assert_eq!(session.controller.mode(), crate::shell::PaneMode::Dead);
+        assert!(!session.is_exited(), "a restored pane must not auto-close");
+        assert!(session.pty.is_none());
+        // cwd seeded -> tab title will show the path, not `pane N`.
+        assert_eq!(session.terminal().cwd(), Some(std::path::Path::new("/work/proj")));
+        assert_eq!(session.persist_pane_row(), Some(42));
+        // drain is inert (no panic, returns 0, stays not-exited).
+        let mut session = session;
+        assert_eq!(session.drain(), 0);
+        assert!(!session.is_exited());
+    }
 
     #[test]
     fn fresh_pane_has_one_prompt_block() {

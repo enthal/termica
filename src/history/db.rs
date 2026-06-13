@@ -500,6 +500,15 @@ impl HistoryStore {
         Ok(())
     }
 
+    /// A pane row's last-known cwd (recorded at `begin_session`). Restore
+    /// seeds it onto the rebuilt pane so the tab title shows the path.
+    pub fn pane_cwd(&self, pane_id: i64) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row("SELECT cwd FROM pane WHERE id = ?1", params![pane_id], |r| r.get(0))
+            .optional()
+            .map(|opt| opt.flatten())
+    }
+
     /// The most recently saved window's `layout_blob`, or `None` if no
     /// layout has been saved yet. Restore reads this on launch.
     pub fn latest_layout(&self) -> rusqlite::Result<Option<Vec<u8>>> {

@@ -109,6 +109,28 @@ pub enum Block {
 }
 
 impl Block {
+    /// Build a `Sealed` block from restored scrollback (9F). A chunk
+    /// stores only the *output* logical lines, not the command string,
+    /// exit code, or git header (those live in `runs`, not linked to
+    /// chunks today) — so a restored block carries an empty command and
+    /// `exit: None`, showing the transcript without a command label.
+    /// `duration` is recovered from the chunk's recorded time span.
+    pub fn restored_sealed(
+        id: BlockId,
+        snapshot: Vec<StyledLine>,
+        start_time_ms: i64,
+        end_time_ms: i64,
+    ) -> Self {
+        Block::Sealed {
+            id,
+            header: BlockHeader::default(),
+            command: String::new(),
+            snapshot,
+            duration: Duration::from_millis(end_time_ms.saturating_sub(start_time_ms).max(0) as u64),
+            exit: None,
+        }
+    }
+
     /// Stable id, regardless of variant.
     pub fn id(&self) -> BlockId {
         match self {
@@ -183,6 +205,28 @@ impl BlockStack {
             id,
             header: BlockHeader::default(),
             started_at_frame,
+            editor: PromptEditor::new(),
+        });
+        stack
+    }
+
+    /// Build a stack pre-populated with restored `Sealed` blocks (9F),
+    /// then a fresh live `Prompt` tail so the invariants hold (last is
+    /// always live; ids are monotonic). The blocks must all be
+    /// `Block::Sealed` and ordered oldest→newest; their ids are
+    /// reassigned `0..n` so the tail `Prompt` gets `n`.
+    pub fn with_restored_sealed(sealed: Vec<Block>) -> Self {
+        debug_assert!(
+            sealed.iter().all(|b| matches!(b, Block::Sealed { .. })),
+            "with_restored_sealed takes only Sealed blocks"
+        );
+        let next_id = sealed.len() as u64;
+        let mut stack = Self { blocks: sealed, next_id, event_clock_ms: 0, current_git: None };
+        let id = stack.alloc_id();
+        stack.blocks.push(Block::Prompt {
+            id,
+            header: BlockHeader::default(),
+            started_at_frame: 0,
             editor: PromptEditor::new(),
         });
         stack
@@ -960,6 +1004,25 @@ mod tests {
                 assert_eq!(text, "0123456789abcde");
             }
             other => panic!("expected Sealed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_restored_sealed_preserves_blocks_and_keeps_invariants() {
+        let sealed: Vec<Block> = (0..3)
+            .map(|i| Block::restored_sealed(BlockId(i), vec![StyledLine::default()], 0, 100))
+            .collect();
+        let stack = BlockStack::with_restored_sealed(sealed);
+        // 3 sealed + 1 fresh Prompt tail.
+        assert_eq!(stack.len(), 4);
+        let mut it = stack.iter();
+        for _ in 0..3 {
+            assert!(matches!(it.next().unwrap(), Block::Sealed { .. }));
+        }
+        // Invariant: last is always live (a Prompt here), with the next id.
+        match stack.last().unwrap() {
+            Block::Prompt { id, .. } => assert_eq!(*id, BlockId(3)),
+            other => panic!("tail must be a live Prompt, got {other:?}"),
         }
     }
 
