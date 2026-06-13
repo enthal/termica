@@ -304,6 +304,18 @@ impl PromptController {
             LifecycleEvent::Continuation => {
                 self.try_promote_to_editor_for_continuation(frame);
             }
+            LifecycleEvent::Completion { .. } => {
+                // Routed to the pane's completion popup (`PaneSession`),
+                // never a mode transition. Mode safety: a completion reply
+                // says nothing about whether we're at a prompt — the
+                // request is only ever sent while already in
+                // `ShellPromptEditor`, and the shell emits the reply and
+                // loops straight back to its read prompt without a
+                // preexec/precmd. Promotion is gated solely on `Precmd`
+                // (above) and demotion on submit; `Completion` is in
+                // neither set, so the machine is provably inert here
+                // (spec/05 safety rules).
+            }
         }
     }
 
@@ -918,6 +930,25 @@ mod tests {
         c.observe_event(LifecycleEvent::Continuation, 4);
         assert_eq!(c.mode(), PaneMode::ShellPromptEditor);
         assert_eq!(c.last_transition().reason, TransitionReason::ContinuationMarker);
+    }
+
+    #[test]
+    fn completion_reply_is_inert_to_the_mode_machine() {
+        // A live-shell completion reply must NEVER move the pane mode:
+        // it's sent and received while already at the prompt, and the
+        // shell loops straight back to `read` without a precmd. Promote
+        // to the editor, then feed a Completion at a LATER frame and
+        // assert nothing about the mode or the last transition changed.
+        let mut c = PromptController::new(0);
+        ready(&mut c, 1);
+        c.observe_event(LifecycleEvent::Precmd { cwd: PathBuf::from("/tmp") }, 2);
+        assert_eq!(c.mode(), PaneMode::ShellPromptEditor);
+        let before = c.last_transition().clone();
+
+        c.observe_event(LifecycleEvent::Completion { id: 1, lines: vec!["hello".into()] }, 9);
+
+        assert_eq!(c.mode(), PaneMode::ShellPromptEditor, "mode unchanged by a completion reply");
+        assert_eq!(c.last_transition(), &before, "no transition recorded for a completion reply");
     }
 
     #[test]

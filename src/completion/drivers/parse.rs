@@ -108,41 +108,56 @@ pub fn parse_for(tool: DriverTool, stdout: &str, line: &str) -> Vec<CompletionCa
     }
 }
 
-/// Parse `fish ... complete -C` stdout: one `value\tdescription` per line,
-/// description optional. Fish **always** separates value and description
-/// with a single literal tab (and completion values can contain spaces —
-/// e.g. a filename), so unlike [`parse_cobra_complete`] we split on the
-/// tab *only*, never on a run of spaces.
+/// Parse `fish ... complete -C` stdout into candidates. Each line is
+/// `value<sep>description` where `<sep>` is a tab (fish's normal format)
+/// **or** a run of 2+ spaces — the latter because some commands' fish
+/// completions (notably `kubectl`, whose completion dumps `kubectl
+/// api-resources`-style space-padded columns) emit no tab at all, so a
+/// tab-only split would swallow the whole padded row as the value. We
+/// reuse the same [`split_value_desc`] heuristic as the cobra drivers; a
+/// completion *value* may contain single spaces (a filename), which the
+/// 2+-space rule preserves. The description's internal whitespace runs are
+/// collapsed so a wide padded row renders as compact text in the popup.
 pub fn parse_fish_complete(stdout: &str) -> Vec<CompletionCandidate> {
     let source = CompletionSource::Driver(DriverTool::FishComplete);
     stdout
         .lines()
-        .filter(|l| !l.is_empty())
-        .map(|line| match line.split_once('\t') {
-            Some((value, desc)) if !desc.trim().is_empty() => {
-                CompletionCandidate::with_description(value, desc.trim(), source)
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| match split_value_desc(line) {
+            (value, Some(desc)) => {
+                CompletionCandidate::with_description(value, collapse_whitespace(desc), source)
             }
-            Some((value, _)) => CompletionCandidate::simple(value, source),
-            None => CompletionCandidate::simple(line, source),
+            (value, None) => CompletionCandidate::simple(value, source),
         })
         .collect()
 }
 
-/// Like [`driver_target`] but **shell-driven, not command-driven**: fires
-/// for *any* command in argument position, since a shell sidecar
-/// (`complete -C`) completes everything the shell knows, not just a fixed
-/// set of CLI tools. Returns `(line, point)` — the current command segment
-/// up to the cursor and the cursor's byte offset within it (always
-/// `line.len()`). `None` in command position (let the local `$PATH` source
-/// handle the command name) or when the segment has no command word yet.
-pub fn arg_segment(editor_text: &str, cursor: usize) -> Option<(String, usize)> {
-    if local::is_command_position(editor_text, cursor) {
+/// Collapse every run of whitespace to a single space. Used to tame the
+/// wide column-padding in a tool's completion description (e.g. kubectl's
+/// `name      shortnames      apiversion …`) so it reads as plain text.
+fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The completion target for a **fish pane**, which is **shell-driven, not
+/// command-driven** and fires in **both command and argument position**:
+/// fish's `complete -C` completes the command *name* too — including the
+/// user's aliases, functions, and abbreviations, which the local `$PATH`
+/// source can't see — as well as arguments. Returns `(line, point)`: the
+/// current command segment up to the cursor and the cursor's byte offset
+/// within it (always `line.len()`).
+///
+/// `None` only when the segment is **empty** — an empty editor, or right
+/// after a sequencer (`| `, `; `) — so we never fire `complete -C ""` and
+/// flood the popup with every command on the system. The driver result is
+/// merged with the local sources (the `$PATH` executables at command
+/// position, files at argument position), so a command that's both on
+/// `$PATH` and known to fish collapses to one row ([`super::super::ranking`]).
+pub fn fish_segment(editor_text: &str, cursor: usize) -> Option<(String, usize)> {
+    let segment = current_command_segment(editor_text, cursor);
+    if segment.is_empty() {
         return None;
     }
-    let segment = current_command_segment(editor_text, cursor);
-    // Require a leading command word; a segment that is pure whitespace
-    // (e.g. `| `) has nothing to complete an argument *of*.
-    segment.split_whitespace().next()?;
     Some((segment.to_string(), segment.len()))
 }
 
@@ -386,6 +401,26 @@ mod tests {
     }
 
     #[test]
+    fn fish_parse_splits_space_padded_kubectl_columns() {
+        // kubectl's fish completion dumps `api-resources`-style columns
+        // padded with spaces and NO tabs. A tab-only split would swallow
+        // the whole row as the value (the reported bug — accepting it
+        // inserted `deployments    deploy    apps/v1 …`). The 2+-space
+        // heuristic must take just the first column as the value, and the
+        // wide internal padding must collapse in the description.
+        let stdout = "daemonsets                ds       apps/v1            true    DaemonSet\n\
+                      deployments               deploy   apps/v1            true    Deployment\n";
+        let cands = parse_fish_complete(stdout);
+        assert_eq!(cands[0].value, "daemonsets", "value is the first column only");
+        assert_eq!(cands[1].value, "deployments");
+        assert_eq!(
+            cands[0].description.as_deref(),
+            Some("ds apps/v1 true DaemonSet"),
+            "padded columns collapse to single-spaced description"
+        );
+    }
+
+    #[test]
     fn fish_parse_value_only_line_has_no_description() {
         // A completion with no description (no tab) is all value — and a
         // value may legitimately contain spaces (a filename), which the
@@ -404,30 +439,39 @@ mod tests {
     }
 
     #[test]
-    fn arg_segment_fires_for_any_command_in_arg_position() {
-        // Unlike driver_target, arg_segment fires for an *unknown* command
-        // — the shell sidecar completes anything.
+    fn fish_segment_fires_for_any_command_in_arg_position() {
+        // Like the per-tool drivers but for an *unknown* command — the
+        // shell sidecar completes anything.
         let text = "frobnicate --wi";
-        let (line, point) = arg_segment(text, text.len()).expect("fires for any command");
+        let (line, point) = fish_segment(text, text.len()).expect("fires for any command");
         assert_eq!(line, "frobnicate --wi");
         assert_eq!(point, text.len());
     }
 
     #[test]
-    fn arg_segment_none_in_command_position() {
-        assert!(arg_segment("frobni", 6).is_none(), "command name is the local source's job");
+    fn fish_segment_fires_in_command_position() {
+        // The key difference from the per-tool `driver_target`: fish
+        // completes the command NAME too (aliases, functions,
+        // abbreviations the local `$PATH` source can't see), so it fires
+        // while the user is still typing the command word.
+        let (line, point) = fish_segment("hel", 3).expect("fires on the command name");
+        assert_eq!(line, "hel");
+        assert_eq!(point, 3);
     }
 
     #[test]
-    fn arg_segment_uses_segment_after_pipe() {
+    fn fish_segment_uses_segment_after_pipe() {
         let text = "echo hi | grep -";
-        let (line, _) = arg_segment(text, text.len()).expect("fires after pipe");
+        let (line, _) = fish_segment(text, text.len()).expect("fires after pipe");
         assert_eq!(line, "grep -", "segment after the pipe, leading space trimmed");
     }
 
     #[test]
-    fn arg_segment_none_for_empty_segment() {
-        // After a bare pipe there's no command word to complete an arg of.
-        assert!(arg_segment("echo hi | ", 10).is_none());
+    fn fish_segment_none_for_empty_segment() {
+        // Empty editor, or right after a sequencer: nothing typed yet, so
+        // don't fire `complete -C ""` and flood the popup.
+        assert!(fish_segment("", 0).is_none(), "empty editor");
+        assert!(fish_segment("echo hi | ", 10).is_none(), "right after a pipe");
+        assert!(fish_segment("echo hi ; ", 10).is_none(), "right after a semicolon");
     }
 }

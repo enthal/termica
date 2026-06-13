@@ -234,6 +234,8 @@ If `command_finished` arrives without a prior `preexec`:
 - The pane closes any pending block with the reported exit code.
 - The "orphan" lifecycle is logged via `tracing` but does not corrupt state.
 
+**Mode-inert lifecycle messages.** Some messages carry information for other consumers but must **never** drive a transition. `prompt_vars` (status header), `shell_vars` (`$VAR` completion source), and `completion` (the [live-shell completion](03-shell-integration.md#completion--live-shell-completion) reply) are all inert: `PromptController::observe_event` handles them as no-ops. In particular a `completion` reply says nothing about whether we're at a prompt — the request is only ever issued while already in `ShellPromptEditor`, and the shell emits the reply and loops straight back to `read` without a `precmd`. Promotion is gated solely on `precmd` and demotion on the eager triggers above; `completion` is in neither set, so it is provably non-transitioning (`completion_reply_is_inert_to_the_mode_machine`).
+
 ## Per-rule mapping to tests
 
 Every safety rule must have at least one test that fails before the rule is implemented and passes after. These are the canonical entries; new tests join the same list.
