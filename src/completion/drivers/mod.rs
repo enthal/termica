@@ -100,6 +100,15 @@ pub enum DriverTool {
     Docker,
     Aws,
     Git,
+    /// The fish **shell sidecar**: `fish -c 'complete -C <line>'`. Unlike
+    /// the other variants this isn't a single CLI tool but the user's
+    /// whole shell — it completes any command fish knows (built-ins,
+    /// installed completions, the user's aliases and `complete`
+    /// functions), so in a fish pane it supersedes the per-tool drivers.
+    /// It rides the same engine: a one-shot subprocess whose stdout is
+    /// the same `value\tdescription` per line as cobra's `__complete`
+    /// ([spec/04a §"Source 2"](../../../spec/04a-completion.md)).
+    FishComplete,
 }
 
 impl DriverTool {
@@ -111,6 +120,7 @@ impl DriverTool {
             DriverTool::Docker => "docker",
             DriverTool::Aws => "aws",
             DriverTool::Git => "git",
+            DriverTool::FishComplete => "fish",
         }
     }
 }
@@ -208,6 +218,17 @@ fn invocation(req: &DriverRequest) -> (&'static str, Vec<String>, Vec<(String, S
         DriverTool::Git => {
             ("git", vec!["--list-cmds=builtins,others,nohelpers".to_string()], Vec::new())
         }
+        // `fish -c 'complete -C $argv[1]' <line>`: fish completes the
+        // command line passed as `$argv[1]` and prints `value\tdescription`
+        // per line. We pass the line as a positional arg (not interpolated
+        // into the script) so embedded quotes/spaces can't break out. No
+        // `--no-config`: we WANT the user's config (their aliases and
+        // `complete` definitions are the whole point of the sidecar).
+        DriverTool::FishComplete => (
+            "fish",
+            vec!["-c".to_string(), "complete -C $argv[1]".to_string(), req.line.clone()],
+            Vec::new(),
+        ),
     }
 }
 
@@ -454,6 +475,26 @@ mod tests {
         e.request(PathBuf::from("/r"), (DriverTool::Kubectl, "kubectl get ".to_string(), 12));
         let resp = e.result_rx.recv().expect("worker should send a response");
         assert!(resp.candidates.is_empty(), "missing tool → no candidates, no panic");
+    }
+
+    #[test]
+    fn fish_complete_invocation_passes_line_as_positional_arg() {
+        // The command line must go through `$argv[1]` (a single positional
+        // arg), NOT be interpolated into the `-c` script — otherwise quotes
+        // or spaces in the line could break out of the script. No
+        // `--no-config`: the sidecar deliberately loads the user's config.
+        let req = DriverRequest {
+            id: DriverRequestId(1),
+            tool: DriverTool::FishComplete,
+            cwd: PathBuf::from("/repo"),
+            line: "git che".to_string(),
+            point: 7,
+        };
+        let (program, args, envs) = invocation(&req);
+        assert_eq!(program, "fish");
+        assert_eq!(args, vec!["-c", "complete -C $argv[1]", "git che"]);
+        assert!(envs.is_empty());
+        assert!(!args.iter().any(|a| a == "--no-config"), "sidecar loads user config");
     }
 
     #[test]
