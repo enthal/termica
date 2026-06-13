@@ -108,24 +108,35 @@ pub fn parse_for(tool: DriverTool, stdout: &str, line: &str) -> Vec<CompletionCa
     }
 }
 
-/// Parse `fish ... complete -C` stdout: one `value\tdescription` per line,
-/// description optional. Fish **always** separates value and description
-/// with a single literal tab (and completion values can contain spaces —
-/// e.g. a filename), so unlike [`parse_cobra_complete`] we split on the
-/// tab *only*, never on a run of spaces.
+/// Parse `fish ... complete -C` stdout into candidates. Each line is
+/// `value<sep>description` where `<sep>` is a tab (fish's normal format)
+/// **or** a run of 2+ spaces — the latter because some commands' fish
+/// completions (notably `kubectl`, whose completion dumps `kubectl
+/// api-resources`-style space-padded columns) emit no tab at all, so a
+/// tab-only split would swallow the whole padded row as the value. We
+/// reuse the same [`split_value_desc`] heuristic as the cobra drivers; a
+/// completion *value* may contain single spaces (a filename), which the
+/// 2+-space rule preserves. The description's internal whitespace runs are
+/// collapsed so a wide padded row renders as compact text in the popup.
 pub fn parse_fish_complete(stdout: &str) -> Vec<CompletionCandidate> {
     let source = CompletionSource::Driver(DriverTool::FishComplete);
     stdout
         .lines()
-        .filter(|l| !l.is_empty())
-        .map(|line| match line.split_once('\t') {
-            Some((value, desc)) if !desc.trim().is_empty() => {
-                CompletionCandidate::with_description(value, desc.trim(), source)
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| match split_value_desc(line) {
+            (value, Some(desc)) => {
+                CompletionCandidate::with_description(value, collapse_whitespace(desc), source)
             }
-            Some((value, _)) => CompletionCandidate::simple(value, source),
-            None => CompletionCandidate::simple(line, source),
+            (value, None) => CompletionCandidate::simple(value, source),
         })
         .collect()
+}
+
+/// Collapse every run of whitespace to a single space. Used to tame the
+/// wide column-padding in a tool's completion description (e.g. kubectl's
+/// `name      shortnames      apiversion …`) so it reads as plain text.
+fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The completion target for a **fish pane**, which is **shell-driven, not
@@ -387,6 +398,26 @@ mod tests {
         assert!(cands.iter().any(|c| c.value == "cherry-pick"), "all candidates parsed");
         // The trailing blank line in fish output must not become a candidate.
         assert!(cands.iter().all(|c| !c.value.is_empty()), "no empty candidates");
+    }
+
+    #[test]
+    fn fish_parse_splits_space_padded_kubectl_columns() {
+        // kubectl's fish completion dumps `api-resources`-style columns
+        // padded with spaces and NO tabs. A tab-only split would swallow
+        // the whole row as the value (the reported bug — accepting it
+        // inserted `deployments    deploy    apps/v1 …`). The 2+-space
+        // heuristic must take just the first column as the value, and the
+        // wide internal padding must collapse in the description.
+        let stdout = "daemonsets                ds       apps/v1            true    DaemonSet\n\
+                      deployments               deploy   apps/v1            true    Deployment\n";
+        let cands = parse_fish_complete(stdout);
+        assert_eq!(cands[0].value, "daemonsets", "value is the first column only");
+        assert_eq!(cands[1].value, "deployments");
+        assert_eq!(
+            cands[0].description.as_deref(),
+            Some("ds apps/v1 true DaemonSet"),
+            "padded columns collapse to single-spaced description"
+        );
     }
 
     #[test]
