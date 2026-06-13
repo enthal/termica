@@ -153,6 +153,18 @@ pub struct DriverResponse {
     pub from_cache: bool,
 }
 
+impl DriverResponse {
+    /// Build a response for a result that did NOT pass through the engine's
+    /// worker thread — the fish **live-shell** completion path, where
+    /// `PaneSession` correlates the reply marker itself and hands the
+    /// candidates straight to the popup. There's no engine request to echo,
+    /// so a placeholder id is used; this never re-enters the engine's
+    /// `poll` id-filter. See [spec/04a §"Fish sidecar"](../../../spec/04a-completion.md).
+    pub fn live(tool: DriverTool, candidates: Vec<CompletionCandidate>) -> Self {
+        DriverResponse { id: DriverRequestId(0), tool, candidates, from_cache: false }
+    }
+}
+
 /// Spawns driver subprocesses and returns their raw stdout. Behind a
 /// trait so the engine round-trip is testable with a fake that never
 /// forks (mirrors [`crate::git_probe::GitRunner`]). `Send` because it

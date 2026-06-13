@@ -77,6 +77,23 @@ pub enum LifecycleEvent {
     /// editing the multi-line command instead of typing into raw
     /// mode. Spec/04 §"Submission semantics" subset.
     Continuation,
+    /// `{"type":"completion","id":N,"value":["<raw complete -C line>", …]}`
+    /// — the live pane shell's answer to a completion request Termica wrote
+    /// down the PTY (the `complete\t<id>\t<b64-line>` frame; see
+    /// [spec/03 §completion](../spec/03-shell-integration.md)). `id`
+    /// correlates the reply with its request. `lines` are the **raw**
+    /// `complete -C` output lines (each is fish's `value\tdescription`, or a
+    /// space-padded multi-column row from a tool like kubectl); they're
+    /// parsed into candidates by the one shared fish parser
+    /// ([`crate::completion::drivers::parse::parse_fish_complete`]) so the
+    /// live path and the one-shot subprocess path can't diverge. The
+    /// candidates come from the shell's OWN `complete -C`, so they reflect
+    /// runtime state (aliases / functions defined in-session) the one-shot
+    /// subprocess can't see. **Inert to the mode machine** — a completion
+    /// reply says nothing about whether we're at a prompt; the bootstrap
+    /// emits it and loops straight back to `read` without a preexec/precmd,
+    /// so the pane mode never moves (spec/05).
+    Completion { id: u64, lines: Vec<String> },
 }
 
 /// The shell kinds recognised in the `integration_ready` payload.
@@ -172,6 +189,19 @@ fn parse_message(value: &serde_json::Value) -> Option<LifecycleEvent> {
             // the signal that the shell's parser is waiting for
             // more input. No payload needed.
             Some(LifecycleEvent::Continuation)
+        }
+        "completion" => {
+            // `id` is a top-level sibling of `value` (it correlates the
+            // reply with its request) — the first message to carry a field
+            // beyond type/session/value. Required: a reply we can't
+            // correlate is useless, so a missing/non-numeric id is dropped.
+            let id = obj.get("id")?.as_u64()?;
+            // `value` is an array of raw `complete -C` output lines. A
+            // non-string element is skipped defensively rather than failing
+            // the whole reply — mirrors `shell_vars`.
+            let lines =
+                value?.as_array()?.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+            Some(LifecycleEvent::Completion { id, lines })
         }
         _ => None,
     }
@@ -358,6 +388,55 @@ mod tests {
     fn unknown_type_returns_none() {
         let b = body(r#"{"type":"yolo","session":"x","value":42}"#);
         assert_eq!(parse_dcs_body(&b), None);
+    }
+
+    // ---- completion (live-shell completion reply) -------------------
+
+    #[test]
+    fn completion_marker_parses_id_and_raw_lines() {
+        // `value` is the raw `complete -C` lines (tab-separated, or a
+        // space-padded kubectl row); parsing into candidates happens later
+        // in the shared fish parser, not here.
+        let b = body(
+            r#"{"type":"completion","session":"x","id":7,"value":["hello\talias hello=echo HI","help","deployments    deploy    apps/v1"]}"#,
+        );
+        assert_eq!(
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::Completion {
+                id: 7,
+                lines: vec![
+                    "hello\talias hello=echo HI".into(),
+                    "help".into(),
+                    "deployments    deploy    apps/v1".into(),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn completion_marker_empty_value_is_empty_list() {
+        // `complete -C` found nothing — the reply still fires (so the
+        // request never hangs), just with no lines.
+        let b = body(r#"{"type":"completion","session":"x","id":1,"value":[]}"#);
+        assert_eq!(parse_dcs_body(&b), Some(LifecycleEvent::Completion { id: 1, lines: vec![] }));
+    }
+
+    #[test]
+    fn completion_marker_missing_id_returns_none() {
+        // No id → we couldn't correlate it to a request → drop it.
+        let b = body(r#"{"type":"completion","session":"x","value":[]}"#);
+        assert_eq!(parse_dcs_body(&b), None);
+    }
+
+    #[test]
+    fn completion_marker_skips_non_string_line() {
+        // A non-string element is skipped defensively rather than failing
+        // the whole reply.
+        let b = body(r#"{"type":"completion","session":"x","id":2,"value":["ok",42,"two"]}"#);
+        assert_eq!(
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::Completion { id: 2, lines: vec!["ok".into(), "two".into()] })
+        );
     }
 
     #[test]

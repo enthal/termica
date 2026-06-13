@@ -39,7 +39,8 @@ Every Termica message is a JSON object with these fields:
 |---|---|---|---|
 | `type` | string | yes | The event kind (table below). |
 | `session` | string | yes | Termica session ID (UUID-shaped), echoed from `TERMICA_SESSION_ID` so messages from a stale spawned shell can be discriminated. |
-| `value` | string / number / object | depends on `type` | Payload. |
+| `value` | string / number / object / array | depends on `type` | Payload. |
+| `id` | number | only `completion` | Correlation id, echoed from the request, so a reply to a superseded request can be dropped. The one message type with a field beyond `type`/`session`/`value`. |
 
 Defined `type` values:
 
@@ -54,6 +55,7 @@ Defined `type` values:
 | `prompt_vars` | object | Optional structured prompt metadata (git branch, virtualenv, etc.) for the native status header. |
 | `command_aborted` | reason string | User cancelled input before execution (Ctrl-C on empty editor, etc.). |
 | `shell_vars` | array of name strings | From the precmd hook (change-gated). The shell's current variable **names** — the source for `$VAR` tab completion. |
+| `completion` | array of `{"value":…, "description"?:…}` | Reply to a **live-shell completion** request Termica wrote to the PTY (fish only, v1). Carries the request `id`. See [§`completion`](#completion--live-shell-completion) and [04a §"Fish sidecar"](04a-completion.md). |
 
 `prompt_vars` is intentionally open-ended — the shell sends whatever it can cheaply derive; Termica consumes the keys it knows about (`cwd`, `git_branch`, `git_dirty`, `venv`, etc.) and ignores the rest.
 
@@ -67,6 +69,19 @@ Two invariants are normative:
 - **Change-gated.** The hook tracks a signature of the last-emitted name set and emits only when it changes, so a steady prompt loop (the common case) costs nothing beyond building the list. `ShellVars` is inert for the pane-mode machine — a variable-name report never triggers a mode transition.
 
 Consumed by [`PaneSession`](../src/pane.rs): the reported names supersede the spawn snapshot as the completion source ([`PaneSession::env_var_names`](../src/pane.rs)).
+
+#### `completion` — live-shell completion
+
+Unlike every other message (which the shell emits on its own lifecycle), `completion` is a **reply to a request Termica sends**. It exists so a fish pane can complete from its **own live shell** — picking up aliases / functions / abbreviations the user defined *interactively at runtime*, which a separate `fish -c 'complete -C'` subprocess can't see ([04a §"Fish sidecar"](04a-completion.md)). v1 is fish-only; bash/zsh keep the one-shot/persistent sidecar.
+
+**Request (Termica → shell, over the PTY):** a single line `complete\t<id>\t<base64(line)>` + `\r` ([`crate::submit_framing::completion_request_bytes`](../src/submit_framing.rs)). The fish bootstrap's read-eval loop reads one line and splits on the first TAB: a leading `complete` field marks a completion request; anything else is a submitted command. A submitted command is pure base64 (alphabet `A–Za–z0–9+/=`, no TAB), so the two are **unambiguous on the wire**. The `line` is base64-encoded for the same reason commands are (spaces / quotes / multi-byte cross the cooked-mode tty cleanly, and the echo is dropped by `EchoSuppressor` — the embedded TABs suppress like any other byte). `id` correlates the reply.
+
+**Reply (shell → Termica):** `{"type":"completion","id":<n>,"value":[{"value":…,"description"?:…}, …]}`. The bootstrap runs `complete -C <line>` **in-process** (so runtime state is visible) and emits this marker, then loops straight back to `read` — it does **not** `eval`, and emits **no** `preexec`/`command_finished`/`precmd`. So a completion request runs no command and produces no block.
+
+Two invariants are normative:
+
+- **Inert to the pane-mode machine.** A `completion` reply never triggers a transition ([05](05-pane-modes.md)): the request is only ever sent while already in `ShellPromptEditor`, and the shell returns to its prompt without a precmd. Promotion is gated solely on `precmd`; `completion` is not in any transition's trigger set.
+- **Superseded replies are dropped.** Each request carries a fresh `id`; a reply whose `id` doesn't match the current in-flight request (the user kept typing, a newer request was issued) is discarded by [`PaneSession`](../src/pane.rs). A request the live shell never answers times out (~600 ms) and falls back to the local candidate sources.
 
 ### Parser requirements
 
@@ -322,7 +337,7 @@ Helpers are exported only where they need to be visible to subshells. Internal h
 ## What the scripts deliberately don't do
 
 - **No PS1 art / fancy prompts.** The visible prompt belongs to Termica's status header ([06](06-workspace-and-tiles.md)).
-- **No completion forwarding.** Tab completion in `ShellPromptEditor` is local in v1 ([04](04-prompt-editor.md)).
+- **Completion forwarding (fish only).** Tab completion is local + CLI-native drivers for every shell ([04a](04a-completion.md)); additionally, a **fish** pane forwards a completion request to its own live shell via the [`completion`](#completion--live-shell-completion) message so runtime aliases/functions complete. bash/zsh do not forward in v1.
 - **No history capture from the shell.** Termica records its own history at submit time ([07](07-history-and-search.md)).
 - **No dotfile mutation.** Ever. The bootstrap mechanisms above are all in-memory or under Termica's data directory.
 - **No background telemetry, no probe loops.** The shell does the minimum required to make the protocol work, and nothing else.

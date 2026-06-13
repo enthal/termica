@@ -202,7 +202,35 @@ pub struct PaneSession {
     /// [`Self::spawn`] path used by tests; [`Self::spawn_managed`] sets the
     /// real shell.
     shell: ShellSpec,
+    /// In-flight fish **live-shell** completion request, if any. Fish at a
+    /// prompt answers completion from its OWN process (so runtime-defined
+    /// aliases / functions complete — a one-shot subprocess can't see them)
+    /// via a PTY request; this holds the correlation `id` (echoed in the
+    /// reply marker, so a superseded request's late reply is dropped) and
+    /// the wall-clock send time (for the timeout fallback). At most one at a
+    /// time — a newer Tab/keystroke supersedes it with a fresh id.
+    fish_live: Option<FishLiveCompletion>,
+    /// A resolved fish live-shell reply, awaiting [`Self::completion_driver_poll`].
+    /// Set when the correlated `completion` marker lands in [`Self::drain`].
+    fish_live_response: Option<DriverResponse>,
+    /// Monotonic id source for fish live-shell completion requests.
+    next_fish_live_id: u64,
 }
+
+/// Bookkeeping for an in-flight fish live-shell completion request
+/// ([`PaneSession::fish_live`]).
+struct FishLiveCompletion {
+    /// Correlation id, echoed back in the `completion` marker.
+    id: u64,
+    /// Wall-clock send time (ms), for the timeout fallback.
+    sent_ms: i64,
+}
+
+/// Wall-clock deadline for a fish live-shell completion reply. The live
+/// `complete -C` runs in-process and answers in ~ms; this only guards a
+/// hung shell or a dropped marker — on expiry we fall back to the local
+/// candidates rather than spin forever.
+const FISH_LIVE_TIMEOUT_MS: i64 = 600;
 
 /// Choose the `$VAR`-completion name source: the shell's live report
 /// (`shell`) when it has arrived, else the spawn-time `snapshot`. Pure so
@@ -285,6 +313,9 @@ impl PaneSession {
             last_git_branch: None,
             shell_var_names: None,
             shell: ShellSpec::Zsh,
+            fish_live: None,
+            fish_live_response: None,
+            next_fish_live_id: 0,
         })
     }
 
@@ -409,6 +440,11 @@ impl PaneSession {
         self.controller.tick_bootstrap_timeout(self.frame);
         self.record_pending_transitions();
 
+        // Time out a fish live-shell completion request the shell never
+        // answered (hung / dropped marker), so the popup falls back to
+        // locals instead of spinning. No-op when none is in flight.
+        self.tick_fish_live_timeout(wall_clock_ms());
+
         // Sync the controller's alt-screen view BEFORE any
         // lifecycle event runs. The bytes above may have toggled
         // alacritty's alt-screen flag (`1049h` / `1049l`) — without
@@ -447,6 +483,13 @@ impl PaneSession {
             // `observe_event` consumes the event below.
             if let crate::markers::LifecycleEvent::ShellVars { names } = &event {
                 self.shell_var_names = Some(names.clone());
+            }
+            // Fish live-shell completion reply: correlate to the in-flight
+            // request and stash the candidates for `completion_driver_poll`.
+            // Cloned out before `observe_event` consumes the event below;
+            // it's inert to the mode machine (spec/05).
+            if let crate::markers::LifecycleEvent::Completion { id, lines } = &event {
+                self.ingest_live_completion(*id, lines);
             }
             // Multi-line continuation: if the shell's parser saw an
             // incomplete command after submit and emitted `PS2` (as
@@ -833,8 +876,18 @@ impl PaneSession {
         ctx: &egui::Context,
         target: (DriverTool, String, usize),
     ) {
-        let Some(cwd) = self.current_cwd() else { return };
         let (tool, line) = (target.0, target.1.clone());
+        // Live-shell path: a fish pane sitting at a prompt with confirmed
+        // integration answers from its OWN shell (so it sees aliases /
+        // functions defined at runtime), via a PTY request rather than a
+        // one-shot subprocess. The reply lands as a `completion` marker.
+        if tool == DriverTool::FishComplete && self.fish_live_capable() {
+            self.fish_live_complete_request(line);
+            return;
+        }
+        // Fallback: the one-shot subprocess engine — non-fish panes, or a
+        // fish pane whose integration is degraded / not at a prompt.
+        let Some(cwd) = self.current_cwd() else { return };
         let engine = self
             .completion_driver
             .get_or_insert_with(|| CompletionDriverEngine::spawn(ctx.clone()));
@@ -844,7 +897,14 @@ impl PaneSession {
 
     /// Drain freshly-arrived driver candidates for the current in-flight
     /// request, if any. The renderer merges them into the open popup.
+    /// A resolved fish live-shell reply takes precedence over the one-shot
+    /// engine (for a fish pane at a prompt the engine is never spawned).
     pub fn completion_driver_poll(&mut self) -> Option<DriverResponse> {
+        if let Some(resp) = self.fish_live_response.take() {
+            // The `DriverResult` event was already recorded when the marker
+            // landed (`ingest_live_completion`), so don't double-record.
+            return Some(resp);
+        }
         let resp = self.completion_driver.as_mut().and_then(|engine| engine.poll());
         if let Some(r) = &resp {
             self.record_completion(&CompletionEvent::DriverResult {
@@ -854,6 +914,76 @@ impl PaneSession {
             });
         }
         resp
+    }
+
+    /// True when this pane can answer completion from its **live** fish
+    /// shell: it's a fish pane, sitting at a prompt (`ShellPromptEditor`),
+    /// with shell integration confirmed. Only then is the bootstrap's
+    /// read-eval loop waiting to service a completion request.
+    fn fish_live_capable(&self) -> bool {
+        self.shell == ShellSpec::Fish
+            && self.controller.mode() == PaneMode::ShellPromptEditor
+            && matches!(
+                self.controller.integration(),
+                crate::shell::IntegrationState::Confirmed { .. }
+            )
+    }
+
+    /// Write a live-shell completion request for `line` to the PTY. Assigns
+    /// a fresh correlation id (superseding any in-flight request — its late
+    /// reply will be dropped on id-mismatch), primes echo suppression for
+    /// the request bytes (so the tty's echo of them never reaches the grid,
+    /// exactly like a submitted command), and writes. On PTY-write failure
+    /// it leaves no in-flight request, so the popup falls back to locals.
+    fn fish_live_complete_request(&mut self, line: String) {
+        let id = self.next_fish_live_id;
+        self.next_fish_live_id = self.next_fish_live_id.wrapping_add(1);
+        let bytes = crate::submit_framing::completion_request_bytes(id, &line);
+        self.terminal.prime_echo_suppression(&bytes);
+        if self.pty.write(&bytes).is_err() {
+            return;
+        }
+        self.fish_live = Some(FishLiveCompletion { id, sent_ms: wall_clock_ms() });
+        self.record_completion(&CompletionEvent::DriverRequest {
+            tool: DriverTool::FishComplete,
+            line,
+            cache_hit: false,
+        });
+    }
+
+    /// Correlate a `completion` reply marker to the in-flight request and
+    /// stash its candidates for [`Self::completion_driver_poll`]. A reply
+    /// whose `id` doesn't match the current request (a superseded request's
+    /// late answer) is dropped. The reply carries the **raw** `complete -C`
+    /// lines; parsing into candidates uses the one shared fish parser, so
+    /// the live and one-shot paths handle tabs / padded columns identically.
+    fn ingest_live_completion(&mut self, id: u64, lines: &[String]) {
+        if self.fish_live.as_ref().map(|f| f.id) != Some(id) {
+            return;
+        }
+        self.fish_live = None;
+        let candidates = crate::completion::drivers::parse::parse_fish_complete(&lines.join("\n"));
+        self.record_completion(&CompletionEvent::DriverResult {
+            tool: DriverTool::FishComplete,
+            candidates: candidates.len(),
+            cache_hit: false,
+        });
+        self.fish_live_response = Some(DriverResponse::live(DriverTool::FishComplete, candidates));
+    }
+
+    /// Drop an in-flight live-shell request the shell never answered within
+    /// [`FISH_LIVE_TIMEOUT_MS`], synthesizing an empty result so the popup
+    /// resolves to its local candidates instead of spinning. `now_ms` is
+    /// passed in (not read from a clock) so the logic is deterministic in
+    /// tests. No-op when nothing is in flight.
+    fn tick_fish_live_timeout(&mut self, now_ms: i64) {
+        if let Some(f) = &self.fish_live
+            && now_ms.saturating_sub(f.sent_ms) >= FISH_LIVE_TIMEOUT_MS
+        {
+            self.fish_live = None;
+            self.fish_live_response =
+                Some(DriverResponse::live(DriverTool::FishComplete, Vec::new()));
+        }
     }
 
     /// Emit a tab-[`CompletionEvent`] to `TERMICA_DUMP_EVENTS`, if enabled.
@@ -1503,6 +1633,68 @@ mod tests {
             .expect("spawn");
         let view = session.view();
         assert!(!view.alt_screen);
+    }
+
+    // ---- fish live-shell completion wiring ---------------------------
+
+    #[test]
+    fn fish_live_reply_correlates_by_id() {
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c("sleep 0.1"), "t".into(), 0, None).expect("spawn");
+        // Simulate an in-flight request with id 5.
+        session.fish_live = Some(FishLiveCompletion { id: 5, sent_ms: 0 });
+
+        // A reply for a DIFFERENT id (a superseded request) is dropped.
+        session.ingest_live_completion(9, &["stale".to_string()]);
+        assert!(session.fish_live_response.is_none(), "mismatched id is ignored");
+        assert!(session.fish_live.is_some(), "in-flight request still pending");
+
+        // The matching reply resolves and clears the in-flight marker. The
+        // raw lines are parsed by the shared fish parser — including a
+        // kubectl-style space-padded row, whose value must be just the
+        // first column (the bug that motivated raw-line parsing).
+        session.ingest_live_completion(
+            5,
+            &[
+                "hello\talias hello=echo HI".to_string(),
+                "deployments    deploy    apps/v1    true    Deployment".to_string(),
+            ],
+        );
+        assert!(session.fish_live.is_none(), "in-flight cleared on a correlated reply");
+        let resp = session.completion_driver_poll().expect("a response is available");
+        assert_eq!(resp.tool, DriverTool::FishComplete);
+        assert_eq!(resp.candidates.len(), 2);
+        assert_eq!(resp.candidates[0].value, "hello");
+        assert_eq!(resp.candidates[0].description.as_deref(), Some("alias hello=echo HI"));
+        assert_eq!(
+            resp.candidates[0].source,
+            crate::completion::CompletionSource::Driver(DriverTool::FishComplete)
+        );
+        assert_eq!(
+            resp.candidates[1].value, "deployments",
+            "a space-padded kubectl row's value is the first column, not the whole line"
+        );
+        // Polled once, then gone.
+        assert!(session.completion_driver_poll().is_none());
+    }
+
+    #[test]
+    fn fish_live_timeout_falls_back_to_empty_response() {
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c("sleep 0.1"), "t".into(), 0, None).expect("spawn");
+        session.fish_live = Some(FishLiveCompletion { id: 1, sent_ms: 1_000 });
+
+        // Before the deadline: still in flight, no fallback.
+        session.tick_fish_live_timeout(1_000 + FISH_LIVE_TIMEOUT_MS - 1);
+        assert!(session.fish_live.is_some(), "not yet timed out");
+        assert!(session.fish_live_response.is_none());
+
+        // At the deadline: drop the request and synthesize an empty result
+        // so the popup resolves to its locals instead of spinning.
+        session.tick_fish_live_timeout(1_000 + FISH_LIVE_TIMEOUT_MS);
+        assert!(session.fish_live.is_none(), "timed-out request dropped");
+        let resp = session.completion_driver_poll().expect("empty fallback response");
+        assert!(resp.candidates.is_empty(), "fallback carries no candidates");
     }
 
     // ---- block stack wiring ------------------------------------------

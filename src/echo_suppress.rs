@@ -261,6 +261,20 @@ mod tests {
     }
 
     #[test]
+    fn tab_framed_completion_request_is_suppressed_verbatim() {
+        // A fish live-shell completion request `complete\t<id>\t<b64>\r` is
+        // echoed by the cooked tty; its embedded TABs are ordinary bytes
+        // and must suppress like any other (the `\r` expands to `\r\n`).
+        // Regression guard for the live-completion path — if a future
+        // change special-cased TAB, this would leak the request into the grid.
+        let mut s = EchoSuppressor::new();
+        s.expect(b"complete\t7\tZ2l0IGNoZQ==\r");
+        let out = s.filter(b"complete\t7\tZ2l0IGNoZQ==\r\n");
+        assert_eq!(out, b"", "the whole request echo, TABs included, is suppressed");
+        assert!(!s.is_armed());
+    }
+
+    #[test]
     fn mismatch_in_middle_of_match_disengages_immediately() {
         // Real scenario: shell echo got truncated for some weird
         // reason. We must NOT eat the first byte of the actual
