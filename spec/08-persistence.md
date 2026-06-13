@@ -60,7 +60,12 @@ CREATE TABLE tab (
 
 CREATE TABLE pane (
     id            INTEGER PRIMARY KEY,
-    tab_id        INTEGER NOT NULL REFERENCES tab(id),
+    -- NULL until the pane is placed in a saved layout. A pane's
+    -- identity and its scrollback are independent of where it sits in
+    -- the tile tree, so the pane row exists and accumulates chunks
+    -- from its first session, before any tab/window/workspace row.
+    -- The restore path (10) populates tab_id when it writes layout.
+    tab_id        INTEGER REFERENCES tab(id),
     title         TEXT,
     cwd           TEXT,                     -- last known cwd (URL-decoded path)
     shell_kind    TEXT NOT NULL,

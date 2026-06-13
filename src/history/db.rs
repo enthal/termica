@@ -72,6 +72,16 @@ impl HistoryStore {
             })?;
         }
         let conn = Connection::open(path)?;
+        // WAL mode: concurrent readers (the UI, a second Termica
+        // process) coexist with the single background scrollback
+        // writer without `SQLITE_BUSY` churn. `busy_timeout` bounds
+        // how long a writer waits on a transient lock before erroring
+        // (5s is generous; history/scrollback writes are short). Both
+        // are no-ops on an in-memory DB, so they're set only here.
+        // `journal_mode = WAL` returns a row, so use `query_row`, not
+        // `execute_batch` (which rejects statements that yield rows).
+        conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -144,7 +154,11 @@ impl HistoryStore {
 
             CREATE TABLE IF NOT EXISTS pane (
                 id            INTEGER PRIMARY KEY,
-                tab_id        INTEGER NOT NULL REFERENCES tab(id),
+                -- NULL until the pane is placed in a saved layout (9F).
+                -- A pane's identity + its scrollback are independent of
+                -- where it currently sits in the tile tree, so a pane row
+                -- exists and accumulates chunks before any tab row does.
+                tab_id        INTEGER REFERENCES tab(id),
                 title         TEXT,
                 cwd           TEXT,
                 shell_kind    TEXT NOT NULL,
@@ -324,6 +338,49 @@ impl HistoryStore {
                 row_to_entry,
             )
             .optional()
+    }
+
+    /// Allocate the `pane` + `session` rows that anchor a new shell
+    /// session's scrollback, in one transaction, and return their
+    /// SQLite-assigned ids as `(pane_id, session_id)`.
+    ///
+    /// The pane row is created with `tab_id = NULL` — placement in the
+    /// tile layout is a restore-time concern ([spec/08] §pane). The
+    /// session id is allocated under the WAL writer lock, so it is
+    /// unique across every process sharing the database; the on-disk
+    /// `session-<id>/` directory is named from it, which is how two
+    /// concurrent Termica processes never collide on chunk files
+    /// ([spec/08] §"Concurrent processes and session ownership"). The
+    /// filesystem side (creating that directory) is done by
+    /// [`crate::persist::store::Persistence::begin_session`], which
+    /// calls this.
+    pub fn begin_session_rows(
+        &self,
+        cwd: Option<&str>,
+        shell_kind: &str,
+        now_ms: i64,
+    ) -> rusqlite::Result<(i64, i64)> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO pane (cwd, shell_kind, created_at, last_open)
+             VALUES (?1, ?2, ?3, ?3)",
+            params![cwd, shell_kind, now_ms],
+        )?;
+        let pane_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO session (pane_id, started_at) VALUES (?1, ?2)",
+            params![pane_id, now_ms],
+        )?;
+        let session_id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok((pane_id, session_id))
+    }
+
+    /// Read-only access to the underlying connection, for tests that
+    /// need to assert raw row state the typed API doesn't expose.
+    #[cfg(test)]
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
     }
 }
 
@@ -582,6 +639,20 @@ mod tests {
         let entries = s.recent(&Scope::Global, 10).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].text, "first run");
+    }
+
+    #[test]
+    fn file_backed_open_enables_wal() {
+        // A file-backed DB runs in WAL mode so a reader (e.g. the UI)
+        // and the background scrollback writer never block each other,
+        // and a second Termica process can read concurrently. In-memory
+        // DBs can't be WAL, so this is asserted only on disk.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("termica.sqlite");
+        let s = HistoryStore::open(&path).expect("open");
+        let mode: String =
+            s.conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).expect("journal_mode");
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
     }
 
     #[test]
