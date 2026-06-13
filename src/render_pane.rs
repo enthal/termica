@@ -2979,23 +2979,28 @@ pub fn render_pane(
         let is_macos = cfg!(target_os = "macos");
         let events: Vec<egui::Event> = ctx.input(|i| i.events.clone());
 
-        // Copy shortcut: macOS trusts Event::Copy from Cmd+C; off-
-        // Mac we look for Ctrl+Shift+C in the Key event (plain
-        // Ctrl+C must remain SIGINT for the shell, so we cannot
-        // trust Event::Copy there).
+        // Copy shortcut: macOS trusts Event::Copy from Cmd+C.
+        //
+        // On Linux, egui-winit's `is_copy_command` fires on
+        // `modifiers.command && Key::C`. Because `command` maps to
+        // Ctrl on Linux, BOTH Ctrl+C and Ctrl+Shift+C produce
+        // `Event::Copy` (and no `Event::Key`). We need Shift to
+        // distinguish the user's copy intent from a bare Ctrl+C
+        // that must remain SIGINT, so we accept `Event::Copy` only
+        // when the frame's modifier state includes Shift.
+        let frame_shift = ctx.input(|i| i.modifiers.shift);
         let copy_pressed = events.iter().any(|e| match e {
-            egui::Event::Copy => is_macos,
+            egui::Event::Copy => is_macos || frame_shift,
             egui::Event::Key { key, pressed: true, modifiers, .. } => {
                 !is_macos && input::is_copy_shortcut(*key, *modifiers, false)
             }
             _ => false,
         });
-        // Cut shortcut: macOS sends `Event::Cut` from Cmd+X. Off-Mac
-        // we look for Ctrl+Shift+X. Cmd+X in the editor cuts the
-        // selection (copy then delete); outside editor mode it's a
-        // no-op for now (alacritty selection has no notion of cut).
+        // Cut shortcut: macOS sends `Event::Cut` from Cmd+X.
+        // Same egui-winit issue: on Linux, Ctrl+X and Ctrl+Shift+X
+        // both produce `Event::Cut`. Accept only with Shift.
         let cut_pressed = events.iter().any(|e| match e {
-            egui::Event::Cut => is_macos,
+            egui::Event::Cut => is_macos || frame_shift,
             egui::Event::Key { key, pressed: true, modifiers, .. } => {
                 !is_macos
                     && *key == egui::Key::X
@@ -3117,13 +3122,20 @@ pub fn render_pane(
             slot.session.blocks().editor_on_tail().map(|e| (e.text().to_string(), e.cursor()));
 
         for event in &events {
-            // Belt and braces: skip the Ctrl+Shift+C key event so the
-            // encoder never sees it (the encoder wouldn't emit bytes
-            // for that modifier combo anyway, but be explicit).
+            // Belt and braces: skip copy/cut events so the encoder
+            // never sees them. On Linux, egui-winit emits
+            // Event::Copy / Event::Cut instead of Event::Key for
+            // Ctrl+[Shift+]C/X, so we must skip both variants.
             if let egui::Event::Key { key, pressed: true, modifiers, .. } = event
                 && !is_macos
                 && input::is_copy_shortcut(*key, *modifiers, false)
             {
+                continue;
+            }
+            if matches!(event, egui::Event::Copy) && copy_pressed {
+                continue;
+            }
+            if matches!(event, egui::Event::Cut) && cut_pressed {
                 continue;
             }
             // Phase 4B: in `ShellPromptEditor` mode, keystrokes go to
