@@ -129,9 +129,15 @@ pub fn write_chunk(
     // name. A crash leaves either no file or the complete chunk, never a
     // torn one. The temp shares the directory so the rename is on one
     // filesystem.
-    let file_name = format!("{seq:08}.chunk.zst");
+    //
+    // `.chunk.tmck` names OUR container (TMCK = TerMica ChunK), not a
+    // bare zstd stream — the 16-byte header sits uncompressed in front,
+    // so the file is not directly `zstd -d`-able. Whether the body is
+    // compressed is recorded in that header's flags and the row's
+    // `compressed` column, not in the extension.
+    let file_name = format!("{seq:08}.chunk.tmck");
     let final_path = dir.join(&file_name);
-    let tmp_path = dir.join(format!(".{seq:08}.chunk.zst.tmp"));
+    let tmp_path = dir.join(format!(".{seq:08}.chunk.tmck.tmp"));
     std::fs::write(&tmp_path, &bytes)?;
     std::fs::rename(&tmp_path, &final_path)?;
 
@@ -209,12 +215,12 @@ mod tests {
         assert_eq!(n, 2);
 
         // File exists and decodes back to the exact logical lines.
-        let file = rec.dir.join("00000001.chunk.zst");
+        let file = rec.dir.join("00000001.chunk.tmck");
         assert!(file.is_file(), "chunk file published at the sequenced name");
         let bytes = std::fs::read(&file).unwrap();
         assert_eq!(decode_chunk(&bytes).unwrap(), snap.lines, "round-trips through the file");
         // No temp left behind.
-        assert!(!rec.dir.join(".00000001.chunk.zst.tmp").exists());
+        assert!(!rec.dir.join(".00000001.chunk.tmck.tmp").exists());
 
         // Index row matches.
         let s = store.lock().unwrap();
@@ -230,7 +236,7 @@ mod tests {
         assert_eq!(
             path,
             format!(
-                "scrollback/session-{}/pane-{}/00000001.chunk.zst",
+                "scrollback/session-{}/pane-{}/00000001.chunk.tmck",
                 rec.session.0, rec.pane_row.0
             )
         );
@@ -247,7 +253,7 @@ mod tests {
         let n = write_chunk(&rec.dir, &store, rec.session, rec.pane_row, 1, 0, &snapshot(1, &[]))
             .unwrap();
         assert_eq!(n, 0, "empty snapshot writes nothing");
-        assert!(!rec.dir.join("00000001.chunk.zst").exists());
+        assert!(!rec.dir.join("00000001.chunk.tmck").exists());
         let count: i64 = store
             .lock()
             .unwrap()
@@ -269,9 +275,9 @@ mod tests {
         writer.join_and_finish();
 
         // Two files (the empty one is skipped), sequenced 1 and 2.
-        assert!(rec.dir.join("00000001.chunk.zst").is_file());
-        assert!(rec.dir.join("00000002.chunk.zst").is_file());
-        assert!(!rec.dir.join("00000003.chunk.zst").exists());
+        assert!(rec.dir.join("00000001.chunk.tmck").is_file());
+        assert!(rec.dir.join("00000002.chunk.tmck").is_file());
+        assert!(!rec.dir.join("00000003.chunk.tmck").exists());
 
         // Rows: the cursor advances past the skipped empty block, so the
         // second chunk starts where the first ended (no gap from the

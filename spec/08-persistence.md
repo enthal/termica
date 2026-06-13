@@ -9,7 +9,7 @@ Termica must survive a crash and a restart without losing what the user typed, w
 | Store | Purpose | Format |
 |---|---|---|
 | **SQLite** | Sessions, panes, layout, command runs, history entries, scrollback chunk index | Single file: `<data-dir>/termica.sqlite` |
-| **Chunk files** | Transcript content (logical lines + style); sealed, append-only | `<data-dir>/scrollback/<session>/<pane>/<NNNNNNNN>.chunk[.zst]` |
+| **Chunk files** | Transcript content (logical lines + style); sealed, append-only | `<data-dir>/scrollback/<session>/<pane>/<NNNNNNNN>.chunk.tmck` |
 
 Splitting them is deliberate: SQLite is bad at holding large blobs; the filesystem is bad at indexing. We use each for what it's good at. The bulky transcript payload (potentially many MiB per chunk) lives on the filesystem; SQLite holds only a small index row per chunk (path, logical-line range, byte size, compressed flag) — never the chunk bytes themselves.
 
@@ -22,11 +22,14 @@ Splitting them is deliberate: SQLite is bad at holding large blobs; the filesyst
 ├── termica.sqlite-shm
 └── scrollback/
     └── session-<sid>/
+        ├── .lock                   (advisory session-ownership lock)
         └── pane-<pid>/
-            ├── 00000001.chunk
-            ├── 00000002.chunk.zst
-            └── 00000003.chunk
+            ├── 00000001.chunk.tmck
+            ├── 00000002.chunk.tmck
+            └── 00000003.chunk.tmck
 ```
+
+Chunk files are named `<NNNNNNNN>.chunk.tmck` — `.tmck` (TerMica ChunK) names *our* container format, not a bare zstd stream: the 16-byte header is uncompressed (so the compressed-flag is readable without decompressing), so the file is deliberately **not** directly `zstd -d`-able. Whether the body is zstd-compressed is recorded in the header flags and the row's `compressed` column, never in the extension.
 
 `<data-dir>` is `$XDG_DATA_HOME/termica/` on Linux and `~/Library/Application Support/termica/` on macOS — whatever `directories::ProjectDirs::from("", "", "termica").data_dir()` resolves to (the basename is lowercase `termica`, matching the crate's output, not the display-cased product name).
 
@@ -188,13 +191,15 @@ Replay is **never allowed to block startup**. If the data dir can't be resolved 
 
 ### Why no foreign-key cascades for chunks
 
-A scrollback chunk on disk has a longer life than its row should imply: if SQLite is corrupted or rolled back, the chunk file is still good. We do not let SQLite cascade-delete chunks. Cleanup is a separate `Persistence::gc()` pass that:
+A scrollback chunk on disk has a longer life than its row should imply: if SQLite is corrupted or rolled back, the chunk file is still good. We do not let SQLite cascade-delete chunks. Cleanup is a separate `Persistence::gc()` pass ([`src/persist/gc.rs`](../src/persist/gc.rs)) that runs on startup, off the UI thread, and is **liveness-aware**: for each session it *tries to take the session's ownership lock* (§"Concurrent processes"); a held lock means the session is live (this or another process), and its chunks are never touched. Against the non-live remainder it, in order:
 
-1. Reads alive chunk rows.
-2. Walks `<data-dir>/scrollback/` and lists chunk files.
-3. Deletes chunks that no row references **and** are older than the retention threshold.
+1. Deletes **aged** chunks (row + file) past the retention threshold (default 30 days).
+2. Enforces the **global** byte cap (default 2 GB) by evicting the oldest non-live chunks until under it.
+3. Enforces each **per-session** byte cap (default 200 MB) the same way.
+4. Trims `runs` to its newest *N* rows (default 50k).
+5. Removes leftover `.tmp` files (torn writes — a crash between write and rename); these are never valid chunks.
 
-This is intentionally conservative.
+The file is deleted before its row (so a crash mid-gc leaves a recoverable orphan file, never a row pointing at nothing). **Orphan chunk files** (a file with *no* index row) are deliberately **not** deleted by gc: the consistency model says chunk-on-disk wins and restore recovers the missing row, so deleting it would lose recoverable data — that reconciliation is restore's job. This is intentionally conservative.
 
 ## Chunk format
 
@@ -267,7 +272,7 @@ The hard question: SQLite and chunk files can diverge under a crash. The unit of
 1. A block seals when its command finishes (`CommandFinished`). The seal already un-wraps the grid into logical lines (§"Logical lines, not grid rows"); that snapshot is handed to a per-pane background writer thread.
 2. The writer keeps a running cursor over the pane's cumulative *logical* lines, so block N's chunk covers `[cursor, cursor + N_lines)` — a width-independent range. For each sealed block it:
    1. Encodes the logical lines (chunk format above), zstd-compressed (off the UI thread).
-   2. Writes a temp dotfile, then atomically renames it to `NNNNNNNN.chunk.zst` (rename is the commit point — a crash leaves either no file or the complete chunk, never a torn one). The sequence number `NNNNNNNN` increments per written chunk; a block with no output writes nothing and does not advance the sequence or the cursor.
+   2. Writes a temp dotfile, then atomically renames it to `NNNNNNNN.chunk.tmck` (rename is the commit point — a crash leaves either no file or the complete chunk, never a torn one). The sequence number `NNNNNNNN` increments per written chunk; a block with no output writes nothing and does not advance the sequence or the cursor.
    3. Inserts the `scrollback_chunk` row (logical-line range, `emit_cols`, byte size, `compressed`) under the WAL writer lock. The stored `path` is relative to the data dir, so the index survives the data dir moving.
 3. On startup, the chunk files on disk are the source of truth: if SQLite is missing a row but a chunk file exists, recover the row (chunk wins). If a row points at a missing chunk, drop the row with a warning and surface a "scrollback chunk missing" marker at that position.
 

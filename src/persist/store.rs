@@ -132,11 +132,13 @@ impl Persistence {
         };
         let dir = self.session_pane_dir(session_id, pane_id);
         std::fs::create_dir_all(&dir)?;
-        // Take this session's ownership lock. The session id is freshly
+        // Take this session's ownership lock — on the SESSION directory
+        // (`session-<id>/`), the same path `gc()` and restore probe for
+        // liveness, not the pane subdir. The session id is freshly
         // allocated and unique, so no other process could be holding it —
         // a `None` here would mean a same-process double-begin, which we
         // surface rather than silently run unlocked.
-        let lock = crate::persist::lock::SessionLock::try_acquire(&dir)?
+        let lock = crate::persist::lock::SessionLock::try_acquire(&self.session_dir(session_id))?
             .ok_or(PersistError::SessionLockHeld)?;
         Ok(SessionRecord {
             pane_row: PaneRowId(pane_id),
@@ -146,14 +148,18 @@ impl Persistence {
         })
     }
 
+    /// A session's directory: `<root>/scrollback/session-<session>/`.
+    /// This is the unit of ownership — its `.lock` sentinel carries the
+    /// advisory lock. Pure path arithmetic.
+    pub(crate) fn session_dir(&self, session_id: i64) -> PathBuf {
+        self.root.join("scrollback").join(format!("session-{session_id}"))
+    }
+
     /// The directory a session's chunk files live in:
     /// `<root>/scrollback/session-<session>/pane-<pane>/`. Pure path
     /// arithmetic — does not touch the filesystem.
     fn session_pane_dir(&self, session_id: i64, pane_id: i64) -> PathBuf {
-        self.root
-            .join("scrollback")
-            .join(format!("session-{session_id}"))
-            .join(format!("pane-{pane_id}"))
+        self.session_dir(session_id).join(format!("pane-{pane_id}"))
     }
 
     /// The persistence root (`<data-dir>`).

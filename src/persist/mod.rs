@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod chunk;
+pub mod gc;
 pub mod lock;
 pub mod store;
 pub mod writer;

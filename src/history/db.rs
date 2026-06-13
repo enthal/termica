@@ -417,6 +417,67 @@ impl HistoryStore {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Every `scrollback_chunk` row, newest-ended first. Backs both
+    /// `gc()` (which decides what to delete) and restore (which lists a
+    /// pane's chunks). Returned wholesale because the index is small (one
+    /// row per sealed block) — the bulky payload lives in the files.
+    pub fn all_scrollback_chunks(&self) -> rusqlite::Result<Vec<ChunkRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, pane_id, path, start_line, end_line,
+                    emit_cols, start_time, end_time, compressed, byte_size
+             FROM scrollback_chunk
+             ORDER BY end_time DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([], row_to_chunk)?;
+        rows.collect()
+    }
+
+    /// All chunk rows for one pane, oldest logical line first — the
+    /// order restore re-pages them in. (Restore attaches a pane's
+    /// transcript to its persisted chunks.)
+    pub fn pane_scrollback_chunks(&self, pane_id: i64) -> rusqlite::Result<Vec<ChunkRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, pane_id, path, start_line, end_line,
+                    emit_cols, start_time, end_time, compressed, byte_size
+             FROM scrollback_chunk
+             WHERE pane_id = ?1
+             ORDER BY start_line ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![pane_id], row_to_chunk)?;
+        rows.collect()
+    }
+
+    /// Delete one `scrollback_chunk` index row by id. The file on disk
+    /// is the caller's responsibility (gc deletes the file first, then
+    /// the row — chunk-on-disk is the source of truth, so an orphan file
+    /// is recoverable but an orphan row is not).
+    pub fn delete_scrollback_chunk(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM scrollback_chunk WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Number of rows in `runs` (the global history cap is enforced
+    /// against this).
+    pub fn count_runs(&self) -> rusqlite::Result<i64> {
+        self.conn.query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))
+    }
+
+    /// Trim `runs` to its newest `keep` rows by `started_at`, deleting
+    /// the oldest overflow. Returns how many rows were deleted. A no-op
+    /// when already at or under `keep`.
+    pub fn trim_runs_to_newest(&self, keep: i64) -> rusqlite::Result<usize> {
+        // Keep the `keep` highest started_at ids; delete the rest. The
+        // subquery picks the survivors so ties on started_at are broken
+        // deterministically by id.
+        let n = self.conn.execute(
+            "DELETE FROM runs WHERE id NOT IN (
+                 SELECT id FROM runs ORDER BY started_at DESC, id DESC LIMIT ?1
+             )",
+            params![keep],
+        )?;
+        Ok(n)
+    }
+
     /// Read-only access to the underlying connection, for tests that
     /// need to assert raw row state the typed API doesn't expose.
     #[cfg(test)]
@@ -436,6 +497,41 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
         app_run_id: row.get(6)?,
         pane_id: row.get(7)?,
         source: row.get(8)?,
+    })
+}
+
+/// One `scrollback_chunk` index row. The chunk *bytes* live in the file
+/// at `path` (relative to the data dir); this is the small queryable
+/// pointer to it. `start_line` / `end_line` are cumulative LOGICAL-line
+/// offsets (width-independent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkRow {
+    pub id: i64,
+    pub session_id: i64,
+    pub pane_id: i64,
+    pub path: String,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub emit_cols: i64,
+    pub start_time: i64,
+    pub end_time: i64,
+    pub compressed: bool,
+    pub byte_size: i64,
+}
+
+fn row_to_chunk(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkRow> {
+    Ok(ChunkRow {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        pane_id: row.get(2)?,
+        path: row.get(3)?,
+        start_line: row.get(4)?,
+        end_line: row.get(5)?,
+        emit_cols: row.get(6)?,
+        start_time: row.get(7)?,
+        end_time: row.get(8)?,
+        compressed: row.get::<_, i64>(9)? != 0,
+        byte_size: row.get(10)?,
     })
 }
 

@@ -200,6 +200,38 @@ impl TermicaApp {
             Some((store, root)) => (Some(store), Some(root)),
             None => (None, None),
         };
+        // Scrollback gc (9E): enforce the disk + `runs` growth caps on a
+        // background thread so launch never blocks on it. It skips live
+        // sessions (lock-held) and is conservative — see
+        // [`crate::persist::gc`]. Real wall-clock `now` is fine here
+        // (production, not a test).
+        if let (Some(store), Some(root)) = (history.as_ref(), persist_root.as_ref()) {
+            let persist = crate::persist::store::Persistence::new(root.clone(), store.clone());
+            let now_ms = now_unix_ms();
+            std::thread::spawn(move || {
+                match crate::persist::gc::gc(
+                    &persist,
+                    now_ms,
+                    &crate::persist::gc::GcCaps::default(),
+                ) {
+                    Ok(r)
+                        if r.chunks_deleted > 0
+                            || r.runs_trimmed > 0
+                            || r.tmp_files_deleted > 0 =>
+                    {
+                        eprintln!(
+                            "termica: gc reclaimed {} chunks ({} bytes), trimmed {} runs, removed {} temps",
+                            r.chunks_deleted,
+                            r.bytes_reclaimed,
+                            r.runs_trimmed,
+                            r.tmp_files_deleted
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("termica: gc failed: {e}"),
+                }
+            });
+        }
         let app_run_id = uuid::Uuid::new_v4().to_string();
         let mut app = Self {
             panes: HashMap::new(),
@@ -1043,6 +1075,16 @@ fn init_event_recorder() -> Option<Arc<EventRecorder>> {
 /// Replay is idempotent (see [`crate::history::replay`]) so the
 /// "run on every startup" model is safe: re-reading the same file
 /// doesn't duplicate rows.
+/// Wall-clock Unix-epoch milliseconds. Production only (startup gc
+/// timestamp); tests inject a fixed `now` instead, per the determinism
+/// rule. A pre-epoch clock clamps to 0.
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 fn init_history_store(
     home: Option<&std::path::Path>,
 ) -> Option<(Arc<Mutex<HistoryStore>>, std::path::PathBuf)> {
