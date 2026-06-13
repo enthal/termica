@@ -187,7 +187,7 @@ Replay is **never allowed to block startup**. If the data dir can't be resolved 
 
 ### What lives in the layout blob
 
-`window.layout_blob` is a bincode-serialized `egui_tiles::Tree<PaneId>` plus minimal egui state (active leaf, split fractions). The format is owned by Termica; we ship a migration when the layout serialization changes.
+`window.layout_blob` is a **JSON-serialized `SavedLayout`** ([`src/persist/layout.rs`](../src/persist/layout.rs)): the `egui_tiles::Tree<PaneId>` topology (tabs, splits, active leaf — egui_tiles' own serde) plus a `db_pane_by_app` map from each app `PaneId` to its durable `pane` row id, so a restored leaf can find its scrollback chunks (chunks are keyed by the db pane id, which outlives any single process). JSON over bincode: a layout blob is tiny and human-inspectable, and reuses the `serde_json` we already depend on. The format is owned by Termica; we ship a migration when it changes. It is written on clean quit (`save_layout`, single-window app → clear-and-insert one workspace + window).
 
 ### Why no foreign-key cascades for chunks
 

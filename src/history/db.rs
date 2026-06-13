@@ -478,6 +478,64 @@ impl HistoryStore {
         Ok(n)
     }
 
+    /// Persist the current window layout (Phase 9F): replace the single
+    /// workspace + window with one carrying `layout_blob`. Termica is a
+    /// single-window app today, so this is a clear-and-insert rather than
+    /// a per-window upsert. Done in one transaction.
+    pub fn save_layout(&self, layout_blob: &[u8], now_ms: i64) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        // window references workspace, so clear window first.
+        tx.execute("DELETE FROM window", [])?;
+        tx.execute("DELETE FROM workspace", [])?;
+        tx.execute(
+            "INSERT INTO workspace (name, created_at) VALUES ('default', ?1)",
+            params![now_ms],
+        )?;
+        let workspace_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO window (workspace_id, title, layout_blob) VALUES (?1, NULL, ?2)",
+            params![workspace_id, layout_blob],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The most recently saved window's `layout_blob`, or `None` if no
+    /// layout has been saved yet. Restore reads this on launch.
+    pub fn latest_layout(&self) -> rusqlite::Result<Option<Vec<u8>>> {
+        self.conn
+            .query_row("SELECT layout_blob FROM window ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .optional()
+    }
+
+    /// The most recent session id for a pane (its latest PTY spawn), or
+    /// `None` if the pane has no sessions. Restore uses this to find the
+    /// session directory whose ownership lock decides liveness.
+    pub fn latest_session_for_pane(&self, pane_id: i64) -> rusqlite::Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM session WHERE pane_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![pane_id],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// Stamp a session's end (`ended_at`, optional `exit_code`). Called
+    /// when a pane closes or the app quits. No-op if the id is unknown.
+    pub fn end_session(
+        &self,
+        session_id: i64,
+        ended_at_ms: i64,
+        exit_code: Option<i32>,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE session SET ended_at = ?1, exit_code = ?2 WHERE id = ?3",
+            params![ended_at_ms, exit_code, session_id],
+        )?;
+        Ok(())
+    }
+
     /// Read-only access to the underlying connection, for tests that
     /// need to assert raw row state the typed API doesn't expose.
     #[cfg(test)]
@@ -642,6 +700,36 @@ mod tests {
             .query_row("SELECT text FROM runs WHERE started_at = 123", [], |r| r.get(0))
             .expect("the pre-existing v2 runs row survives the migration");
         assert_eq!(text, "echo hi");
+    }
+
+    #[test]
+    fn save_layout_replaces_and_latest_reads_back() {
+        let s = store();
+        assert!(s.latest_layout().unwrap().is_none(), "no layout before first save");
+        s.save_layout(b"first-blob", 1000).unwrap();
+        assert_eq!(s.latest_layout().unwrap().as_deref(), Some(&b"first-blob"[..]));
+        // A second save replaces (single-window app) — exactly one window
+        // row remains, carrying the newest blob.
+        s.save_layout(b"second-blob", 2000).unwrap();
+        assert_eq!(s.latest_layout().unwrap().as_deref(), Some(&b"second-blob"[..]));
+        let windows: i64 =
+            s.conn.query_row("SELECT COUNT(*) FROM window", [], |r| r.get(0)).unwrap();
+        let workspaces: i64 =
+            s.conn.query_row("SELECT COUNT(*) FROM workspace", [], |r| r.get(0)).unwrap();
+        assert_eq!((windows, workspaces), (1, 1), "save replaces, never accumulates");
+    }
+
+    #[test]
+    fn end_session_stamps_ended_at_and_latest_session_lookup() {
+        let s = store();
+        let (pane, session) = s.begin_session_rows(Some("/w"), "zsh", 100).unwrap();
+        assert_eq!(s.latest_session_for_pane(pane).unwrap(), Some(session));
+        s.end_session(session, 500, Some(0)).unwrap();
+        let ended: i64 = s
+            .conn
+            .query_row("SELECT ended_at FROM session WHERE id = ?1", [session], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ended, 500);
     }
 
     #[test]

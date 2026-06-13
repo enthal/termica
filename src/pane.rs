@@ -208,6 +208,15 @@ pub struct PaneSession {
     /// Held purely for its `Drop` (lock release); never read.
     #[allow(dead_code)]
     session_lock: Option<crate::persist::lock::SessionLock>,
+    /// This pane's durable `pane` row id (9D/9F), `Some` when
+    /// persistence is active. Saved into the layout blob so a relaunch
+    /// can reconnect the restored pane to its scrollback chunks (which
+    /// are keyed by this db id, not the ephemeral app `PaneId`). Also
+    /// the `session.id` we stamp `ended_at` on at teardown.
+    persist_pane_row: Option<i64>,
+    /// This pane's current `session` row id (its live PTY spawn), for
+    /// stamping `ended_at` on close/quit.
+    persist_session: Option<i64>,
 }
 
 /// Choose the `$VAR`-completion name source: the shell's live report
@@ -292,6 +301,8 @@ impl PaneSession {
             shell_var_names: None,
             chunk_writer: None,
             session_lock: None,
+            persist_pane_row: None,
+            persist_session: None,
         })
     }
 
@@ -351,6 +362,8 @@ impl PaneSession {
                     ));
                     // Hold the session-ownership lock for the pane's life.
                     session.session_lock = Some(record.lock);
+                    session.persist_pane_row = Some(record.pane_row.0);
+                    session.persist_session = Some(record.session.0);
                 }
                 Err(e) => eprintln!("termica: persistence begin_session failed: {e}"),
             }
@@ -767,6 +780,19 @@ impl PaneSession {
     /// CLAUDE.md).
     pub fn pane_id(&self) -> u64 {
         self.pane_id
+    }
+
+    /// This pane's durable `pane` row id, if persistence is active.
+    /// Saved into the layout blob so a restored pane reconnects to its
+    /// scrollback chunks.
+    pub fn persist_pane_row(&self) -> Option<i64> {
+        self.persist_pane_row
+    }
+
+    /// This pane's live `session` row id, if persistence is active.
+    /// Stamped with `ended_at` when the pane closes or the app quits.
+    pub fn persist_session(&self) -> Option<i64> {
+        self.persist_session
     }
 
     /// Mutable handle to the editor on the live `Prompt` block, if

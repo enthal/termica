@@ -19,7 +19,7 @@ use crate::pane::PaneSession;
 /// from other identifier flavours that arrive in later phases
 /// (`CommandRunId`, `HistoryEntryId`, …). `Copy + Eq + Hash` so it
 /// works as both a tree payload and a HashMap key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PaneId(pub u64);
 
 /// App-level intents staged by `render_pane` when the focused pane

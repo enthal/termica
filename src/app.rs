@@ -282,6 +282,44 @@ impl TermicaApp {
         Some(crate::persist::store::Persistence::new(root, store))
     }
 
+    /// Save the current window layout + stamp live sessions ended (9F),
+    /// so the next launch can restore. Best-effort: a missing store,
+    /// serialization failure, or DB error degrades to "no restore next
+    /// time", never a crash on quit.
+    fn save_layout_on_quit(&self) {
+        let Some(store) = self.history.as_ref() else { return };
+        // Map every live pane's app id -> its durable db pane row id.
+        let mut db_pane_by_app = std::collections::HashMap::new();
+        for (pane_id, slot) in &self.panes {
+            if let Some(db) = slot.session.persist_pane_row() {
+                db_pane_by_app.insert(pane_id.0, db);
+            }
+        }
+        if db_pane_by_app.is_empty() {
+            return; // nothing persistable (degraded mode)
+        }
+        let layout =
+            crate::persist::layout::SavedLayout { tree: self.tree.clone(), db_pane_by_app };
+        let blob = match layout.to_blob() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("termica: layout serialize failed: {e}");
+                return;
+            }
+        };
+        let now = now_unix_ms();
+        if let Ok(store) = store.lock() {
+            if let Err(e) = store.save_layout(&blob, now) {
+                eprintln!("termica: layout save failed: {e}");
+            }
+            for slot in self.panes.values() {
+                if let Some(sid) = slot.session.persist_session() {
+                    let _ = store.end_session(sid, now, None);
+                }
+            }
+        }
+    }
+
     fn bootstrap(&mut self) {
         let pane_id = self.mint_pane_id();
         let shell = resolve_shell_from_env();
@@ -848,6 +886,10 @@ impl eframe::App for TermicaApp {
         }
 
         if self.should_quit {
+            // Persist the layout (9F) so the next launch can restore it,
+            // and stamp the live sessions ended. Best-effort; never
+            // blocks the close.
+            self.save_layout_on_quit();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 

@@ -3768,6 +3768,7 @@ dependencies = [
  "portable-pty",
  "regex",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",

@@ -94,6 +94,13 @@ home = "0.5"
 # keeps `tail -f` readable.
 serde_json = { version = "1", features = ["preserve_order"] }
 
+# Phase 9 (9F): derive Serialize/Deserialize for the persisted layout —
+# the `egui_tiles::Tree<PaneId>` (egui_tiles already enables its `serde`
+# feature by default) plus our `SavedLayout` wrapper, stored as JSON in
+# `window.layout_blob`. JSON (via serde_json above) over bincode: a
+# layout blob is tiny and human-inspectable, and avoids a new dep.
+serde = { version = "1", features = ["derive"] }
+
 # Phase 3E: per-session scratch directory for shell-integration
 # wrappers (zsh's `.zshrc` under our ZDOTDIR, bash's `--rcfile`).
 # These are regenerated on every spawn from `include_str!` constants
