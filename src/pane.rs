@@ -1031,6 +1031,14 @@ impl PaneSession {
         effective_var_names(self.shell_var_names.as_deref(), self.pty.env_var_names())
     }
 
+    /// The shell this pane is running. Drives shell-specific completion
+    /// routing (a fish pane completes via the `complete -C` sidecar rather
+    /// than the per-tool CLI drivers — see
+    /// [`crate::completion::plan_completion`]).
+    pub fn shell(&self) -> ShellSpec {
+        self.shell
+    }
+
     /// Borrow the underlying terminal state mutably. Used by the
     /// update loop for VT-state operations that don't go through the
     /// PTY — currently only [`TerminalState::scroll_display`] (mouse

@@ -187,15 +187,21 @@ get	Display one or many resources
 …
 ```
 
-No `compsys`-style ZLE state. No `COMPREPLY`. Just one CLI call per request. Our fish sidecar is a thin wrapper that reads JSON requests from stdin, runs `complete -C` for each, formats the response. The whole helper is ~30 lines.
+No `compsys`-style ZLE state. No `COMPREPLY`. Just one CLI call per request.
 
-Fish is the **reference implementation** for the protocol — when in doubt about the wire shape or the lifecycle, look at the fish path first.
+> **As built (slice 3 — one-shot, not a persistent process).** Because fish exposes completion as a plain CLI whose stdout is already `value\tdescription` per line — the **same format cobra `__complete` emits** — the fish sidecar does **not** need the persistent-process / JSON-RPC machinery sketched below for bash/zsh. It rides the existing **CLI-native driver engine** ([Source 1](#source-1--cli-native-drivers)) instead: a new `DriverTool::FishComplete` whose invocation is `fish -c 'complete -C $argv[1]' <line>` (the line passed as a positional arg so quotes/spaces can't break out of the `-c` script; **no** `--no-config`, since the user's aliases and `complete` definitions are the whole point) and whose parser is `parse_fish_complete` (tab-only split — fish always separates value/description with a single literal tab, and a completion *value* may contain spaces). This reuses the engine's per-pane worker thread, 2 s deadline, [result cache](#caching), `paint_searching` spinner, and `TERMICA_DUMP_EVENTS` records for free.
+>
+> **Routing**: in a **fish** pane, `complete -C` is a superset of the per-tool CLI drivers, so `completion::plan_completion` routes *any* command in argument position to `FishComplete` (via `drivers::parse::arg_segment`) and never also fires a per-tool driver — a single async source per pane, no merge. Non-fish panes keep the per-tool `driver_target` path unchanged. Command-position completion (the command **name**) stays with the local `$PATH` source in both. The shell is read from `PaneSession::shell()`.
+>
+> The persistent-process model below remains the plan for **bash** and **zsh** (slices 4–5), whose extraction (`complete -p` / `_main_complete`) genuinely needs a warm, rc-loaded shell. Multi-source racing (driver + sidecar + locals streaming together) and command-position sidecar completion are deferred follow-ups.
+
+Fish is the **reference implementation** for the protocol — when in doubt about the wire shape or the lifecycle, look at the fish path first. (For the persistent-process bash/zsh sidecars, that means the wire/lifecycle below; fish itself sidesteps it via the one-shot path above.)
 
 ### Sidecar lifecycle
 
 | Phase | Trigger | Action |
 |---|---|---|
-| Spawn | First Tab press in pane | Spawn the matching sidecar (`bash --rcfile`, `zsh -i`, `fish -i`) with stdio pipes. Detect shell from `PaneSession.shell` (the integration bootstrap already records this). |
+| Spawn | First Tab press in pane | Spawn the matching **persistent** sidecar (`bash --rcfile`, `zsh -i`) with stdio pipes. Detect shell from `PaneSession.shell`. **Fish is exempt** — it uses the one-shot driver-engine path above (a fresh `fish -c 'complete -C'` per request, no persistent process), so this lifecycle applies to bash/zsh only. |
 | Steady state | Subsequent Tab presses | Send `COMPLETE` requests; read responses. ~30–80 ms per call after warm-up. |
 | Idle timeout | No request for `SIDECAR_IDLE_SECS = 300` (5 min) | Send `shutdown`; close pipes. Re-spawn on next Tab. |
 | Crash | Sidecar process exits unexpectedly | Drop the handle, fall back to source 3 for this request. Re-spawn on next Tab; rate-limit re-spawn attempts at 1/sec to avoid fork bombs. |

@@ -39,6 +39,7 @@ pub mod ranking;
 pub use drivers::DriverTool;
 pub use popup::CompletionPopup;
 
+use crate::integration::ShellSpec;
 use std::path::{Path, PathBuf};
 
 /// Orchestrate the three local sources and produce a popup, or
@@ -250,16 +251,41 @@ pub fn plan_completion(
     cwd: Option<&Path>,
     home: Option<&Path>,
     env_var_names: &[String],
+    shell: ShellSpec,
     history_lookup: impl FnOnce() -> Vec<String>,
 ) -> CompletionPlan {
     let (origin, token, locals) =
         local_candidates_at(editor_text, cursor, cwd, home, env_var_names, history_lookup);
-    if let Some(target) = drivers::parse::driver_target(editor_text, cursor) {
+    if let Some(target) = driver_target_for_shell(editor_text, cursor, shell) {
         return CompletionPlan::AwaitDriver { origin_byte: origin, token, locals, target };
     }
     match CompletionPopup::new(origin, token, locals) {
         Some(popup) => CompletionPlan::Open(popup),
         None => CompletionPlan::Closed,
+    }
+}
+
+/// Pick the async completion target for the editor state, by shell.
+///
+/// In a **fish** pane, fish's `complete -C` is a superset of the
+/// per-tool CLI drivers (it covers built-ins, installed completions, and
+/// the user's aliases / `complete` functions), so we route *any*
+/// argument-position completion to the fish sidecar and never also fire a
+/// per-tool driver. Every other shell keeps the per-tool driver path,
+/// which fires only for the handful of commands with a known `__complete`
+/// endpoint. Command-position completion (the command name itself) stays
+/// with the local `$PATH` source in both cases.
+fn driver_target_for_shell(
+    editor_text: &str,
+    cursor: usize,
+    shell: ShellSpec,
+) -> Option<(DriverTool, String, usize)> {
+    match shell {
+        ShellSpec::Fish => {
+            let (line, point) = drivers::parse::arg_segment(editor_text, cursor)?;
+            Some((DriverTool::FishComplete, line, point))
+        }
+        ShellSpec::Zsh | ShellSpec::Bash => drivers::parse::driver_target(editor_text, cursor),
     }
 }
 
@@ -496,7 +522,8 @@ mod tests {
         // driver never fired). Now it must AwaitDriver so the driver's
         // `checkout`/`cherry` can open the popup.
         let dir = tempfile::tempdir().unwrap();
-        let plan = plan_completion("git ch", 6, Some(dir.path()), None, &[], Vec::new);
+        let plan =
+            plan_completion("git ch", 6, Some(dir.path()), None, &[], ShellSpec::Zsh, Vec::new);
         match plan {
             CompletionPlan::AwaitDriver { target, locals, .. } => {
                 assert_eq!(target.0, DriverTool::Git);
@@ -514,7 +541,7 @@ mod tests {
         // never an `Open` of files.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("notes.txt"), b"").unwrap();
-        let plan = plan_completion("gh ", 3, Some(dir.path()), None, &[], Vec::new);
+        let plan = plan_completion("gh ", 3, Some(dir.path()), None, &[], ShellSpec::Zsh, Vec::new);
         match plan {
             CompletionPlan::AwaitDriver { target, locals, .. } => {
                 assert_eq!(target.0, DriverTool::Gh);
@@ -533,7 +560,7 @@ mod tests {
         // no waiting.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("notes.txt"), b"").unwrap();
-        let plan = plan_completion("ls ", 3, Some(dir.path()), None, &[], Vec::new);
+        let plan = plan_completion("ls ", 3, Some(dir.path()), None, &[], ShellSpec::Zsh, Vec::new);
         match plan {
             CompletionPlan::Open(popup) => {
                 assert!(popup.candidates.iter().any(|c| c.display.ends_with("notes.txt")));
@@ -545,8 +572,70 @@ mod tests {
     #[test]
     fn plan_non_driver_no_local_match_is_closed() {
         let dir = tempfile::tempdir().unwrap();
-        let plan = plan_completion("ls zzz_no_such", 14, Some(dir.path()), None, &[], Vec::new);
+        let plan = plan_completion(
+            "ls zzz_no_such",
+            14,
+            Some(dir.path()),
+            None,
+            &[],
+            ShellSpec::Zsh,
+            Vec::new,
+        );
         assert!(matches!(plan, CompletionPlan::Closed), "no driver, no match → nothing");
+    }
+
+    #[test]
+    fn plan_fish_pane_routes_any_command_to_fish_sidecar() {
+        // In a fish pane, an *unknown* command in argument position must
+        // AwaitDriver against the fish sidecar (`complete -C`) — not fall
+        // through to a local-only popup. zsh would never fire here (no
+        // per-tool driver for `frobnicate`).
+        let dir = tempfile::tempdir().unwrap();
+        let plan = plan_completion(
+            "frobnicate --wi",
+            15,
+            Some(dir.path()),
+            None,
+            &[],
+            ShellSpec::Fish,
+            Vec::new,
+        );
+        match plan {
+            CompletionPlan::AwaitDriver { target, .. } => {
+                assert_eq!(target.0, DriverTool::FishComplete);
+                assert_eq!(target.1, "frobnicate --wi");
+            }
+            other => panic!("expected AwaitDriver(FishComplete), got {other:?}"),
+        }
+
+        // Same input in a zsh pane: no driver for `frobnicate`, so it does
+        // NOT await — the routing is shell-specific.
+        let zsh = plan_completion(
+            "frobnicate --wi",
+            15,
+            Some(dir.path()),
+            None,
+            &[],
+            ShellSpec::Zsh,
+            Vec::new,
+        );
+        assert!(
+            !matches!(zsh, CompletionPlan::AwaitDriver { .. }),
+            "zsh has no driver for an unknown command; got {zsh:?}"
+        );
+    }
+
+    #[test]
+    fn plan_fish_pane_command_position_stays_local() {
+        // Typing the command name itself in a fish pane uses the local
+        // `$PATH` source, not the sidecar.
+        let dir = tempfile::tempdir().unwrap();
+        let plan =
+            plan_completion("frobni", 6, Some(dir.path()), None, &[], ShellSpec::Fish, Vec::new);
+        assert!(
+            !matches!(plan, CompletionPlan::AwaitDriver { .. }),
+            "command-position completion is local, got {plan:?}"
+        );
     }
 
     #[test]
