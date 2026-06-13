@@ -55,6 +55,7 @@ pub mod persist;
 pub mod pr_context;
 pub mod prompt_editor;
 pub mod pty;
+pub mod reflow;
 pub mod render;
 pub mod selection;
 pub mod shell;

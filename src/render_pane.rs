@@ -1135,6 +1135,36 @@ pub fn render_pane(
     let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
     let (cell_w, row_h) = ui.fonts_mut(|f| (f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
     let (rows, cols) = cells_from_pixels(avail, cell_w, row_h);
+
+    // ---- Phase 9B: refresh the sealed-block reflow cache -------------
+    // Re-wrap each sealed block's logical lines to the current pane
+    // width so paint / hit-test / find all share one set of visual rows
+    // and one logical↔visual map. Rebuilt only when the width or the
+    // set of sealed blocks changes (sealed blocks are immutable).
+    {
+        let reflow_cols = cols as usize;
+        let sealed_count = slot
+            .session
+            .blocks()
+            .iter()
+            .filter(|b| matches!(b, crate::block::Block::Sealed { .. }))
+            .count();
+        if !slot.ui.reflow_cache.is_current(reflow_cols, sealed_count) {
+            let maps = slot
+                .session
+                .blocks()
+                .iter()
+                .filter_map(|b| match b {
+                    crate::block::Block::Sealed { id, snapshot, .. } => {
+                        Some((*id, crate::reflow::ReflowMap::build(snapshot, reflow_cols)))
+                    }
+                    _ => None,
+                })
+                .collect();
+            slot.ui.reflow_cache.replace(reflow_cols, sealed_count, maps);
+        }
+    }
+
     // Debounce: an interactive window drag recomputes this size every
     // frame; committing each one storms the child with SIGWINCHs and
     // piles orphaned repaint frames into scrollback. Only resize once
@@ -1384,11 +1414,28 @@ pub fn render_pane(
             fo.recompute(&lines);
             find_selected_match = fo.selected_match().cloned();
             for (i, m) in fo.matches.iter().enumerate() {
+                let is_current = i == fo.selected;
                 let entry = find_hl_by_block.entry(m.block_id).or_default();
-                let tuple = (m.row, m.col_start, m.col_end, i == fo.selected);
                 match m.kind {
-                    crate::find::LineKind::Command => entry.command.push(tuple),
-                    crate::find::LineKind::Output => entry.output.push(tuple),
+                    // Command rows are not reflowed (1:1).
+                    crate::find::LineKind::Command => {
+                        entry.command.push((m.row, m.col_start, m.col_end, is_current));
+                    }
+                    // Output rows are LOGICAL lines; a match may span
+                    // several visual rows after reflow, so split it into
+                    // per-visual-row highlight segments via the map.
+                    crate::find::LineKind::Output => match slot.ui.reflow_cache.get(m.block_id) {
+                        Some(map) => {
+                            entry.output.extend(crate::reflow::output_match_visual_segments(
+                                map,
+                                m.row,
+                                m.col_start,
+                                m.col_end,
+                                is_current,
+                            ))
+                        }
+                        None => entry.output.push((m.row, m.col_start, m.col_end, is_current)),
+                    },
                 }
             }
         }
@@ -1500,20 +1547,38 @@ pub fn render_pane(
                                 duration,
                                 ..
                             } => {
-                                let total_rows = (if command.is_empty() {
+                                let cmd_lines = if command.is_empty() {
                                     0
                                 } else {
                                     command.split('\n').count()
-                                }) + snapshot.len();
+                                };
+                                // `total_rows` is the LOGICAL unified height
+                                // (command rows + logical output lines) — the
+                                // space `block_range_for` and the stored
+                                // selection live in.
+                                let total_rows = cmd_lines + snapshot.len();
                                 let sel_for_this = pane_sel
                                     .as_ref()
                                     .and_then(|s| s.block_range_for(*id, total_rows));
+                                // Phase 9B: paint the reflowed VISUAL rows for
+                                // the current width, and convert the logical
+                                // selection to visual so the overlay lines up.
+                                let reflow = slot.ui.reflow_cache.get(*id);
+                                let visual_rows: &[crate::terminal::StyledLine] =
+                                    reflow.map(|m| m.visual_rows()).unwrap_or(snapshot.as_slice());
+                                let sel_visual = match (sel_for_this, reflow) {
+                                    (Some((a, b)), Some(m)) => Some((
+                                        crate::reflow::unified_logical_to_visual(a, cmd_lines, m),
+                                        crate::reflow::unified_logical_to_visual(b, cmd_lines, m),
+                                    )),
+                                    (other, _) => other,
+                                };
                                 let block_top = ui.next_widget_position().y;
                                 let sealed_render = render::paint_sealed_block(
                                     ui,
                                     command,
-                                    snapshot,
-                                    sel_for_this,
+                                    visual_rows,
+                                    sel_visual,
                                     render::BlockHeader {
                                         cwd: header.cwd.as_deref(),
                                         home,
@@ -1647,7 +1712,24 @@ pub fn render_pane(
                             crate::find::LineKind::Output => Some(sr.snapshot.rect.min),
                         };
                         if let Some(o) = origin {
-                            let y = o.y + m.row as f32 * row_h;
+                            // Output match rows are LOGICAL; scroll to the
+                            // first visual row the match occupies after reflow.
+                            let visual_row = match m.kind {
+                                crate::find::LineKind::Command => m.row,
+                                crate::find::LineKind::Output => slot
+                                    .ui
+                                    .reflow_cache
+                                    .get(m.block_id)
+                                    .map(|map| {
+                                        map.logical_to_visual(crate::reflow::LogicalPos::new(
+                                            m.row,
+                                            m.col_start,
+                                        ))
+                                        .row
+                                    })
+                                    .unwrap_or(m.row),
+                            };
+                            let y = o.y + visual_row as f32 * row_h;
                             // Extend the target rect UP by the height of this
                             // block's sticky-top header (the pinned chrome +
                             // capped command). An output match scrolled flush to
@@ -1928,9 +2010,9 @@ pub fn render_pane(
             }
         })
     {
-        let (cl, sl) = slot.session.sealed_block_rows(block_id).unwrap_or((0, 0));
-        let total_rows = cl + sl;
-        let mut cursor_pt = sealed_cursor_for_pos(block_rect, pos, cell_w, row_h, total_rows);
+        let (cl, _sl) = slot.session.sealed_block_rows(block_id).unwrap_or((0, 0));
+        let reflow = slot.ui.reflow_cache.get(block_id);
+        let mut cursor_pt = sealed_cursor_for_pos(block_rect, pos, cell_w, row_h, cl, reflow);
         if let Some(row_len) = slot.session.sealed_row_len(block_id, cursor_pt.row) {
             cursor_pt.col = cursor_pt.col.min(row_len);
         }
@@ -1943,24 +2025,43 @@ pub fn render_pane(
             // overlay + underline that `paint_terminal` uses on the
             // live grid, so the visual reads consistently across
             // the live and frozen paths.
-            let x0 = block_rect.min.x + link.col_start as f32 * cell_w;
-            let x1 = block_rect.min.x + (link.col_end as f32 + 1.0) * cell_w;
-            let row_top = block_rect.min.y + link.row as f32 * row_h;
-            let row_bottom = row_top + row_h;
-            let underline_y = row_bottom - 1.5;
+            // Links are stored in LOGICAL unified rows; convert to the
+            // visual rows painted at this width. An output link that
+            // wraps spans several visual rows, so paint one segment each
+            // (command links, `row < cl`, are 1:1).
+            let segments: Vec<(usize, usize, usize)> = match reflow {
+                Some(map) if link.row >= cl => crate::reflow::output_match_visual_segments(
+                    map,
+                    link.row - cl,
+                    link.col_start,
+                    link.col_end + 1,
+                    false,
+                )
+                .into_iter()
+                .map(|(vr, c0, c1, _)| (cl + vr, c0, c1))
+                .collect(),
+                _ => vec![(link.row, link.col_start, link.col_end + 1)],
+            };
             let painter = ui.painter();
-            painter.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::Pos2::new(x0, row_top),
-                    egui::Pos2::new(x1, row_bottom),
-                ),
-                0.0,
-                render::LINK_HOVER_OVERLAY_COLOR,
-            );
-            painter.line_segment(
-                [egui::Pos2::new(x0, underline_y), egui::Pos2::new(x1, underline_y)],
-                egui::Stroke::new(1.5, render::LINK_UNDERLINE_COLOR),
-            );
+            for (vrow, c0, c1) in segments {
+                let x0 = block_rect.min.x + c0 as f32 * cell_w;
+                let x1 = block_rect.min.x + c1 as f32 * cell_w;
+                let row_top = block_rect.min.y + vrow as f32 * row_h;
+                let row_bottom = row_top + row_h;
+                let underline_y = row_bottom - 1.5;
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::Pos2::new(x0, row_top),
+                        egui::Pos2::new(x1, row_bottom),
+                    ),
+                    0.0,
+                    render::LINK_HOVER_OVERLAY_COLOR,
+                );
+                painter.line_segment(
+                    [egui::Pos2::new(x0, underline_y), egui::Pos2::new(x1, underline_y)],
+                    egui::Stroke::new(1.5, render::LINK_UNDERLINE_COLOR),
+                );
+            }
         }
     }
 
@@ -2375,13 +2476,24 @@ pub fn render_pane(
         pos: egui::Pos2,
         cell_w: f32,
         row_h: f32,
-        total_rows: usize,
+        cmd_lines: usize,
+        reflow: Option<&crate::reflow::ReflowMap>,
     ) -> crate::block_selection::BlockCursor {
         let dy = (pos.y - rect.min.y).max(0.0);
         let dx = (pos.x - rect.min.x).max(0.0);
-        let row = ((dy / row_h) as usize).min(total_rows.saturating_sub(1));
-        let col = (dx / cell_w) as usize;
-        crate::block_selection::BlockCursor::new(row, col)
+        // Pixels give a VISUAL row/col over the painted (reflowed) rows.
+        let visual_row = (dy / row_h) as usize;
+        let vcol = (dx / cell_w) as usize;
+        // Convert to the LOGICAL unified cursor the selection model
+        // stores: command rows (`< cmd_lines`) are 1:1; output visual
+        // rows map back through the block's reflow map. Without a map
+        // (cache miss / empty output) fall back to 1:1.
+        let Some(map) = reflow else {
+            return crate::block_selection::BlockCursor::new(visual_row, vcol);
+        };
+        let visual_total = cmd_lines + map.visual_row_count();
+        let visual_row = visual_row.min(visual_total.saturating_sub(1));
+        crate::reflow::unified_visual_to_logical(visual_row, vcol, cmd_lines, map)
     }
 
     /// Resolve a screen-space pointer position to a sealed block + a
@@ -2414,6 +2526,7 @@ pub fn render_pane(
         cell_w: f32,
         row_h: f32,
         session: &crate::pane::PaneSession,
+        cache: &crate::reflow::ReflowCache,
     ) -> (crate::block::BlockId, crate::block_selection::BlockCursor) {
         // Falls-through for empty list; callers only reach this when
         // the press is on a sealed block, so the list is non-empty in
@@ -2454,8 +2567,8 @@ pub fn render_pane(
             }
             if pos.y < rect.bottom() {
                 // Inside this block.
-                let total_rows = total_for(*bid);
-                let mut c = sealed_cursor_for_pos(rect, pos, cell_w, row_h, total_rows);
+                let (cl, _) = session.sealed_block_rows(*bid).unwrap_or((0, 0));
+                let mut c = sealed_cursor_for_pos(rect, pos, cell_w, row_h, cl, cache.get(*bid));
                 if let Some(row_len) = session.sealed_row_len(*bid, c.row) {
                     c.col = c.col.min(row_len);
                 }
@@ -2576,11 +2689,16 @@ pub fn render_pane(
         // the origin block's row space. For a pinned press, `origin_rect`
         // top IS command row 0 (the pinned strip shows only the command
         // rows), so the same mapping yields a command-row cursor.
-        let (origin_cmd_lines, origin_snap_lines) =
+        let (origin_cmd_lines, _) =
             slot.session.sealed_block_rows(origin_block_id).unwrap_or((0, 0));
-        let origin_total_rows = origin_cmd_lines + origin_snap_lines;
-        let mut origin_cursor =
-            sealed_cursor_for_pos(origin_rect, pos, cell_w, row_h, origin_total_rows);
+        let mut origin_cursor = sealed_cursor_for_pos(
+            origin_rect,
+            pos,
+            cell_w,
+            row_h,
+            origin_cmd_lines,
+            slot.ui.reflow_cache.get(origin_block_id),
+        );
         if let Some(row_len) = slot.session.sealed_row_len(origin_block_id, origin_cursor.row) {
             origin_cursor.col = origin_cursor.col.min(row_len);
         }
@@ -2664,15 +2782,28 @@ pub fn render_pane(
             // real-rect mapper, which would target the scrolled-off
             // output the strip overlays.
             let (head_block_id, head_cursor) = if from_sticky {
-                let mut c =
-                    sealed_cursor_for_pos(origin_rect, pos, cell_w, row_h, origin_total_rows);
+                let mut c = sealed_cursor_for_pos(
+                    origin_rect,
+                    pos,
+                    cell_w,
+                    row_h,
+                    origin_cmd_lines,
+                    slot.ui.reflow_cache.get(origin_block_id),
+                );
                 c.row = c.row.min(origin_cmd_lines.saturating_sub(1));
                 if let Some(row_len) = slot.session.sealed_row_len(origin_block_id, c.row) {
                     c.col = c.col.min(row_len);
                 }
                 (origin_block_id, c)
             } else {
-                find_head_block_for_pos(pos, &sealed_block_renders, cell_w, row_h, &slot.session)
+                find_head_block_for_pos(
+                    pos,
+                    &sealed_block_renders,
+                    cell_w,
+                    row_h,
+                    &slot.session,
+                    &slot.ui.reflow_cache,
+                )
             };
             match (slot.ui.click_count, slot.ui.sealed_drag_anchor) {
                 (2, Some((anchor_block, a_start, a_end))) => {

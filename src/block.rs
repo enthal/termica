@@ -351,7 +351,11 @@ impl BlockStack {
         let command = command.clone();
         let started_ms = *started_at_ms;
 
-        let snapshot = terminal.snapshot_lines_all();
+        // Store the sealed output as width-independent LOGICAL lines
+        // (un-wrapped from the grid rows), not fixed-width grid rows, so
+        // the block can reflow to the current pane width on render
+        // (Phase 9B; see [`crate::reflow`] and spec/08 §"Logical lines").
+        let snapshot = crate::persist::chunk::unwrap_rows(&terminal.snapshot_lines_all());
         terminal.reset_for_new_block();
         // Real wall-clock duration; clamp negative clock skew to zero.
         let duration = Duration::from_millis(now_ms.saturating_sub(started_ms).max(0) as u64);
@@ -878,6 +882,34 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join("\n");
                 assert!(joined.contains("hello"), "snapshot missing command output: {joined:?}");
+            }
+            other => panic!("expected Sealed, got {other:?}"),
+        }
+    }
+
+    /// Phase 9B: the sealed snapshot stores width-independent LOGICAL
+    /// lines (un-wrapped), not fixed-width grid rows. A line longer than
+    /// the terminal width soft-wraps into two grid rows but must seal as
+    /// one logical line. Fails on the pre-9B tree, which stored the raw
+    /// grid rows.
+    #[test]
+    fn sealed_snapshot_stores_unwrapped_logical_lines() {
+        let mut term = TerminalState::new(5, 10);
+        let mut stack = fresh_stack();
+        stack.observe_lifecycle_event(
+            &LifecycleEvent::Preexec { command: "x".into() },
+            &mut term,
+            1,
+        );
+        // 15 chars at width 10 -> alacritty soft-wraps into two rows.
+        term.feed(b"0123456789abcde");
+        stack.observe_lifecycle_event(&LifecycleEvent::CommandFinished { exit: 0 }, &mut term, 2);
+
+        match stack.iter().next().unwrap() {
+            Block::Sealed { snapshot, .. } => {
+                assert_eq!(snapshot.len(), 1, "soft-wrapped output is one logical line");
+                let text: String = snapshot[0].text_chars().collect();
+                assert_eq!(text, "0123456789abcde");
             }
             other => panic!("expected Sealed, got {other:?}"),
         }

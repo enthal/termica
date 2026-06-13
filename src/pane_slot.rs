@@ -124,6 +124,12 @@ pub struct PaneUiState {
     /// the drag handler can union them with the word / line under
     /// the current pointer.
     pub(crate) sealed_drag_anchor: Option<(BlockId, BlockCursor, BlockCursor)>,
+    /// Phase 9B: per-width reflow of each sealed block's logical lines
+    /// into the visual rows painted at the current pane width, plus the
+    /// logical↔visual coordinate map. Rebuilt by `render_pane` when the
+    /// width or the set of sealed blocks changes; read by paint,
+    /// hit-testing, and find-highlight. See [`crate::reflow`].
+    pub(crate) reflow_cache: crate::reflow::ReflowCache,
     /// "Force the scroll area to the bottom on next render." Set by
     /// `render_pane` when the editor's `Enter` submit fires; the
     /// ScrollArea normally only sticks to the bottom when the user
