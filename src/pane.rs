@@ -201,6 +201,13 @@ pub struct PaneSession {
     /// writing. `None` on the low-level `spawn` path and in degraded
     /// mode. Dropped with the pane → its thread exits (RAII teardown).
     chunk_writer: Option<crate::persist::writer::ChunkWriter>,
+    /// This session's ownership lock (9F). Held for the pane's lifetime
+    /// so no other Termica process adopts the session while it's live;
+    /// released on pane drop / process death. `Some` exactly when
+    /// `chunk_writer` is. See [spec/08 §"Concurrent processes"].
+    /// Held purely for its `Drop` (lock release); never read.
+    #[allow(dead_code)]
+    session_lock: Option<crate::persist::lock::SessionLock>,
 }
 
 /// Choose the `$VAR`-completion name source: the shell's live report
@@ -284,6 +291,7 @@ impl PaneSession {
             last_git_branch: None,
             shell_var_names: None,
             chunk_writer: None,
+            session_lock: None,
         })
     }
 
@@ -341,6 +349,8 @@ impl PaneSession {
                         record.session,
                         record.pane_row,
                     ));
+                    // Hold the session-ownership lock for the pane's life.
+                    session.session_lock = Some(record.lock);
                 }
                 Err(e) => eprintln!("termica: persistence begin_session failed: {e}"),
             }

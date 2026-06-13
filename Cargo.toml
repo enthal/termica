@@ -139,6 +139,16 @@ regex = "1"
 # the format the spec names.
 zstd = "0.13"
 
+# Phase 9 (9F): per-session OS advisory file lock for session
+# ownership (spec/08 §"Concurrent processes and session ownership").
+# A live session holds `flock` on its session dir; a second process's
+# `try_lock` fails so it never adopts a live session, and the kernel
+# releases the lock on process death (clean OR crash) so the next
+# launch adopts an orphaned session. `fs4` is the safe wrapper around
+# `flock`/`LockFileEx` — the `unsafe` lives in the crate, our code
+# stays `#![forbid(unsafe_code)]`. Default (`sync`) feature only.
+fs4 = "0.13"
+
 # macOS-only: we need `EventLoopBuilderExtMacOS::with_default_menu(false)`
 # to disable winit's default app menubar. Its Quit item invokes
 # `[NSApplication terminate:]` directly, which bypasses our key

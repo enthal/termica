@@ -31,14 +31,23 @@ pub struct SessionId(pub i64);
 pub struct PaneRowId(pub i64);
 
 /// What [`Persistence::begin_session`] hands back: the freshly
-/// allocated row ids and the directory their chunk files go in.
-#[derive(Debug, Clone)]
+/// allocated row ids, the directory their chunk files go in, and the
+/// held session-ownership lock.
+///
+/// Not `Clone`: it owns the [`SessionLock`], whose lifetime *is* the
+/// session's ownership. The caller (the pane) must keep this alive for
+/// as long as the session is live — dropping it releases ownership.
+#[derive(Debug)]
 pub struct SessionRecord {
     pub pane_row: PaneRowId,
     pub session: SessionId,
     /// `<data-dir>/scrollback/session-<session>/pane-<pane_row>/`,
     /// created on disk by the time this is returned.
     pub dir: PathBuf,
+    /// The exclusive advisory lock on this session's directory, held so
+    /// no other process adopts it while we're running ([spec/08]
+    /// §"Concurrent processes"). Released on drop / process death.
+    pub lock: crate::persist::lock::SessionLock,
 }
 
 /// Failure modes of a persistence operation. Kept coarse: callers
@@ -52,6 +61,10 @@ pub enum PersistError {
     /// The shared store mutex was poisoned by a panic in another
     /// thread. Unrecoverable for this operation.
     Lock,
+    /// A freshly-begun session's directory was already locked — should
+    /// be impossible (session ids are unique), so it signals a logic
+    /// bug rather than normal contention.
+    SessionLockHeld,
 }
 
 impl std::fmt::Display for PersistError {
@@ -60,6 +73,9 @@ impl std::fmt::Display for PersistError {
             PersistError::Db(e) => write!(f, "persistence db error: {e}"),
             PersistError::Io(e) => write!(f, "persistence io error: {e}"),
             PersistError::Lock => write!(f, "persistence store mutex poisoned"),
+            PersistError::SessionLockHeld => {
+                write!(f, "new session directory was already locked (unexpected)")
+            }
         }
     }
 }
@@ -116,7 +132,18 @@ impl Persistence {
         };
         let dir = self.session_pane_dir(session_id, pane_id);
         std::fs::create_dir_all(&dir)?;
-        Ok(SessionRecord { pane_row: PaneRowId(pane_id), session: SessionId(session_id), dir })
+        // Take this session's ownership lock. The session id is freshly
+        // allocated and unique, so no other process could be holding it —
+        // a `None` here would mean a same-process double-begin, which we
+        // surface rather than silently run unlocked.
+        let lock = crate::persist::lock::SessionLock::try_acquire(&dir)?
+            .ok_or(PersistError::SessionLockHeld)?;
+        Ok(SessionRecord {
+            pane_row: PaneRowId(pane_id),
+            session: SessionId(session_id),
+            dir,
+            lock,
+        })
     }
 
     /// The directory a session's chunk files live in:
