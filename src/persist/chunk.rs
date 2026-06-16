@@ -187,6 +187,11 @@ pub enum ChunkError {
     /// The char count and the expanded style-run cell count disagreed.
     #[error("cell-count mismatch: {chars} chars but {cells} styled cells")]
     CellCountMismatch { chars: usize, cells: usize },
+    /// A single style run declared more cells than the line has chars —
+    /// caught *before* expanding it, so a crafted/corrupt `run_len` (up to
+    /// `u32::MAX`) can never drive an unbounded allocation.
+    #[error("style run of {run_len} cells overflows a {chars}-char line")]
+    RunOverflow { chars: usize, run_len: usize },
     /// zstd refused to inflate the body.
     #[error("zstd decompression failed")]
     Decompress,
@@ -343,6 +348,14 @@ fn decode_logical_line(cur: &mut Cursor<'_>) -> Result<StyledLine, ChunkError> {
         let fg = read_color(&mut style_cur)?.to_ansi()?;
         let bg = read_color(&mut style_cur)?.to_ansi()?;
         let flags = Flags::from_bits_truncate(style_cur.u16()?);
+        // Bound the expansion against the line's known char count BEFORE
+        // allocating. A valid chunk has `Σ run_len == chars.len()`, so any
+        // run pushing the cumulative total past `chars.len()` is corrupt —
+        // bail now rather than expand (a lone `u32::MAX` run would
+        // otherwise OOM the process before the post-loop check runs).
+        if styles.len() + run_len > chars.len() {
+            return Err(ChunkError::RunOverflow { chars: chars.len(), run_len });
+        }
         for _ in 0..run_len {
             styles.push((fg, bg, flags));
         }
@@ -783,6 +796,54 @@ mod tests {
         bytes.extend_from_slice(&body);
 
         assert_eq!(decode_chunk(&bytes), Err(ChunkError::CellCountMismatch { chars: 3, cells: 2 }));
+    }
+
+    /// Build an uncompressed single-line chunk whose one style run claims
+    /// `run_len` cells over a 1-char line. `run_len > 1` is always a lie.
+    fn chunk_with_single_run_len(run_len: u32) -> Vec<u8> {
+        let mut style = Vec::new();
+        style.extend_from_slice(&1u32.to_le_bytes()); // run_count = 1
+        style.extend_from_slice(&run_len.to_le_bytes());
+        encode_color(&mut style, ChunkColor::Named(0)); // fg
+        encode_color(&mut style, ChunkColor::Named(0)); // bg
+        style.extend_from_slice(&0u16.to_le_bytes()); // flags
+        let line_bytes = b"x"; // 1 char
+        let mut body = Vec::new();
+        body.extend_from_slice(&(line_bytes.len() as u32).to_le_bytes());
+        body.extend_from_slice(&(style.len() as u32).to_le_bytes());
+        body.extend_from_slice(line_bytes);
+        body.extend_from_slice(&style);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&CHUNK_MAGIC);
+        bytes.extend_from_slice(&CHUNK_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // flags: uncompressed
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        bytes.extend_from_slice(&body);
+        bytes
+    }
+
+    #[test]
+    fn decode_rejects_run_length_overflow_without_oom() {
+        // A style run that claims more cells than the line has chars must
+        // be rejected in O(1) — decode must bail BEFORE expanding the run,
+        // never allocate `run_len` style entries. The runaway is `run_len`
+        // (one run, tiny file, unbounded expansion), not `run_count` (each
+        // run consumes input, so a huge count self-limits to `Truncated`).
+
+        // Small overflow: caught early as RunOverflow, not the post-loop
+        // CellCountMismatch. Safe to evaluate even unbounded.
+        assert_eq!(
+            decode_chunk(&chunk_with_single_run_len(9)),
+            Err(ChunkError::RunOverflow { chars: 1, run_len: 9 })
+        );
+
+        // The pathological case: `u32::MAX` cells. With the bound this is
+        // instant; without it, ~68 GB of allocation. The assertion proves
+        // we never enter the expansion loop.
+        assert_eq!(
+            decode_chunk(&chunk_with_single_run_len(u32::MAX)),
+            Err(ChunkError::RunOverflow { chars: 1, run_len: u32::MAX as usize })
+        );
     }
 
     // ---- property: random lines round-trip --------------------------
