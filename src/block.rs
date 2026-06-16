@@ -232,6 +232,16 @@ impl BlockStack {
         stack
     }
 
+    /// Consume the stack and return just its `Sealed` blocks (the live
+    /// `Prompt`/`Running` tail is dropped). Used by restart (9F) to carry
+    /// a restored pane's scrollback into the freshly-spawned shell —
+    /// `BlockStack::with_restored_sealed(stack.into_sealed())` rebuilds a
+    /// valid stack with those blocks under a new live tail. No clone: the
+    /// (potentially large) snapshots move.
+    pub fn into_sealed(self) -> Vec<Block> {
+        self.blocks.into_iter().filter(|b| matches!(b, Block::Sealed { .. })).collect()
+    }
+
     fn alloc_id(&mut self) -> BlockId {
         let id = BlockId(self.next_id);
         self.next_id += 1;
@@ -1024,6 +1034,21 @@ mod tests {
             Block::Prompt { id, .. } => assert_eq!(*id, BlockId(3)),
             other => panic!("tail must be a live Prompt, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn into_sealed_drops_the_live_tail_and_round_trips() {
+        // Restart's transplant: with_restored_sealed then into_sealed is
+        // the identity on the sealed blocks (the live Prompt tail added by
+        // the constructor is dropped again).
+        let sealed: Vec<Block> = (0..3)
+            .map(|i| Block::restored_sealed(BlockId(i), vec![StyledLine::default()], 0, 50))
+            .collect();
+        let stack = BlockStack::with_restored_sealed(sealed);
+        assert_eq!(stack.len(), 4, "3 sealed + 1 Prompt tail");
+        let back = stack.into_sealed();
+        assert_eq!(back.len(), 3, "into_sealed returns just the sealed blocks");
+        assert!(back.iter().all(|b| matches!(b, Block::Sealed { .. })));
     }
 
     #[test]

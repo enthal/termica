@@ -545,6 +545,33 @@ impl HistoryStore {
         Ok(())
     }
 
+    /// Open a new `session` row under an **existing** `pane` (restart,
+    /// 9F): the pane's durable identity is reused so its chunks
+    /// accumulate across shell restarts. Bumps `pane.last_open`. Returns
+    /// the new session id.
+    pub fn resume_session_rows(&self, pane_id: i64, now_ms: i64) -> rusqlite::Result<i64> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("UPDATE pane SET last_open = ?1 WHERE id = ?2", params![now_ms, pane_id])?;
+        tx.execute(
+            "INSERT INTO session (pane_id, started_at) VALUES (?1, ?2)",
+            params![pane_id, now_ms],
+        )?;
+        let session_id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(session_id)
+    }
+
+    /// The highest `end_line` across all of a pane's chunks (0 if it has
+    /// none) — the cumulative logical-line offset a resumed session's
+    /// writer continues from, so new chunks never overlap the old ones.
+    pub fn pane_max_end_line(&self, pane_id: i64) -> rusqlite::Result<i64> {
+        self.conn.query_row(
+            "SELECT COALESCE(MAX(end_line), 0) FROM scrollback_chunk WHERE pane_id = ?1",
+            params![pane_id],
+            |r| r.get(0),
+        )
+    }
+
     /// Read-only access to the underlying connection, for tests that
     /// need to assert raw row state the typed API doesn't expose.
     #[cfg(test)]

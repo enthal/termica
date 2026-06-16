@@ -66,6 +66,10 @@ pub enum PaneAction {
     /// full-screen program owns the viewport, and the transcript it
     /// would search isn't visible.
     OpenFind,
+    /// Restart a `Dead` pane (9F): spawn a fresh shell into it, keeping
+    /// the restored scrollback. Staged when the user clicks the
+    /// "Restart shell" affordance on a restored/exited pane.
+    RestartShell,
 }
 
 /// Per-pane UI interaction state. Each pane gets its own multi-

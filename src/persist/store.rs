@@ -48,6 +48,10 @@ pub struct SessionRecord {
     /// no other process adopts it while we're running ([spec/08]
     /// §"Concurrent processes"). Released on drop / process death.
     pub lock: crate::persist::lock::SessionLock,
+    /// The writer's initial cumulative logical-line cursor: `0` for a
+    /// fresh pane, the pane's current max `end_line` for a resumed one
+    /// (restart), so chunks accumulate across restarts without overlap.
+    pub start_line: u64,
 }
 
 /// Failure modes of a persistence operation. Kept coarse: callers
@@ -145,6 +149,35 @@ impl Persistence {
             session: SessionId(session_id),
             dir,
             lock,
+            start_line: 0,
+        })
+    }
+
+    /// Resume an existing pane under a new session (restart, 9F): reuse
+    /// the durable `pane` row so its chunks accumulate, open a fresh
+    /// session + directory + lock, and seed the writer's cursor at the
+    /// pane's current max `end_line` so new chunks continue past the old.
+    pub fn resume_session(
+        &self,
+        pane_row_id: i64,
+        now_ms: i64,
+    ) -> Result<SessionRecord, PersistError> {
+        let (session_id, start_line) = {
+            let store = self.store.lock().map_err(|_| PersistError::Lock)?;
+            let session_id = store.resume_session_rows(pane_row_id, now_ms)?;
+            let start_line = store.pane_max_end_line(pane_row_id)?.max(0) as u64;
+            (session_id, start_line)
+        };
+        let dir = self.session_pane_dir(session_id, pane_row_id);
+        std::fs::create_dir_all(&dir)?;
+        let lock = crate::persist::lock::SessionLock::try_acquire(&self.session_dir(session_id))?
+            .ok_or(PersistError::SessionLockHeld)?;
+        Ok(SessionRecord {
+            pane_row: PaneRowId(pane_row_id),
+            session: SessionId(session_id),
+            dir,
+            lock,
+            start_line,
         })
     }
 

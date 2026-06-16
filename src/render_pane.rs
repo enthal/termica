@@ -1130,6 +1130,29 @@ pub fn render_pane(
         return;
     }
 
+    // ---- Dead pane: "Restart shell" affordance (9F) -----------------
+    // A restored (or exited) pane shows its scrollback with no live
+    // shell. Offer a restart that respawns a shell in the last cwd and
+    // keeps the transcript (the new output appends below it). A thin top
+    // strip — the scrollback still renders below.
+    if view.mode == Some(crate::shell::PaneMode::Dead) {
+        let clicked = ui
+            .horizontal(|ui| {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("Shell exited")
+                        .size(12.0)
+                        .color(egui::Color32::from_gray(140)),
+                );
+                ui.button("Restart shell").clicked()
+            })
+            .inner;
+        if clicked {
+            slot.ui.pending_action = Some(crate::pane_slot::PaneAction::RestartShell);
+        }
+        ui.separator();
+    }
+
     // ---- resize PTY to fit available space ----------------------
     let avail = ui.available_size();
     let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);

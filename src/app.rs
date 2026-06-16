@@ -432,6 +432,7 @@ impl TermicaApp {
             recorder,
             history,
             persist,
+            None, // fresh pane
         )
         .expect("spawn initial pane");
         self.panes.insert(pane_id, PaneSlot { session, ui: PaneUiState::default() });
@@ -440,6 +441,54 @@ impl TermicaApp {
         let pane_tile = tiles.insert_pane(pane_id);
         let tabs_tile = tiles.insert_tab_tile(vec![pane_tile]);
         self.tree = Tree::new("termica-tree", tabs_tile, tiles);
+    }
+
+    /// Restart a `Dead` pane (9F): spawn a fresh managed shell in the
+    /// pane's last-known cwd and transplant the restored scrollback into
+    /// it, so the new shell's output appends below the old transcript.
+    /// The pane keeps its `PaneId` (and tree slot); only its live half is
+    /// replaced. No-op if the pane is gone or not actually dead.
+    fn restart_pane(&mut self, pane_id: PaneId) {
+        let Some(slot) = self.panes.get(&pane_id) else { return };
+        if !slot.session.is_dead() {
+            return;
+        }
+        let cwd = slot.session.terminal().cwd().map(|p| p.to_path_buf());
+        // Reuse the pane's durable db row so its chunks accumulate across
+        // restarts (the new shell's output continues the same pane's
+        // logical-line sequence, rather than orphaning the old scrollback).
+        let resume_pane_row = slot.session.persist_pane_row();
+
+        // Gather spawn inputs before the mutable borrow of `panes`.
+        let shell = resolve_shell_from_env();
+        let recorder = self.event_recorder.clone();
+        let history = self.history_ctx();
+        let persist = self.persist();
+        let fresh = match PaneSession::spawn_managed(
+            MIN_ROWS.max(24),
+            MIN_COLS.max(80),
+            shell,
+            cwd,
+            pane_id.0,
+            recorder,
+            history,
+            persist,
+            resume_pane_row,
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("termica: restart shell failed: {e}");
+                return;
+            }
+        };
+
+        // Swap the live session in, then move the dead pane's restored
+        // scrollback into the fresh one (no clone — the snapshots move).
+        if let Some(slot) = self.panes.get_mut(&pane_id) {
+            let old = std::mem::replace(&mut slot.session, fresh);
+            slot.session.adopt_restored_scrollback(old.into_sealed_blocks());
+            slot.ui.needs_focus = true;
+        }
     }
 
     fn mint_pane_id(&mut self) -> PaneId {
@@ -576,6 +625,7 @@ impl TermicaApp {
                     slot.ui.needs_focus = true;
                 }
             }
+            PaneAction::RestartShell => self.restart_pane(pane_id),
         }
     }
 
@@ -640,7 +690,7 @@ impl TermicaApp {
         let history = self.history_ctx();
         let persist = self.persist();
         let session = match PaneSession::spawn_managed(
-            24, 80, shell, cwd, pane_id.0, recorder, history, persist,
+            24, 80, shell, cwd, pane_id.0, recorder, history, persist, None,
         ) {
             Ok(s) => s,
             Err(e) => {

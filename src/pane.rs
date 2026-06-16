@@ -398,6 +398,10 @@ impl PaneSession {
         recorder: Option<Arc<EventRecorder>>,
         history: Option<HistoryContext>,
         persist: Option<crate::persist::store::Persistence>,
+        // `Some(db_pane_id)` to RESUME an existing pane (restart, 9F):
+        // the pane's durable identity is reused so its chunks accumulate
+        // across restarts. `None` begins a fresh pane.
+        resume_pane_row: Option<i64>,
     ) -> Result<Self, PtyError> {
         let session_id = new_session_id();
         let ManagedSpawn { argv, pty_bootstrap, env, wrapper_dir } =
@@ -421,20 +425,27 @@ impl PaneSession {
         // history). `None` persist (degraded mode / low-level spawn) skips
         // it entirely.
         if let Some(persist) = persist {
-            match persist.begin_session(cwd_str.as_deref(), shell.name(), wall_clock_ms()) {
+            // Restart reuses the pane row (chunks accumulate); a fresh
+            // pane begins a new one.
+            let begun = match resume_pane_row {
+                Some(pane_row) => persist.resume_session(pane_row, wall_clock_ms()),
+                None => persist.begin_session(cwd_str.as_deref(), shell.name(), wall_clock_ms()),
+            };
+            match begun {
                 Ok(record) => {
                     session.chunk_writer = Some(crate::persist::writer::ChunkWriter::spawn(
                         record.dir,
                         persist.store_handle(),
                         record.session,
                         record.pane_row,
+                        record.start_line,
                     ));
                     // Hold the session-ownership lock for the pane's life.
                     session.session_lock = Some(record.lock);
                     session.persist_pane_row = Some(record.pane_row.0);
                     session.persist_session = Some(record.session.0);
                 }
-                Err(e) => eprintln!("termica: persistence begin_session failed: {e}"),
+                Err(e) => eprintln!("termica: persistence session start failed: {e}"),
             }
         }
         // Tie the wrapper TempDir's lifetime to the pane session.
@@ -872,6 +883,27 @@ impl PaneSession {
     /// Stamped with `ended_at` when the pane closes or the app quits.
     pub fn persist_session(&self) -> Option<i64> {
         self.persist_session
+    }
+
+    /// Whether the pane is in `Dead` mode — its shell has exited or it
+    /// was restored without one. Drives the "Restart shell" affordance.
+    pub fn is_dead(&self) -> bool {
+        self.controller.mode() == crate::shell::PaneMode::Dead
+    }
+
+    /// Consume the pane and return just its `Sealed` scrollback blocks.
+    /// Restart (9F) uses this to carry a restored pane's transcript into
+    /// the freshly-spawned shell via [`Self::adopt_restored_scrollback`].
+    pub fn into_sealed_blocks(self) -> Vec<crate::block::Block> {
+        self.blocks.into_sealed()
+    }
+
+    /// Replace this (freshly-spawned) pane's empty block stack with one
+    /// carrying `sealed` scrollback under a fresh live `Prompt` tail, so
+    /// a restarted shell's output appends *below* the restored
+    /// transcript. Called right after `spawn_managed` during restart.
+    pub fn adopt_restored_scrollback(&mut self, sealed: Vec<crate::block::Block>) {
+        self.blocks = BlockStack::with_restored_sealed(sealed);
     }
 
     /// Mutable handle to the editor on the live `Prompt` block, if

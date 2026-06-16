@@ -287,7 +287,7 @@ On launch:
 1. Read the most recent `workspace` row whose sessions are **not owned by a live process** (see §"Concurrent processes and session ownership" — a workspace still held by another running Termica is left alone, never adopted).
 2. For each window: deserialize `layout_blob`, restore tile tree.
 3. For each pane: create a `Pane` in `Dead` mode, attach its transcript view to its persisted chunks. Chunks are logical lines, so they re-wrap to the *current* (restore-time) pane width — a workspace saved on a wide monitor restores cleanly onto a narrow one. The pane's `cleared_before_line` watermark is honoured: logical lines below it are not shown.
-4. Show a per-pane "Restart shell" affordance. Click → spawn fresh PTY in the persisted cwd; pane transitions to `RawTerminal`.
+4. Show a per-pane "Restart shell" affordance. Click → spawn a fresh PTY in the persisted cwd; the pane leaves `Dead` and bootstraps normally. **Restart reuses the pane's durable `pane` row** (a new `session` under the same pane, not a new pane), and the writer resumes its cumulative logical-line cursor at the pane's current `MAX(end_line)` — so a pane's chunks **accumulate across restarts** as one contiguous, non-overlapping range, and the restored transcript is preserved through restart→quit→relaunch rather than orphaned. The new shell's output appends *below* the restored scrollback (which is transplanted into the fresh session in memory).
 
 We do **not** restore live PTYs. Process-survival across app restart is a session-daemon problem ([10](10-roadmap.md)).
 

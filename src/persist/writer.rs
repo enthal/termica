@@ -40,14 +40,20 @@ impl ChunkWriter {
     /// `…/scrollback/session-<id>/pane-<id>/` directory (created by
     /// [`crate::persist::store::Persistence::begin_session`]); `store`
     /// is the shared `termica.sqlite` handle.
+    /// `start_line` is the writer's initial cumulative logical-line
+    /// cursor — `0` for a fresh pane, the pane's current max `end_line`
+    /// for a resumed one (restart), so chunks accumulate across restarts
+    /// without overlapping line ranges.
     pub fn spawn(
         dir: PathBuf,
         store: Arc<Mutex<HistoryStore>>,
         session: SessionId,
         pane_row: PaneRowId,
+        start_line: u64,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<SealedSnapshot>();
-        let worker = thread::spawn(move || run_worker(dir, store, session, pane_row, rx));
+        let worker =
+            thread::spawn(move || run_worker(dir, store, session, pane_row, start_line, rx));
         Self { tx, _worker: worker }
     }
 
@@ -77,13 +83,16 @@ fn run_worker(
     store: Arc<Mutex<HistoryStore>>,
     session: SessionId,
     pane_row: PaneRowId,
+    start_line: u64,
     rx: mpsc::Receiver<SealedSnapshot>,
 ) {
     // Defensive: the directory was created at begin_session, but a
     // racing cleanup or a fresh recovery path may have removed it.
     let _ = std::fs::create_dir_all(&dir);
+    // `next_seq` is per session directory (file naming, fresh each
+    // session); `cumulative_line` is per pane (continues across restarts).
     let mut next_seq: u64 = 1;
-    let mut cumulative_line: u64 = 0;
+    let mut cumulative_line: u64 = start_line;
     while let Ok(snapshot) = rx.recv() {
         match write_chunk(&dir, &store, session, pane_row, next_seq, cumulative_line, &snapshot) {
             Ok(lines_written) if lines_written > 0 => {
@@ -206,6 +215,54 @@ mod tests {
     }
 
     #[test]
+    fn restart_resumes_the_pane_and_continues_the_logical_cursor() {
+        // The 9F restart fix: a resumed session reuses the pane row and
+        // continues the logical-line cursor, so a pane's chunks accumulate
+        // across restarts in one contiguous, non-overlapping range.
+        let (_tmp, persist, rec1) = fixture();
+        let store = persist.store_handle();
+        write_chunk(
+            &rec1.dir,
+            &store,
+            rec1.session,
+            rec1.pane_row,
+            1,
+            0,
+            &snapshot(1, &["a", "b"]),
+        )
+        .unwrap();
+
+        // Restart: resume the SAME pane under a new session.
+        let rec2 = persist.resume_session(rec1.pane_row.0, 2000).unwrap();
+        assert_eq!(rec2.pane_row.0, rec1.pane_row.0, "restart reuses the pane row");
+        assert_ne!(rec2.session.0, rec1.session.0, "restart opens a new session");
+        assert_eq!(rec2.start_line, 2, "cursor resumes at the pane's max end_line");
+
+        // The resumed writer continues past the old chunks (seq restarts at
+        // 1 in the new session dir; start_line continues at 2).
+        write_chunk(
+            &rec2.dir,
+            &store,
+            rec2.session,
+            rec2.pane_row,
+            1,
+            rec2.start_line,
+            &snapshot(2, &["c", "d", "e"]),
+        )
+        .unwrap();
+
+        // All of the pane's chunks, across both sessions, form one
+        // contiguous logical-line range.
+        let rows = store.lock().unwrap().pane_scrollback_chunks(rec1.pane_row.0).unwrap();
+        let ranges: Vec<(i64, i64)> = rows.iter().map(|r| (r.start_line, r.end_line)).collect();
+        assert_eq!(
+            ranges,
+            vec![(0, 2), (2, 5)],
+            "chunks accumulate without overlap across restart"
+        );
+    }
+
+    #[test]
     fn write_chunk_creates_file_and_row_and_round_trips() {
         let (_tmp, persist, rec) = fixture();
         let snap = snapshot(1, &["hello world", "second line"]);
@@ -267,7 +324,8 @@ mod tests {
     fn writer_thread_sequences_chunks_and_advances_logical_cursor() {
         let (_tmp, persist, rec) = fixture();
         let store = persist.store_handle();
-        let writer = ChunkWriter::spawn(rec.dir.clone(), store.clone(), rec.session, rec.pane_row);
+        let writer =
+            ChunkWriter::spawn(rec.dir.clone(), store.clone(), rec.session, rec.pane_row, 0);
         // Three blocks: 2 lines, 0 lines (skipped), 3 lines.
         writer.submit(snapshot(1, &["a", "b"]));
         writer.submit(snapshot(2, &[]));
