@@ -108,26 +108,116 @@ pub fn parse_for(tool: DriverTool, stdout: &str, line: &str) -> Vec<CompletionCa
     }
 }
 
-/// Parse `fish ... complete -C` stdout into candidates. Each line is
-/// `value<sep>description` where `<sep>` is a tab (fish's normal format)
-/// **or** a run of 2+ spaces — the latter because some commands' fish
-/// completions (notably `kubectl`, whose completion dumps `kubectl
-/// api-resources`-style space-padded columns) emit no tab at all, so a
-/// tab-only split would swallow the whole padded row as the value. We
-/// reuse the same [`split_value_desc`] heuristic as the cobra drivers; a
-/// completion *value* may contain single spaces (a filename), which the
-/// 2+-space rule preserves. The description keeps its 2+-space column
-/// separators intact — the popup aligns them into a table
-/// ([`crate::completion::popup`]), so flattening them here would destroy
-/// the column structure.
+/// Parse `fish ... complete -C` stdout into candidates.
+///
+/// Two formats, auto-detected:
+/// - **Tab-separated** (`value\tdescription`, fish's normal output): split
+///   each line on its first tab.
+/// - **Fixed-width table** (no tabs): some commands' fish completions —
+///   notably `kubectl`, which dumps `api-resources`-style space-padded
+///   columns — have NO tabs and may leave a cell EMPTY (e.g. a resource
+///   with no short name). A naive split-on-spaces drops the empty cell and
+///   shifts that row's later columns left. So we detect the column
+///   boundaries across ALL lines ([`split_table_columns`]) and keep empty
+///   cells, encoding the description columns joined by `\t` — which the
+///   popup ([`crate::completion::popup`]) splits to align them by index.
+///
+/// In both cases the candidate *value* is just the first column, so
+/// accepting inserts `deployments`, never the whole padded row.
 pub fn parse_fish_complete(stdout: &str) -> Vec<CompletionCandidate> {
     let source = CompletionSource::Driver(DriverTool::FishComplete);
-    stdout
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|line| match split_value_desc(line) {
-            (value, Some(desc)) => CompletionCandidate::with_description(value, desc, source),
-            (value, None) => CompletionCandidate::simple(value, source),
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+
+    if lines.iter().any(|l| l.contains('\t')) {
+        return lines
+            .iter()
+            .map(|line| match line.split_once('\t') {
+                Some((value, desc)) if !desc.trim().is_empty() => {
+                    CompletionCandidate::with_description(value.trim_end(), desc.trim(), source)
+                }
+                Some((value, _)) => CompletionCandidate::simple(value.trim_end(), source),
+                None => CompletionCandidate::simple(*line, source),
+            })
+            .collect();
+    }
+
+    split_table_columns(&lines)
+        .into_iter()
+        .filter_map(|cells| {
+            let (value, desc_cells) = cells.split_first()?;
+            if value.is_empty() {
+                return None;
+            }
+            if desc_cells.iter().all(String::is_empty) {
+                Some(CompletionCandidate::simple(value, source))
+            } else {
+                // `\t`-join so the popup preserves empty cells by index.
+                Some(CompletionCandidate::with_description(value, desc_cells.join("\t"), source))
+            }
+        })
+        .collect()
+}
+
+/// Parse a block of completion lines as a **fixed-width table**: column
+/// boundaries are the character columns that are whitespace in EVERY line,
+/// where a *gap* is a run of 2+ such columns (a lone space stays inside a
+/// cell). Returns one trimmed cell per column per line, with **empty cells
+/// preserved** so a row missing a value (e.g. kubectl's blank short-name
+/// column) stays aligned with the others rather than shifting left. All
+/// rows get the same number of cells.
+fn split_table_columns(lines: &[&str]) -> Vec<Vec<String>> {
+    let rows: Vec<Vec<char>> = lines.iter().map(|l| l.chars().collect()).collect();
+    let width = rows.iter().map(Vec::len).max().unwrap_or(0);
+    // `sep[c]`: every row is whitespace (or has ended) at char column `c`.
+    let mut sep = vec![true; width];
+    for r in &rows {
+        for (c, ch) in r.iter().enumerate() {
+            if !ch.is_whitespace() {
+                sep[c] = false;
+            }
+        }
+    }
+    // Column char-ranges: a gap is a run of 2+ `sep` columns (or leading
+    // whitespace); everything between gaps — including lone `sep` columns —
+    // is one column.
+    let is_gap_at = |c: usize| -> Option<usize> {
+        if !sep.get(c).copied().unwrap_or(false) {
+            return None;
+        }
+        let mut e = c;
+        while e < width && sep[e] {
+            e += 1;
+        }
+        (e - c >= 2).then_some(e)
+    };
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut c = 0;
+    while c < width {
+        if let Some(e) = is_gap_at(c) {
+            c = e; // skip the inter-column gap
+            continue;
+        }
+        // A column runs until the next gap; a lone separator (run < 2) is
+        // intra-cell and keeps the column going.
+        let start = c;
+        let mut e = c;
+        while e < width && is_gap_at(e).is_none() {
+            e += 1;
+        }
+        ranges.push((start, e));
+        c = e;
+    }
+    rows.iter()
+        .map(|r| {
+            ranges
+                .iter()
+                .map(|&(s, e)| {
+                    let end = e.min(r.len());
+                    let cell: String =
+                        if s < end { r[s..end].iter().collect() } else { String::new() };
+                    cell.trim().to_string()
+                })
+                .collect()
         })
         .collect()
 }
@@ -393,25 +483,61 @@ mod tests {
         assert!(cands.iter().all(|c| !c.value.is_empty()), "no empty candidates");
     }
 
+    /// Build a fixed-width row from cells + column widths (last cell
+    /// unpadded), so the test controls the exact column positions.
+    fn fixed_row(cells: &[&str], widths: &[usize]) -> String {
+        let mut s = String::new();
+        for (i, cell) in cells.iter().enumerate() {
+            if i + 1 == cells.len() {
+                s.push_str(cell);
+            } else {
+                s.push_str(&format!("{cell:<width$}", width = widths[i]));
+            }
+        }
+        s
+    }
+
     #[test]
-    fn fish_parse_splits_space_padded_kubectl_columns() {
-        // kubectl's fish completion dumps `api-resources`-style columns
-        // padded with spaces and NO tabs. A tab-only split would swallow
-        // the whole row as the value (the reported bug — accepting it
-        // inserted `deployments    deploy    apps/v1 …`). The 2+-space
-        // heuristic must take just the first column as the value, and the
-        // wide internal padding must collapse in the description.
-        let stdout = "daemonsets                ds       apps/v1            true    DaemonSet\n\
-                      deployments               deploy   apps/v1            true    Deployment\n";
-        let cands = parse_fish_complete(stdout);
+    fn split_table_columns_preserves_empty_cells() {
+        // kubectl's fish completion: fixed-width columns, and a row can
+        // have an EMPTY cell (deviceclasses has no short name). Splitting
+        // on spaces would drop it and shift the row's later columns left;
+        // fixed-width detection must keep it aligned.
+        let w = &[15, 8, 20, 7];
+        let lines_owned = [
+            fixed_row(&["daemonsets", "ds", "apps/v1", "true", "DaemonSet"], w),
+            fixed_row(&["deployments", "deploy", "apps/v1", "true", "Deployment"], w),
+            fixed_row(&["deviceclasses", "", "resource.k8s.io/v1", "false", "DeviceClass"], w),
+        ];
+        let lines: Vec<&str> = lines_owned.iter().map(String::as_str).collect();
+        let rows = split_table_columns(&lines);
+        assert_eq!(rows[0], ["daemonsets", "ds", "apps/v1", "true", "DaemonSet"]);
+        assert_eq!(
+            rows[2],
+            ["deviceclasses", "", "resource.k8s.io/v1", "false", "DeviceClass"],
+            "the empty short-name cell is preserved, so later columns stay aligned"
+        );
+    }
+
+    #[test]
+    fn fish_parse_space_padded_table_value_is_first_column_empty_cells_kept() {
+        let w = &[15, 8, 20, 7];
+        let stdout = [
+            fixed_row(&["daemonsets", "ds", "apps/v1", "true", "DaemonSet"], w),
+            fixed_row(&["deviceclasses", "", "resource.k8s.io/v1", "false", "DeviceClass"], w),
+        ]
+        .join("\n");
+        let cands = parse_fish_complete(&stdout);
         assert_eq!(cands[0].value, "daemonsets", "value is the first column only");
-        assert_eq!(cands[1].value, "deployments");
-        // The description keeps its 2+-space column separators — the popup
-        // turns them into an aligned table, so they must survive parsing.
-        let desc = cands[0].description.as_deref().unwrap();
-        assert!(desc.starts_with("ds"), "description starts at the second column");
-        assert!(desc.contains("  "), "column separators (2+ spaces) preserved");
-        assert!(desc.contains("apps/v1") && desc.ends_with("DaemonSet"));
+        assert_eq!(cands[1].value, "deviceclasses");
+        // Description columns are `\t`-joined; the empty short-name cell of
+        // deviceclasses is a leading empty field so columns stay aligned.
+        assert_eq!(cands[0].description.as_deref(), Some("ds\tapps/v1\ttrue\tDaemonSet"));
+        assert_eq!(
+            cands[1].description.as_deref(),
+            Some("\tresource.k8s.io/v1\tfalse\tDeviceClass"),
+            "leading empty cell preserved as an empty `\\t` field"
+        );
     }
 
     #[test]

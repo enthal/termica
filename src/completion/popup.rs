@@ -311,13 +311,14 @@ fn paint_keybind_hint(ui: &mut egui::Ui) {
     });
 }
 
-/// Split a completion description into its whitespace-aligned columns: a
-/// run of **2+ spaces** is a column separator (a single space stays inside
-/// a cell, so a normal prose description is one cell), each cell trimmed,
-/// empties from uneven padding dropped. This is what lets a tabular
-/// completion (e.g. kubectl's `name  shortnames  apiversion  …`) line up.
+/// Split a completion description into its columns. The driver parsers
+/// encode a tabular completion's cells joined by `\t` (with **empty cells
+/// preserved** as empty fields, so a row missing a value stays aligned —
+/// see [`crate::completion::drivers::parse::parse_fish_complete`]); a plain
+/// prose description has no `\t` and is a single cell. We split on `\t`
+/// only (keeping empties), so column `k` of every row lines up by index.
 fn split_columns(desc: &str) -> Vec<&str> {
-    desc.split("  ").map(str::trim).filter(|s| !s.is_empty()).collect()
+    desc.split('\t').collect()
 }
 
 /// Per-column maximum widths (in characters) across a popup's candidates,
@@ -462,27 +463,34 @@ mod tests {
     // ---- column layout (tabular completions) ------------------------
 
     #[test]
-    fn split_columns_splits_on_two_or_more_spaces_only() {
-        // 2+ spaces = a column boundary; a single space stays inside a cell.
+    fn split_columns_splits_on_tabs_preserving_empties() {
+        // `\t` = column boundary; empty fields are KEPT so columns align by
+        // index. A prose description (no `\t`) is one cell.
         assert_eq!(
-            split_columns("ds    apps/v1   true  DaemonSet"),
+            split_columns("ds\tapps/v1\ttrue\tDaemonSet"),
             ["ds", "apps/v1", "true", "DaemonSet"]
         );
+        assert_eq!(
+            split_columns("\tresource.k8s.io/v1\tfalse\tDeviceClass"),
+            ["", "resource.k8s.io/v1", "false", "DeviceClass"],
+            "a leading empty cell is preserved (the row's missing short-name column)"
+        );
         assert_eq!(split_columns("Switch branches"), ["Switch branches"]);
-        assert_eq!(split_columns(""), Vec::<&str>::new());
     }
 
     #[test]
-    fn column_layout_keeps_widest_cell_per_column() {
-        // Column 0 is the name; columns 1.. are the description cells.
+    fn column_layout_keeps_widest_cell_per_column_with_empty_cells() {
+        // Column 0 is the name; columns 1.. are the `\t` cells. The third
+        // row has an EMPTY short-name cell, so its apiversion stays in the
+        // apiversion column (not shifted into the short-name column).
         let cands = vec![
-            cand_desc("daemonsets", "ds      apps/v1   true   DaemonSet"),
-            cand_desc("deployments", "deploy  apps/v1   true   Deployment"),
-            cand_desc("deviceclasses", "resource.k8s.io/v1   false  DeviceClass"),
+            cand_desc("daemonsets", "ds\tapps/v1\ttrue\tDaemonSet"),
+            cand_desc("deployments", "deploy\tapps/v1\ttrue\tDeployment"),
+            cand_desc("deviceclasses", "\tresource.k8s.io/v1\tfalse\tDeviceClass"),
         ];
         let layout = ColumnLayout::compute(&cands);
-        // col0 = max name = "deviceclasses" (13). col1 = max(ds, deploy,
-        // resource.k8s.io/v1) = 18. The third row has fewer cells; that's fine.
+        // col0 = max name = "deviceclasses" (13). col1 (short) = max(ds,
+        // deploy, "") = 6. col2 (apiversion) = max(apps/v1, resource.k8s.io/v1) = 18.
         assert_eq!(layout.ncols(), 5);
         assert_eq!(layout.col_start(0, 2), 0);
         assert_eq!(
@@ -490,7 +498,7 @@ mod tests {
             13 + 2,
             "descriptions start after the widest name + gap"
         );
-        assert_eq!(layout.col_start(2, 2), 13 + 2 + 18 + 2);
+        assert_eq!(layout.col_start(2, 2), 13 + 2 + 6 + 2, "apiversion column after name + short");
     }
 
     #[test]

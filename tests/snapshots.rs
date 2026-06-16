@@ -1459,22 +1459,22 @@ fn snapshot_completion_popup_tabular_columns() {
     // popup splits on 2+ spaces and paints every column at a shared
     // tab-stop, so the rows line up into a table and the popup widens to
     // fit. Pins the column-alignment layout (`ColumnLayout`).
+    // Description cells are `\t`-joined (as the driver parsers emit them);
+    // `deviceclasses` has an EMPTY short-name cell (leading `\t`), which the
+    // popup must keep aligned in its own column rather than shifting the
+    // rest of the row left.
     use termica::completion::DriverTool;
     let fish = CompletionSource::Driver(DriverTool::FishComplete);
     let cands = vec![
-        CompletionCandidate::with_description(
-            "daemonsets",
-            "ds      apps/v1   true   DaemonSet",
-            fish,
-        ),
+        CompletionCandidate::with_description("daemonsets", "ds\tapps/v1\ttrue\tDaemonSet", fish),
         CompletionCandidate::with_description(
             "deployments",
-            "deploy  apps/v1   true   Deployment",
+            "deploy\tapps/v1\ttrue\tDeployment",
             fish,
         ),
         CompletionCandidate::with_description(
-            "statefulsets",
-            "sts     apps/v1   true   StatefulSet",
+            "deviceclasses",
+            "\tresource.k8s.io/v1\tfalse\tDeviceClass",
             fish,
         ),
     ];
