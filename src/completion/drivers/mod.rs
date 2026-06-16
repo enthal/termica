@@ -119,6 +119,15 @@ pub enum DriverTool {
     /// **values only** (zsh descriptions are config-gated and fragile) — see
     /// [spec/04a §"Zsh sidecar"](../../../spec/04a-completion.md).
     ZshComplete,
+    /// The bash **live-shell** completion source. Like [`Self::ZshComplete`]
+    /// there is NO one-shot form; it exists only as a live-shell tool, and
+    /// its reply rides the same `completion` marker parsed the same way. The
+    /// capture is simpler than zsh's — bash completion functions just fill
+    /// `COMPREPLY` and need no real readline context, so the managed bash
+    /// completes **in-process** (like fish's `complete -C`), no captive
+    /// child. v1 emits **values only** — see
+    /// [spec/04a §"Bash sidecar"](../../../spec/04a-completion.md).
+    BashComplete,
 }
 
 impl DriverTool {
@@ -132,6 +141,7 @@ impl DriverTool {
             DriverTool::Git => "git",
             DriverTool::FishComplete => "fish",
             DriverTool::ZshComplete => "zsh",
+            DriverTool::BashComplete => "bash",
         }
     }
 }
@@ -259,6 +269,10 @@ fn invocation(req: &DriverRequest) -> (&'static str, Vec<String>, Vec<(String, S
         // zero candidates, gracefully (shell integration is the only source of
         // truth for live completion; without it, none).
         DriverTool::ZshComplete => ("false", Vec::new(), Vec::new()),
+        // Defensive only, same as `ZshComplete`: bash live completion runs
+        // in the managed shell and replies via the PTY marker path, never
+        // the worker. `false` → no stdout → zero candidates if it ever lands.
+        DriverTool::BashComplete => ("false", Vec::new(), Vec::new()),
     }
 }
 

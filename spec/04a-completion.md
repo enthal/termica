@@ -100,47 +100,15 @@ Newline-delimited JSON over stdin/stdout. Termica controls the request side; the
 
 ### Bash sidecar
 
-Bash exposes completion via the `complete -p` builtin and the `COMPREPLY` array. Termica's bash sidecar script (vendored alongside the existing integration scripts in [`integration/`](../integration/)) does roughly this on each request:
-
-```sh
-# Sidecar helper, runs for every COMPLETE request.
-__termica_complete() {
-    local line="$1" point="$2"
-    local words=() current word_index
-    # 1. Split line into words with bash's own splitter so we
-    #    match what readline would see.
-    COMP_LINE="$line"
-    COMP_POINT="$point"
-    eval "COMP_WORDS=($line)"
-    COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 ))
-    # 2. Look up the function bound for this command.
-    local cmd="${COMP_WORDS[0]}"
-    local func
-    func=$(complete -p "$cmd" 2>/dev/null | sed -n 's/.* -F \([a-zA-Z_]*\) .*/\1/p')
-    if [[ -z "$func" ]]; then
-        # Fall back to bash's default: filename completion.
-        COMPREPLY=( $(compgen -f -- "${COMP_WORDS[$COMP_CWORD]}") )
-    else
-        "$func"
-    fi
-    # 3. Emit JSON.
-    printf '{"id":%d,"type":"candidates","items":[' "$3"
-    local first=1
-    for item in "${COMPREPLY[@]}"; do
-        if (( first == 0 )); then printf ','; fi
-        first=0
-        printf '{"value":%s,"display":%s}' "$(__termica_json_str "$item")" "$(__termica_json_str "$item")"
-    done
-    printf ']}\n'
-}
-```
-
-This is the production-tested approach used by [bash-preexec](https://github.com/rcaloras/bash-preexec) and a half-dozen completion bridges (`fzf`, `mcfly`, etc.). It works because `complete -p <cmd>` is bash's documented introspection mechanism.
-
-**Caveats:**
-- Some completion functions assume readline state (`READLINE_LINE`, `READLINE_POINT`). We set those alongside `COMP_*` so the common cases work; uncommon ones may break.
-- Completion functions that fork their own subshells will pick up the sidecar's environment, which is the user's rc-loaded one — usually fine, occasionally surprising.
-- Bash 3 (default on stock macOS) has subtle differences from bash 4+ in `compgen`. The sidecar bootstrap detects the bash version and degrades gracefully (fewer completions, never wrong ones).
+> **As built (slice 4 — live-shell capture, in-process).** Bash ships as live-shell completion, like fish and zsh — answered by the pane's own integration so **runtime-defined** `complete` specs / aliases resolve. It is the *simplest* of the three: unlike zsh's `compadd` (which early-returns outside a real ZLE widget, forcing a captive `zpty` child), **bash completion functions just fill the `COMPREPLY` array and need no readline context**, so the managed bash captures completions **in-process** — no sidecar child at all, the same shape as fish's in-process `complete -C`.
+>
+> On a request, `__termica_bc_capture <line>` (in [`integration/bash-bootstrap.bash`](../integration/bash-bootstrap.bash)) sets the `COMP_*` globals, triggers bash-completion's lazy loader (`_comp_load`) for the command, reads the registered `-F <function>` from `complete -p` (or the dynamic `-D` default), calls that function, and dedupes `COMPREPLY` into a values array. The `COMP_*` are all `local`, so they can never leak into the next real command's bash-preexec DEBUG trap (which **skips** preexec while `COMP_POINT` is set — a stuck value would silently stop the block model).
+>
+> The captured **values** go out in a [`completion`](03-shell-integration.md#completion--live-shell-completion) DCS marker, parsed by the same Rust parser as fish/zsh. The dispatch is the shared `__termica_complete` sentinel command, but with a **bash-specific difference**: it carries **no leading space**. bash-preexec reads the running command from `builtin history 1`; under `HISTCONTROL=ignorespace` a leading-space command never enters history, so bash-preexec would hand `termica_preexec` the *previous* command and corrupt the block model. So the bash sentinel enters history normally (where the preexec/precmd guards recognise it and stay inert) and `__termica_complete` **deletes its own history entry**. `$?` is preserved. Mode-inertness is normative in [spec/03 §`completion`](03-shell-integration.md#completion--live-shell-completion).
+>
+> **Bash-completion is loaded by the bootstrap** if the user's `~/.bashrc` didn't (the bash analog of zsh's `compinit`): `--noprofile` skips the profile.d loader, so the wrapper sources `bash_completion.sh` from the standard locations, interactive-only. **Graceful degradation**: `bash-completion` 2.x needs bash ≥ 4.1; on an old bash (stock macOS ships 3.2) it won't load, so the capture only resolves the few manually-registered specs — the terminal and prompt editor are unaffected. The bootstrap reports capability in `integration_ready` (`{"bash_major":N,"completion":true|false}`) so Termica can surface a one-time UI notice (the notice itself is a follow-up; the signal ships here).
+>
+> **v1 emits values only.** **Routing** mirrors zsh exactly: the per-tool **cobra drivers stay authoritative** (`gh`/`git`/`kubectl`/…) and only the **long tail** routes to the live shell (`DriverTool::BashComplete`, command *and* argument position via `fish_segment`); an empty segment never fires.
 
 ### Zsh sidecar
 
@@ -171,7 +139,7 @@ No `compsys`-style ZLE state. No `COMPREPLY`. Just one CLI call per request.
 >
 > **Routing**: in a **fish** pane, `complete -C` is a superset of the per-tool CLI drivers, so `completion::plan_completion` routes *any* completion — in **both command and argument position** — to `FishComplete` (via `drivers::parse::fish_segment`) and never also fires a per-tool driver. Routing the command **name** to fish (not just arguments) is what lets the user's **aliases, functions, and abbreviations** complete, since the local `$PATH` source only knows on-disk executables; the `FishComplete` result is merged with the local sources (the `$PATH` executables at command position, files at argument position) so a command on both collapses to one row. The only thing that does *not* fire the sidecar is an **empty** segment (empty editor, or right after a `|`/`;`), which would otherwise `complete -C ""` the entire command set. Non-fish panes keep the per-tool `driver_target` path unchanged (argument position only; the command name stays local). The shell is read from `PaneSession::shell()`.
 >
-> The persistent-process / JSON-RPC model below remains the plan for **bash** (slice 4). **zsh** shipped (slice 5) on a *different* model — live-shell capture via a warm `zpty` child, not a persistent rc-loaded sidecar process — see [§"Zsh sidecar"](#zsh-sidecar).
+> The persistent-process / JSON-RPC model sketched below was **not** used by any shell in the end. All three ship as **live-shell capture** answered by the pane's own integration: fish via in-process `complete -C`, **bash** via in-process `COMPREPLY` (see [§"Bash sidecar"](#bash-sidecar)), **zsh** via a warm `zpty` child (see [§"Zsh sidecar"](#zsh-sidecar)). The JSON-RPC sketch is retained below only as historical design context.
 
 > **As built (slice 3b — live-shell completion is now the primary fish path).** The one-shot subprocess above loads the user's *config* but can't see aliases/functions defined **interactively at runtime** (they live in the pane's own fish process). So when a fish pane is **at a prompt with confirmed integration**, completion is answered by the pane's **own live shell**: Termica writes a `complete\t<id>\t<base64-line>` request to the PTY, the bootstrap's read-eval loop runs `complete -C` **in-process** and replies with a [`completion`](03-shell-integration.md#completion--live-shell-completion) DCS marker, and `PaneSession` correlates the reply (by `id`) into the same `AwaitDriver` → `resolve_driver` popup flow the drivers use — so the renderer is unchanged. This reflects the true live shell (runtime aliases, functions, abbreviations, current `cd`) and is *faster* than the one-shot (no `fish -c` startup). The wire/lifecycle/mode-safety is normative in [spec/03 §`completion`](03-shell-integration.md#completion--live-shell-completion); it is **inert to the pane-mode machine** ([spec/05](05-pane-modes.md)).
 >

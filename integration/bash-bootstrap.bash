@@ -84,10 +84,127 @@ termica_emit_vars() {
     termica_emit_raw "shell_vars" "$json"
 }
 
+# ----- live-shell completion ---------------------------------------------
+#
+# A bash pane at a prompt answers Tab-completion from its OWN process, so the
+# user's runtime-defined aliases / functions / `complete` specs and every
+# `bash-completion`-installed completion resolve (a fresh `bash -c` subprocess
+# couldn't see them, and re-sourcing dotfiles per Tab would be unacceptably
+# slow). Unlike zsh — whose `compadd` needs a real ZLE widget, forcing a warm
+# captive child — bash completion functions just fill `COMPREPLY` and need no
+# readline context, so the capture runs IN-PROCESS here.
+#
+# Dispatched as the guarded command `__termica_complete <id> <base64(line)>`
+# (see src/submit_framing.rs). Kept INERT to the mode machine by the
+# sentinel guards in `termica_preexec` / `termica_precmd`, and out of history
+# by `__termica_complete` deleting its own entry. v1 emits VALUES ONLY.
+
+# Capture completion candidates for the command line $1 (up to the cursor)
+# into `__termica_bc_rows` (values only, deduped, stable order). Best-effort:
+# any failure leaves the rows empty and the popup falls back to locals.
+__termica_bc_rows=()
+__termica_bc_capture() {
+    __termica_bc_rows=()
+    local line="$1"
+    # All COMP_* are `local`, so they are gone when this returns — nothing can
+    # leak into the next real command's bash-preexec DEBUG trap, which SKIPS
+    # preexec whenever COMP_POINT is set (a stuck COMP_POINT would silently
+    # stop emitting preexec and break the block model).
+    local COMP_LINE COMP_POINT COMP_CWORD cur prev cmd spec func c
+    local -a COMP_WORDS COMPREPLY
+    COMP_LINE="$line"
+    COMP_POINT=${#line}
+    read -ra COMP_WORDS <<< "$line"
+    # A trailing space (or empty line) means a fresh, empty word at the cursor.
+    [[ -z "$line" || "$line" == *[[:space:]] ]] && COMP_WORDS+=("")
+    COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 ))
+    (( COMP_CWORD < 0 )) && COMP_CWORD=0
+    cmd="${COMP_WORDS[0]}"
+    [[ -z "$cmd" ]] && return 0
+    # Trigger bash-completion's lazy loader for this command, if loaded.
+    if declare -F _comp_load >/dev/null 2>&1; then
+        _comp_load -- "$cmd" 2>/dev/null
+    elif declare -F __load_completion >/dev/null 2>&1; then
+        __load_completion "$cmd" 2>/dev/null
+    fi
+    # The registered spec, or the dynamic `-D` default. We only drive the
+    # `-F <function>` form (what bash-completion uses for everything that
+    # matters); `-G`/`-W`/`-C`-only specs fall through to the local sources.
+    spec="$(complete -p "$cmd" 2>/dev/null)" || spec="$(complete -p -D 2>/dev/null)"
+    [[ "$spec" =~ -F[[:space:]]+([^[:space:]]+) ]] || return 0
+    func="${BASH_REMATCH[1]}"
+    declare -F "$func" >/dev/null 2>&1 || return 0
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    (( COMP_CWORD > 0 )) && prev="${COMP_WORDS[COMP_CWORD-1]}"
+    # Completion functions are called as `func cmd cur prev`; they read the
+    # COMP_* globals (set above) and fill COMPREPLY. Errors are swallowed.
+    "$func" "$cmd" "$cur" "$prev" 2>/dev/null
+    local -A __seen=()
+    for c in "${COMPREPLY[@]}"; do
+        [[ -z "$c" ]] && continue
+        [[ -n "${__seen[$c]:-}" ]] && continue
+        __seen[$c]=1
+        __termica_bc_rows+=("$c")
+    done
+}
+
+# Emit the `completion` DCS marker carrying $1 (the correlation id) and the
+# captured rows as a JSON string array — the same shape fish/zsh emit, so
+# Rust's shared parser handles all three. The extra top-level `id` field means
+# this can't reuse `termica_emit_raw`.
+__termica_emit_completion() {
+    local id="$1" json="[" first=1 c
+    for c in "${__termica_bc_rows[@]}"; do
+        if (( first )); then first=0; else json+=","; fi
+        json+="\"$(termica_escape_json "$c")\""
+    done
+    json+="]"
+    printf '\033PTermica;{"type":"completion","session":"%s","id":%s,"value":%s}\033\\' \
+        "${TERMICA_SESSION_ID:-}" "$id" "$json"
+}
+
+# The completion sentinel dispatched by Termica as a real command:
+# `__termica_complete <id> <base64(line)>`. Stays INERT to the mode machine
+# (the `termica_preexec`/`termica_precmd` guards) and out of history (deletes
+# its own entry — bash-preexec read it from history, so we can't use a leading
+# space / `ignorespace`, which would also hide it from bash-preexec and
+# corrupt the block model). Preserves the user's last `$?`.
+__termica_complete() {
+    local __exit=$?
+    __termica_skip_next_precmd=1
+    # Drop our own history entry: parse the index from `history 1` and delete
+    # it. (bash adds the command to history before running it, so it's the
+    # most recent entry here.)
+    local __entry __idx
+    __entry="$(builtin history 1)"
+    __idx="${__entry#"${__entry%%[![:space:]]*}"}"
+    __idx="${__idx%% *}"
+    [[ "$__idx" == [0-9]* ]] && builtin history -d "$__idx" 2>/dev/null
+    local id="$1" line
+    line="$(printf '%s' "$2" | base64 -d 2>/dev/null)"
+    __termica_bc_capture "$line"
+    __termica_emit_completion "$id"
+    return "$__exit"
+}
+
 # ----- lifecycle hooks ---------------------------------------------------
 
+# True when bash-preexec's $1 (the running command line) is our completion
+# sentinel. The sentinel has no leading space, so a simple prefix match is
+# exact; the `__termica_` namespace makes a real user command here implausible.
+__termica_is_completion_sentinel() {
+    [[ "$1" == __termica_complete\ * ]]
+}
+
 termica_preexec() {
-    # bash-preexec passes the command line as $1.
+    # bash-preexec passes the command line as $1. The completion sentinel must
+    # NOT announce a command (no preexec/command_finished/precmd) — set the
+    # skip flag and stay silent so it's invisible to the block model.
+    if __termica_is_completion_sentinel "$1"; then
+        __termica_skip_next_precmd=1
+        return
+    fi
     termica_emit_string "preexec" "$1"
 }
 
@@ -97,6 +214,12 @@ termica_precmd() {
     # at the very top — bash-preexec has already preserved it for us.
     # We still capture immediately for symmetry with the zsh script.
     local exit_status=$?
+    # Inert tail of a completion sentinel: consume the skip flag and emit
+    # nothing, so the synthetic request leaves the prompt cycle untouched.
+    if [[ -n "${__termica_skip_next_precmd:-}" ]]; then
+        unset __termica_skip_next_precmd
+        return
+    fi
     termica_emit_int "command_finished" "$exit_status"
     termica_emit_string "precmd" "$PWD"
     # Live `$VAR`-completion source (change-gated, names only).
@@ -153,6 +276,27 @@ if [[ -r "$HOME/.bashrc" ]]; then
     source "$HOME/.bashrc"
 fi
 
+# Load bash-completion if the user's rc didn't, so the live-completion source
+# (`__termica_bc_capture`) sees the installed completions. This is the bash
+# analog of zsh's `compinit`. Interactive-only (bash-completion guards on `$-`),
+# and `--noprofile` skipped the profile.d loader, so we load it here. Guarded
+# on the version var so a user who already sourced it isn't double-loaded.
+if [[ -z "${BASH_COMPLETION_VERSINFO:-}" ]]; then
+    for __termica_bc in \
+        /opt/homebrew/etc/profile.d/bash_completion.sh \
+        /usr/local/etc/profile.d/bash_completion.sh \
+        /etc/profile.d/bash_completion.sh \
+        /usr/share/bash-completion/bash_completion \
+        /etc/bash_completion; do
+        if [[ -r "$__termica_bc" ]]; then
+            # shellcheck disable=SC1090
+            source "$__termica_bc" 2>/dev/null
+            break
+        fi
+    done
+    unset __termica_bc
+fi
+
 # Reassert hooks after user config has had its chance.
 termica_ensure_hooks
 
@@ -173,5 +317,19 @@ PS1=''
 # bytes once at bootstrap time and bakes them into PS2.
 PS2=$(printf '\[\033PTermica;{"type":"continuation","session":"%s","value":""}\033\\\]' "${TERMICA_SESSION_ID:-}")
 
+# Whether live Tab-completion is fully available: bash-completion 2.x needs
+# bash 4.1+, and must have loaded. On an old bash (e.g. macOS's stock 3.2) it
+# won't, so `__termica_bc_capture` only resolves the few manually-registered
+# `complete` specs — the terminal and prompt editor still work fully. The flag
+# rides `integration_ready` so Termica can surface a one-time UI notice.
+if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 1) )) \
+    && [[ -n "${BASH_COMPLETION_VERSINFO:-}" ]]; then
+    __termica_completion=true
+else
+    __termica_completion=false
+fi
+
 # Emit the gate-opening lifecycle message.
-termica_emit_raw "integration_ready" "{\"shell\":\"bash\",\"version\":${TERMICA_INTEGRATION_VERSION:-1}}"
+termica_emit_raw "integration_ready" \
+    "{\"shell\":\"bash\",\"version\":${TERMICA_INTEGRATION_VERSION:-1},\"bash_major\":${BASH_VERSINFO[0]},\"completion\":${__termica_completion}}"
+unset __termica_completion
