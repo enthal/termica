@@ -66,11 +66,15 @@ pub fn restore_blocks_for_pane(persist: &Persistence, pane_db_id: i64) -> Vec<Bl
     };
     let root = persist.root().to_path_buf();
     let mut blocks = Vec::with_capacity(rows_and_meta.len());
-    for (i, (row, meta)) in rows_and_meta.iter().enumerate() {
+    for (row, meta) in rows_and_meta.iter() {
         match load_chunk(&root, row) {
             Ok(lines) => {
+                // Id from the *surviving* count, not the row index: a
+                // skipped chunk must not leave a gap, or the live Prompt
+                // tail (id = sealed.len()) would collide with a kept
+                // block. Contiguous 0..n is the BlockId contract here.
                 blocks.push(Block::restored_sealed(
-                    BlockId(i as u64),
+                    BlockId(blocks.len() as u64),
                     lines,
                     row.start_time,
                     row.end_time,
@@ -217,6 +221,34 @@ mod tests {
             }
             other => panic!("expected Sealed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn skipped_middle_chunk_leaves_contiguous_block_ids() {
+        // A missing chunk in the *middle* must not leave a gap in the
+        // assigned BlockIds: ids must be contiguous 0..n over the
+        // surviving blocks. Otherwise the live Prompt tail (whose id is
+        // `next_id = sealed.len()`) collides with a surviving sealed
+        // block — a duplicate-BlockId, the documented critical-bug class.
+        let (_tmp, p) = persistence();
+        let rec = p.begin_session(None, "zsh", 1).unwrap();
+        let store = p.store_handle();
+        write_chunk(&rec.dir, &store, rec.session, rec.pane_row, 1, 0, &snap(&["first"])).unwrap();
+        write_chunk(&rec.dir, &store, rec.session, rec.pane_row, 2, 1, &snap(&["middle"])).unwrap();
+        write_chunk(&rec.dir, &store, rec.session, rec.pane_row, 3, 2, &snap(&["last"])).unwrap();
+        // Delete the *middle* chunk's file (row survives).
+        std::fs::remove_file(rec.dir.join("00000002.chunk.tmck")).unwrap();
+
+        let blocks = restore_blocks_for_pane(&p, rec.pane_row.0);
+        assert_eq!(blocks.len(), 2, "the two readable chunks restore");
+        let ids: Vec<u64> = blocks
+            .iter()
+            .map(|b| match b {
+                Block::Sealed { id, .. } => id.0,
+                other => panic!("expected Sealed, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, vec![0, 1], "ids are contiguous 0..n, not [0, 2]");
     }
 
     #[test]
