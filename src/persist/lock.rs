@@ -52,7 +52,20 @@ impl SessionLock {
         // `flock` is per open-file-description, so even within one
         // process two separate `File::create`s of the same path contend
         // — which is what makes this testable in-process.
-        if file.try_lock_exclusive()? { Ok(Some(SessionLock { _file: file })) } else { Ok(None) }
+        //
+        // `flock(2)` can be interrupted by a signal (`EINTR`) — common
+        // under load when sibling work reaps children (`SIGCHLD`). That
+        // is NOT contention, so retry rather than surface it as an error
+        // (which a caller like `gc` would conservatively read as "live"
+        // and skip — a real, load-dependent flake we hit in CI).
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(true) => return Ok(Some(SessionLock { _file: file })),
+                Ok(false) => return Ok(None),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 

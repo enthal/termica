@@ -17,7 +17,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// Read on open via `PRAGMA user_version` and compared against
 /// the embedded constant; mismatching versions trigger the
 /// migration ladder.
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 /// One row in `runs`. `pane_id` / `app_run_id` / `cwd` are `None`
 /// for entries replayed from a shell-history file (those formats
@@ -109,11 +109,32 @@ impl HistoryStore {
                 1 => self.apply_v1()?,
                 2 => self.apply_v2()?,
                 3 => self.apply_v3()?,
+                4 => self.apply_v4()?,
                 _ => unreachable!("no migration for v{v}"),
             }
         }
         self.conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
+    }
+
+    fn apply_v4(&self) -> rusqlite::Result<()> {
+        // Phase 9F: per-chunk block metadata as an open key/value side
+        // table — the command, exit code, cwd, git context, and any future
+        // chip (kube/aws/ssh/pr…) a restored block displays. Flexible by
+        // design: a new chip is a new `key`, never a migration. The chunk
+        // *output bytes* stay in the TMCK file; only this small,
+        // queryable metadata lives in SQLite. gc deletes a chunk's chips
+        // alongside its row (FKs are OFF, so the delete is explicit).
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS chunk_chip (
+                chunk_id INTEGER NOT NULL REFERENCES scrollback_chunk(id),
+                key      TEXT NOT NULL,
+                value    TEXT,
+                PRIMARY KEY (chunk_id, key)
+            );
+            ",
+        )
     }
 
     fn apply_v3(&self) -> rusqlite::Result<()> {
@@ -447,13 +468,47 @@ impl HistoryStore {
         rows.collect()
     }
 
-    /// Delete one `scrollback_chunk` index row by id. The file on disk
-    /// is the caller's responsibility (gc deletes the file first, then
-    /// the row — chunk-on-disk is the source of truth, so an orphan file
-    /// is recoverable but an orphan row is not).
+    /// Delete one `scrollback_chunk` index row by id, plus its chips. The
+    /// file on disk is the caller's responsibility (gc deletes the file
+    /// first, then the row — chunk-on-disk is the source of truth, so an
+    /// orphan file is recoverable but an orphan row is not). FKs are OFF,
+    /// so the chip cascade is explicit.
     pub fn delete_scrollback_chunk(&self, id: i64) -> rusqlite::Result<()> {
-        self.conn.execute("DELETE FROM scrollback_chunk WHERE id = ?1", params![id])?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM chunk_chip WHERE chunk_id = ?1", params![id])?;
+        tx.execute("DELETE FROM scrollback_chunk WHERE id = ?1", params![id])?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// Attach block metadata to a chunk as key/value chips (command,
+    /// exit, cwd, git, …). Open-ended: callers add new keys without a
+    /// migration. `INSERT OR REPLACE` so a re-write is idempotent.
+    pub fn insert_chunk_chips(
+        &self,
+        chunk_id: i64,
+        chips: &[(&str, String)],
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO chunk_chip (chunk_id, key, value) VALUES (?1, ?2, ?3)",
+            )?;
+            for (key, value) in chips {
+                stmt.execute(params![chunk_id, key, value])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Read a chunk's chips as `(key, value)` pairs. Restore turns these
+    /// back into a block's command / exit / cwd / git header.
+    pub fn chunk_chips(&self, chunk_id: i64) -> rusqlite::Result<Vec<(String, String)>> {
+        let mut stmt =
+            self.conn.prepare("SELECT key, value FROM chunk_chip WHERE chunk_id = ?1")?;
+        let rows = stmt.query_map(params![chunk_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
     }
 
     /// Number of rows in `runs` (the global history cap is enforced
@@ -673,8 +728,8 @@ mod tests {
     /// act; this literal catches an accidental change to the constant
     /// without a matching migration arm + fixture test.
     #[test]
-    fn schema_version_is_three() {
-        assert_eq!(SCHEMA_VERSION, 3);
+    fn schema_version_is_four() {
+        assert_eq!(SCHEMA_VERSION, 4);
     }
 
     /// Every v3 table the Phase 9 persistence layer adds is present
@@ -684,7 +739,8 @@ mod tests {
     #[test]
     fn fresh_store_has_layout_session_and_chunk_tables() {
         let s = store();
-        for t in ["workspace", "window", "tab", "pane", "session", "scrollback_chunk"] {
+        for t in ["workspace", "window", "tab", "pane", "session", "scrollback_chunk", "chunk_chip"]
+        {
             let n: i64 = s
                 .conn
                 .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
@@ -720,15 +776,16 @@ mod tests {
         .unwrap();
         let store = HistoryStore { conn };
 
-        store.migrate().expect("v2 -> v3 migration applies cleanly");
+        store.migrate().expect("v2 -> v4 migration applies cleanly");
 
         let v: u32 = store.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 3, "ladder advances the fixture to v3");
-        for t in ["workspace", "window", "tab", "pane", "session", "scrollback_chunk"] {
+        assert_eq!(v, 4, "ladder advances the fixture to v4");
+        for t in ["workspace", "window", "tab", "pane", "session", "scrollback_chunk", "chunk_chip"]
+        {
             let n: i64 = store
                 .conn
                 .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
-                .unwrap_or_else(|e| panic!("v3 adds table `{t}`: {e}"));
+                .unwrap_or_else(|e| panic!("v3/v4 adds table `{t}`: {e}"));
             assert_eq!(n, 0);
         }
         let text: String = store
@@ -736,6 +793,30 @@ mod tests {
             .query_row("SELECT text FROM runs WHERE started_at = 123", [], |r| r.get(0))
             .expect("the pre-existing v2 runs row survives the migration");
         assert_eq!(text, "echo hi");
+    }
+
+    #[test]
+    fn chunk_chips_write_read_and_cascade_on_chunk_delete() {
+        let s = store();
+        let (pane, session) = s.begin_session_rows(None, "zsh", 1).unwrap();
+        let chunk_id = s
+            .insert_scrollback_chunk(session, pane, "p/0.tmck", 0, 3, 80, 100, 200, true, 42)
+            .unwrap();
+        s.insert_chunk_chips(chunk_id, &[("command", "ls -la".into()), ("exit", "0".into())])
+            .unwrap();
+        let mut chips = s.chunk_chips(chunk_id).unwrap();
+        chips.sort();
+        assert_eq!(
+            chips,
+            vec![
+                ("command".to_string(), "ls -la".to_string()),
+                ("exit".to_string(), "0".to_string())
+            ]
+        );
+        // Deleting the chunk row cascades to its chips (FKs are OFF, so
+        // delete_scrollback_chunk does it explicitly).
+        s.delete_scrollback_chunk(chunk_id).unwrap();
+        assert!(s.chunk_chips(chunk_id).unwrap().is_empty(), "chips deleted with the chunk");
     }
 
     #[test]

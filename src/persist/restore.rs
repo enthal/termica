@@ -4,9 +4,10 @@
 //!
 //! `restore_blocks_for_pane` is the pure data path: db pane id → its
 //! chunk rows (in logical-line order) → one restored `Sealed` block per
-//! chunk. The app then wraps these in a no-PTY `Dead` pane. Honoring
-//! the `cleared_before_line` Cmd-K watermark and reconnecting command
-//! labels (from `runs`) are layered on top later.
+//! chunk, with each block's command / exit / cwd / git rebuilt from the
+//! chunk's `chunk_chip` rows (9F-block-meta). The app then wraps these in
+//! a no-PTY `Dead` pane. Honoring the `cleared_before_line` Cmd-K
+//! watermark is still layered on top later.
 
 #![forbid(unsafe_code)]
 
@@ -48,13 +49,24 @@ pub fn load_chunk(root: &Path, row: &ChunkRow) -> Result<Vec<StyledLine>, LoadEr
 /// still restore. Returns an empty vec if the pane has no chunks.
 pub fn restore_blocks_for_pane(persist: &Persistence, pane_db_id: i64) -> Vec<Block> {
     let store = persist.store_handle();
-    let rows: Vec<ChunkRow> = match store.lock() {
-        Ok(s) => s.pane_scrollback_chunks(pane_db_id).unwrap_or_default(),
+    // Pull the chunk rows and each chunk's chips up front (one lock
+    // window), so the decode loop below touches only the filesystem.
+    let rows_and_meta: Vec<(ChunkRow, crate::block::BlockMeta)> = match store.lock() {
+        Ok(s) => s
+            .pane_scrollback_chunks(pane_db_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| {
+                let chips = s.chunk_chips(row.id).unwrap_or_default();
+                let meta = crate::block::BlockMeta::from_chips(&chips);
+                (row, meta)
+            })
+            .collect(),
         Err(_) => return Vec::new(),
     };
     let root = persist.root().to_path_buf();
-    let mut blocks = Vec::with_capacity(rows.len());
-    for (i, row) in rows.iter().enumerate() {
+    let mut blocks = Vec::with_capacity(rows_and_meta.len());
+    for (i, (row, meta)) in rows_and_meta.iter().enumerate() {
         match load_chunk(&root, row) {
             Ok(lines) => {
                 blocks.push(Block::restored_sealed(
@@ -62,6 +74,7 @@ pub fn restore_blocks_for_pane(persist: &Persistence, pane_db_id: i64) -> Vec<Bl
                     lines,
                     row.start_time,
                     row.end_time,
+                    meta.clone(),
                 ));
             }
             Err(e) => {
@@ -110,6 +123,7 @@ mod tests {
             emit_cols: 80,
             start_time_ms: 1000,
             end_time_ms: 2000,
+            meta: crate::block::BlockMeta::default(),
         }
     }
 
@@ -152,7 +166,8 @@ mod tests {
                 assert_eq!(snapshot.len(), 1);
                 let text: String = snapshot[0].text_chars().collect();
                 assert_eq!(text, "first cmd out");
-                assert!(command.is_empty(), "restored blocks have no command label yet");
+                // This chunk was written with default (empty) meta.
+                assert!(command.is_empty());
                 assert_eq!(*exit, None);
             }
             other => panic!("expected Sealed, got {other:?}"),
@@ -161,6 +176,44 @@ mod tests {
             Block::Sealed { id, snapshot, .. } => {
                 assert_eq!(*id, BlockId(1));
                 assert_eq!(snapshot.len(), 2);
+            }
+            other => panic!("expected Sealed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restored_block_carries_command_exit_and_git_from_chips() {
+        use crate::block::BlockMeta;
+        use crate::git_context::{DirtySummary, GitContext};
+        let (_tmp, p) = persistence();
+        let rec = p.begin_session(None, "zsh", 1).unwrap();
+        let git = GitContext {
+            branch: Some("main".into()),
+            ahead: 1,
+            behind: 0,
+            dirty: DirtySummary { files_changed: 2, lines_added: 9, lines_removed: 3 },
+        };
+        let mut s = snap(&["cargo build output"]);
+        s.meta = BlockMeta {
+            command: "cargo build".into(),
+            exit: Some(101),
+            cwd: Some("/work/proj".into()),
+            git: Some(git.clone()),
+        };
+        write_chunk(&rec.dir, &p.store_handle(), rec.session, rec.pane_row, 1, 0, &s).unwrap();
+
+        let blocks = restore_blocks_for_pane(&p, rec.pane_row.0);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            Block::Sealed { command, exit, header, .. } => {
+                assert_eq!(command, "cargo build", "command label restores from chips");
+                assert_eq!(*exit, Some(101), "exit code restores");
+                assert_eq!(header.cwd.as_deref(), Some(std::path::Path::new("/work/proj")));
+                assert_eq!(
+                    header.git.as_ref(),
+                    Some(&git),
+                    "full git context restores (JSON chip)"
+                );
             }
             other => panic!("expected Sealed, got {other:?}"),
         }

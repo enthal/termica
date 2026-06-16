@@ -86,13 +86,9 @@ pub fn gc(persist: &Persistence, now_ms: i64, caps: &GcCaps) -> Result<GcReport,
     // -> assume live (never delete what we can't prove is dead).
     let mut live_by_session: HashMap<i64, bool> = HashMap::new();
     for row in &rows {
-        live_by_session.entry(row.session_id).or_insert_with(|| {
-            match SessionLock::try_acquire(&persist.session_dir(row.session_id)) {
-                Ok(Some(_guard)) => false,
-                Ok(None) => true,
-                Err(_) => true,
-            }
-        });
+        live_by_session
+            .entry(row.session_id)
+            .or_insert_with(|| session_is_live(persist, row.session_id));
     }
     let is_live = |sid: i64| live_by_session.get(&sid).copied().unwrap_or(true);
 
@@ -168,6 +164,33 @@ pub fn gc(persist: &Persistence, now_ms: i64, caps: &GcCaps) -> Result<GcReport,
     Ok(report)
 }
 
+/// Decide whether a session is live (owned by a running process) by
+/// trying to take its lock. A free lock means the session is dead and
+/// its chunks are gc-eligible.
+///
+/// We retry while it appears *held*, because a **dead** session's lock
+/// can transiently look held: `flock` lives on the open file
+/// description, and a concurrently-spawning shell inherits the lock fd
+/// across `fork` until its `exec` closes it (CLOEXEC). That window is
+/// sub-millisecond; a genuinely-live session stays held across all
+/// retries. Erring toward "live" never deletes a chunk a live pane
+/// could re-page — at worst gc collects a dead session on a later pass.
+fn session_is_live(persist: &Persistence, session_id: i64) -> bool {
+    const ATTEMPTS: u32 = 5;
+    let dir = persist.session_dir(session_id);
+    for attempt in 0..ATTEMPTS {
+        match SessionLock::try_acquire(&dir) {
+            Ok(Some(_guard)) => return false, // free -> dead (guard dropped here)
+            Ok(None) => {}                    // held -> maybe a transient fork window; retry
+            Err(_) => return true,            // can't determine -> assume live, be safe
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    true // persistently held -> genuinely live
+}
+
 /// Remove leftover `.tmp` files (torn writes — a crash between
 /// `write` and `rename`) anywhere under the scrollback tree. These are
 /// never valid chunks, so they're always safe to delete.
@@ -223,6 +246,7 @@ mod tests {
             emit_cols: 80,
             start_time_ms: end_time_ms - 1,
             end_time_ms,
+            meta: crate::block::BlockMeta::default(),
         }
     }
 

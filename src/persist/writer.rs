@@ -95,13 +95,13 @@ fn run_worker(
     let mut cumulative_line: u64 = start_line;
     while let Ok(snapshot) = rx.recv() {
         match write_chunk(&dir, &store, session, pane_row, next_seq, cumulative_line, &snapshot) {
-            Ok(lines_written) if lines_written > 0 => {
+            Ok(lines_written) => {
+                // Always advance the file sequence (a chunk was written,
+                // even a zero-line one); advance the logical cursor by the
+                // lines this chunk added (0 for a no-output block).
                 cumulative_line += lines_written;
                 next_seq += 1;
             }
-            // Empty snapshot (a command with no output): nothing written,
-            // cursor and sequence unchanged.
-            Ok(_) => {}
             Err(e) => eprintln!("termica: scrollback chunk write failed: {e}"),
         }
     }
@@ -123,10 +123,13 @@ pub fn write_chunk(
     start_line: u64,
     snapshot: &SealedSnapshot,
 ) -> Result<u64, PersistError> {
+    // Every sealed block is persisted, INCLUDING zero-output ones (a
+    // `false`, a `cd`, an `export`): the command label + exit + chips are
+    // what make them worth restoring, and a no-output block was visible
+    // in the live session, so restore must match it. A zero-line chunk is
+    // a tiny valid TMCK (header + empty body) with `start_line ==
+    // end_line`; it carries its chips like any other.
     let n_lines = snapshot.lines.len() as u64;
-    if n_lines == 0 {
-        return Ok(0);
-    }
     let end_line = start_line + n_lines;
 
     // Sealed chunks are always compressed (off the UI thread, so the
@@ -155,7 +158,7 @@ pub fn write_chunk(
     let rel_path = format!("scrollback/session-{}/pane-{}/{}", session.0, pane_row.0, file_name);
 
     let store = store.lock().map_err(|_| PersistError::Lock)?;
-    store.insert_scrollback_chunk(
+    let chunk_id = store.insert_scrollback_chunk(
         session.0,
         pane_row.0,
         &rel_path,
@@ -167,6 +170,12 @@ pub fn write_chunk(
         true,
         bytes.len() as i64,
     )?;
+    // Block metadata (command / exit / cwd / git) as the chunk's chips,
+    // so a restored block shows its label + chips, not just output (9F).
+    let chips = snapshot.meta.to_chips();
+    if !chips.is_empty() {
+        store.insert_chunk_chips(chunk_id, &chips)?;
+    }
     Ok(n_lines)
 }
 
@@ -201,6 +210,7 @@ mod tests {
             emit_cols: 80,
             start_time_ms: 1000,
             end_time_ms: 2000,
+            meta: crate::block::BlockMeta::default(),
         }
     }
 
@@ -304,20 +314,47 @@ mod tests {
     }
 
     #[test]
-    fn write_chunk_skips_empty_snapshot() {
+    fn write_chunk_persists_empty_block_with_its_chips() {
+        // A no-output command (e.g. `false`) still seals a block worth
+        // restoring — its command + exit survive as chips, the chunk is a
+        // tiny zero-line file, and its logical range is empty so the
+        // cursor doesn't advance.
         let (_tmp, persist, rec) = fixture();
         let store = persist.store_handle();
-        let n = write_chunk(&rec.dir, &store, rec.session, rec.pane_row, 1, 0, &snapshot(1, &[]))
-            .unwrap();
-        assert_eq!(n, 0, "empty snapshot writes nothing");
-        assert!(!rec.dir.join("00000001.chunk.tmck").exists());
-        let count: i64 = store
-            .lock()
-            .unwrap()
+        let mut snap = snapshot(1, &[]);
+        snap.meta = crate::block::BlockMeta {
+            command: "false".into(),
+            exit: Some(1),
+            cwd: None,
+            git: None,
+        };
+        let n = write_chunk(&rec.dir, &store, rec.session, rec.pane_row, 1, 4, &snap).unwrap();
+        assert_eq!(n, 0, "no output lines");
+
+        let file = rec.dir.join("00000001.chunk.tmck");
+        assert!(file.is_file(), "a tiny chunk file is still written");
+        assert!(
+            decode_chunk(&std::fs::read(&file).unwrap()).unwrap().is_empty(),
+            "decodes to zero lines"
+        );
+
+        let s = store.lock().unwrap();
+        let (id, start, end): (i64, i64, i64) = s
             .conn()
-            .query_row("SELECT COUNT(*) FROM scrollback_chunk", [], |r| r.get(0))
+            .query_row("SELECT id, start_line, end_line FROM scrollback_chunk", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
             .unwrap();
-        assert_eq!(count, 0, "no index row for an empty block");
+        assert_eq!((start, end), (4, 4), "empty logical range; cursor doesn't advance");
+        let mut chips = s.chunk_chips(id).unwrap();
+        chips.sort();
+        assert_eq!(
+            chips,
+            vec![
+                ("command".to_string(), "false".to_string()),
+                ("exit".to_string(), "1".to_string())
+            ]
+        );
     }
 
     #[test]
@@ -326,30 +363,32 @@ mod tests {
         let store = persist.store_handle();
         let writer =
             ChunkWriter::spawn(rec.dir.clone(), store.clone(), rec.session, rec.pane_row, 0);
-        // Three blocks: 2 lines, 0 lines (skipped), 3 lines.
+        // Three blocks: 2 lines, 0 lines (still persisted), 3 lines.
         writer.submit(snapshot(1, &["a", "b"]));
         writer.submit(snapshot(2, &[]));
         writer.submit(snapshot(3, &["c", "d", "e"]));
         writer.join_and_finish();
 
-        // Two files (the empty one is skipped), sequenced 1 and 2.
+        // Three files now — the zero-output block is persisted too (seq 2),
+        // so its command/exit can be restored.
         assert!(rec.dir.join("00000001.chunk.tmck").is_file());
         assert!(rec.dir.join("00000002.chunk.tmck").is_file());
-        assert!(!rec.dir.join("00000003.chunk.tmck").exists());
+        assert!(rec.dir.join("00000003.chunk.tmck").is_file());
 
-        // Rows: the cursor advances past the skipped empty block, so the
-        // second chunk starts where the first ended (no gap from the
-        // empty one).
+        // Ranges: [0,2), the empty [2,2), then [2,5). The cursor is
+        // unbroken (the empty block has zero width).
         let s = store.lock().unwrap();
         let mut stmt = s
             .conn()
-            .prepare("SELECT start_line, end_line FROM scrollback_chunk ORDER BY start_line")
+            .prepare(
+                "SELECT start_line, end_line FROM scrollback_chunk ORDER BY start_line, end_line",
+            )
             .unwrap();
         let ranges: Vec<(i64, i64)> = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
-        assert_eq!(ranges, vec![(0, 2), (2, 5)], "contiguous logical-line ranges, empty skipped");
+        assert_eq!(ranges, vec![(0, 2), (2, 2), (2, 5)], "empty block kept, cursor unbroken");
     }
 }

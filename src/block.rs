@@ -109,25 +109,24 @@ pub enum Block {
 }
 
 impl Block {
-    /// Build a `Sealed` block from restored scrollback (9F). A chunk
-    /// stores only the *output* logical lines, not the command string,
-    /// exit code, or git header (those live in `runs`, not linked to
-    /// chunks today) — so a restored block carries an empty command and
-    /// `exit: None`, showing the transcript without a command label.
-    /// `duration` is recovered from the chunk's recorded time span.
+    /// Build a `Sealed` block from restored scrollback (9F). The output
+    /// logical lines come from the chunk file; the command label, exit
+    /// code, cwd, and git header come from the chunk's [`BlockMeta`]
+    /// chips. `duration` is recovered from the chunk's recorded span.
     pub fn restored_sealed(
         id: BlockId,
         snapshot: Vec<StyledLine>,
         start_time_ms: i64,
         end_time_ms: i64,
+        meta: BlockMeta,
     ) -> Self {
         Block::Sealed {
             id,
-            header: BlockHeader::default(),
-            command: String::new(),
+            header: meta.to_header(),
+            command: meta.command,
             snapshot,
             duration: Duration::from_millis(end_time_ms.saturating_sub(start_time_ms).max(0) as u64),
-            exit: None,
+            exit: meta.exit,
         }
     }
 
@@ -156,6 +155,74 @@ pub struct SealedSnapshot {
     pub emit_cols: u32,
     pub start_time_ms: i64,
     pub end_time_ms: i64,
+    /// Block identity + chips (command, exit, cwd, git) — persisted as
+    /// the chunk's key/value `chunk_chip` rows so a restored block shows
+    /// its label and chips, not just its output (9F).
+    pub meta: BlockMeta,
+}
+
+/// A block's metadata — its command label, exit code, cwd, and git
+/// context — kept TYPED in code while it's stored as an open key/value
+/// set (`chunk_chip`) on disk: the typed↔chips conversion is the only
+/// place chip keys live, so a new chip (kube/aws/ssh/pr…) is a new field
+/// here + a new key, never a schema migration.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BlockMeta {
+    pub command: String,
+    pub exit: Option<i32>,
+    pub cwd: Option<String>,
+    pub git: Option<crate::git_context::GitContext>,
+}
+
+impl BlockMeta {
+    /// Capture a sealed block's metadata from its parts.
+    pub fn from_block(command: &str, exit: Option<i32>, header: &BlockHeader) -> Self {
+        BlockMeta {
+            command: command.to_string(),
+            exit,
+            cwd: header.cwd.as_ref().map(|p| p.display().to_string()),
+            git: header.git.clone(),
+        }
+    }
+
+    /// Fan out to the `(key, value)` chips stored on the chunk. Absent
+    /// fields produce no row. `git` is JSON (a structured value under one
+    /// key); the rest are plain strings.
+    pub fn to_chips(&self) -> Vec<(&'static str, String)> {
+        let mut chips = Vec::new();
+        if !self.command.is_empty() {
+            chips.push(("command", self.command.clone()));
+        }
+        if let Some(exit) = self.exit {
+            chips.push(("exit", exit.to_string()));
+        }
+        if let Some(cwd) = &self.cwd {
+            chips.push(("cwd", cwd.clone()));
+        }
+        if let Some(git) = &self.git
+            && let Ok(json) = serde_json::to_string(git)
+        {
+            chips.push(("git", json));
+        }
+        chips
+    }
+
+    /// Rebuild from a chunk's stored chips (restore). Unknown keys are
+    /// ignored; malformed values fall back to absent.
+    pub fn from_chips(chips: &[(String, String)]) -> Self {
+        let get = |k: &str| chips.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+        BlockMeta {
+            command: get("command").unwrap_or("").to_string(),
+            exit: get("exit").and_then(|s| s.parse().ok()),
+            cwd: get("cwd").map(|s| s.to_string()),
+            git: get("git").and_then(|s| serde_json::from_str(s).ok()),
+        }
+    }
+
+    /// The `BlockHeader` this metadata reconstructs for a restored block.
+    pub fn to_header(&self) -> BlockHeader {
+        BlockHeader { cwd: self.cwd.as_ref().map(PathBuf::from), git: self.git.clone() }
+    }
 }
 
 /// The per-pane vertical stack of [`Block`]s. The last element is
@@ -459,6 +526,7 @@ impl BlockStack {
             emit_cols,
             start_time_ms: started_ms,
             end_time_ms: now_ms,
+            meta: BlockMeta::from_block(&command, Some(exit), &header),
         };
 
         let sealed = Block::Sealed {
@@ -1020,7 +1088,15 @@ mod tests {
     #[test]
     fn with_restored_sealed_preserves_blocks_and_keeps_invariants() {
         let sealed: Vec<Block> = (0..3)
-            .map(|i| Block::restored_sealed(BlockId(i), vec![StyledLine::default()], 0, 100))
+            .map(|i| {
+                Block::restored_sealed(
+                    BlockId(i),
+                    vec![StyledLine::default()],
+                    0,
+                    100,
+                    BlockMeta::default(),
+                )
+            })
             .collect();
         let stack = BlockStack::with_restored_sealed(sealed);
         // 3 sealed + 1 fresh Prompt tail.
@@ -1042,7 +1118,15 @@ mod tests {
         // the identity on the sealed blocks (the live Prompt tail added by
         // the constructor is dropped again).
         let sealed: Vec<Block> = (0..3)
-            .map(|i| Block::restored_sealed(BlockId(i), vec![StyledLine::default()], 0, 50))
+            .map(|i| {
+                Block::restored_sealed(
+                    BlockId(i),
+                    vec![StyledLine::default()],
+                    0,
+                    50,
+                    BlockMeta::default(),
+                )
+            })
             .collect();
         let stack = BlockStack::with_restored_sealed(sealed);
         assert_eq!(stack.len(), 4, "3 sealed + 1 Prompt tail");
