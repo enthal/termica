@@ -76,6 +76,30 @@ pub fn encode_event(event: &egui::Event, modes: TerminalModes) -> Option<Vec<u8>
         egui::Event::Key { key, pressed: true, modifiers, .. } => {
             encode_key(*key, *modifiers, modes)
         }
+        // egui-winit on Linux maps Ctrl+C to Event::Copy (because
+        // `modifiers.command` is Ctrl there), swallowing the
+        // Event::Key that would normally produce 0x03 (ETX /
+        // SIGINT). When the caller has NOT claimed this as an
+        // app-level copy (Ctrl+Shift+C), the Copy event falls
+        // through to the encoder and we must emit the ETX byte so
+        // the PTY sees Ctrl+C.  macOS never reaches here — Cmd+C is
+        // claimed as copy above, and plain Ctrl+C still emits
+        // Event::Key.
+        egui::Event::Copy => {
+            if cfg!(not(target_os = "macos")) {
+                Some(vec![0x03])
+            } else {
+                None
+            }
+        }
+        // Same for Ctrl+X → Event::Cut → 0x18 (CAN).
+        egui::Event::Cut => {
+            if cfg!(not(target_os = "macos")) {
+                Some(vec![0x18])
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -564,6 +588,31 @@ mod tests {
             encode_event(&key_event(Key::C, just_ctrl()), default_modes()).unwrap(),
             vec![0x03]
         );
+    }
+
+    // --- Event::Copy / Event::Cut (Linux egui-winit workaround) ------
+
+    #[test]
+    fn event_copy_produces_etx_on_linux() {
+        // egui-winit on Linux swallows Ctrl+C into Event::Copy,
+        // so the encoder must emit 0x03 (ETX / SIGINT) for it.
+        let result = encode_event(&egui::Event::Copy, default_modes());
+        if cfg!(target_os = "macos") {
+            assert_eq!(result, None);
+        } else {
+            assert_eq!(result.unwrap(), vec![0x03]);
+        }
+    }
+
+    #[test]
+    fn event_cut_produces_can_on_linux() {
+        // Same: Ctrl+X → Event::Cut → 0x18 (CAN).
+        let result = encode_event(&egui::Event::Cut, default_modes());
+        if cfg!(target_os = "macos") {
+            assert_eq!(result, None);
+        } else {
+            assert_eq!(result.unwrap(), vec![0x18]);
+        }
     }
 
     // --- function keys ----------------------------------------------
