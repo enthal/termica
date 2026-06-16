@@ -55,7 +55,7 @@ Defined `type` values:
 | `prompt_vars` | object | Optional structured prompt metadata (git branch, virtualenv, etc.) for the native status header. |
 | `command_aborted` | reason string | User cancelled input before execution (Ctrl-C on empty editor, etc.). |
 | `shell_vars` | array of name strings | From the precmd hook (change-gated). The shell's current variable **names** — the source for `$VAR` tab completion. |
-| `completion` | array of `{"value":…, "description"?:…}` | Reply to a **live-shell completion** request Termica wrote to the PTY (fish only, v1). Carries the request `id`. See [§`completion`](#completion--live-shell-completion) and [04a §"Fish sidecar"](04a-completion.md). |
+| `completion` | array of raw completion-line strings | Reply to a **live-shell completion** request Termica wrote to the PTY (fish + zsh). Carries the request `id`. See [§`completion`](#completion--live-shell-completion) and [04a §"Fish sidecar"](04a-completion.md). |
 
 `prompt_vars` is intentionally open-ended — the shell sends whatever it can cheaply derive; Termica consumes the keys it knows about (`cwd`, `git_branch`, `git_dirty`, `venv`, etc.) and ignores the rest.
 
@@ -72,11 +72,16 @@ Consumed by [`PaneSession`](../src/pane.rs): the reported names supersede the sp
 
 #### `completion` — live-shell completion
 
-Unlike every other message (which the shell emits on its own lifecycle), `completion` is a **reply to a request Termica sends**. It exists so a fish pane can complete from its **own live shell** — picking up aliases / functions / abbreviations the user defined *interactively at runtime*, which a separate `fish -c 'complete -C'` subprocess can't see ([04a §"Fish sidecar"](04a-completion.md)). v1 is fish-only; bash/zsh keep the one-shot/persistent sidecar.
+Unlike every other message (which the shell emits on its own lifecycle), `completion` is a **reply to a request Termica sends**. It exists so a pane can complete from its **own live shell** — picking up aliases / functions the user defined *interactively at runtime*, which a separate subprocess can't see ([04a §"Fish sidecar"](04a-completion.md), [§"Zsh sidecar"](04a-completion.md)). Live in **fish and zsh**; bash keeps the local sources only.
 
-**Request (Termica → shell, over the PTY):** a single line `complete\t<id>\t<base64(line)>` + `\r` ([`crate::submit_framing::completion_request_bytes`](../src/submit_framing.rs)). The fish bootstrap's read-eval loop reads one line and splits on the first TAB: a leading `complete` field marks a completion request; anything else is a submitted command. A submitted command is pure base64 (alphabet `A–Za–z0–9+/=`, no TAB), so the two are **unambiguous on the wire**. The `line` is base64-encoded for the same reason commands are (spaces / quotes / multi-byte cross the cooked-mode tty cleanly, and the echo is dropped by `EchoSuppressor` — the embedded TABs suppress like any other byte). `id` correlates the reply.
+**Request (Termica → shell, over the PTY)** — the framing differs by shell, because the two run on different input models, but both produce a `completion` reply and both are **inert to the mode machine**:
 
-**Reply (shell → Termica):** `{"type":"completion","id":<n>,"value":[{"value":…,"description"?:…}, …]}`. The bootstrap runs `complete -C <line>` **in-process** (so runtime state is visible) and emits this marker, then loops straight back to `read` — it does **not** `eval`, and emits **no** `preexec`/`command_finished`/`precmd`. So a completion request runs no command and produces no block.
+- **fish** ([`completion_request_bytes`](../src/submit_framing.rs)): a single line `complete\t<id>\t<base64(line)>` + `\r`. fish runs non-interactively via a read-eval loop that reads one line and splits on the first TAB — a leading `complete` field marks a completion request; anything else is a submitted command (pure base64, alphabet `A–Za–z0–9+/=`, no TAB), so the two are **unambiguous on the wire**.
+- **zsh** ([`completion_request_bytes_zsh`](../src/submit_framing.rs)): a guarded command ` __termica_complete <id> <base64(line)>` + `\r`. zsh has **no** read-eval loop — it runs interactively (with `unsetopt zle`) and *executes* each input line — so the request is dispatched as a real command. The bootstrap's `termica_preexec` / `termica_precmd` recognise the `__termica_complete` sentinel and emit **nothing** for it (inert), a `zshaddhistory` hook keeps it out of history, and the function preserves the user's last `$?`. The leading space mirrors a "private" command.
+
+In both cases the `line` is base64-encoded so spaces / quotes / multi-byte cross the cooked-mode tty cleanly, with the echo dropped by `EchoSuppressor`. `id` correlates the reply.
+
+**Reply (shell → Termica):** `{"type":"completion","id":<n>,"value":[<line>, …]}` — a JSON array of the shell's **raw** completion lines (fish: `complete -C` output, `value\tdescription` or a space-padded table; zsh: value-only lines from the warm completion child). The split into value/description is done once, in Rust ([`parse_shell_complete`](../src/completion/drivers/parse.rs)), so the shells can't diverge. fish runs `complete -C <line>` **in-process** and loops straight back to `read`; zsh captures from a persistent `zsh/zpty` completion child driven by a real completion widget (see [04a §"Zsh sidecar"](04a-completion.md)). Neither `eval`s the user's line, and neither emits `preexec` / `command_finished` / `precmd` — so a completion request runs no command and produces no block.
 
 Two invariants are normative:
 
