@@ -202,35 +202,41 @@ pub struct PaneSession {
     /// [`Self::spawn`] path used by tests; [`Self::spawn_managed`] sets the
     /// real shell.
     shell: ShellSpec,
-    /// In-flight fish **live-shell** completion request, if any. Fish at a
-    /// prompt answers completion from its OWN process (so runtime-defined
-    /// aliases / functions complete — a one-shot subprocess can't see them)
-    /// via a PTY request; this holds the correlation `id` (echoed in the
-    /// reply marker, so a superseded request's late reply is dropped) and
-    /// the wall-clock send time (for the timeout fallback). At most one at a
-    /// time — a newer Tab/keystroke supersedes it with a fresh id.
-    fish_live: Option<FishLiveCompletion>,
-    /// A resolved fish live-shell reply, awaiting [`Self::completion_driver_poll`].
+    /// In-flight **live-shell** completion request, if any. A fish or zsh
+    /// pane at a prompt answers completion from its OWN shell (so runtime-
+    /// defined aliases / functions complete — a one-shot subprocess can't
+    /// see them) via a PTY request; this holds the correlation `id` (echoed
+    /// in the reply marker, so a superseded request's late reply is dropped),
+    /// the wall-clock send time (for the timeout fallback), and the
+    /// originating tool (so the reply's candidates get the right source tag,
+    /// `fish` / `zsh`). At most one at a time — a newer Tab/keystroke
+    /// supersedes it with a fresh id.
+    live_completion: Option<LiveCompletion>,
+    /// A resolved live-shell reply, awaiting [`Self::completion_driver_poll`].
     /// Set when the correlated `completion` marker lands in [`Self::drain`].
-    fish_live_response: Option<DriverResponse>,
-    /// Monotonic id source for fish live-shell completion requests.
-    next_fish_live_id: u64,
+    live_completion_response: Option<DriverResponse>,
+    /// Monotonic id source for live-shell completion requests.
+    next_live_completion_id: u64,
 }
 
-/// Bookkeeping for an in-flight fish live-shell completion request
-/// ([`PaneSession::fish_live`]).
-struct FishLiveCompletion {
+/// Bookkeeping for an in-flight live-shell completion request
+/// ([`PaneSession::live_completion`]).
+struct LiveCompletion {
     /// Correlation id, echoed back in the `completion` marker.
     id: u64,
     /// Wall-clock send time (ms), for the timeout fallback.
     sent_ms: i64,
+    /// The tool that issued the request ([`DriverTool::FishComplete`] /
+    /// [`DriverTool::ZshComplete`]), so the reply candidates are tagged with
+    /// the right source.
+    tool: DriverTool,
 }
 
-/// Wall-clock deadline for a fish live-shell completion reply. The live
-/// `complete -C` runs in-process and answers in ~ms; this only guards a
+/// Wall-clock deadline for a live-shell completion reply. fish's `complete -C`
+/// and zsh's warm completion child both answer in ~ms; this only guards a
 /// hung shell or a dropped marker — on expiry we fall back to the local
 /// candidates rather than spin forever.
-const FISH_LIVE_TIMEOUT_MS: i64 = 600;
+const LIVE_COMPLETION_TIMEOUT_MS: i64 = 600;
 
 /// Choose the `$VAR`-completion name source: the shell's live report
 /// (`shell`) when it has arrived, else the spawn-time `snapshot`. Pure so
@@ -313,9 +319,9 @@ impl PaneSession {
             last_git_branch: None,
             shell_var_names: None,
             shell: ShellSpec::Zsh,
-            fish_live: None,
-            fish_live_response: None,
-            next_fish_live_id: 0,
+            live_completion: None,
+            live_completion_response: None,
+            next_live_completion_id: 0,
         })
     }
 
@@ -440,10 +446,10 @@ impl PaneSession {
         self.controller.tick_bootstrap_timeout(self.frame);
         self.record_pending_transitions();
 
-        // Time out a fish live-shell completion request the shell never
+        // Time out a live-shell completion request the shell never
         // answered (hung / dropped marker), so the popup falls back to
         // locals instead of spinning. No-op when none is in flight.
-        self.tick_fish_live_timeout(wall_clock_ms());
+        self.tick_live_completion_timeout(wall_clock_ms());
 
         // Sync the controller's alt-screen view BEFORE any
         // lifecycle event runs. The bytes above may have toggled
@@ -484,10 +490,10 @@ impl PaneSession {
             if let crate::markers::LifecycleEvent::ShellVars { names } = &event {
                 self.shell_var_names = Some(names.clone());
             }
-            // Fish live-shell completion reply: correlate to the in-flight
-            // request and stash the candidates for `completion_driver_poll`.
-            // Cloned out before `observe_event` consumes the event below;
-            // it's inert to the mode machine (spec/05).
+            // Live-shell completion reply (fish or zsh): correlate to the
+            // in-flight request and stash the candidates for
+            // `completion_driver_poll`. Cloned out before `observe_event`
+            // consumes the event below; it's inert to the mode machine (spec/05).
             if let crate::markers::LifecycleEvent::Completion { id, lines } = &event {
                 self.ingest_live_completion(*id, lines);
             }
@@ -877,12 +883,17 @@ impl PaneSession {
         target: (DriverTool, String, usize),
     ) {
         let (tool, line) = (target.0, target.1.clone());
-        // Live-shell path: a fish pane sitting at a prompt with confirmed
-        // integration answers from its OWN shell (so it sees aliases /
-        // functions defined at runtime), via a PTY request rather than a
-        // one-shot subprocess. The reply lands as a `completion` marker.
-        if tool == DriverTool::FishComplete && self.fish_live_capable() {
-            self.fish_live_complete_request(line);
+        // Live-shell path: a fish or zsh pane sitting at a prompt with
+        // confirmed integration answers from its OWN shell (so it sees
+        // aliases / functions defined at runtime), via a PTY request rather
+        // than a one-shot subprocess. The reply lands as a `completion`
+        // marker. `ZshComplete` has no one-shot form at all, so it MUST take
+        // this path; `FishComplete` falls through to the subprocess engine
+        // when the fish pane isn't live-capable (degraded integration).
+        if matches!(tool, DriverTool::FishComplete | DriverTool::ZshComplete)
+            && self.live_completion_capable()
+        {
+            self.live_completion_request(tool, line);
             return;
         }
         // Fallback: the one-shot subprocess engine — non-fish panes, or a
@@ -897,10 +908,10 @@ impl PaneSession {
 
     /// Drain freshly-arrived driver candidates for the current in-flight
     /// request, if any. The renderer merges them into the open popup.
-    /// A resolved fish live-shell reply takes precedence over the one-shot
-    /// engine (for a fish pane at a prompt the engine is never spawned).
+    /// A resolved live-shell reply takes precedence over the one-shot
+    /// engine (for a fish / zsh pane at a prompt the engine is never spawned).
     pub fn completion_driver_poll(&mut self) -> Option<DriverResponse> {
-        if let Some(resp) = self.fish_live_response.take() {
+        if let Some(resp) = self.live_completion_response.take() {
             // The `DriverResult` event was already recorded when the marker
             // landed (`ingest_live_completion`), so don't double-record.
             return Some(resp);
@@ -916,12 +927,13 @@ impl PaneSession {
         resp
     }
 
-    /// True when this pane can answer completion from its **live** fish
-    /// shell: it's a fish pane, sitting at a prompt (`ShellPromptEditor`),
-    /// with shell integration confirmed. Only then is the bootstrap's
-    /// read-eval loop waiting to service a completion request.
-    fn fish_live_capable(&self) -> bool {
-        self.shell == ShellSpec::Fish
+    /// True when this pane can answer completion from its **live** shell:
+    /// it's a fish OR zsh pane, sitting at a prompt (`ShellPromptEditor`),
+    /// with shell integration confirmed. Only then is the bootstrap ready to
+    /// service a completion request (fish's read-eval loop; zsh's
+    /// `__termica_complete` sentinel + warm completion child).
+    fn live_completion_capable(&self) -> bool {
+        matches!(self.shell, ShellSpec::Fish | ShellSpec::Zsh)
             && self.controller.mode() == PaneMode::ShellPromptEditor
             && matches!(
                 self.controller.integration(),
@@ -929,60 +941,60 @@ impl PaneSession {
             )
     }
 
-    /// Write a live-shell completion request for `line` to the PTY. Assigns
-    /// a fresh correlation id (superseding any in-flight request — its late
-    /// reply will be dropped on id-mismatch), primes echo suppression for
-    /// the request bytes (so the tty's echo of them never reaches the grid,
-    /// exactly like a submitted command), and writes. On PTY-write failure
-    /// it leaves no in-flight request, so the popup falls back to locals.
-    fn fish_live_complete_request(&mut self, line: String) {
-        let id = self.next_fish_live_id;
-        self.next_fish_live_id = self.next_fish_live_id.wrapping_add(1);
-        let bytes = crate::submit_framing::completion_request_bytes(id, &line);
+    /// Write a live-shell completion request for `line` to the PTY, framed
+    /// for the pane's shell (`tool` is [`DriverTool::FishComplete`] or
+    /// [`DriverTool::ZshComplete`]). Assigns a fresh correlation id
+    /// (superseding any in-flight request — its late reply is dropped on
+    /// id-mismatch), primes echo suppression for the request bytes (so the
+    /// tty's echo of them never reaches the grid, exactly like a submitted
+    /// command), and writes. On PTY-write failure it leaves no in-flight
+    /// request, so the popup falls back to locals.
+    fn live_completion_request(&mut self, tool: DriverTool, line: String) {
+        let id = self.next_live_completion_id;
+        self.next_live_completion_id = self.next_live_completion_id.wrapping_add(1);
+        let bytes = crate::submit_framing::completion_request_bytes_for(self.shell, id, &line);
         self.terminal.prime_echo_suppression(&bytes);
         if self.pty.write(&bytes).is_err() {
             return;
         }
-        self.fish_live = Some(FishLiveCompletion { id, sent_ms: wall_clock_ms() });
-        self.record_completion(&CompletionEvent::DriverRequest {
-            tool: DriverTool::FishComplete,
-            line,
-            cache_hit: false,
-        });
+        self.live_completion = Some(LiveCompletion { id, sent_ms: wall_clock_ms(), tool });
+        self.record_completion(&CompletionEvent::DriverRequest { tool, line, cache_hit: false });
     }
 
     /// Correlate a `completion` reply marker to the in-flight request and
     /// stash its candidates for [`Self::completion_driver_poll`]. A reply
     /// whose `id` doesn't match the current request (a superseded request's
-    /// late answer) is dropped. The reply carries the **raw** `complete -C`
-    /// lines; parsing into candidates uses the one shared fish parser, so
-    /// the live and one-shot paths handle tabs / padded columns identically.
+    /// late answer) is dropped. The reply carries the **raw** shell lines;
+    /// parsing uses the one shared parser tagged with the originating tool,
+    /// so the fish and zsh paths handle tabs / padded columns identically.
     fn ingest_live_completion(&mut self, id: u64, lines: &[String]) {
-        if self.fish_live.as_ref().map(|f| f.id) != Some(id) {
+        let Some(req) = self.live_completion.as_ref().filter(|f| f.id == id) else {
             return;
-        }
-        self.fish_live = None;
-        let candidates = crate::completion::drivers::parse::parse_fish_complete(&lines.join("\n"));
+        };
+        let tool = req.tool;
+        self.live_completion = None;
+        let candidates =
+            crate::completion::drivers::parse::parse_shell_complete(&lines.join("\n"), tool);
         self.record_completion(&CompletionEvent::DriverResult {
-            tool: DriverTool::FishComplete,
+            tool,
             candidates: candidates.len(),
             cache_hit: false,
         });
-        self.fish_live_response = Some(DriverResponse::live(DriverTool::FishComplete, candidates));
+        self.live_completion_response = Some(DriverResponse::live(tool, candidates));
     }
 
     /// Drop an in-flight live-shell request the shell never answered within
-    /// [`FISH_LIVE_TIMEOUT_MS`], synthesizing an empty result so the popup
-    /// resolves to its local candidates instead of spinning. `now_ms` is
-    /// passed in (not read from a clock) so the logic is deterministic in
+    /// [`LIVE_COMPLETION_TIMEOUT_MS`], synthesizing an empty result so the
+    /// popup resolves to its local candidates instead of spinning. `now_ms`
+    /// is passed in (not read from a clock) so the logic is deterministic in
     /// tests. No-op when nothing is in flight.
-    fn tick_fish_live_timeout(&mut self, now_ms: i64) {
-        if let Some(f) = &self.fish_live
-            && now_ms.saturating_sub(f.sent_ms) >= FISH_LIVE_TIMEOUT_MS
+    fn tick_live_completion_timeout(&mut self, now_ms: i64) {
+        if let Some(f) = &self.live_completion
+            && now_ms.saturating_sub(f.sent_ms) >= LIVE_COMPLETION_TIMEOUT_MS
         {
-            self.fish_live = None;
-            self.fish_live_response =
-                Some(DriverResponse::live(DriverTool::FishComplete, Vec::new()));
+            let tool = f.tool;
+            self.live_completion = None;
+            self.live_completion_response = Some(DriverResponse::live(tool, Vec::new()));
         }
     }
 
@@ -1635,29 +1647,30 @@ mod tests {
         assert!(!view.alt_screen);
     }
 
-    // ---- fish live-shell completion wiring ---------------------------
+    // ---- live-shell completion wiring (fish + zsh) -------------------
 
     #[test]
     fn fish_live_reply_correlates_by_id() {
         let mut session =
             PaneSession::spawn(5, 40, &sh_c("sleep 0.1"), "t".into(), 0, None).expect("spawn");
-        // Simulate an in-flight request with id 5.
-        session.fish_live = Some(FishLiveCompletion { id: 5, sent_ms: 0 });
+        // Simulate an in-flight fish request with id 5.
+        session.live_completion =
+            Some(LiveCompletion { id: 5, sent_ms: 0, tool: DriverTool::FishComplete });
 
         // A reply for a DIFFERENT id (a superseded request) is dropped.
         session.ingest_live_completion(9, &["stale".to_string()]);
-        assert!(session.fish_live_response.is_none(), "mismatched id is ignored");
-        assert!(session.fish_live.is_some(), "in-flight request still pending");
+        assert!(session.live_completion_response.is_none(), "mismatched id is ignored");
+        assert!(session.live_completion.is_some(), "in-flight request still pending");
 
         // The matching reply resolves and clears the in-flight marker. The
-        // raw `complete -C` lines are parsed by the shared fish parser
+        // raw `complete -C` lines are parsed by the shared parser
         // (here fish's normal `value\tdescription` form, including a
         // runtime alias's description).
         session.ingest_live_completion(
             5,
             &["hello\talias hello=echo HI".to_string(), "help\tDisplay help".to_string()],
         );
-        assert!(session.fish_live.is_none(), "in-flight cleared on a correlated reply");
+        assert!(session.live_completion.is_none(), "in-flight cleared on a correlated reply");
         let resp = session.completion_driver_poll().expect("a response is available");
         assert_eq!(resp.tool, DriverTool::FishComplete);
         assert_eq!(resp.candidates.len(), 2);
@@ -1673,22 +1686,58 @@ mod tests {
     }
 
     #[test]
-    fn fish_live_timeout_falls_back_to_empty_response() {
+    fn zsh_live_reply_correlates_by_id_and_tags_zsh() {
+        // The same live-completion plumbing serves a zsh pane: a reply
+        // carrying the warm child's raw value-only lines is correlated by id
+        // and the candidates are tagged `ZshComplete` (so the popup shows the
+        // `zsh` source chip), NOT `FishComplete`.
         let mut session =
             PaneSession::spawn(5, 40, &sh_c("sleep 0.1"), "t".into(), 0, None).expect("spawn");
-        session.fish_live = Some(FishLiveCompletion { id: 1, sent_ms: 1_000 });
+        session.live_completion =
+            Some(LiveCompletion { id: 2, sent_ms: 0, tool: DriverTool::ZshComplete });
+
+        // Mismatched id dropped.
+        session.ingest_live_completion(1, &["nope".to_string()]);
+        assert!(session.live_completion.is_some(), "in-flight still pending after mismatch");
+
+        // zsh v1 emits VALUES ONLY (no `\t` descriptions) — runtime alias
+        // included.
+        session.ingest_live_completion(
+            2,
+            &["greethere".to_string(), "grep".to_string(), "groups".to_string()],
+        );
+        assert!(session.live_completion.is_none());
+        let resp = session.completion_driver_poll().expect("a response is available");
+        assert_eq!(resp.tool, DriverTool::ZshComplete);
+        assert_eq!(resp.candidates.len(), 3);
+        assert_eq!(resp.candidates[0].value, "greethere", "runtime alias completes");
+        assert_eq!(resp.candidates[0].description, None, "values-only in v1");
+        assert_eq!(
+            resp.candidates[0].source,
+            crate::completion::CompletionSource::Driver(DriverTool::ZshComplete)
+        );
+    }
+
+    #[test]
+    fn live_completion_timeout_falls_back_to_empty_response_tagged_by_tool() {
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c("sleep 0.1"), "t".into(), 0, None).expect("spawn");
+        session.live_completion =
+            Some(LiveCompletion { id: 1, sent_ms: 1_000, tool: DriverTool::ZshComplete });
 
         // Before the deadline: still in flight, no fallback.
-        session.tick_fish_live_timeout(1_000 + FISH_LIVE_TIMEOUT_MS - 1);
-        assert!(session.fish_live.is_some(), "not yet timed out");
-        assert!(session.fish_live_response.is_none());
+        session.tick_live_completion_timeout(1_000 + LIVE_COMPLETION_TIMEOUT_MS - 1);
+        assert!(session.live_completion.is_some(), "not yet timed out");
+        assert!(session.live_completion_response.is_none());
 
-        // At the deadline: drop the request and synthesize an empty result
-        // so the popup resolves to its locals instead of spinning.
-        session.tick_fish_live_timeout(1_000 + FISH_LIVE_TIMEOUT_MS);
-        assert!(session.fish_live.is_none(), "timed-out request dropped");
+        // At the deadline: drop the request and synthesize an empty result so
+        // the popup resolves to its locals instead of spinning. The empty
+        // fallback keeps the originating tool's tag.
+        session.tick_live_completion_timeout(1_000 + LIVE_COMPLETION_TIMEOUT_MS);
+        assert!(session.live_completion.is_none(), "timed-out request dropped");
         let resp = session.completion_driver_poll().expect("empty fallback response");
         assert!(resp.candidates.is_empty(), "fallback carries no candidates");
+        assert_eq!(resp.tool, DriverTool::ZshComplete);
     }
 
     // ---- block stack wiring ------------------------------------------

@@ -105,6 +105,9 @@ pub fn parse_for(tool: DriverTool, stdout: &str, line: &str) -> Vec<CompletionCa
         DriverTool::Aws => parse_aws_completer(stdout),
         DriverTool::Git => parse_git_list_cmds(stdout, last_word(line)),
         DriverTool::FishComplete => parse_fish_complete(stdout),
+        // Defensive: zsh completion is live-only (no one-shot worker path),
+        // but keep the parser total. Same shape as fish, tagged `zsh`.
+        DriverTool::ZshComplete => parse_shell_complete(stdout, DriverTool::ZshComplete),
     }
 }
 
@@ -125,7 +128,18 @@ pub fn parse_for(tool: DriverTool, stdout: &str, line: &str) -> Vec<CompletionCa
 /// In both cases the candidate *value* is just the first column, so
 /// accepting inserts `deployments`, never the whole padded row.
 pub fn parse_fish_complete(stdout: &str) -> Vec<CompletionCandidate> {
-    let source = CompletionSource::Driver(DriverTool::FishComplete);
+    parse_shell_complete(stdout, DriverTool::FishComplete)
+}
+
+/// Parse a live-shell completion reply, tagging each candidate with `tool`.
+///
+/// Shared by the fish (`complete -C`) and zsh (warm completion child)
+/// live-shell paths: the on-the-wire shape — `value\tdescription` lines, or a
+/// space-padded fixed-width table — is identical, so the split into
+/// value/description is done ONCE here and the two shells can't diverge. Only
+/// the `tool` (and thus the popup's source tag, `fish` / `zsh`) differs.
+pub fn parse_shell_complete(stdout: &str, tool: DriverTool) -> Vec<CompletionCandidate> {
+    let source = CompletionSource::Driver(tool);
     let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
 
     if lines.iter().any(|l| l.contains('\t')) {

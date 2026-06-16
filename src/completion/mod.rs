@@ -276,10 +276,16 @@ pub fn plan_completion(
 /// only knows on-disk executables); the driver result merges with the
 /// local sources so a command on both collapses to one row.
 ///
-/// Every other shell keeps the per-tool driver path, which fires only for
-/// the handful of commands with a known `__complete` endpoint and only in
-/// argument position; there, the command name stays with the local `$PATH`
-/// source.
+/// A **zsh** pane keeps the per-tool cobra drivers AUTHORITATIVE for the
+/// commands that have a robust `__complete` endpoint (`gh` / `git` /
+/// `kubectl` / …) — those are reliable and already shipped, and we don't
+/// want to route them through the comparatively fragile shell-capture. For
+/// everything else — the long tail of aliases, functions, built-ins, and
+/// tools with shell-installed completions — zsh routes to its live-shell
+/// completion (command *and* argument position, like fish), so the user's
+/// own completions work. The capture is values-only in v1.
+///
+/// **bash** keeps the per-tool driver path only (no sidecar yet).
 fn driver_target_for_shell(
     editor_text: &str,
     cursor: usize,
@@ -290,7 +296,16 @@ fn driver_target_for_shell(
             let (line, point) = drivers::parse::fish_segment(editor_text, cursor)?;
             Some((DriverTool::FishComplete, line, point))
         }
-        ShellSpec::Zsh | ShellSpec::Bash => drivers::parse::driver_target(editor_text, cursor),
+        ShellSpec::Zsh => {
+            // Cobra drivers win for the tools that have them.
+            if let Some(target) = drivers::parse::driver_target(editor_text, cursor) {
+                return Some(target);
+            }
+            // Long tail → the live zsh shell (command + argument position).
+            let (line, point) = drivers::parse::fish_segment(editor_text, cursor)?;
+            Some((DriverTool::ZshComplete, line, point))
+        }
+        ShellSpec::Bash => drivers::parse::driver_target(editor_text, cursor),
     }
 }
 
@@ -562,10 +577,14 @@ mod tests {
     #[test]
     fn plan_non_driver_command_opens_locals_immediately() {
         // `ls ` (not a driver) with a file → open the local list now,
-        // no waiting.
+        // no waiting. Uses a **bash** pane: bash keeps the per-tool driver
+        // path only (no sidecar), so a non-cobra command opens locals
+        // immediately. (In a zsh pane `ls ` now routes to the live shell —
+        // covered by the zsh routing tests.)
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("notes.txt"), b"").unwrap();
-        let plan = plan_completion("ls ", 3, Some(dir.path()), None, &[], ShellSpec::Zsh, Vec::new);
+        let plan =
+            plan_completion("ls ", 3, Some(dir.path()), None, &[], ShellSpec::Bash, Vec::new);
         match plan {
             CompletionPlan::Open(popup) => {
                 assert!(popup.candidates.iter().any(|c| c.display.ends_with("notes.txt")));
@@ -576,6 +595,8 @@ mod tests {
 
     #[test]
     fn plan_non_driver_no_local_match_is_closed() {
+        // bash pane, non-cobra command, no local match → nothing. (zsh would
+        // instead await the live shell — see the zsh routing tests.)
         let dir = tempfile::tempdir().unwrap();
         let plan = plan_completion(
             "ls zzz_no_such",
@@ -583,7 +604,7 @@ mod tests {
             Some(dir.path()),
             None,
             &[],
-            ShellSpec::Zsh,
+            ShellSpec::Bash,
             Vec::new,
         );
         assert!(matches!(plan, CompletionPlan::Closed), "no driver, no match → nothing");
@@ -613,8 +634,9 @@ mod tests {
             other => panic!("expected AwaitDriver(FishComplete), got {other:?}"),
         }
 
-        // Same input in a zsh pane: no driver for `frobnicate`, so it does
-        // NOT await — the routing is shell-specific.
+        // Same input in a zsh pane: `frobnicate` has no cobra driver, so it
+        // routes to the zsh LIVE shell (the long tail) — `ZshComplete`, not
+        // `FishComplete`. The routing is shell-specific.
         let zsh = plan_completion(
             "frobnicate --wi",
             15,
@@ -624,9 +646,54 @@ mod tests {
             ShellSpec::Zsh,
             Vec::new,
         );
+        match zsh {
+            CompletionPlan::AwaitDriver { target, .. } => {
+                assert_eq!(target.0, DriverTool::ZshComplete);
+                assert_eq!(target.1, "frobnicate --wi");
+            }
+            other => panic!("expected AwaitDriver(ZshComplete) for zsh long tail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_zsh_cobra_tool_stays_authoritative_over_shell_capture() {
+        // A zsh pane keeps the robust cobra driver for `git` — it must NOT
+        // route `git ch` through the fragile shell capture. (Decision: cobra
+        // authoritative, zsh shell for the long tail only.)
+        let dir = tempfile::tempdir().unwrap();
+        let plan =
+            plan_completion("git ch", 6, Some(dir.path()), None, &[], ShellSpec::Zsh, Vec::new);
+        match plan {
+            CompletionPlan::AwaitDriver { target, .. } => {
+                assert_eq!(target.0, DriverTool::Git, "cobra git driver wins, not ZshComplete");
+            }
+            other => panic!("expected AwaitDriver(Git), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_zsh_command_position_long_tail_routes_to_shell_capture() {
+        // Typing a command NAME with no cobra driver in a zsh pane awaits the
+        // live zsh shell — that's what lets runtime aliases / functions
+        // complete (the local `$PATH` source can't see them).
+        let dir = tempfile::tempdir().unwrap();
+        let plan =
+            plan_completion("greethe", 7, Some(dir.path()), None, &[], ShellSpec::Zsh, Vec::new);
+        match plan {
+            CompletionPlan::AwaitDriver { target, .. } => {
+                assert_eq!(target.0, DriverTool::ZshComplete);
+                assert_eq!(target.1, "greethe");
+            }
+            other => {
+                panic!("expected AwaitDriver(ZshComplete) for the command name, got {other:?}")
+            }
+        }
+
+        // But an empty editor must NOT fire a capture request.
+        let empty = plan_completion("", 0, Some(dir.path()), None, &[], ShellSpec::Zsh, Vec::new);
         assert!(
-            !matches!(zsh, CompletionPlan::AwaitDriver { .. }),
-            "zsh has no driver for an unknown command; got {zsh:?}"
+            !matches!(empty, CompletionPlan::AwaitDriver { .. }),
+            "empty editor must not flood the zsh shell, got {empty:?}"
         );
     }
 

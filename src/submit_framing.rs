@@ -86,6 +86,47 @@ pub fn completion_request_bytes(id: u64, line: &str) -> Vec<u8> {
     bytes
 }
 
+/// The exact bytes to write to the PTY to ask a **zsh** pane's live shell
+/// to complete `line` ([spec/03 §completion](../spec/03-shell-integration.md)).
+///
+/// zsh — unlike fish — has no Termica read-eval loop to field a framed
+/// request: it runs as a real interactive shell (with `unsetopt zle`) that
+/// *executes* each input line as a command. So the request is dispatched as
+/// a real, guarded command: `__termica_complete <id> <base64(line)>`. The
+/// bootstrap's function base64-decodes the line, drives the warm completion
+/// child, and emits the `completion` reply marker — while `termica_preexec`
+/// / `termica_precmd` recognise the sentinel and stay inert (no preexec /
+/// command_finished / precmd), so it never perturbs the block model or the
+/// pane-mode machine (spec/05).
+///
+/// The leading space mirrors a hand-typed "keep this private" command; the
+/// bootstrap's `zshaddhistory` hook is what actually drops the synthetic
+/// request from the user's shell history (up-arrow / `Ctrl+R` / `fc`).
+///
+/// `id` correlates the reply (a superseded request's late answer is
+/// dropped); `line` is base64-encoded so spaces / quotes / multi-byte bytes
+/// cross the cooked-mode tty cleanly, with the kernel echo dropped by
+/// `EchoSuppressor` exactly like a submitted command.
+pub fn completion_request_bytes_zsh(id: u64, line: &str) -> Vec<u8> {
+    // Leading space → kept out of history via `hist_ignore_space`.
+    let mut bytes = format!(" __termica_complete {id} ").into_bytes();
+    bytes.extend_from_slice(base64_encode(line.as_bytes()).as_bytes());
+    bytes.push(b'\r');
+    bytes
+}
+
+/// The live-shell completion request bytes for `shell` — fish's tab-framed
+/// `complete\t…` read-loop request, or zsh's guarded `__termica_complete`
+/// command. Bash has no live path yet, so it borrows zsh's framing only as a
+/// harmless default (a bash pane is never `live_completion_capable`, so this
+/// is never written); kept total so callers don't branch.
+pub fn completion_request_bytes_for(shell: ShellSpec, id: u64, line: &str) -> Vec<u8> {
+    match shell {
+        ShellSpec::Fish => completion_request_bytes(id, line),
+        ShellSpec::Zsh | ShellSpec::Bash => completion_request_bytes_zsh(id, line),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +201,48 @@ mod tests {
         }
         let req = completion_request_bytes(1, "anything\twith\ttabs");
         assert!(req.starts_with(b"complete\t"), "a request always leads with `complete\\t`");
+    }
+
+    #[test]
+    fn zsh_completion_request_is_a_guarded_sentinel_command() {
+        // zsh executes the line as a command, so the request IS a command:
+        // ` __termica_complete <id> <base64("git che")>` + CR. base64("git che")
+        // == "Z2l0IGNoZQ==". The LEADING SPACE keeps it out of history (paired
+        // with the bootstrap's `hist_ignore_space`).
+        let req = completion_request_bytes_zsh(7, "git che");
+        assert_eq!(req, b" __termica_complete 7 Z2l0IGNoZQ==\r");
+        assert_eq!(req[0], b' ', "leading space → hist_ignore_space keeps it out of history");
+        assert_eq!(req.last(), Some(&b'\r'));
+    }
+
+    #[test]
+    fn zsh_completion_request_has_no_embedded_newline() {
+        // A multi-byte / spacey line still rides one tty line (base64), so the
+        // sentinel command is never split across reads.
+        let req = completion_request_bytes_zsh(3, "echo 'a b'\tx\né");
+        assert!(
+            !req[..req.len() - 1].contains(&b'\n'),
+            "no embedded newline before the CR: {req:?}"
+        );
+        assert!(req.starts_with(b" __termica_complete 3 "));
+    }
+
+    #[test]
+    fn completion_request_for_dispatches_by_shell() {
+        // fish → tab-framed read-loop request; zsh → guarded sentinel command.
+        assert!(
+            completion_request_bytes_for(ShellSpec::Fish, 1, "git che").starts_with(b"complete\t")
+        );
+        assert!(
+            completion_request_bytes_for(ShellSpec::Zsh, 1, "git che")
+                .starts_with(b" __termica_complete ")
+        );
+        // The two framings are distinct on the wire — a zsh request never
+        // looks like a fish request and vice-versa.
+        assert_ne!(
+            completion_request_bytes_for(ShellSpec::Fish, 1, "x"),
+            completion_request_bytes_for(ShellSpec::Zsh, 1, "x")
+        );
     }
 
     #[test]
