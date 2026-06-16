@@ -258,21 +258,51 @@ pub fn fish_segment(editor_text: &str, cursor: usize) -> Option<(String, usize)>
     Some((segment.to_string(), segment.len()))
 }
 
-/// Parse cobra's `__complete` stdout: one `value\tdescription` per line
-/// (description optional), terminated by a `:N` directive line we ignore.
-/// kubectl's *resource* completion deviates from the tab convention and
-/// pads columns with spaces instead, so a run of two or more spaces is
-/// also accepted as the value/description boundary (cobra completion
-/// values never contain spaces).
+/// Parse cobra's `__complete` stdout, terminated by a `:N` directive line
+/// we ignore. Two on-the-wire shapes, auto-detected:
+///
+/// - **Tab-separated** (`value\tdescription`, cobra's normal output — gh,
+///   kubectl subcommands): the description is free prose (may contain
+///   spaces) and stays a single cell, split on the first tab.
+/// - **Space-padded fixed-width table** (no tabs — kubectl's *resource*
+///   completion, which dumps `api-resources`-style columns): detect the
+///   column boundaries across ALL rows and keep empty cells (e.g. a
+///   resource with no short name), encoding the description columns
+///   `\t`-joined so the popup ([`crate::completion::popup`]) splits them to
+///   align by index. A naive split-on-the-first-space-run would fold the
+///   whole padded remainder into one cell and misalign rows whose
+///   short-name column is blank.
+///
+/// In both shapes the candidate *value* is just the first column, so
+/// accepting inserts `pods`, never the whole padded row.
 pub fn parse_cobra_complete(stdout: &str, tool: DriverTool) -> Vec<CompletionCandidate> {
     let source = CompletionSource::Driver(tool);
-    stdout
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter(|l| !l.starts_with(':'))
-        .map(|line| match split_value_desc(line) {
-            (value, Some(desc)) => CompletionCandidate::with_description(value, desc, source),
-            (value, None) => CompletionCandidate::simple(value, source),
+    let lines: Vec<&str> =
+        stdout.lines().filter(|l| !l.trim().is_empty()).filter(|l| !l.starts_with(':')).collect();
+
+    if lines.iter().any(|l| l.contains('\t')) {
+        return lines
+            .iter()
+            .map(|line| match split_value_desc(line) {
+                (value, Some(desc)) => CompletionCandidate::with_description(value, desc, source),
+                (value, None) => CompletionCandidate::simple(value, source),
+            })
+            .collect();
+    }
+
+    split_table_columns(&lines)
+        .into_iter()
+        .filter_map(|cells| {
+            let (value, desc_cells) = cells.split_first()?;
+            if value.is_empty() {
+                return None;
+            }
+            if desc_cells.iter().all(String::is_empty) {
+                Some(CompletionCandidate::simple(value, source))
+            } else {
+                // `\t`-join so the popup preserves empty cells by index.
+                Some(CompletionCandidate::with_description(value, desc_cells.join("\t"), source))
+            }
         })
         .collect()
 }
@@ -379,6 +409,34 @@ mod tests {
         let pods = cands.iter().find(|c| c.value == "pods").expect("pods present");
         assert_eq!(pods.value, "pods");
         assert_eq!(pods.source, CompletionSource::Driver(DriverTool::Kubectl));
+    }
+
+    #[test]
+    fn cobra_parse_kubectl_resources_keep_empty_short_name_cell_for_alignment() {
+        // kubectl's space-padded resource table has a SHORTNAMES column that
+        // is blank for some resources (e.g. podtemplates). The description
+        // must be split into the same per-column cells for every row, with
+        // the empty short-name cell PRESERVED — so the popup aligns the
+        // api-version / namespaced / kind columns across rows. Regression:
+        // the whole padded remainder used to become one cell, so a row with a
+        // blank short name shifted its later columns left and misaligned.
+        let cands = parse_cobra_complete(KUBECTL_RESOURCES, DriverTool::Kubectl);
+        let cells = |value: &str| -> Vec<String> {
+            cands
+                .iter()
+                .find(|c| c.value == value)
+                .and_then(|c| c.description.clone())
+                .unwrap_or_default()
+                .split('\t')
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(cells("pods"), ["po", "v1", "true", "Pod"]);
+        assert_eq!(
+            cells("podtemplates"),
+            ["", "v1", "true", "PodTemplate"],
+            "the empty short-name cell is preserved so later columns stay aligned"
+        );
     }
 
     #[test]
