@@ -206,7 +206,7 @@ Replay is **never allowed to block startup**. If the data dir can't be resolved 
 
 ### Why no foreign-key cascades for chunks
 
-A scrollback chunk on disk has a longer life than its row should imply: if SQLite is corrupted or rolled back, the chunk file is still good. We do not let SQLite cascade-delete chunks. Cleanup is a separate `Persistence::gc()` pass ([`src/persist/gc.rs`](../src/persist/gc.rs)) that runs on startup, off the UI thread, and is **liveness-aware**: for each session it *tries to take the session's ownership lock* (§"Concurrent processes"); a held lock means the session is live (this or another process), and its chunks are never touched. Against the non-live remainder it, in order:
+A scrollback chunk on disk has a longer life than its row should imply: if SQLite is corrupted or rolled back, the chunk file is still good. We do not let SQLite cascade-delete chunks. Cleanup is a separate `Persistence::gc()` pass ([`src/persist/gc.rs`](../src/persist/gc.rs)) that runs on startup, off the UI thread, and is **liveness-aware**. Liveness is a property of the **pane**, not of the session that authored a chunk: restart reuses the pane row under a *new* session (§"Restart"), so an old session's chunks belong to a pane that may be live right now and still able to re-page them. For each pane, gc resolves its **current (latest) session** and *tries to take that session's ownership lock* (§"Concurrent processes"); a held lock means the pane is live (this or another process), and **none** of that pane's chunks — across every session it has ever had — are touched. Against the chunks of non-live panes it, in order:
 
 1. Deletes **aged** chunks (row + file) past the retention threshold (default 30 days).
 2. Enforces the **global** byte cap (default 2 GB) by evicting the oldest non-live chunks until under it.
@@ -264,7 +264,9 @@ color (tag byte + payload):
   0x02  Indexed : u8           -- 256-color palette index
 ```
 
-The color encoding is **Termica's own**, deliberately decoupled from `alacritty_terminal::vte::ansi::Color` so an upstream change to that enum can't silently break stored chunks; the encode/decode path converts between the two and is exhaustively round-trip-tested over every `NamedColor` variant. `WRAPLINE` and the wide-char *spacer* flags are stripped on store because wrapping is a function of the render width, recomputed on load (see below) — keeping them would bake a width into the chunk.
+The color encoding is **Termica's own**, deliberately decoupled from `alacritty_terminal::vte::ansi::Color` so an upstream change to that enum can't silently break stored chunks; the encode/decode path converts between the two and is exhaustively round-trip-tested over every `NamedColor` variant.
+
+Decode is **bounded against corrupt input**: a valid line satisfies `Σ run_len == char count`, so the decoder rejects any run whose cumulative cells would exceed the line's char count (`ChunkError::RunOverflow`) *before* expanding it. This matters because `run_len` is a `u32`: without the bound, a single crafted or bit-flipped run of up to `u32::MAX` cells would drive an unbounded allocation. Decode on malformed bytes must always error, never panic, hang, or OOM — it is strict-layer persistence code. `WRAPLINE` and the wide-char *spacer* flags are stripped on store because wrapping is a function of the render width, recomputed on load (see below) — keeping them would bake a width into the chunk.
 
 ### Logical lines, not grid rows
 

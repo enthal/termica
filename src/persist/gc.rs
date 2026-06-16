@@ -81,16 +81,33 @@ pub fn gc(persist: &Persistence, now_ms: i64, caps: &GcCaps) -> Result<GcReport,
         s.all_scrollback_chunks()?
     };
 
-    // Liveness per session: try to take the lock. Acquired -> orphaned
-    // (release immediately by dropping the guard); held -> live; error
-    // -> assume live (never delete what we can't prove is dead).
-    let mut live_by_session: HashMap<i64, bool> = HashMap::new();
+    // Liveness is a property of the PANE, not of the session that
+    // authored a chunk: restart reuses the pane row under a *new*
+    // session, so an old (now-unlocked) session's chunks belong to a
+    // pane that may be live right now and able to re-page them. Resolve
+    // each pane's current (latest) session, then probe *that* session's
+    // lock. Acquired -> orphaned (drop the guard); held -> live; error ->
+    // assume live (never delete what we can't prove is dead).
+    let latest_session_by_pane: HashMap<i64, Option<i64>> = {
+        let s = store.lock().map_err(|_| PersistError::Lock)?;
+        let mut m: HashMap<i64, Option<i64>> = HashMap::new();
+        for row in &rows {
+            if let std::collections::hash_map::Entry::Vacant(e) = m.entry(row.pane_id) {
+                e.insert(s.latest_session_for_pane(row.pane_id)?);
+            }
+        }
+        m
+    };
+    let mut live_by_pane: HashMap<i64, bool> = HashMap::new();
     for row in &rows {
-        live_by_session
-            .entry(row.session_id)
-            .or_insert_with(|| session_is_live(persist, row.session_id));
+        live_by_pane.entry(row.pane_id).or_insert_with(|| {
+            match latest_session_by_pane.get(&row.pane_id).copied().flatten() {
+                Some(sid) => session_is_live(persist, sid),
+                None => false, // no session row at all -> nothing live to protect
+            }
+        });
     }
-    let is_live = |sid: i64| live_by_session.get(&sid).copied().unwrap_or(true);
+    let is_live = |pane: i64| live_by_pane.get(&pane).copied().unwrap_or(true);
 
     // Decide which rows die. `deleted` is the single source of truth;
     // each phase only adds to it.
@@ -99,14 +116,14 @@ pub fn gc(persist: &Persistence, now_ms: i64, caps: &GcCaps) -> Result<GcReport,
     // (a) Aged chunks of non-live sessions.
     let aged_cutoff = now_ms - caps.retention_ms;
     for r in &rows {
-        if !is_live(r.session_id) && r.end_time < aged_cutoff {
+        if !is_live(r.pane_id) && r.end_time < aged_cutoff {
             deleted.insert(r.id);
         }
     }
 
     // (b) Global byte cap: oldest non-live chunks first, until under.
     let live_or_deleted =
-        |r: &ChunkRow, deleted: &HashSet<i64>| is_live(r.session_id) || deleted.contains(&r.id);
+        |r: &ChunkRow, deleted: &HashSet<i64>| is_live(r.pane_id) || deleted.contains(&r.id);
     let mut total: i64 =
         rows.iter().filter(|r| !deleted.contains(&r.id)).map(|r| r.byte_size).sum();
     if total > caps.total_bytes {
@@ -160,7 +177,7 @@ pub fn gc(persist: &Persistence, now_ms: i64, caps: &GcCaps) -> Result<GcReport,
     }
 
     report.tmp_files_deleted = cleanup_tmp_files(&root.join("scrollback"));
-    report.sessions_skipped_live = live_by_session.values().filter(|&&live| live).count();
+    report.sessions_skipped_live = live_by_pane.values().filter(|&&live| live).count();
     Ok(report)
 }
 
@@ -305,6 +322,33 @@ mod tests {
         assert_eq!(report.chunks_deleted, 0, "a live session is never gc'd");
         assert_eq!(report.sessions_skipped_live, 1);
         assert!(rec.dir.join("00000001.chunk.tmck").is_file());
+    }
+
+    #[test]
+    fn never_deletes_chunks_of_a_pane_live_under_a_new_session() {
+        // Restart reuses the pane row under a NEW session. The OLD
+        // session's chunks belong to a pane that is currently live (and
+        // can re-page them), so gc must not evict them even though the
+        // old session's own lock is long released. Liveness is a property
+        // of the *pane*, not of the session that authored a chunk.
+        let (_tmp, p) = persistence();
+        let rec1 = p.begin_session(Some("/w"), "zsh", 1000).unwrap();
+        let pane = rec1.pane_row.0;
+        write_one(&p, &rec1, 1, 0, &snap(&["pre-restart output"], 1000));
+        let old_chunk = rec1.dir.join("00000001.chunk.tmck");
+        drop(rec1); // old session's lock released — process "restarted"
+
+        // Restart: same pane, a new live session holding its own lock.
+        let rec2 = p.resume_session(pane, 2000).unwrap();
+        assert_eq!(rec2.pane_row.0, pane);
+
+        // Ancient now: the old chunk is well past retention.
+        let now = 1000 + 999 * 24 * 60 * 60 * 1000;
+        let report = gc(&p, now, &GcCaps::default()).unwrap();
+
+        assert_eq!(report.chunks_deleted, 0, "a live pane's pre-restart chunks survive gc");
+        assert!(old_chunk.is_file(), "old-session chunk file still present");
+        drop(rec2);
     }
 
     #[test]
