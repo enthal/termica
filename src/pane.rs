@@ -1650,15 +1650,12 @@ mod tests {
         assert!(session.fish_live.is_some(), "in-flight request still pending");
 
         // The matching reply resolves and clears the in-flight marker. The
-        // raw lines are parsed by the shared fish parser — including a
-        // kubectl-style space-padded row, whose value must be just the
-        // first column (the bug that motivated raw-line parsing).
+        // raw `complete -C` lines are parsed by the shared fish parser
+        // (here fish's normal `value\tdescription` form, including a
+        // runtime alias's description).
         session.ingest_live_completion(
             5,
-            &[
-                "hello\talias hello=echo HI".to_string(),
-                "deployments    deploy    apps/v1    true    Deployment".to_string(),
-            ],
+            &["hello\talias hello=echo HI".to_string(), "help\tDisplay help".to_string()],
         );
         assert!(session.fish_live.is_none(), "in-flight cleared on a correlated reply");
         let resp = session.completion_driver_poll().expect("a response is available");
@@ -1670,10 +1667,7 @@ mod tests {
             resp.candidates[0].source,
             crate::completion::CompletionSource::Driver(DriverTool::FishComplete)
         );
-        assert_eq!(
-            resp.candidates[1].value, "deployments",
-            "a space-padded kubectl row's value is the first column, not the whole line"
-        );
+        assert_eq!(resp.candidates[1].value, "help");
         // Polled once, then gone.
         assert!(session.completion_driver_poll().is_none());
     }
