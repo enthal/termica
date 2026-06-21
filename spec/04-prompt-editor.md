@@ -406,28 +406,12 @@ pub struct DirtySummary {
 }
 ```
 
-**Git context: live on the prompt, captured-at-run-time on
-running / sealed blocks.** The `PaneSession` holds the pane's *current*
-`Option<GitContext>`, refreshed off-thread by a [`GitProbe`](../src/git_probe.rs).
-Two surfaces consume it:
+**Git context: live on the prompt, captured-at-run-time on running / sealed blocks.** The `PaneSession` holds the pane's *current* `Option<GitContext>`, refreshed off-thread by a [`GitProbe`](../src/git_probe.rs). Two surfaces consume it:
 
-- The **live `Prompt` header** reads the pane's current git directly, so
-  it updates as you `cd` / dirty the tree. The block's own `header.git`
-  stays `None` here.
-- At **`Preexec`** the pane stamps its current git into the new
-  `Running` block's `header.git` (alongside the start-time cwd and
-  clock), and the seal carries it into `Sealed`. So a running / sealed
-  block shows the branch / dirtiness the command **actually ran under**,
-  frozen as history — not whatever is current now (which would be
-  anachronistic on scroll-back). This mirrors how `cwd` and `duration`
-  lock at command-start.
+- The **live `Prompt` header** reads the pane's current git directly, so it updates as you `cd` / dirty the tree. The block's own `header.git` stays `None` here.
+- At **`Preexec`** the pane stamps its current git into the new `Running` block's `header.git` (alongside the start-time cwd and clock), and the seal carries it into `Sealed`. So a running / sealed block shows the branch / dirtiness the command **actually ran under**, frozen as history — not whatever is current now (which would be anachronistic on scroll-back). This mirrors how `cwd` and `duration` lock at command-start.
 
-The probe runs `git status --porcelain=v2 --branch` +
-`git diff HEAD --numstat` for the pane's cwd on a background thread,
-re-triggered when the cwd changes or a command finishes, debounced and
-cancelled on pane teardown (per [01](01-architecture.md) "Do not block
-the UI on probes"). Parsing is pure ([`src/git_context.rs`](../src/git_context.rs));
-the capture is in `BlockStack::start_running` (unit-tested).
+The probe runs `git status --porcelain=v2 --branch` + `git diff HEAD --numstat` for the pane's cwd on a background thread, re-triggered when the cwd changes or a command finishes, debounced and cancelled on pane teardown (per [01](01-architecture.md) "Do not block the UI on probes"). Parsing is pure ([`src/git_context.rs`](../src/git_context.rs)); the capture is in `BlockStack::start_running` (unit-tested).
 
 A `PaneSession` owns `Vec<Block>` plus an `active: Option<BlockId>` pointing at the live one (always the last; `None` very briefly between command_finished and the next precmd).
 
@@ -435,23 +419,7 @@ A `PaneSession` owns `Vec<Block>` plus an `active: Option<BlockId>` pointing at 
 
 Each block paints differently per state:
 
-Each chip is a rounded pill; `[…]` below stands in for one. The git
-chips slot in after cwd: branch, an optional `ahead N behind N` chip,
-then an amber dirty chip (`N files +A -R`, files-only when the dirt is
-untracked). Sealed / running show the git **captured at command-start**;
-the prompt shows **live** current git. The branch chip is green (the
-headline of the git chips); on **sealed** (historical) blocks every chip
-is rendered muted — desaturated toward grey but still slightly tinted —
-so finished blocks read as past-tense while the live prompt / running
-chips stay vivid (`fade_chip_color` in [`src/render.rs`](../src/render.rs)).
-The one exception is the failed-`exit` chip: a non-zero exit stays vivid
-red even on a sealed block, so failures don't fade into scroll-back. After the git chips, the **live
-prompt only** adds a `PR #NN` chip for the branch's open GitHub PR,
-colored by its rolled-up CI status (green passing / yellow pending /
-red failing) — sourced from an async [`GhProbe`](../src/gh_probe.rs)
-(`gh pr view`). It's prompt-only because a finished command's CI status
-is meaningless on scroll-back; you want *current* CI, where you're about
-to act.
+Each chip is a rounded pill; `[…]` below stands in for one. The git chips slot in after cwd: branch, an optional `ahead N behind N` chip, then an amber dirty chip (`N files +A -R`, files-only when the dirt is untracked). Sealed / running show the git **captured at command-start**; the prompt shows **live** current git. The branch chip is green (the headline of the git chips); on **sealed** (historical) blocks every chip is rendered muted — desaturated toward grey but still slightly tinted — so finished blocks read as past-tense while the live prompt / running chips stay vivid (`fade_chip_color` in [`src/render.rs`](../src/render.rs)). The one exception is the failed-`exit` chip: a non-zero exit stays vivid red even on a sealed block, so failures don't fade into scroll-back. After the git chips, the **live prompt only** adds a `PR #NN` chip for the branch's open GitHub PR, colored by its rolled-up CI status (green passing / yellow pending / red failing) — sourced from an async [`GhProbe`](../src/gh_probe.rs) (`gh pr view`). It's prompt-only because a finished command's CI status is meaningless on scroll-back; you want *current* CI, where you're about to act.
 
 ```
 ┌─────────────────────────── Sealed ─────────────────────────────┐
