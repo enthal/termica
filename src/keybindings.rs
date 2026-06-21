@@ -60,6 +60,13 @@ pub fn shortcut_groups(is_macos: bool) -> Vec<ShortcutGroup> {
     let edit = |k: &'static str| -> Vec<Cap> {
         if is_macos { vec![Cap::Cmd, Cap::Key(k)] } else { vec![Cap::Ctrl, Cap::Key(k)] }
     };
+    // Editor word-grained chord (caret-by-word, delete-by-word): Option
+    // on macOS, Ctrl on Linux — see `render_pane::classify_editor_motion`
+    // and the word-delete handlers. NOTE: word-motion is NOT `opt+arrow`
+    // on Linux; the implementation binds Ctrl there.
+    let word = |k: &'static str| -> Vec<Cap> {
+        if is_macos { vec![Cap::Alt("Option"), Cap::Key(k)] } else { vec![Cap::Ctrl, Cap::Key(k)] }
+    };
     let opt = if is_macos { Cap::Alt("Option") } else { Cap::Alt("Alt") };
 
     vec![
@@ -89,6 +96,18 @@ pub fn shortcut_groups(is_macos: bool) -> Vec<ShortcutGroup> {
             ],
         },
         ShortcutGroup {
+            // egui's built-in keyboard zoom (Options::zoom_with_keyboard,
+            // on by default). It scales the whole UI via the zoom factor;
+            // we inherit it rather than wiring our own. COMMAND maps to
+            // Cmd on macOS, Ctrl on Linux — same as the `edit` chord.
+            title: "View",
+            items: vec![
+                sc(edit("+"), "Zoom in"),
+                sc(edit("-"), "Zoom out"),
+                sc(edit("0"), "Reset zoom"),
+            ],
+        },
+        ShortcutGroup {
             title: "Scroll & select",
             items: vec![
                 sc(
@@ -107,6 +126,8 @@ pub fn shortcut_groups(is_macos: bool) -> Vec<ShortcutGroup> {
                     },
                     "Scroll to bottom",
                 ),
+                sc(vec![Cap::Ctrl, Cap::Key("PgUp")], "Scroll page up"),
+                sc(vec![Cap::Ctrl, Cap::Key("PgDn")], "Scroll page down"),
                 sc(
                     if is_macos {
                         vec![Cap::Cmd, Cap::Shift, Cap::Key("C")]
@@ -114,6 +135,14 @@ pub fn shortcut_groups(is_macos: bool) -> Vec<ShortcutGroup> {
                         vec![Cap::Ctrl, Cap::Shift, Cap::Key("C")]
                     },
                     "Copy selection",
+                ),
+                sc(
+                    if is_macos {
+                        vec![Cap::Cmd, Cap::Key("V")]
+                    } else {
+                        vec![Cap::Ctrl, Cap::Shift, Cap::Key("V")]
+                    },
+                    "Paste",
                 ),
             ],
         },
@@ -140,12 +169,33 @@ pub fn shortcut_groups(is_macos: bool) -> Vec<ShortcutGroup> {
             items: vec![
                 sc(vec![Cap::Key("Enter")], "Run command"),
                 sc(vec![Cap::Shift, Cap::Key("Enter")], "Insert newline"),
-                sc(vec![Cap::Key("Esc")], "Leave editor"),
                 sc(vec![Cap::Ctrl, Cap::Key("A")], "Caret to line start"),
                 sc(vec![Cap::Ctrl, Cap::Key("E")], "Caret to line end"),
+                sc(word("Left"), "Caret one word left"),
+                sc(word("Right"), "Caret one word right"),
+                sc(
+                    if is_macos { vec![Cap::Cmd, Cap::Key("Up")] } else { vec![Cap::Key("PgUp")] },
+                    "Caret to buffer start",
+                ),
+                sc(
+                    if is_macos {
+                        vec![Cap::Cmd, Cap::Key("Down")]
+                    } else {
+                        vec![Cap::Key("PgDn")]
+                    },
+                    "Caret to buffer end",
+                ),
+                sc(word("Backspace"), "Delete word left"),
+                sc(word("Delete"), "Delete word right"),
+                sc(
+                    if is_macos {
+                        vec![Cap::Cmd, Cap::Key("Backspace")]
+                    } else {
+                        vec![Cap::Ctrl, Cap::Key("U")]
+                    },
+                    "Delete to line start",
+                ),
                 sc(vec![Cap::Ctrl, Cap::Key("T")], "Transpose characters"),
-                sc(vec![opt, Cap::Key("Left")], "Caret one word left"),
-                sc(vec![opt, Cap::Key("Right")], "Caret one word right"),
                 sc(edit("Z"), "Undo"),
                 sc(
                     if is_macos {
@@ -381,8 +431,11 @@ mod tests {
     }
 
     #[test]
-    fn option_label_is_platform_specific() {
-        // The word-left editor chord uses Option on macOS, Alt on Linux.
+    fn word_motion_chord_is_platform_specific() {
+        // The word-left editor chord is Option+← on macOS but Ctrl+← on
+        // Linux — it must match `render_pane::classify_editor_motion`,
+        // which binds Ctrl (not Alt) on Linux. A previous version of this
+        // popup advertised Alt+← on Linux, which did nothing.
         let find_groups = |mac: bool| {
             shortcut_groups(mac)
                 .into_iter()
@@ -391,7 +444,10 @@ mod tests {
                 .unwrap()
         };
         assert!(find_groups(true).keys.contains(&Cap::Alt("Option")));
-        assert!(find_groups(false).keys.contains(&Cap::Alt("Alt")));
+        assert!(!find_groups(true).keys.contains(&Cap::Ctrl));
+        let linux = find_groups(false);
+        assert!(linux.keys.contains(&Cap::Ctrl));
+        assert!(!linux.keys.contains(&Cap::Alt("Alt")), "Linux word-motion is Ctrl, not Alt");
     }
 
     #[test]

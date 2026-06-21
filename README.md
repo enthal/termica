@@ -102,7 +102,8 @@ Shortcuts use **Cmd** on macOS and **Ctrl+Shift** on Linux.
 | Close tab | Cmd+W | Ctrl+Shift+W |
 | Next / previous tab | Cmd+Shift+] / [ | Ctrl+Shift+] / [ |
 | Clear scrollback | Cmd+K | Ctrl+Shift+K |
-| Scroll through scrollback | Cmd+Option+↑ / ↓ | Ctrl+Alt+↑ / ↓ |
+| Scroll scrollback to top / bottom | Cmd+Option+↑ / ↓ or Ctrl+Home / End | Ctrl+Alt+↑ / ↓ or Ctrl+Home / End |
+| Page scrollback up / down | Ctrl+PgUp / PgDn | Ctrl+PgUp / PgDn |
 | Find in pane | Cmd+F | Ctrl+Shift+F |
 | Keyboard shortcuts | Cmd+/ | Ctrl+/ |
 | Quit | Cmd+Q | Ctrl+Shift+Q |
@@ -118,6 +119,7 @@ At the prompt:
 | History search | Cmd+R or Ctrl+R |
 | Tab completion | Tab |
 | Caret to line start / end | Ctrl+A / Ctrl+E |
+| Caret to buffer start / end | PgUp / PgDn |
 | Transpose characters | Ctrl+T |
 
 ## How it works

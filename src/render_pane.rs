@@ -24,6 +24,12 @@ const MULTI_CLICK_WINDOW_SECS: f64 = 0.5;
 /// still register as a multi-click.
 const MULTI_CLICK_DISTANCE_PX: f32 = 8.0;
 
+/// Frames to keep `stick_to_bottom` disabled after a `Ctrl+PageUp/Down`
+/// so the `scroll_with_delta` animation (≤ 0.3 s ≈ 18 frames at 60 Hz)
+/// plays out instead of being re-snapped to the tail. See
+/// [`crate::pane_slot::PaneUiState::scroll_page_frames`].
+const PAGE_SCROLL_STICK_OFF_FRAMES: u8 = 24;
+
 /// Color of the 1px border painted around the cell grid while a pane
 /// is in alternate-screen mode (vim / htop / less / fzf / ssh-with-
 /// TUI). A muted teal that's clearly visible against the dark
@@ -423,6 +429,17 @@ fn classify_editor_motion(
 ) -> Option<(EditorMotion, bool)> {
     use egui::Key;
     let extending = modifiers.shift;
+    // Page Up / Page Down move the caret to the buffer start / end on
+    // both platforms (Shift extends). No other modifier may be held —
+    // `Ctrl+PageUp` / `Ctrl+PageDown` is a scrollback shortcut owned by
+    // `match_pane_shortcut`, not an editor caret motion.
+    if !modifiers.command && !modifiers.ctrl && !modifiers.alt {
+        match key {
+            Key::PageUp => return Some((EditorMotion::DocStart, extending)),
+            Key::PageDown => return Some((EditorMotion::DocEnd, extending)),
+            _ => {}
+        }
+    }
     if is_macos {
         // macOS: Option (alt) without Cmd → word. Cmd (command)
         // without Option → line / doc.
@@ -443,14 +460,14 @@ fn classify_editor_motion(
             };
         }
     } else {
-        // Linux / Windows: Ctrl drives both. Distinguish by key:
-        // arrows = word, Home / End = doc.
+        // Linux / Windows: Ctrl + arrows = word motion. (Ctrl+Home /
+        // Ctrl+End are NOT editor motions — they scroll the pane
+        // viewport via `match_pane_shortcut`; caret-to-doc-start/end is
+        // PageUp / PageDown above.)
         if modifiers.ctrl && !modifiers.alt {
             return match key {
                 Key::ArrowLeft => Some((EditorMotion::WordLeft, extending)),
                 Key::ArrowRight => Some((EditorMotion::WordRight, extending)),
-                Key::Home => Some((EditorMotion::DocStart, extending)),
-                Key::End => Some((EditorMotion::DocEnd, extending)),
                 _ => None,
             };
         }
@@ -559,7 +576,11 @@ fn open_history_overlay(slot: &mut PaneSlot) {
 /// the placeholder `Enter`, and `Esc` (which demotes via
 /// `PaneSession::leave_editor_esc`). History walk (Up/Down) and
 /// shift-selection are deferred to 4F/4J.
-fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
+fn apply_event_to_editor(
+    event: &egui::Event,
+    frame_modifiers: egui::Modifiers,
+    slot: &mut PaneSlot,
+) -> bool {
     use egui::{Event, Key};
     match event {
         // Plain printable text from the OS IME / keyboard layout.
@@ -574,6 +595,21 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
         // replacement, etc.) goes through `insert_str` as a single
         // `OpKind::Other` entry — one paste, one undo.
         Event::Text(s) => {
+            // Modifier gate — the same invariant the encoder enforces in
+            // `input::encode_key`: a held modifier must never be silently
+            // dropped into bare text. egui-winit suppresses `Event::Text`
+            // under Ctrl/Cmd but NOT under Alt, so on Linux/Windows an
+            // Alt+letter press still arrives here as a bare `Event::Text`
+            // (the sibling `Event::Key { alt }` is correctly rejected by
+            // the `command || alt` gate below). Drop it so Alt+letter is
+            // inert, matching the `Event::Key` path. Exemptions:
+            //   - macOS: Option+letter is intentional compose input
+            //     (Option+E E → é); it must pass through.
+            //   - AltGr (= Ctrl+Alt on Windows) produces legitimate text;
+            //     `!ctrl` keeps it working.
+            if !cfg!(target_os = "macos") && frame_modifiers.alt && !frame_modifiers.ctrl {
+                return false;
+            }
             slot.session.clear_history_recall();
             if let Some(editor) = slot.session.editor_mut() {
                 let mut chars = s.chars();
@@ -1411,6 +1447,38 @@ pub fn render_pane(
     }
     let force_to_bottom = one_shot_bottom || multi_frame_bottom;
     let force_to_top = std::mem::take(&mut slot.ui.scroll_to_top_pending);
+    // Ctrl+PageUp/PageDown page-scroll. Convert the pending page count
+    // into a `scroll_with_delta` (applied in the scroll closure). One
+    // page = the *measured* viewport height (`last_scroll_viewport_h`)
+    // minus one row, so consecutive pages overlap by a line. egui's
+    // `scroll_with_delta` is inverted (positive moves toward older
+    // output, i.e. up), matching positive `pending_pages` = PageUp.
+    // Sizing off the area's max-height instead overshoots the visible
+    // height and leaves gaps between pages.
+    let pending_pages = std::mem::take(&mut slot.ui.scroll_page_pending);
+    let page_scroll_delta = if pending_pages != 0 {
+        let viewport = slot.ui.last_scroll_viewport_h;
+        // First-ever page (no measurement yet) falls back to the max
+        // bound; it self-corrects next frame once `inner_rect` is known.
+        let viewport = if viewport > 0.0 { viewport } else { scroll_max_h };
+        // One row of overlap for context — plus ~3 more, because the
+        // measured viewport height over-reports the genuinely-visible
+        // scrollback by about that much (the bottom prompt-footer chrome
+        // sits inside the scroll area's `inner_rect`). Tuned against the
+        // running app; without it consecutive pages leave a ~3-line gap.
+        let page = (viewport - 4.0 * row_h).max(viewport * 0.5);
+        // Re-arm the stick-off window so the animation isn't cancelled
+        // by stick_to_bottom re-engaging mid-flight (see the field doc).
+        slot.ui.scroll_page_frames = PAGE_SCROLL_STICK_OFF_FRAMES;
+        Some(pending_pages as f32 * page)
+    } else {
+        None
+    };
+    let page_animating = slot.ui.scroll_page_frames > 0;
+    if page_animating {
+        slot.ui.scroll_page_frames -= 1;
+        ctx.request_repaint();
+    }
 
     // ---- Phase 8 in-pane find: recompute + highlight map ----------
     //
@@ -1462,9 +1530,20 @@ pub fn render_pane(
     // commands). Disable it when `force_to_top` (the user is asking to
     // leave the bottom) or while find is open (see above); `force_to_top`
     // additionally overrides the persisted offset directly below.
+    //
+    // It must ALSO be off while a page-scroll animation is in flight.
+    // `scroll_with_delta` animates `state.offset` over ~0.1–0.3 s; if
+    // stick re-engages mid-animation while we started pinned at the tail,
+    // ScrollArea re-snaps to the end (egui scroll_area.rs: `if
+    // stick_to_end && scroll_stuck_to_end`) and cancels the page-scroll.
+    // (Ctrl+Home dodged this — it goes through the `force_to_top` instant
+    // override.) Holding stick off for the animation window lets the
+    // delta play out; once it settles, the end-of-frame recompute sets
+    // `scroll_stuck_to_end` from where we ended (false after a page-up;
+    // true again if a page-down reaches the bottom, re-pinning the tail).
     let scroll_area = egui::ScrollArea::vertical()
         .id_salt(("pane-blocks", slot.session.pane_id()))
-        .stick_to_bottom(!force_to_top && !find_open)
+        .stick_to_bottom(!force_to_top && !find_open && !page_animating)
         .auto_shrink([false, false])
         .max_height(scroll_max_h);
     // `force_to_top` uses a direct offset override (0.0) because
@@ -1508,6 +1587,16 @@ pub fn render_pane(
                 // is laid out there.
                 if force_to_top && !in_alt_screen {
                     ui.scroll_to_cursor(Some(egui::Align::TOP));
+                }
+                // Ctrl+PageUp / Ctrl+PageDown: animate the viewport by a
+                // page (positive = toward older output). `stick_to_bottom`
+                // is held off for the animation window above so this
+                // isn't re-snapped when we started pinned. No-op in
+                // alt-screen (no block stack is laid out).
+                if let Some(delta) = page_scroll_delta
+                    && !in_alt_screen
+                {
+                    ui.scroll_with_delta(egui::Vec2::new(0.0, delta));
                 }
                 // Top spacer bottom-aligns short content (computed
                 // above). In alt-screen mode `content_h` is 0 and the
@@ -1864,6 +1953,10 @@ pub fn render_pane(
             .inner
     });
     let scroll_viewport = scroll_inner.inner_rect;
+    // Remember the visible viewport height so the next frame's
+    // Ctrl+PageUp/PageDown pages by the actual visible height (see
+    // `PaneUiState::last_scroll_viewport_h`).
+    slot.ui.last_scroll_viewport_h = scroll_viewport.height();
     let (rendered, links_in_view, highlighted_link) = scroll_inner.inner;
     let highlighted_link = highlighted_link.as_ref();
 
@@ -3425,7 +3518,7 @@ pub fn render_pane(
                     continue;
                 }
             }
-            if editor_active && apply_event_to_editor(event, slot) {
+            if editor_active && apply_event_to_editor(event, ctx.input(|i| i.modifiers), slot) {
                 continue;
             }
             // Boundary gate (spec/04): while the editor owns the line,
@@ -4086,16 +4179,54 @@ mod tests {
     }
 
     #[test]
-    fn classify_linux_ctrl_home_end_is_doc_move() {
-        let m = mods(true, false, false, false);
-        assert_eq!(
-            classify_editor_motion(egui::Key::Home, m, false),
-            Some((EditorMotion::DocStart, false))
-        );
-        assert_eq!(
-            classify_editor_motion(egui::Key::End, m, false),
-            Some((EditorMotion::DocEnd, false))
-        );
+    fn classify_ctrl_home_end_is_not_an_editor_motion() {
+        // Ctrl+Home / Ctrl+End were reassigned to scrollback navigation
+        // (`match_pane_shortcut` → ScrollToTop/Bottom); they no longer
+        // move the editor caret on either platform. Caret-to-doc-start /
+        // -end is now bare PageUp / PageDown (below) and, on macOS, the
+        // existing Cmd+Up / Cmd+Down.
+        let ctrl = mods(true, false, false, false);
+        assert_eq!(classify_editor_motion(egui::Key::Home, ctrl, false), None);
+        assert_eq!(classify_editor_motion(egui::Key::End, ctrl, false), None);
+        assert_eq!(classify_editor_motion(egui::Key::Home, ctrl, true), None);
+        assert_eq!(classify_editor_motion(egui::Key::End, ctrl, true), None);
+    }
+
+    #[test]
+    fn classify_page_keys_are_doc_move_both_platforms() {
+        // Bare PageUp / PageDown move the caret to the buffer start /
+        // end on both platforms; Shift extends the selection.
+        for is_macos in [true, false] {
+            let bare = mods(false, false, false, false);
+            assert_eq!(
+                classify_editor_motion(egui::Key::PageUp, bare, is_macos),
+                Some((EditorMotion::DocStart, false))
+            );
+            assert_eq!(
+                classify_editor_motion(egui::Key::PageDown, bare, is_macos),
+                Some((EditorMotion::DocEnd, false))
+            );
+            let shift = mods(false, false, true, false);
+            assert_eq!(
+                classify_editor_motion(egui::Key::PageUp, shift, is_macos),
+                Some((EditorMotion::DocStart, true))
+            );
+            assert_eq!(
+                classify_editor_motion(egui::Key::PageDown, shift, is_macos),
+                Some((EditorMotion::DocEnd, true))
+            );
+        }
+    }
+
+    #[test]
+    fn classify_ctrl_page_keys_are_not_editor_motions() {
+        // Ctrl+PageUp / Ctrl+PageDown are scrollback page shortcuts, not
+        // caret motions — the editor must not claim them.
+        let ctrl = mods(true, false, false, false);
+        assert_eq!(classify_editor_motion(egui::Key::PageUp, ctrl, false), None);
+        assert_eq!(classify_editor_motion(egui::Key::PageDown, ctrl, false), None);
+        assert_eq!(classify_editor_motion(egui::Key::PageUp, ctrl, true), None);
+        assert_eq!(classify_editor_motion(egui::Key::PageDown, ctrl, true), None);
     }
 
     #[test]
@@ -4232,12 +4363,13 @@ mod tests {
     fn ctrl_c_on_typed_line_leaves_text_untouched() {
         let mut slot = spawn_editor_active_slot();
         slot.session.editor_mut().unwrap().insert_str("echo too bad");
-        let ctrl_c = key_ev(egui::Key::C, mods(true, false, false, false));
+        let ctrl = mods(true, false, false, false);
+        let ctrl_c = key_ev(egui::Key::C, ctrl);
         // The editor does NOT consume it (falls through to the gate,
         // which swallows it because the editor is non-empty) and the
         // typed line is left exactly as it was — Ctrl+C is a no-op on a
         // typed line, never a line-discard.
-        assert!(!apply_event_to_editor(&ctrl_c, &mut slot));
+        assert!(!apply_event_to_editor(&ctrl_c, ctrl, &mut slot));
         assert_eq!(slot.session.blocks().editor_on_tail().unwrap().text(), "echo too bad");
     }
 
@@ -4245,12 +4377,13 @@ mod tests {
     fn ctrl_c_on_empty_editor_is_inert() {
         let mut slot = spawn_editor_active_slot();
         assert!(slot.session.blocks().editor_on_tail().unwrap().is_empty());
-        let ctrl_c = key_ev(egui::Key::C, mods(true, false, false, false));
+        let ctrl = mods(true, false, false, false);
+        let ctrl_c = key_ev(egui::Key::C, ctrl);
         // apply_event_to_editor doesn't consume it; the boundary gate
         // then swallows it (Ctrl+C is not the EOF chord), so no `\x03`
         // reaches the shell — no cosmetic `^C` at an idle prompt. The
         // editor is left empty and active.
-        assert!(!apply_event_to_editor(&ctrl_c, &mut slot));
+        assert!(!apply_event_to_editor(&ctrl_c, ctrl, &mut slot));
         assert!(!pty_passthrough_allowed(&ctrl_c, true, true));
         assert!(slot.session.editor_is_active());
         assert!(slot.session.blocks().editor_on_tail().unwrap().is_empty());
@@ -4265,10 +4398,35 @@ mod tests {
         let mut slot = spawn_editor_active_slot();
         slot.session.editor_mut().unwrap().insert_str("echo hi");
         assert!(slot.session.editor_is_active());
-        let esc = key_ev(egui::Key::Escape, mods(false, false, false, false));
-        assert!(apply_event_to_editor(&esc, &mut slot)); // consumed, no PTY leak
+        let none = mods(false, false, false, false);
+        let esc = key_ev(egui::Key::Escape, none);
+        assert!(apply_event_to_editor(&esc, none, &mut slot)); // consumed, no PTY leak
         assert!(slot.session.editor_is_active(), "Esc must not demote out of the editor");
         assert_eq!(slot.session.blocks().editor_on_tail().unwrap().text(), "echo hi");
+    }
+
+    #[test]
+    fn alt_letter_text_event_is_inert_off_macos() {
+        // egui-winit suppresses Event::Text under Ctrl/Cmd but NOT under
+        // Alt, so on Linux/Windows an Alt+letter press still arrives as a
+        // bare Event::Text("b"). It must be dropped (a held modifier is
+        // never silently turned into typed text) so Alt+letter is inert,
+        // matching the rejected sibling Event::Key. macOS exempts it:
+        // Option+letter is intentional compose input.
+        let mut slot = spawn_editor_active_slot();
+        let alt = mods(false, true, false, false); // (ctrl, alt, shift, command)
+        let text = egui::Event::Text("b".to_string());
+        let consumed = apply_event_to_editor(&text, alt, &mut slot);
+        if cfg!(target_os = "macos") {
+            assert!(consumed, "macOS Option-compose text must pass through");
+            assert_eq!(slot.session.blocks().editor_on_tail().unwrap().text(), "b");
+        } else {
+            assert!(!consumed, "Alt+letter text must not be consumed");
+            assert!(
+                slot.session.blocks().editor_on_tail().unwrap().is_empty(),
+                "Alt+letter must not insert the bare letter"
+            );
+        }
     }
 
     #[test]
