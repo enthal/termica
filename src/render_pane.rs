@@ -533,6 +533,45 @@ fn pty_passthrough_allowed(event: &egui::Event, editor_active: bool, editor_empt
     editor_empty && is_eof_chord(event)
 }
 
+/// Pick the mouse cursor for the pane body from what the pointer is
+/// over. A Cmd-hovered link affordance (URL / file path) wins with the
+/// pointing hand — that's what a Cmd-click would activate. Otherwise
+/// selectable terminal content (the live grid, a sealed block, the
+/// prompt editor) shows the I-beam, matching every other terminal and
+/// text surface. `None` leaves egui's default arrow (chrome, gutters).
+///
+/// Centralizing the precedence here keeps the scattered hover sites
+/// from disagreeing about what beats what. Selection — and therefore
+/// the I-beam — is available whenever the terminal has not enabled
+/// mouse reporting, which is currently always (spec/02 §"selection").
+fn pane_body_cursor_icon(
+    over_selectable_text: bool,
+    over_link_affordance: bool,
+) -> Option<egui::CursorIcon> {
+    if over_link_affordance {
+        Some(egui::CursorIcon::PointingHand)
+    } else if over_selectable_text {
+        Some(egui::CursorIcon::Text)
+    } else {
+        None
+    }
+}
+
+/// Should this frame extend the pane/grid selection?
+///
+/// A modifier-click that opened a link (URL / file path) claims the
+/// whole gesture: it starts no selection, and the drag frames that
+/// follow the press must NOT extend one either — otherwise Cmd-clicking
+/// a link also grows whatever selection happened to be on screen. We
+/// track "this gesture opened a link" across frames in
+/// [`PaneUiState::gesture_opened_link`] (reset on every fresh press),
+/// and suppress the drag-extend while it is set. A deliberate
+/// `Shift`+click extend always wins — a fresh press has already reset
+/// the flag, so `shift_extend` is never poisoned by a prior link-open.
+fn drag_extends_selection(dragged: bool, shift_extend: bool, gesture_opened_link: bool) -> bool {
+    shift_extend || (dragged && !gesture_opened_link)
+}
+
 /// Close every per-pane popup (history / completion / find /
 /// keybindings). Popups are mutually exclusive — opening one calls
 /// this first so two never show at once. The find query history is
@@ -2047,8 +2086,17 @@ pub fn render_pane(
             sticky_command = Some((sticky_id, resp));
         }
     }
-    if highlighted_link.is_some() {
-        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+    // Cursor over the live grid or any sealed block: I-beam for
+    // selectable text, or the pointing hand when a Cmd-hovered link
+    // sits under the pointer. The sealed-link case below may upgrade
+    // this to the hand too (last writer wins).
+    let over_selectable_text = rendered.response.contains_pointer()
+        || sealed_block_renders.iter().any(|(_, r)| {
+            r.snapshot.contains_pointer()
+                || r.command.as_ref().is_some_and(|c| c.contains_pointer())
+        });
+    if let Some(icon) = pane_body_cursor_icon(over_selectable_text, highlighted_link.is_some()) {
+        ctx.set_cursor_icon(icon);
     }
 
     // Sealed-block link hover: when Cmd is held and the pointer is
@@ -2191,6 +2239,14 @@ pub fn render_pane(
             ui.id().with(("editor-footer", slot.session.pane_id())),
             egui::Sense::click_and_drag(),
         ));
+        // I-beam over the editable prompt text — a text surface like
+        // the terminal body. No link affordance competes in the footer.
+        if let Some(icon) = pane_body_cursor_icon(
+            editor_response.as_ref().is_some_and(|r| r.contains_pointer()),
+            false,
+        ) {
+            ctx.set_cursor_icon(icon);
+        }
 
         if let Some(editor) = slot.session.blocks().editor_on_tail() {
             let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
@@ -2727,6 +2783,14 @@ pub fn render_pane(
             origin_cursor.col = origin_cursor.col.min(row_len);
         }
 
+        // Link (URL / path) under the press, if any — needed both to
+        // decide a Cmd-click-open and to mark the gesture so its drag
+        // frames don't also extend a selection.
+        let sealed_link =
+            slot.session.sealed_block_links(origin_block_id, home).and_then(|links| {
+                links.iter().find(|l| l.contains(origin_cursor.row, origin_cursor.col)).cloned()
+            });
+
         // Shift+click EXTENDS the existing pane selection (across blocks
         // and into / out of command vs output) instead of starting a new
         // one — falling through to the shared extend branch below, which
@@ -2736,14 +2800,18 @@ pub fn render_pane(
             shift_held,
             slot.session.pane_selection().is_some(),
         );
+
+        // A modifier-click that opens a link claims the whole gesture:
+        // record it on the press (reset every fresh press) so its drag
+        // frames don't also extend the pane selection below. Mirrors the
+        // open condition — a non-shift Cmd-press on a link opens it.
+        if primary_just_pressed {
+            slot.ui.gesture_opened_link = !shift_extend && modifier_held && sealed_link.is_some();
+        }
         if primary_just_pressed && !shift_extend {
             // -------- START a selection in the press block ----
             // Anchor + head both land in the origin block;
             // multi-click expands within that block.
-            let sealed_link =
-                slot.session.sealed_block_links(origin_block_id, home).and_then(|links| {
-                    links.iter().find(|l| l.contains(origin_cursor.row, origin_cursor.col)).cloned()
-                });
             if modifier_held && let Some(link) = &sealed_link {
                 // Cmd-click on a URL / path: open it, don't
                 // start a selection.
@@ -2791,7 +2859,9 @@ pub fn render_pane(
                     }
                 }
             }
-        } else if let Some(sel) = slot.session.pane_selection().copied() {
+        } else if !slot.ui.gesture_opened_link
+            && let Some(sel) = slot.session.pane_selection().copied()
+        {
             // -------- EXTEND the selection -------------------
             //
             // Cross-block: the pointer may be over a different
@@ -2943,6 +3013,17 @@ pub fn render_pane(
         // of starting fresh.
         let shift_extend_grid =
             press_extends_selection(primary_just_pressed, shift_held, selection.is_some());
+
+        // A modifier-click that opens a link claims the whole gesture:
+        // record it on the press (reset every fresh press) so the
+        // drag-extend below is suppressed. The condition mirrors the
+        // open below — a non-shift Cmd-press on a link opens it; a
+        // Shift+click extends instead and never opens. See
+        // `drag_extends_selection`.
+        if primary_just_pressed {
+            slot.ui.gesture_opened_link =
+                !shift_extend_grid && modifier_held && link_under_press.is_some();
+        }
         if primary_just_pressed && !shift_extend_grid {
             if modifier_held && let Some(link) = link_under_press {
                 open_url(&link.url);
@@ -2961,12 +3042,17 @@ pub fn render_pane(
                     slot.session.start_selection(press_pt, mode);
                 }
             }
-        } else if rendered.response.dragged() || shift_extend_grid {
+        } else if drag_extends_selection(
+            rendered.response.dragged(),
+            shift_extend_grid,
+            slot.ui.gesture_opened_link,
+        ) {
             // EXTEND. Egui's `dragged()` is the canonical
             // "this widget is being dragged" signal once the
             // drag threshold is met; `shift_extend_grid` is the
             // discrete Shift+click extend. Both keep the mode the
-            // selection was started in.
+            // selection was started in — but a gesture that opened a
+            // link extends nothing (`drag_extends_selection`).
             slot.session.extend_selection(press_pt);
         }
     }
@@ -4293,6 +4379,66 @@ mod tests {
         assert!(pty_passthrough_allowed(&key_ev(egui::Key::D, ctrl), true, true));
         // On a typed line it's swallowed — the editor owns the line.
         assert!(!pty_passthrough_allowed(&key_ev(egui::Key::D, ctrl), true, false));
+    }
+
+    // ---- pane_body_cursor_icon (I-beam vs hand vs default) -----------
+
+    #[test]
+    fn cursor_is_ibeam_over_selectable_text() {
+        // Plain hover over the grid / a sealed block / the editor with
+        // no link under the pointer shows the text caret.
+        assert_eq!(pane_body_cursor_icon(true, false), Some(egui::CursorIcon::Text));
+    }
+
+    #[test]
+    fn cursor_is_hand_over_a_link_affordance() {
+        // A Cmd-hovered URL / path beats the I-beam — that's what a
+        // Cmd-click would activate.
+        assert_eq!(pane_body_cursor_icon(true, true), Some(egui::CursorIcon::PointingHand));
+        // The link wins even if we somehow didn't flag the text (the
+        // affordance only arises over content anyway).
+        assert_eq!(pane_body_cursor_icon(false, true), Some(egui::CursorIcon::PointingHand));
+    }
+
+    #[test]
+    fn cursor_is_default_off_content() {
+        // Over chrome / gutters / empty space: leave egui's arrow.
+        assert_eq!(pane_body_cursor_icon(false, false), None);
+    }
+
+    // ---- drag_extends_selection (Cmd-click-open supersedes extend) ----
+    //
+    // Bug: a modifier-click that opens a URL/path also extended the text
+    // selection, because the drag frames that follow the press hit the
+    // EXTEND branch. The gesture that opened a link must claim the whole
+    // press: no extend until the next press.
+
+    #[test]
+    fn link_open_gesture_does_not_extend_on_drag() {
+        // THE FIX: the press opened a link, so a following drag frame
+        // must NOT extend the selection. (Pre-fix this was `true`.)
+        assert!(!drag_extends_selection(true, false, true));
+    }
+
+    #[test]
+    fn normal_drag_extends() {
+        // A plain selection drag (gesture did not open a link) extends.
+        assert!(drag_extends_selection(true, false, false));
+    }
+
+    #[test]
+    fn shift_extend_always_extends() {
+        // A deliberate Shift+click extend wins regardless of the
+        // link-gesture flag (which a fresh press has already reset).
+        assert!(drag_extends_selection(false, true, false));
+        assert!(drag_extends_selection(false, true, true));
+        assert!(drag_extends_selection(true, true, true));
+    }
+
+    #[test]
+    fn no_drag_no_shift_does_not_extend() {
+        assert!(!drag_extends_selection(false, false, false));
+        assert!(!drag_extends_selection(false, false, true));
     }
 
     #[test]

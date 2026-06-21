@@ -133,6 +133,14 @@ pub struct PaneUiState {
     /// the drag handler can union them with the word / line under
     /// the current pointer.
     pub(crate) sealed_drag_anchor: Option<(BlockId, BlockCursor, BlockCursor)>,
+    /// True for the duration of a pointer gesture that opened a link
+    /// (a modifier-click on a URL / file path). Such a gesture must not
+    /// also extend a selection on the drag frames that follow the
+    /// press, so the drag-extend handlers consult this. Set when the
+    /// press opens a link; reset on every fresh primary press. Read
+    /// only by `render_pane`'s grid / sealed drag handlers via
+    /// [`drag_extends_selection`](crate::render_pane).
+    pub(crate) gesture_opened_link: bool,
     /// "Force the scroll area to the bottom on next render." Set by
     /// `render_pane` when the editor's `Enter` submit fires; the
     /// ScrollArea normally only sticks to the bottom when the user
