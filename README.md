@@ -8,9 +8,7 @@
 
 A real, native terminal emulator in Rust — vim, ssh, htop, tmux all behave exactly as they should — with an editor-driven prompt, structured command history, and a tab-and-split workspace layered on top.
 
-[![Rust](https://img.shields.io/badge/Rust-2024_edition-orange)](rust-toolchain.toml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue)](#license)
-[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-informational)](#platform-support)
+[![Rust](https://img.shields.io/badge/Rust-2024_edition-orange)](rust-toolchain.toml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue)](#license) [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-informational)](#platform-support)
 
 [termica.io](https://termica.io) · [Spec](SPEC.md) · [Roadmap](https://github.com/enthal/termica/issues)
 
@@ -108,8 +106,7 @@ Shortcuts use **Cmd** on macOS and **Ctrl+Shift** on Linux.
 | Keyboard shortcuts | Cmd+/ | Ctrl+/ |
 | Quit | Cmd+Q | Ctrl+Shift+Q |
 
-Press **Cmd+/** (**Ctrl+/** on Linux) any time for the full,
-platform-local cheat-sheet.
+Press **Cmd+/** (**Ctrl+/** on Linux) any time for the full, platform-local cheat-sheet.
 
 At the prompt:
 

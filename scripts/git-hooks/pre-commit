@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Termica pre-commit hook.
 #
-# Runs fmt + clippy locally so formatting/lint regressions can't slip
-# into a commit. Does NOT run `cargo test`: the project follows a
-# tests-first discipline (CLAUDE.md), which means a failing test is
-# expected to be committed BEFORE the implementation that makes it
-# pass. CI runs tests and gates merge — that's where test failures
-# block the world.
+# Runs fmt + clippy + the markdown hard-wrap lint locally so style
+# regressions can't slip into a commit. Does NOT run the general
+# `cargo test` suite: the project follows a tests-first discipline
+# (CLAUDE.md), which means a failing behavioural test is expected to be
+# committed BEFORE the implementation that makes it pass. CI runs the
+# full suite and gates merge — that's where test failures block the
+# world. The markdown lint is the one exception: it is a deterministic
+# lint (never committed red-first), so it belongs here with fmt/clippy.
 #
 # Install with:
 #
@@ -51,5 +53,13 @@ cargo fmt --all -- --check || fail "formatting issues; run: cargo fmt --all"
 step "cargo clippy --workspace --all-targets -- -D warnings"
 cargo clippy --workspace --all-targets -- -D warnings || fail "clippy warnings"
 
-printf "%spre-commit passed%s %s(tests are CI's job; see scripts/git-hooks/pre-commit header)%s\n" \
+# The markdown-wrap check is a deterministic *lint*, not a behavioural
+# test — it is never committed red-first — so it belongs here alongside
+# fmt/clippy rather than in CI-only territory. `clippy --all-targets`
+# above already compiled this test target, so the marginal cost is small.
+step "cargo test --test markdown_no_hardwrap (markdown hard-wrap lint)"
+cargo test --test markdown_no_hardwrap --quiet \
+    || fail "markdown is hard-wrapped; one line per paragraph (see failures above)"
+
+printf "%spre-commit passed%s %s(behavioural tests are CI's job; see scripts/git-hooks/pre-commit header)%s\n" \
     "${GREEN}" "${RESET}" "${DIM}" "${RESET}"

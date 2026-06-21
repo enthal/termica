@@ -71,7 +71,7 @@ After regenerating `egui_kittest` snapshots (`UPDATE_SNAPSHOTS=1 cargo test`):
 
 Run `cargo fmt`, `cargo clippy`, and `cargo test --workspace` before every commit. Treat clippy warnings as errors.
 
-A developer-installable pre-commit hook lives at `scripts/git-hooks/pre-commit`. It runs **fmt + clippy** locally so formatting / lint regressions can't slip into a commit. It deliberately does **not** run `cargo test`, because the project's tests-first discipline requires committing a failing test *before* the implementation that makes it pass — a pre-commit that blocked failing tests would block the workflow itself. CI runs tests and gates merge, so test failures still block the world; they just block it at the right boundary. Bypass the hook once with `git commit --no-verify` only if the user explicitly says so.
+A developer-installable pre-commit hook lives at `scripts/git-hooks/pre-commit` (install it with `scripts/install-git-hooks.sh`, which symlinks `scripts/git-hooks/*` into `.git/hooks/`). It runs **fmt + clippy + the markdown hard-wrap lint** (`cargo test --test markdown_no_hardwrap`) locally so style regressions can't slip into a commit. It deliberately does **not** run the general `cargo test` suite, because the project's tests-first discipline requires committing a failing behavioural test *before* the implementation that makes it pass — a pre-commit that blocked failing tests would block the workflow itself. The markdown lint is the one exception: it's a deterministic lint, never committed red-first, so it sits with fmt/clippy. CI runs the full suite and gates merge, so behavioural test failures still block the world; they just block it at the right boundary. Bypass the hook once with `git commit --no-verify` only if the user explicitly says so.
 
 ## Design principles
 
@@ -100,6 +100,7 @@ These are operational reminders. The full rationale is in the spec.
 - Trait shapes in the spec are normative. If you need to deviate, update the spec in the same commit with the reason.
 - **No `unsafe` code.** Every Termica crate sets `#![forbid(unsafe_code)]` at the crate root. PTY and OS-handle interaction is mediated through `portable-pty` and `alacritty_terminal`, which contain `unsafe` themselves but expose safe APIs we consume. If you find yourself wanting `unsafe`, stop and ask — it almost certainly means a different dependency, a different abstraction, or a redesign is the right answer.
 - No `unwrap()` or `expect()` in non-test code except where a contract makes failure impossible — and even then, prefer a typed `Result`. `expect` messages must describe the invariant, not restate the operation.
+- **Markdown is never hard-wrapped.** One logical line per paragraph, list item, and block-quote — let the editor/renderer soft-wrap. Do not insert newlines mid-paragraph to hit a column width (it carries no meaning and churns diffs). Applies to every `.md` file. Enforced by `tests/markdown_no_hardwrap.rs` (run by CI and the pre-commit hook).
 
 ## Git commit protocol
 
