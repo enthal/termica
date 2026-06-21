@@ -14,8 +14,14 @@
 //! - **bash** — `bash --noprofile --norc --rcfile <wrapper> -i`.
 //!   The wrapper rcfile is generated on disk; bash reads it during
 //!   normal startup.
-//! - **fish** — `fish --no-config --init-command "<bootstrap>" -i`.
-//!   fish executes the init-command before the first prompt.
+//! - **fish** — `fish --no-config -c "<bootstrap>"` (non-interactive).
+//!   Fish's line editor (the `reader`) never starts, so it draws no
+//!   prompt and performs no echo; the bootstrap ends with a read-eval
+//!   loop that reads finished commands from stdin and runs them. This
+//!   mirrors zsh's `unsetopt zle` / bash's `--noediting`: the tty stays
+//!   cooked and the kernel echo is dropped by [`crate::echo_suppress`].
+//!   Running fish `-i` instead leaked fish's own prompt + duplicated the
+//!   command echo into the block.
 //!
 //! Opt out by setting `TERMICA_NO_SHELL_INTEGRATION=1`; spawned
 //! shells skip the managed-startup machinery and launch with normal
@@ -217,12 +223,17 @@ fn managed_spawn_for_inner(
             })
         }
         ShellSpec::Fish => Ok(ManagedSpawn {
+            // Run fish **non-interactively** (`-c`, no `-i`): its line
+            // editor never starts, so there's no leaked prompt and no
+            // duplicated reader echo. The bootstrap ends with a read-eval
+            // loop that reads finished commands from stdin (the tty stays
+            // cooked, so the kernel echo is dropped by `EchoSuppressor`,
+            // exactly as for zsh `unsetopt zle` / bash `--noediting`).
             argv: vec![
                 "fish".into(),
                 "--no-config".into(),
-                "--init-command".into(),
+                "-c".into(),
                 FISH_BOOTSTRAP.to_string(),
-                "-i".into(),
             ],
             pty_bootstrap: None,
             env,
@@ -337,14 +348,21 @@ mod tests {
     }
 
     #[test]
-    fn managed_spawn_fish_carries_init_command() {
+    fn managed_spawn_fish_runs_bootstrap_non_interactively() {
         let spec = managed_spawn_for_inner(ShellSpec::Fish, "x", false).expect("spawn");
         assert_eq!(spec.argv[0], "fish");
         assert!(spec.argv.iter().any(|a| a == "--no-config"));
-        assert!(spec.argv.iter().any(|a| a == "--init-command"));
+        // Non-interactive: the bootstrap is the `-c` command, and there is
+        // NO `-i` (fish's line editor must not run — that's what leaked the
+        // prompt + duplicated the echo).
+        assert!(spec.argv.iter().any(|a| a == "-c"));
+        assert!(!spec.argv.iter().any(|a| a == "-i"));
+        assert!(!spec.argv.iter().any(|a| a == "--init-command"));
         assert!(spec.pty_bootstrap.is_none());
-        // The bootstrap is shipped inline as one argv slot.
+        // The bootstrap (with its read-eval loop) is shipped inline as one
+        // argv slot.
         assert!(spec.argv.iter().any(|a| a.contains("termica_emit_raw")));
+        assert!(spec.argv.iter().any(|a| a.contains("IFS= read -r line")));
     }
 
     #[test]

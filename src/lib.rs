@@ -32,6 +32,7 @@ pub mod block;
 pub mod block_links;
 pub mod block_selection;
 pub mod completion;
+pub mod cursor_env;
 pub mod echo_suppress;
 pub mod events;
 pub mod find;
@@ -60,6 +61,7 @@ pub mod render;
 pub mod selection;
 pub mod shell;
 pub mod shell_syntax;
+pub mod submit_framing;
 pub mod terminal;
 pub mod visual_picker;
 pub mod watermark;
@@ -173,6 +175,14 @@ fn install_desktop_entry() {
 /// Run the native window. Used by `main` and any future end-to-end
 /// harness.
 pub fn run() -> eframe::Result<()> {
+    // Linux: winit reads the cursor size/theme only from XCURSOR_SIZE
+    // / XCURSOR_THEME, ignoring the desktop's (possibly magnified)
+    // pointer preference. Bridge that gap before the event loop —
+    // and before any other startup work, since this may re-exec us.
+    // See [`crate::cursor_env`].
+    #[cfg(target_os = "linux")]
+    crate::cursor_env::seed_cursor_env_via_reexec();
+
     // Cheap arg sniff — no full clap dep needed for the current
     // surface (one boolean flag + one optional positional path).
     //

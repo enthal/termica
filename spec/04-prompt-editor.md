@@ -86,7 +86,7 @@ Standard text-editor mapping, OS-aware. macOS uses `Option`/`Cmd`; Linux/Windows
 | Move cursor one line | Arrow ↑ / ↓ | Arrow ↑ / ↓ |
 | Move to line start / end | `Home` / `End` (also `Cmd + ←` / `Cmd + →`) | `Home` / `End` |
 | Move by word | `Option + ← / →` | `Ctrl + ← / →` |
-| Move to document start / end | `Cmd + ↑` / `Cmd + ↓` | `Ctrl + Home` / `Ctrl + End` |
+| Move to buffer start / end | `Cmd + ↑` / `Cmd + ↓`, or `PageUp` / `PageDown` | `PageUp` / `PageDown` |
 | Select all | `Cmd + A` | `Ctrl + A` |
 | Undo / redo (Phase 4 polish) | `Cmd + Z` / `Cmd + Shift + Z` | `Ctrl + Z` / `Ctrl + Shift + Z` |
 | Copy / paste / cut | `Cmd + C / V / X` | `Ctrl + C / V / X` |
@@ -102,7 +102,12 @@ Standard text-editor mapping, OS-aware. macOS uses `Option`/`Cmd`; Linux/Windows
 
 The matching matrix lives in [`classify_editor_motion`](../src/render_pane.rs); both branches are unit-tested with the `is_macos` flag flipped explicitly so each OS's convention is verified on every CI run, not only on the host that runs CI. New motion keys are added there first, with tests, before any new row appears above.
 
-**Note on Cmd+↑/↓ vs scrollback nav.** Cmd+↑ / Cmd+↓ (macOS) and Ctrl+Home / Ctrl+End (Linux/Windows) are *editor* caret motions per the row above. Adding the Option / Alt modifier — `Cmd+Option+↑/↓` (macOS) / `Ctrl+Alt+↑/↓` (Linux/Windows) — escapes the editor and jumps the pane's scroll position to the top / bottom of the sealed-block stack instead. See [spec/11 §Shipped](11-keyboard-shortcuts.md#shipped-phase-1--phase-2) for the pane-level binding. The disambiguating modifier is intentional: a pane has both an editor and a scrollback that need independent "jump to ends" chords; Option / Alt is the standard way to layer an additional gesture on a chord without ambiguity.
+**Note on caret motion vs scrollback nav.** A pane has both an *editor* caret and a *scrollback* viewport that each need "go to start / end" and "page" gestures, so they're split by modifier:
+
+- **Editor caret** — `Cmd+↑/↓` (macOS) and bare `PageUp`/`PageDown` (both platforms) move the caret to the buffer start / end; `Shift` extends.
+- **Scrollback viewport** — `Ctrl+Home`/`Ctrl+End` jump to the top / bottom of the sealed-block stack and `Ctrl+PageUp`/`Ctrl+PageDown` page it (both platforms); `Cmd+Option+↑/↓` (macOS) / `Ctrl+Alt+↑/↓` (Linux) are the equivalent jump chords. These are *app-level* — they fire in `RawTerminal` (a running command) too, and are no-ops in alt-screen. See [spec/11 §Shipped](11-keyboard-shortcuts.md#shipped-phase-1--phase-2) and [§Per-mode keyboard routing](11-keyboard-shortcuts.md#per-mode-keyboard-routing).
+
+`Ctrl+Home`/`Ctrl+End` are deliberately *not* editor caret motions (an earlier draft mapped them to caret-to-doc-start/-end on Linux); the caret reaches the buffer ends via `PageUp`/`PageDown` instead, leaving `Ctrl+Home/End` free for the scrollback.
 
 Shell-binding keys (`Ctrl+R`, `Ctrl+P`, `Ctrl+N`, `Ctrl+S`, `Ctrl+G`) are **consumed without effect** in the editor today: they don't reach the PTY (the editor swallows them) and they don't fire any app behaviour either, until [4J](10-roadmap.md#phase-4--editor-at-prompt-block-model-pivot) ships history walk and Ctrl+R popup. This is deliberate: forwarding them would leak literal `^R` glyphs into the editor while the user's muscle memory hasn't been wired up yet.
 
@@ -401,28 +406,12 @@ pub struct DirtySummary {
 }
 ```
 
-**Git context: live on the prompt, captured-at-run-time on
-running / sealed blocks.** The `PaneSession` holds the pane's *current*
-`Option<GitContext>`, refreshed off-thread by a [`GitProbe`](../src/git_probe.rs).
-Two surfaces consume it:
+**Git context: live on the prompt, captured-at-run-time on running / sealed blocks.** The `PaneSession` holds the pane's *current* `Option<GitContext>`, refreshed off-thread by a [`GitProbe`](../src/git_probe.rs). Two surfaces consume it:
 
-- The **live `Prompt` header** reads the pane's current git directly, so
-  it updates as you `cd` / dirty the tree. The block's own `header.git`
-  stays `None` here.
-- At **`Preexec`** the pane stamps its current git into the new
-  `Running` block's `header.git` (alongside the start-time cwd and
-  clock), and the seal carries it into `Sealed`. So a running / sealed
-  block shows the branch / dirtiness the command **actually ran under**,
-  frozen as history — not whatever is current now (which would be
-  anachronistic on scroll-back). This mirrors how `cwd` and `duration`
-  lock at command-start.
+- The **live `Prompt` header** reads the pane's current git directly, so it updates as you `cd` / dirty the tree. The block's own `header.git` stays `None` here.
+- At **`Preexec`** the pane stamps its current git into the new `Running` block's `header.git` (alongside the start-time cwd and clock), and the seal carries it into `Sealed`. So a running / sealed block shows the branch / dirtiness the command **actually ran under**, frozen as history — not whatever is current now (which would be anachronistic on scroll-back). This mirrors how `cwd` and `duration` lock at command-start.
 
-The probe runs `git status --porcelain=v2 --branch` +
-`git diff HEAD --numstat` for the pane's cwd on a background thread,
-re-triggered when the cwd changes or a command finishes, debounced and
-cancelled on pane teardown (per [01](01-architecture.md) "Do not block
-the UI on probes"). Parsing is pure ([`src/git_context.rs`](../src/git_context.rs));
-the capture is in `BlockStack::start_running` (unit-tested).
+The probe runs `git status --porcelain=v2 --branch` + `git diff HEAD --numstat` for the pane's cwd on a background thread, re-triggered when the cwd changes or a command finishes, debounced and cancelled on pane teardown (per [01](01-architecture.md) "Do not block the UI on probes"). Parsing is pure ([`src/git_context.rs`](../src/git_context.rs)); the capture is in `BlockStack::start_running` (unit-tested).
 
 A `PaneSession` owns `Vec<Block>` plus an `active: Option<BlockId>` pointing at the live one (always the last; `None` very briefly between command_finished and the next precmd).
 
@@ -430,23 +419,7 @@ A `PaneSession` owns `Vec<Block>` plus an `active: Option<BlockId>` pointing at 
 
 Each block paints differently per state:
 
-Each chip is a rounded pill; `[…]` below stands in for one. The git
-chips slot in after cwd: branch, an optional `ahead N behind N` chip,
-then an amber dirty chip (`N files +A -R`, files-only when the dirt is
-untracked). Sealed / running show the git **captured at command-start**;
-the prompt shows **live** current git. The branch chip is green (the
-headline of the git chips); on **sealed** (historical) blocks every chip
-is rendered muted — desaturated toward grey but still slightly tinted —
-so finished blocks read as past-tense while the live prompt / running
-chips stay vivid (`fade_chip_color` in [`src/render.rs`](../src/render.rs)).
-The one exception is the failed-`exit` chip: a non-zero exit stays vivid
-red even on a sealed block, so failures don't fade into scroll-back. After the git chips, the **live
-prompt only** adds a `PR #NN` chip for the branch's open GitHub PR,
-colored by its rolled-up CI status (green passing / yellow pending /
-red failing) — sourced from an async [`GhProbe`](../src/gh_probe.rs)
-(`gh pr view`). It's prompt-only because a finished command's CI status
-is meaningless on scroll-back; you want *current* CI, where you're about
-to act.
+Each chip is a rounded pill; `[…]` below stands in for one. The git chips slot in after cwd: branch, an optional `ahead N behind N` chip, then an amber dirty chip (`N files +A -R`, files-only when the dirt is untracked). Sealed / running show the git **captured at command-start**; the prompt shows **live** current git. The branch chip is green (the headline of the git chips); on **sealed** (historical) blocks every chip is rendered muted — desaturated toward grey but still slightly tinted — so finished blocks read as past-tense while the live prompt / running chips stay vivid (`fade_chip_color` in [`src/render.rs`](../src/render.rs)). The one exception is the failed-`exit` chip: a non-zero exit stays vivid red even on a sealed block, so failures don't fade into scroll-back. After the git chips, the **live prompt only** adds a `PR #NN` chip for the branch's open GitHub PR, colored by its rolled-up CI status (green passing / yellow pending / red failing) — sourced from an async [`GhProbe`](../src/gh_probe.rs) (`gh pr view`). It's prompt-only because a finished command's CI status is meaningless on scroll-back; you want *current* CI, where you're about to act.
 
 ```
 ┌─────────────────────────── Sealed ─────────────────────────────┐

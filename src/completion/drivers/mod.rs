@@ -100,6 +100,25 @@ pub enum DriverTool {
     Docker,
     Aws,
     Git,
+    /// The fish **shell sidecar**: `fish -c 'complete -C <line>'`. Unlike
+    /// the other variants this isn't a single CLI tool but the user's
+    /// whole shell — it completes any command fish knows (built-ins,
+    /// installed completions, the user's aliases and `complete`
+    /// functions), so in a fish pane it supersedes the per-tool drivers.
+    /// It rides the same engine: a one-shot subprocess whose stdout is
+    /// the same `value\tdescription` per line as cobra's `__complete`
+    /// ([spec/04a §"Source 2"](../../../spec/04a-completion.md)).
+    FishComplete,
+    /// The zsh **live-shell** completion source. Unlike [`Self::FishComplete`]
+    /// there is NO one-shot subprocess form (a fresh `zsh -i -c` would
+    /// re-source the user's dotfiles on every Tab — unacceptably slow). It
+    /// exists ONLY as a live-shell tool: the pane's warm completion child
+    /// answers a PTY request and replies with a `completion` marker, parsed
+    /// the same way as fish's. So it never reaches the one-shot engine's
+    /// `invocation` / worker; those arms are defensive no-ops. v1 emits
+    /// **values only** (zsh descriptions are config-gated and fragile) — see
+    /// [spec/04a §"Zsh sidecar"](../../../spec/04a-completion.md).
+    ZshComplete,
 }
 
 impl DriverTool {
@@ -111,6 +130,8 @@ impl DriverTool {
             DriverTool::Docker => "docker",
             DriverTool::Aws => "aws",
             DriverTool::Git => "git",
+            DriverTool::FishComplete => "fish",
+            DriverTool::ZshComplete => "zsh",
         }
     }
 }
@@ -141,6 +162,18 @@ pub struct DriverResponse {
     /// `true` when this response was served from the result cache rather
     /// than a fresh subprocess. Diagnostic only (drives `TERMICA_DUMP_EVENTS`).
     pub from_cache: bool,
+}
+
+impl DriverResponse {
+    /// Build a response for a result that did NOT pass through the engine's
+    /// worker thread — the fish **live-shell** completion path, where
+    /// `PaneSession` correlates the reply marker itself and hands the
+    /// candidates straight to the popup. There's no engine request to echo,
+    /// so a placeholder id is used; this never re-enters the engine's
+    /// `poll` id-filter. See [spec/04a §"Fish sidecar"](../../../spec/04a-completion.md).
+    pub fn live(tool: DriverTool, candidates: Vec<CompletionCandidate>) -> Self {
+        DriverResponse { id: DriverRequestId(0), tool, candidates, from_cache: false }
+    }
 }
 
 /// Spawns driver subprocesses and returns their raw stdout. Behind a
@@ -208,6 +241,24 @@ fn invocation(req: &DriverRequest) -> (&'static str, Vec<String>, Vec<(String, S
         DriverTool::Git => {
             ("git", vec!["--list-cmds=builtins,others,nohelpers".to_string()], Vec::new())
         }
+        // `fish -c 'complete -C $argv[1]' <line>`: fish completes the
+        // command line passed as `$argv[1]` and prints `value\tdescription`
+        // per line. We pass the line as a positional arg (not interpolated
+        // into the script) so embedded quotes/spaces can't break out. No
+        // `--no-config`: we WANT the user's config (their aliases and
+        // `complete` definitions are the whole point of the sidecar).
+        DriverTool::FishComplete => (
+            "fish",
+            vec!["-c".to_string(), "complete -C $argv[1]".to_string(), req.line.clone()],
+            Vec::new(),
+        ),
+        // Defensive only: `ZshComplete` is a live-shell tool with no one-shot
+        // form, so routing never sends it to the worker (it goes to the pane's
+        // PTY request path instead). If it somehow arrives here — a zsh pane
+        // whose integration isn't confirmed — `false` yields no stdout, hence
+        // zero candidates, gracefully (shell integration is the only source of
+        // truth for live completion; without it, none).
+        DriverTool::ZshComplete => ("false", Vec::new(), Vec::new()),
     }
 }
 
@@ -454,6 +505,26 @@ mod tests {
         e.request(PathBuf::from("/r"), (DriverTool::Kubectl, "kubectl get ".to_string(), 12));
         let resp = e.result_rx.recv().expect("worker should send a response");
         assert!(resp.candidates.is_empty(), "missing tool → no candidates, no panic");
+    }
+
+    #[test]
+    fn fish_complete_invocation_passes_line_as_positional_arg() {
+        // The command line must go through `$argv[1]` (a single positional
+        // arg), NOT be interpolated into the `-c` script — otherwise quotes
+        // or spaces in the line could break out of the script. No
+        // `--no-config`: the sidecar deliberately loads the user's config.
+        let req = DriverRequest {
+            id: DriverRequestId(1),
+            tool: DriverTool::FishComplete,
+            cwd: PathBuf::from("/repo"),
+            line: "git che".to_string(),
+            point: 7,
+        };
+        let (program, args, envs) = invocation(&req);
+        assert_eq!(program, "fish");
+        assert_eq!(args, vec!["-c", "complete -C $argv[1]", "git che"]);
+        assert!(envs.is_empty());
+        assert!(!args.iter().any(|a| a == "--no-config"), "sidecar loads user config");
     }
 
     #[test]

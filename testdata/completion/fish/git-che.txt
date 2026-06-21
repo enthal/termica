@@ -1,0 +1,3 @@
+checkout	Checkout and switch to a branch
+cherry	Find commits yet to be applied to upstream
+cherry-pick	Reapply a commit on another branch

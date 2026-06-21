@@ -604,6 +604,21 @@ impl TermicaApp {
                     slot.ui.scroll_to_bottom_pending = true;
                 }
             }
+            PaneAction::ScrollPageUp => {
+                // Ctrl+PageUp: page the scrollback viewport up (toward
+                // older output). Relative move — accumulate so repeated
+                // presses before a render all count. `render_pane`
+                // applies it via `scroll_with_delta` and resets to 0.
+                if let Some(slot) = self.panes.get_mut(&pane_id) {
+                    slot.ui.scroll_page_pending += 1;
+                }
+            }
+            PaneAction::ScrollPageDown => {
+                // Ctrl+PageDown: page the scrollback viewport down.
+                if let Some(slot) = self.panes.get_mut(&pane_id) {
+                    slot.ui.scroll_page_pending -= 1;
+                }
+            }
             PaneAction::OpenFind => {
                 // Cmd+F / Ctrl+Shift+F: open the in-pane find overlay
                 // (Phase 8). Skip it in alt-screen mode — a full-screen

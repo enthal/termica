@@ -39,7 +39,8 @@ Every Termica message is a JSON object with these fields:
 |---|---|---|---|
 | `type` | string | yes | The event kind (table below). |
 | `session` | string | yes | Termica session ID (UUID-shaped), echoed from `TERMICA_SESSION_ID` so messages from a stale spawned shell can be discriminated. |
-| `value` | string / number / object | depends on `type` | Payload. |
+| `value` | string / number / object / array | depends on `type` | Payload. |
+| `id` | number | only `completion` | Correlation id, echoed from the request, so a reply to a superseded request can be dropped. The one message type with a field beyond `type`/`session`/`value`. |
 
 Defined `type` values:
 
@@ -54,6 +55,7 @@ Defined `type` values:
 | `prompt_vars` | object | Optional structured prompt metadata (git branch, virtualenv, etc.) for the native status header. |
 | `command_aborted` | reason string | User cancelled input before execution (Ctrl-C on empty editor, etc.). |
 | `shell_vars` | array of name strings | From the precmd hook (change-gated). The shell's current variable **names** — the source for `$VAR` tab completion. |
+| `completion` | array of raw completion-line strings | Reply to a **live-shell completion** request Termica wrote to the PTY (fish + zsh). Carries the request `id`. See [§`completion`](#completion--live-shell-completion) and [04a §"Fish sidecar"](04a-completion.md). |
 
 `prompt_vars` is intentionally open-ended — the shell sends whatever it can cheaply derive; Termica consumes the keys it knows about (`cwd`, `git_branch`, `git_dirty`, `venv`, etc.) and ignores the rest.
 
@@ -67,6 +69,24 @@ Two invariants are normative:
 - **Change-gated.** The hook tracks a signature of the last-emitted name set and emits only when it changes, so a steady prompt loop (the common case) costs nothing beyond building the list. `ShellVars` is inert for the pane-mode machine — a variable-name report never triggers a mode transition.
 
 Consumed by [`PaneSession`](../src/pane.rs): the reported names supersede the spawn snapshot as the completion source ([`PaneSession::env_var_names`](../src/pane.rs)).
+
+#### `completion` — live-shell completion
+
+Unlike every other message (which the shell emits on its own lifecycle), `completion` is a **reply to a request Termica sends**. It exists so a pane can complete from its **own live shell** — picking up aliases / functions the user defined *interactively at runtime*, which a separate subprocess can't see ([04a §"Fish sidecar"](04a-completion.md), [§"Zsh sidecar"](04a-completion.md)). Live in **fish and zsh**; bash keeps the local sources only.
+
+**Request (Termica → shell, over the PTY)** — the framing differs by shell, because the two run on different input models, but both produce a `completion` reply and both are **inert to the mode machine**:
+
+- **fish** ([`completion_request_bytes`](../src/submit_framing.rs)): a single line `complete\t<id>\t<base64(line)>` + `\r`. fish runs non-interactively via a read-eval loop that reads one line and splits on the first TAB — a leading `complete` field marks a completion request; anything else is a submitted command (pure base64, alphabet `A–Za–z0–9+/=`, no TAB), so the two are **unambiguous on the wire**.
+- **zsh** ([`completion_request_bytes_zsh`](../src/submit_framing.rs)): a guarded command ` __termica_complete <id> <base64(line)>` + `\r`. zsh has **no** read-eval loop — it runs interactively (with `unsetopt zle`) and *executes* each input line — so the request is dispatched as a real command. The bootstrap's `termica_preexec` / `termica_precmd` recognise the `__termica_complete` sentinel and emit **nothing** for it (inert), a `zshaddhistory` hook keeps it out of history, and the function preserves the user's last `$?`. The leading space mirrors a "private" command.
+
+In both cases the `line` is base64-encoded so spaces / quotes / multi-byte cross the cooked-mode tty cleanly, with the echo dropped by `EchoSuppressor`. `id` correlates the reply.
+
+**Reply (shell → Termica):** `{"type":"completion","id":<n>,"value":[<line>, …]}` — a JSON array of the shell's **raw** completion lines (fish: `complete -C` output, `value\tdescription` or a space-padded table; zsh: value-only lines from the warm completion child). The split into value/description is done once, in Rust ([`parse_shell_complete`](../src/completion/drivers/parse.rs)), so the shells can't diverge. fish runs `complete -C <line>` **in-process** and loops straight back to `read`; zsh captures from a persistent `zsh/zpty` completion child driven by a real completion widget (see [04a §"Zsh sidecar"](04a-completion.md)). Neither `eval`s the user's line, and neither emits `preexec` / `command_finished` / `precmd` — so a completion request runs no command and produces no block.
+
+Two invariants are normative:
+
+- **Inert to the pane-mode machine.** A `completion` reply never triggers a transition ([05](05-pane-modes.md)): the request is only ever sent while already in `ShellPromptEditor`, and the shell returns to its prompt without a precmd. Promotion is gated solely on `precmd`; `completion` is not in any transition's trigger set.
+- **Superseded replies are dropped.** Each request carries a fresh `id`; a reply whose `id` doesn't match the current in-flight request (the user kept typing, a newer request was issued) is discarded by [`PaneSession`](../src/pane.rs). A request the live shell never answers times out (~600 ms) and falls back to the local candidate sources.
 
 ### Parser requirements
 
@@ -255,26 +275,35 @@ The wrapper rcfile is regenerated on every Termica launch (Termica owns the path
 
 **Bash `/etc/bashrc`.** Same TBD as zsh's `/etc/zshrc` — not sourced in v1.
 
-### fish — managed startup with `--init-command`
+### fish — managed startup, run **non-interactively**
 
-fish provides `--init-command 'shell code'` (`-C` short form) which runs before the first prompt. The mechanism is clean:
+Unlike zsh and bash, fish's line editor (the `reader`) **cannot be disabled** while the shell is interactive — there is no `unsetopt zle` / `--noediting` equivalent. Run interactively (`fish -i`), fish draws its own prompt and echoes/redraws the submitted command in raw mode; both leak into the command block, and `EchoSuppressor` (which expects a clean cooked-mode `command\r\n`) can't drop fish's raw-mode redraw. So Termica runs fish **non-interactively** and supplies the line-editing role itself, the same division of labour as zsh (`unsetopt zle`) and bash (`--noediting`):
 
 ```text
-1. Spawn `fish --no-config --init-command "$BOOTSTRAP" -i`.
+1. Spawn `fish --no-config -c "$BOOTSTRAP"`  (note: NO -i).
 
-2. fish runs the init command, which:
+2. The bootstrap:
      a. Defines Termica helpers (fish syntax, not POSIX).
-     b. Sources `~/.config/fish/config.fish` if it exists.
-     c. Sources each `~/.config/fish/conf.d/*.fish` in the order fish
-        would have loaded them.
-     d. Defines event handlers via `function … --on-event fish_preexec`
-        (and `fish_postexec`, `fish_prompt`).
-     e. Emits `integration_ready`.
-
-3. As with bash, the Bootstrapping window is near-zero.
+     b. Sources `~/.config/fish/config.fish` and each
+        `~/.config/fish/conf.d/*.fish` (fish's `--no-config` skips these).
+     c. `status job-control full` so Ctrl+C interrupts the running
+        command's process group, not the bootstrap loop.
+     d. Emits `integration_ready`, then the first `precmd` + `shell_vars`.
+     e. Runs a **read-eval loop**: read one finished command line from
+        stdin, emit `preexec`, `eval` it, emit `command_finished` +
+        `precmd` + `shell_vars`. This is the non-interactive equivalent of
+        fish's interactive prompt cycle — the `fish_preexec` / `fish_prompt`
+        events don't fire in a non-interactive shell, so the loop emits the
+        markers itself.
 ```
 
-fish's event system is first-class; no DEBUG-trap acrobatics. The only fish-specific worry is JSON-escaping in fish syntax (different quoting rules), which gets its own helper.
+Because fish is non-interactive, the tty stays in its default cooked mode: the kernel echoes each submitted command as `command\r\n`, which `EchoSuppressor` drops exactly as for zsh/bash — no leaked prompt, no duplicated echo.
+
+Two fish-specific notes: (1) fish's own `read` builtin runs the line editor on a tty (a `read>` prompt + per-keystroke echo), so the loop reads each line with a one-shot POSIX `sh` (`IFS= read -r line`) instead — a dumb cooked-mode read with EOF signalled via exit status. (2) JSON-escaping uses fish's different quoting rules, handled by a dedicated helper.
+
+**Multi-line commands — base64 framing.** Because the loop reads exactly one line and `eval`s it, a multi-line command (Shift+Enter, a `for`…`end` block, a trailing `&&`) would be split by the cooked-mode tty into separate lines, the first of which is incomplete. So for fish — and *only* fish — Termica **base64-encodes the whole command onto a single line** before writing it ([`crate::submit_framing::submission_bytes`](../src/submit_framing.rs)); the bootstrap decodes it with `base64 -d` and `eval`s the full command as one unit. base64's alphabet (`A–Za–z0–9+/=`) carries no tty-special bytes, so it crosses the cooked-mode tty cleanly and its kernel echo is dropped by `EchoSuppressor` like any plain text; the `preexec` marker still reports the decoded, human-readable command. zsh/bash need no such framing — their own parser accumulates continuation lines across reads. (One residual edge: a base64 line longer than the tty's `MAX_CANON` canonical-input limit — ~1 KB on macOS, so a single command over ~750 raw bytes — is truncated by the line discipline; this is the same cooked-mode cap that already bounds a long single-line command, slightly tighter under base64's 4/3 expansion.)
+
+**Ctrl+C.** While a command runs, Termica sends `SIGINT` to the foreground process group. Without help that signal would also kill the non-interactive bootstrap loop — and, being the pane's only process, take the pane (and a single-tab window) down with it. The bootstrap installs a no-op `--on-signal SIGINT` handler so fish **catches** `SIGINT` and keeps looping, while the running child — which resets to the default `SIGINT` disposition on `exec` — still dies (exit 130), exactly like Ctrl+C at an interactive prompt. (zsh/bash get this for free: their interactive line editor traps `SIGINT` at the prompt.) `status job-control full` additionally separates child process groups so background jobs / `fg` / `bg` have a chance to work.
 
 ### Failure modes and timeouts
 
@@ -313,7 +342,7 @@ Helpers are exported only where they need to be visible to subshells. Internal h
 ## What the scripts deliberately don't do
 
 - **No PS1 art / fancy prompts.** The visible prompt belongs to Termica's status header ([06](06-workspace-and-tiles.md)).
-- **No completion forwarding.** Tab completion in `ShellPromptEditor` is local in v1 ([04](04-prompt-editor.md)).
+- **Completion forwarding (fish only).** Tab completion is local + CLI-native drivers for every shell ([04a](04a-completion.md)); additionally, a **fish** pane forwards a completion request to its own live shell via the [`completion`](#completion--live-shell-completion) message so runtime aliases/functions complete. bash/zsh do not forward in v1.
 - **No history capture from the shell.** Termica records its own history at submit time ([07](07-history-and-search.md)).
 - **No dotfile mutation.** Ever. The bootstrap mechanisms above are all in-memory or under Termica's data directory.
 - **No background telemetry, no probe loops.** The shell does the minimum required to make the protocol work, and nothing else.

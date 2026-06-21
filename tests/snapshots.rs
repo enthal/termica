@@ -1480,6 +1480,43 @@ fn snapshot_completion_popup_driver_rows_with_tags_and_descriptions() {
     );
 }
 
+#[test]
+fn snapshot_completion_popup_tabular_columns() {
+    // A tabular completion (e.g. `kubectl get <resource>` via the fish
+    // sidecar): each description is space-padded multi-column data. The
+    // popup splits on 2+ spaces and paints every column at a shared
+    // tab-stop, so the rows line up into a table and the popup widens to
+    // fit. Pins the column-alignment layout (`ColumnLayout`).
+    // Description cells are `\t`-joined (as the driver parsers emit them);
+    // `deviceclasses` has an EMPTY short-name cell (leading `\t`), which the
+    // popup must keep aligned in its own column rather than shifting the
+    // rest of the row left.
+    use termica::completion::DriverTool;
+    let fish = CompletionSource::Driver(DriverTool::FishComplete);
+    let cands = vec![
+        CompletionCandidate::with_description("daemonsets", "ds\tapps/v1\ttrue\tDaemonSet", fish),
+        CompletionCandidate::with_description(
+            "deployments",
+            "deploy\tapps/v1\ttrue\tDeployment",
+            fish,
+        ),
+        CompletionCandidate::with_description(
+            "deviceclasses",
+            "\tresource.k8s.io/v1\tfalse\tDeviceClass",
+            fish,
+        ),
+    ];
+    let mut popup = CompletionPopup::new(0, "d", cands).expect("non-empty candidate list");
+    popup.selected_index = 0;
+    snapshot_completion_popup(
+        "completion_popup_tabular_columns",
+        popup,
+        egui::Pos2::new(24.0, 232.0),
+        10,
+        egui::Vec2::new(900.0, 260.0),
+    );
+}
+
 // ---- Sticky-top block header (4E) -------------------------------------
 //
 // The sticky-eligibility / paint-position math is unit-tested in

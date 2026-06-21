@@ -200,29 +200,14 @@ The foundational block model was pulled forward into Phase 4 (the block-model pi
 
 ### Phase 8 — In-pane search ⏳
 
-- ✅ Cmd/Ctrl+F overlay with literal + case-insensitive + regex modes
-  (`Aa` + `.*` toggles); `All` / `Commands` / `Outputs` filter chip.
-- ✅ Match highlights paint over the cell grid (translucent amber;
-  current match brighter), with Prev / Next (or Enter / Shift+Enter)
-  navigation, a live `N of M` count, and scroll-to-match.
-- ✅ Find-query history: `↑` / `↓` walk prior searches while the field
-  has the caret; a `▾` button opens a dropdown of recent queries.
-  Per-pane, in-memory for the session (Termica-only addition — not in
-  the original spec/07 sketch).
+- ✅ Cmd/Ctrl+F overlay with literal + case-insensitive + regex modes (`Aa` + `.*` toggles); `All` / `Commands` / `Outputs` filter chip.
+- ✅ Match highlights paint over the cell grid (translucent amber; current match brighter), with Prev / Next (or Enter / Shift+Enter) navigation, a live `N of M` count, and scroll-to-match.
+- ✅ Find-query history: `↑` / `↓` walk prior searches while the field has the caret; a `▾` button opens a dropdown of recent queries. Per-pane, in-memory for the session (Termica-only addition — not in the original spec/07 sketch).
 - ✅ Esc / Done dismiss.
 
-**Scope landed (focused-pane v1).** Search covers the focused pane's
-**sealed** blocks (command lines + frozen output snapshots) — the
-roadmap acceptance ("in-memory scrollback + sealed chunks"). The live
-`Prompt` / `Running` tail is excluded (its output isn't frozen yet),
-and the cross-pane `CurrentTab` scope plus `SelectedBlocks` from
-[spec/07](07-history-and-search.md#scope-model) are deferred —
-`SelectedBlocks` additionally needs block-object selection
-([#120](https://github.com/enthal/termica/issues/120)). Fuzzy (`nucleo`)
-and Tantivy global search stay post-MVP.
+**Scope landed (focused-pane v1).** Search covers the focused pane's **sealed** blocks (command lines + frozen output snapshots) — the roadmap acceptance ("in-memory scrollback + sealed chunks"). The live `Prompt` / `Running` tail is excluded (its output isn't frozen yet), and the cross-pane `CurrentTab` scope plus `SelectedBlocks` from [spec/07](07-history-and-search.md#scope-model) are deferred — `SelectedBlocks` additionally needs block-object selection ([#120](https://github.com/enthal/termica/issues/120)). Fuzzy (`nucleo`) and Tantivy global search stay post-MVP.
 
-**Acceptance:** ✅ find-in-pane works on the in-memory scrollback +
-sealed chunks. Shipped on branch `feat/in-pane-search`.
+**Acceptance:** ✅ find-in-pane works on the in-memory scrollback + sealed chunks. Shipped on branch `feat/in-pane-search`.
 
 ### Phase 9 — Scrollback persistence + restore ⏳
 
@@ -257,7 +242,11 @@ In rough priority order; each is its own future PR / Issue, none committed.
 - **Tab completion engine** (CLI-native drivers + per-pane shell sidecar for bash / zsh / fish) per [04a](04a-completion.md). Supersedes the earlier "OSC request/response shell-completion bridge" stub — the same goal, cleaner mechanism (private stdio JSON sidecar, not an OSC channel over the PTY). Implementation slices: drivers → fish sidecar → bash sidecar → zsh sidecar, in that order.
   - ✅ **CLI-native drivers** (shipped). `kubectl`/`gh`/`docker` (cobra `__complete`), `aws_completer`, `git --list-cmds` stream into the popup off-thread (per-pane worker + `egui::Context` repaint, mirroring `git_probe`); detection is implicit (spawn-failure = silent no-op). `completion::drivers`.
   - ✅ **Driver result cache** (shipped). 10 s TTL `(tool, cwd, line)` cache + injectable `Clock` ([04a §Caching](04a-completion.md#caching)); a re-open within the window is instant, no subprocess. `completion::drivers::cache`.
-  - Remaining: fish sidecar → bash sidecar → zsh sidecar.
+  - ✅ **Fish sidecar** (shipped). One-shot `fish -c 'complete -C $argv[1]'` per Tab as `DriverTool::FishComplete`, reusing the CLI-native driver engine (same `value\tdescription` format as cobra, so same worker / cache / spinner / events). `plan_completion` routes any command — **command and argument position** (`fish_segment`) — to it; non-fish panes unchanged. ([04a §"Fish sidecar"](04a-completion.md#fish-sidecar)).
+  - ✅ **Fish live-shell completion** (shipped). When a fish pane is at a prompt, completion is answered by the pane's **own live shell** (a `complete\t<id>\t<b64>` PTY request → in-process `complete -C` → [`completion`](03-shell-integration.md#completion--live-shell-completion) marker reply, correlated by `PaneSession`), so **runtime-defined aliases/functions** complete — the one-shot subprocess can't see them. The one-shot is the degraded-mode fallback. Inert to the pane-mode machine.
+  - ✅ **Zsh live-shell completion** (shipped). A zsh pane at a prompt answers from a warm `zsh/zpty` completion child — seeded once with the user's `$fpath` + `compinit` (never re-sourcing dotfiles per Tab), driven by a real completion widget with a `compadd -O` recorder, replaying the live `alias` table per request so **runtime-defined aliases** complete ([04a §"Zsh sidecar"](04a-completion.md#zsh-sidecar)). Dispatched as a guarded `__termica_complete` command (inert to the mode machine, out of history, `$?`-preserving — [03 §`completion`](03-shell-integration.md#completion--live-shell-completion)). Values only in v1; cobra drivers stay authoritative for `gh`/`git`/`kubectl`, zsh handles the long tail. `DriverTool::ZshComplete`.
+  - **Decided against — multi-source racing** (showing instant locals then swapping the live reply in): once the popup is shown the list must stay stable, or a click lands on a row that changed under the cursor. Wait for the one authoritative source, then show.
+  - Remaining: bash sidecar.
 - **Workspace search** across panes and persisted sessions.
 - **Command palette** (Cmd/Ctrl+P).
 - **Multi-window** (egui multi-viewport).

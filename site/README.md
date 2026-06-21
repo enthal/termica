@@ -1,8 +1,6 @@
 # termica.io — homepage
 
-The static marketing site for [termica.io](https://termica.io): one HTML page,
-no build step, no framework. Served from a **private** S3 bucket through
-CloudFront. This README covers how to run, change, and evolve it.
+The static marketing site for [termica.io](https://termica.io): one HTML page, no build step, no framework. Served from a **private** S3 bucket through CloudFront. This README covers how to run, change, and evolve it.
 
 ## Layout
 
@@ -29,11 +27,7 @@ site/
   README.md              # this file
 ```
 
-The golden rule: **edit `src/`; deploy `dist/`.** `src/` is the editable source
-(and what you preview locally, with plain unhashed names). `build.sh` copies it
-to `dist/` and content-hashes the assets; `deploy.sh` runs the build and uploads
-`dist/`. Sources that shouldn't ship (raw screenshots) live outside both, in
-`media-src/`.
+The golden rule: **edit `src/`; deploy `dist/`.** `src/` is the editable source (and what you preview locally, with plain unhashed names). `build.sh` copies it to `dist/` and content-hashes the assets; `deploy.sh` runs the build and uploads `dist/`. Sources that shouldn't ship (raw screenshots) live outside both, in `media-src/`.
 
 ## Architecture
 
@@ -44,9 +38,7 @@ Route53 (termica.io + www)  --alias-->  CloudFront  --OAC-->  S3 bucket (private
                                CloudFront Function (www -> apex 301)
 ```
 
-- The S3 bucket is **private**. CloudFront reaches it via **Origin Access
-  Control (OAC)**; a bucket policy grants read to this one distribution only.
-  There is no public S3 website endpoint.
+- The S3 bucket is **private**. CloudFront reaches it via **Origin Access Control (OAC)**; a bucket policy grants read to this one distribution only. There is no public S3 website endpoint.
 - The TLS cert lives in **us-east-1** — CloudFront's only cert region.
 - A **CloudFront Function** 301-redirects `www.termica.io` → `termica.io`.
 - HTTP redirects to HTTPS at the edge.
@@ -57,8 +49,7 @@ Concrete resource IDs live in `infra/config.env`.
 
 ### Preview locally
 
-Absolute paths (`/style.css`, `/img/...`) need a web root, so **serve it** —
-don't open the file with `file://`:
+Absolute paths (`/style.css`, `/img/...`) need a web root, so **serve it** — don't open the file with `file://`:
 
 ```sh
 cd site/src && python3 -m http.server 8787   # http://localhost:8787/
@@ -72,41 +63,29 @@ Edit `src/index.html` / `src/style.css`, then:
 ./infra/deploy.sh      # builds dist/ then uploads it
 ```
 
-You never run `build.sh` by hand — `deploy.sh` does. Every deploy also issues a
-`/*` CloudFront invalidation.
+You never run `build.sh` by hand — `deploy.sh` does. Every deploy also issues a `/*` CloudFront invalidation.
 
 ### Caching & cache-busting
 
 The whole point of the build step. Three tiers of `Cache-Control`:
 
-- **`index.html` → `no-cache`.** Always revalidated, so a new deploy is seen
-  immediately. It's the one file referenced by a fixed URL, and it points at
-  the current hashed asset names.
-- **Fingerprinted assets** (`style.<hash>.css`, `img/hero.<hash>.webp`, …) →
-  `max-age=31536000, immutable`. Safe to cache forever: when the content
-  changes, `build.sh` gives it a new filename, so a browser can never serve a
-  stale copy. (This is the bug the hashing fixes — previously a cached
-  `style.css` survived deploys for up to a week.)
-- **Favicons** keep their conventional unhashed names (browsers fetch
-  `/favicon.ico` directly), so they get a modest `max-age=3600`.
+- **`index.html` → `no-cache`.** Always revalidated, so a new deploy is seen immediately. It's the one file referenced by a fixed URL, and it points at the current hashed asset names.
+- **Fingerprinted assets** (`style.<hash>.css`, `img/hero.<hash>.webp`, …) → `max-age=31536000, immutable`. Safe to cache forever: when the content changes, `build.sh` gives it a new filename, so a browser can never serve a stale copy. (This is the bug the hashing fixes — previously a cached `style.css` survived deploys for up to a week.)
+- **Favicons** keep their conventional unhashed names (browsers fetch `/favicon.ico` directly), so they get a modest `max-age=3600`.
 
 ### Add or replace a screenshot
 
 Screenshots flow through the optimizer so the committed/served files stay small:
 
-1. Capture at full resolution (retina). Drop the PNG into `media-src/` with the
-   right name (see `media-src/README.md`): `hero.png`, `history.png`,
-   `completion.png`.
+1. Capture at full resolution (retina). Drop the PNG into `media-src/` with the right name (see `media-src/README.md`): `hero.png`, `history.png`, `completion.png`.
 2. Generate the web variants:
    ```sh
    python3 infra/optimize-media.py
    ```
-   This writes display-sized **WebP** (1x + 2x) into `src/img/`, plus a JPEG
-   `og.jpg` social card from the hero. Inputs that aren't present are skipped.
+This writes display-sized **WebP** (1x + 2x) into `src/img/`, plus a JPEG `og.jpg` social card from the hero. Inputs that aren't present are skipped.
 3. `./infra/deploy.sh`
 
-The raw originals in `media-src/` are gitignored — they're the source of truth
-on disk and can be re-captured, but they never get committed or deployed.
+The raw originals in `media-src/` are gitignored — they're the source of truth on disk and can be re-captured, but they never get committed or deployed.
 
 ### Regenerate the favicons / logo
 
@@ -124,47 +103,27 @@ cp "$SRC" src/icon.png
 
 ## Images & responsive variants
 
-The optimizer ([`infra/optimize-media.py`](infra/optimize-media.py)) targets the
-page's real display size — the hero renders at most ~960px wide, so there's no
-point shipping a 3680px capture.
+The optimizer ([`infra/optimize-media.py`](infra/optimize-media.py)) targets the page's real display size — the hero renders at most ~960px wide, so there's no point shipping a 3680px capture.
 
 - `<name>.webp` — 1× (≤1000px wide). Loaded on standard-DPI displays.
-- `<name>@2x.webp` — 2× (≤2000px wide). Loaded on Retina/HiDPI displays via the
-  `srcset` `2x` descriptor, so the image stays crisp.
-- `og.jpg` — 1200×630, JPEG q82. The Open Graph / Twitter card shown when a
-  link is shared. Only link unfurlers fetch it, never page visitors, so it
-  doesn't affect page weight; JPEG keeps it ~100KB.
+- `<name>@2x.webp` — 2× (≤2000px wide). Loaded on Retina/HiDPI displays via the `srcset` `2x` descriptor, so the image stays crisp.
+- `og.jpg` — 1200×630, JPEG q82. The Open Graph / Twitter card shown when a link is shared. Only link unfurlers fetch it, never page visitors, so it doesn't affect page weight; JPEG keeps it ~100KB.
 
-WebP only — it's universally supported and ~⅓ the size of PNG for these
-screenshots, so there's no PNG fallback in the markup. Tune `DISPLAY_W` /
-`WEBP_QUALITY` / `OG_QUALITY` at the top of the script. Requires Pillow with
-WebP support.
+WebP only — it's universally supported and ~⅓ the size of PNG for these screenshots, so there's no PNG fallback in the markup. Tune `DISPLAY_W` / `WEBP_QUALITY` / `OG_QUALITY` at the top of the script. Requires Pillow with WebP support.
 
 ## How to evolve the page
 
-- **Change the headline / tagline / CTA:** edit the `.hero` and `.cta` blocks in
-  `index.html`. The palette tokens (`--bg`, `--cyan`, `--blue`, …) are CSS
-  variables at the top of `style.css`, sampled from the app icon.
-- **Add a feature section** (e.g. the planned History and Tab-completion rows):
-  capture the screenshot → `media-src/<name>.png`, add it to `TARGETS` in
-  `optimize-media.py` if it's a new name, run the optimizer, then add a section
-  in `index.html` referencing `/img/<name>.webp` + `@2x` via `srcset`. Keep
-  `width`/`height` (or an `aspect-ratio`) on the `<img>` to avoid layout shift,
-  and `loading="lazy"` for anything below the fold.
-- **Update the social card:** it's regenerated from the hero automatically; if
-  you want a bespoke card, save a 1200×630-ish source and adjust the script.
+- **Change the headline / tagline / CTA:** edit the `.hero` and `.cta` blocks in `index.html`. The palette tokens (`--bg`, `--cyan`, `--blue`, …) are CSS variables at the top of `style.css`, sampled from the app icon.
+- **Add a feature section** (e.g. the planned History and Tab-completion rows): capture the screenshot → `media-src/<name>.png`, add it to `TARGETS` in `optimize-media.py` if it's a new name, run the optimizer, then add a section in `index.html` referencing `/img/<name>.webp` + `@2x` via `srcset`. Keep `width`/`height` (or an `aspect-ratio`) on the `<img>` to avoid layout shift, and `loading="lazy"` for anything below the fold.
+- **Update the social card:** it's regenerated from the hero automatically; if you want a bespoke card, save a 1200×630-ish source and adjust the script.
 
 ## First-time AWS setup
 
-Already done for termica.io — you only need this to recreate from scratch.
-Requires `aws` (v2) + `jq` and credentials with S3/ACM/CloudFront/Route53
-rights; the Route53 hosted zone for the domain must already exist.
+Already done for termica.io — you only need this to recreate from scratch. Requires `aws` (v2) + `jq` and credentials with S3/ACM/CloudFront/Route53 rights; the Route53 hosted zone for the domain must already exist.
 
 ```sh
 ./infra/bootstrap.sh     # ~10-20 min; waits through cert + distribution deploy
 ./infra/deploy.sh        # first upload
 ```
 
-`bootstrap.sh` is idempotent-ish — it reuses existing resources where it can, so
-it's safe to re-run if it dies partway. It writes `infra/config.env` (bucket +
-distribution ID) for `deploy.sh` to consume.
+`bootstrap.sh` is idempotent-ish — it reuses existing resources where it can, so it's safe to re-run if it dies partway. It writes `infra/config.env` (bucket + distribution ID) for `deploy.sh` to consume.

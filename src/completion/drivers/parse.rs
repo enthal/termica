@@ -104,24 +104,205 @@ pub fn parse_for(tool: DriverTool, stdout: &str, line: &str) -> Vec<CompletionCa
         }
         DriverTool::Aws => parse_aws_completer(stdout),
         DriverTool::Git => parse_git_list_cmds(stdout, last_word(line)),
+        DriverTool::FishComplete => parse_fish_complete(stdout),
+        // Defensive: zsh completion is live-only (no one-shot worker path),
+        // but keep the parser total. Same shape as fish, tagged `zsh`.
+        DriverTool::ZshComplete => parse_shell_complete(stdout, DriverTool::ZshComplete),
     }
 }
 
-/// Parse cobra's `__complete` stdout: one `value\tdescription` per line
-/// (description optional), terminated by a `:N` directive line we ignore.
-/// kubectl's *resource* completion deviates from the tab convention and
-/// pads columns with spaces instead, so a run of two or more spaces is
-/// also accepted as the value/description boundary (cobra completion
-/// values never contain spaces).
+/// Parse `fish ... complete -C` stdout into candidates.
+///
+/// Two formats, auto-detected:
+/// - **Tab-separated** (`value\tdescription`, fish's normal output): split
+///   each line on its first tab.
+/// - **Fixed-width table** (no tabs): some commands' fish completions —
+///   notably `kubectl`, which dumps `api-resources`-style space-padded
+///   columns — have NO tabs and may leave a cell EMPTY (e.g. a resource
+///   with no short name). A naive split-on-spaces drops the empty cell and
+///   shifts that row's later columns left. So we detect the column
+///   boundaries across ALL lines ([`split_table_columns`]) and keep empty
+///   cells, encoding the description columns joined by `\t` — which the
+///   popup ([`crate::completion::popup`]) splits to align them by index.
+///
+/// In both cases the candidate *value* is just the first column, so
+/// accepting inserts `deployments`, never the whole padded row.
+pub fn parse_fish_complete(stdout: &str) -> Vec<CompletionCandidate> {
+    parse_shell_complete(stdout, DriverTool::FishComplete)
+}
+
+/// Parse a live-shell completion reply, tagging each candidate with `tool`.
+///
+/// Shared by the fish (`complete -C`) and zsh (warm completion child)
+/// live-shell paths: the on-the-wire shape — `value\tdescription` lines, or a
+/// space-padded fixed-width table — is identical, so the split into
+/// value/description is done ONCE here and the two shells can't diverge. Only
+/// the `tool` (and thus the popup's source tag, `fish` / `zsh`) differs.
+pub fn parse_shell_complete(stdout: &str, tool: DriverTool) -> Vec<CompletionCandidate> {
+    let source = CompletionSource::Driver(tool);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+
+    if lines.iter().any(|l| l.contains('\t')) {
+        return lines
+            .iter()
+            .map(|line| match line.split_once('\t') {
+                Some((value, desc)) if !desc.trim().is_empty() => {
+                    CompletionCandidate::with_description(value.trim_end(), desc.trim(), source)
+                }
+                Some((value, _)) => CompletionCandidate::simple(value.trim_end(), source),
+                None => CompletionCandidate::simple(*line, source),
+            })
+            .collect();
+    }
+
+    split_table_columns(&lines)
+        .into_iter()
+        .filter_map(|cells| {
+            let (value, desc_cells) = cells.split_first()?;
+            if value.is_empty() {
+                return None;
+            }
+            if desc_cells.iter().all(String::is_empty) {
+                Some(CompletionCandidate::simple(value, source))
+            } else {
+                // `\t`-join so the popup preserves empty cells by index.
+                Some(CompletionCandidate::with_description(value, desc_cells.join("\t"), source))
+            }
+        })
+        .collect()
+}
+
+/// Parse a block of completion lines as a **fixed-width table**: column
+/// boundaries are the character columns that are whitespace in EVERY line,
+/// where a *gap* is a run of 2+ such columns (a lone space stays inside a
+/// cell). Returns one trimmed cell per column per line, with **empty cells
+/// preserved** so a row missing a value (e.g. kubectl's blank short-name
+/// column) stays aligned with the others rather than shifting left. All
+/// rows get the same number of cells.
+fn split_table_columns(lines: &[&str]) -> Vec<Vec<String>> {
+    let rows: Vec<Vec<char>> = lines.iter().map(|l| l.chars().collect()).collect();
+    let width = rows.iter().map(Vec::len).max().unwrap_or(0);
+    // `sep[c]`: every row is whitespace (or has ended) at char column `c`.
+    let mut sep = vec![true; width];
+    for r in &rows {
+        for (c, ch) in r.iter().enumerate() {
+            if !ch.is_whitespace() {
+                sep[c] = false;
+            }
+        }
+    }
+    // Column char-ranges: a gap is a run of 2+ `sep` columns (or leading
+    // whitespace); everything between gaps — including lone `sep` columns —
+    // is one column.
+    let is_gap_at = |c: usize| -> Option<usize> {
+        if !sep.get(c).copied().unwrap_or(false) {
+            return None;
+        }
+        let mut e = c;
+        while e < width && sep[e] {
+            e += 1;
+        }
+        (e - c >= 2).then_some(e)
+    };
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut c = 0;
+    while c < width {
+        if let Some(e) = is_gap_at(c) {
+            c = e; // skip the inter-column gap
+            continue;
+        }
+        // A column runs until the next gap; a lone separator (run < 2) is
+        // intra-cell and keeps the column going.
+        let start = c;
+        let mut e = c;
+        while e < width && is_gap_at(e).is_none() {
+            e += 1;
+        }
+        ranges.push((start, e));
+        c = e;
+    }
+    rows.iter()
+        .map(|r| {
+            ranges
+                .iter()
+                .map(|&(s, e)| {
+                    let end = e.min(r.len());
+                    let cell: String =
+                        if s < end { r[s..end].iter().collect() } else { String::new() };
+                    cell.trim().to_string()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The completion target for a **fish pane**, which is **shell-driven, not
+/// command-driven** and fires in **both command and argument position**:
+/// fish's `complete -C` completes the command *name* too — including the
+/// user's aliases, functions, and abbreviations, which the local `$PATH`
+/// source can't see — as well as arguments. Returns `(line, point)`: the
+/// current command segment up to the cursor and the cursor's byte offset
+/// within it (always `line.len()`).
+///
+/// `None` only when the segment is **empty** — an empty editor, or right
+/// after a sequencer (`| `, `; `) — so we never fire `complete -C ""` and
+/// flood the popup with every command on the system. The driver result is
+/// merged with the local sources (the `$PATH` executables at command
+/// position, files at argument position), so a command that's both on
+/// `$PATH` and known to fish collapses to one row ([`super::super::ranking`]).
+pub fn fish_segment(editor_text: &str, cursor: usize) -> Option<(String, usize)> {
+    let segment = current_command_segment(editor_text, cursor);
+    if segment.is_empty() {
+        return None;
+    }
+    Some((segment.to_string(), segment.len()))
+}
+
+/// Parse cobra's `__complete` stdout, terminated by a `:N` directive line
+/// we ignore. Two on-the-wire shapes, auto-detected:
+///
+/// - **Tab-separated** (`value\tdescription`, cobra's normal output — gh,
+///   kubectl subcommands): the description is free prose (may contain
+///   spaces) and stays a single cell, split on the first tab.
+/// - **Space-padded fixed-width table** (no tabs — kubectl's *resource*
+///   completion, which dumps `api-resources`-style columns): detect the
+///   column boundaries across ALL rows and keep empty cells (e.g. a
+///   resource with no short name), encoding the description columns
+///   `\t`-joined so the popup ([`crate::completion::popup`]) splits them to
+///   align by index. A naive split-on-the-first-space-run would fold the
+///   whole padded remainder into one cell and misalign rows whose
+///   short-name column is blank.
+///
+/// In both shapes the candidate *value* is just the first column, so
+/// accepting inserts `pods`, never the whole padded row.
 pub fn parse_cobra_complete(stdout: &str, tool: DriverTool) -> Vec<CompletionCandidate> {
     let source = CompletionSource::Driver(tool);
-    stdout
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter(|l| !l.starts_with(':'))
-        .map(|line| match split_value_desc(line) {
-            (value, Some(desc)) => CompletionCandidate::with_description(value, desc, source),
-            (value, None) => CompletionCandidate::simple(value, source),
+    let lines: Vec<&str> =
+        stdout.lines().filter(|l| !l.trim().is_empty()).filter(|l| !l.starts_with(':')).collect();
+
+    if lines.iter().any(|l| l.contains('\t')) {
+        return lines
+            .iter()
+            .map(|line| match split_value_desc(line) {
+                (value, Some(desc)) => CompletionCandidate::with_description(value, desc, source),
+                (value, None) => CompletionCandidate::simple(value, source),
+            })
+            .collect();
+    }
+
+    split_table_columns(&lines)
+        .into_iter()
+        .filter_map(|cells| {
+            let (value, desc_cells) = cells.split_first()?;
+            if value.is_empty() {
+                return None;
+            }
+            if desc_cells.iter().all(String::is_empty) {
+                Some(CompletionCandidate::simple(value, source))
+            } else {
+                // `\t`-join so the popup preserves empty cells by index.
+                Some(CompletionCandidate::with_description(value, desc_cells.join("\t"), source))
+            }
         })
         .collect()
 }
@@ -231,6 +412,34 @@ mod tests {
     }
 
     #[test]
+    fn cobra_parse_kubectl_resources_keep_empty_short_name_cell_for_alignment() {
+        // kubectl's space-padded resource table has a SHORTNAMES column that
+        // is blank for some resources (e.g. podtemplates). The description
+        // must be split into the same per-column cells for every row, with
+        // the empty short-name cell PRESERVED — so the popup aligns the
+        // api-version / namespaced / kind columns across rows. Regression:
+        // the whole padded remainder used to become one cell, so a row with a
+        // blank short name shifted its later columns left and misaligned.
+        let cands = parse_cobra_complete(KUBECTL_RESOURCES, DriverTool::Kubectl);
+        let cells = |value: &str| -> Vec<String> {
+            cands
+                .iter()
+                .find(|c| c.value == value)
+                .and_then(|c| c.description.clone())
+                .unwrap_or_default()
+                .split('\t')
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(cells("pods"), ["po", "v1", "true", "Pod"]);
+        assert_eq!(
+            cells("podtemplates"),
+            ["", "v1", "true", "PodTemplate"],
+            "the empty short-name cell is preserved so later columns stay aligned"
+        );
+    }
+
+    #[test]
     fn cobra_parse_docker_bare_values_no_description() {
         let cands = parse_cobra_complete(DOCKER_RUN, DriverTool::Docker);
         assert!(!cands.is_empty());
@@ -329,5 +538,132 @@ mod tests {
         let text = "/usr/local/bin/kubectl get po";
         let (tool, _, _) = driver_target(text, text.len()).expect("basename maps to a tool");
         assert_eq!(tool, DriverTool::Kubectl);
+    }
+
+    // ---- fish sidecar parsing + routing -----------------------------
+
+    const FISH_GIT_CHE: &str = include_str!("../../../testdata/completion/fish/git-che.txt");
+
+    #[test]
+    fn fish_parse_splits_tab_descriptions() {
+        let cands = parse_fish_complete(FISH_GIT_CHE);
+        let checkout = cands.iter().find(|c| c.value == "checkout").expect("checkout present");
+        assert_eq!(checkout.description.as_deref(), Some("Checkout and switch to a branch"));
+        assert_eq!(checkout.source, CompletionSource::Driver(DriverTool::FishComplete));
+        assert!(cands.iter().any(|c| c.value == "cherry-pick"), "all candidates parsed");
+        // The trailing blank line in fish output must not become a candidate.
+        assert!(cands.iter().all(|c| !c.value.is_empty()), "no empty candidates");
+    }
+
+    /// Build a fixed-width row from cells + column widths (last cell
+    /// unpadded), so the test controls the exact column positions.
+    fn fixed_row(cells: &[&str], widths: &[usize]) -> String {
+        let mut s = String::new();
+        for (i, cell) in cells.iter().enumerate() {
+            if i + 1 == cells.len() {
+                s.push_str(cell);
+            } else {
+                s.push_str(&format!("{cell:<width$}", width = widths[i]));
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn split_table_columns_preserves_empty_cells() {
+        // kubectl's fish completion: fixed-width columns, and a row can
+        // have an EMPTY cell (deviceclasses has no short name). Splitting
+        // on spaces would drop it and shift the row's later columns left;
+        // fixed-width detection must keep it aligned.
+        let w = &[15, 8, 20, 7];
+        let lines_owned = [
+            fixed_row(&["daemonsets", "ds", "apps/v1", "true", "DaemonSet"], w),
+            fixed_row(&["deployments", "deploy", "apps/v1", "true", "Deployment"], w),
+            fixed_row(&["deviceclasses", "", "resource.k8s.io/v1", "false", "DeviceClass"], w),
+        ];
+        let lines: Vec<&str> = lines_owned.iter().map(String::as_str).collect();
+        let rows = split_table_columns(&lines);
+        assert_eq!(rows[0], ["daemonsets", "ds", "apps/v1", "true", "DaemonSet"]);
+        assert_eq!(
+            rows[2],
+            ["deviceclasses", "", "resource.k8s.io/v1", "false", "DeviceClass"],
+            "the empty short-name cell is preserved, so later columns stay aligned"
+        );
+    }
+
+    #[test]
+    fn fish_parse_space_padded_table_value_is_first_column_empty_cells_kept() {
+        let w = &[15, 8, 20, 7];
+        let stdout = [
+            fixed_row(&["daemonsets", "ds", "apps/v1", "true", "DaemonSet"], w),
+            fixed_row(&["deviceclasses", "", "resource.k8s.io/v1", "false", "DeviceClass"], w),
+        ]
+        .join("\n");
+        let cands = parse_fish_complete(&stdout);
+        assert_eq!(cands[0].value, "daemonsets", "value is the first column only");
+        assert_eq!(cands[1].value, "deviceclasses");
+        // Description columns are `\t`-joined; the empty short-name cell of
+        // deviceclasses is a leading empty field so columns stay aligned.
+        assert_eq!(cands[0].description.as_deref(), Some("ds\tapps/v1\ttrue\tDaemonSet"));
+        assert_eq!(
+            cands[1].description.as_deref(),
+            Some("\tresource.k8s.io/v1\tfalse\tDeviceClass"),
+            "leading empty cell preserved as an empty `\\t` field"
+        );
+    }
+
+    #[test]
+    fn fish_parse_value_only_line_has_no_description() {
+        // A completion with no description (no tab) is all value — and a
+        // value may legitimately contain spaces (a filename), which the
+        // tab-only split must preserve rather than truncating at a space.
+        let cands = parse_fish_complete("my file.txt\nplain\n");
+        assert_eq!(cands[0].value, "my file.txt");
+        assert!(cands[0].description.is_none());
+        assert_eq!(cands[1].value, "plain");
+    }
+
+    #[test]
+    fn fish_parse_via_parse_for() {
+        // parse_for must dispatch FishComplete to the fish parser.
+        let cands = parse_for(DriverTool::FishComplete, FISH_GIT_CHE, "git che");
+        assert!(cands.iter().any(|c| c.value == "checkout"));
+    }
+
+    #[test]
+    fn fish_segment_fires_for_any_command_in_arg_position() {
+        // Like the per-tool drivers but for an *unknown* command — the
+        // shell sidecar completes anything.
+        let text = "frobnicate --wi";
+        let (line, point) = fish_segment(text, text.len()).expect("fires for any command");
+        assert_eq!(line, "frobnicate --wi");
+        assert_eq!(point, text.len());
+    }
+
+    #[test]
+    fn fish_segment_fires_in_command_position() {
+        // The key difference from the per-tool `driver_target`: fish
+        // completes the command NAME too (aliases, functions,
+        // abbreviations the local `$PATH` source can't see), so it fires
+        // while the user is still typing the command word.
+        let (line, point) = fish_segment("hel", 3).expect("fires on the command name");
+        assert_eq!(line, "hel");
+        assert_eq!(point, 3);
+    }
+
+    #[test]
+    fn fish_segment_uses_segment_after_pipe() {
+        let text = "echo hi | grep -";
+        let (line, _) = fish_segment(text, text.len()).expect("fires after pipe");
+        assert_eq!(line, "grep -", "segment after the pipe, leading space trimmed");
+    }
+
+    #[test]
+    fn fish_segment_none_for_empty_segment() {
+        // Empty editor, or right after a sequencer: nothing typed yet, so
+        // don't fire `complete -C ""` and flood the popup.
+        assert!(fish_segment("", 0).is_none(), "empty editor");
+        assert!(fish_segment("echo hi | ", 10).is_none(), "right after a pipe");
+        assert!(fish_segment("echo hi ; ", 10).is_none(), "right after a semicolon");
     }
 }

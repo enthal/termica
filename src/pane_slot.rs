@@ -51,16 +51,25 @@ pub enum PaneAction {
     /// the cursor home. The shell process is untouched and will
     /// redraw its prompt on the next prompt cycle.
     ClearScrollback,
-    /// Cmd+Option+Up (macOS) / Ctrl+Alt+Up (Linux/Windows): jump
-    /// the pane's scroll position to the very top of the
-    /// scrollback (the oldest sealed block becomes visible at the
-    /// pane viewport top). No-op in alt-screen mode — the running
-    /// program owns the viewport there.
+    /// Cmd+Option+Up (macOS) / Ctrl+Alt+Up (Linux/Windows), or
+    /// `Ctrl+Home` (both): jump the pane's scroll position to the
+    /// very top of the scrollback (the oldest sealed block becomes
+    /// visible at the pane viewport top). No-op in alt-screen mode —
+    /// the running program owns the viewport there.
     ScrollToTop,
-    /// Cmd+Option+Down (macOS) / Ctrl+Alt+Down (Linux/Windows):
-    /// jump to the live tail (editor / running grid). Same chord
-    /// family as `ScrollToTop`; mirror direction.
+    /// Cmd+Option+Down (macOS) / Ctrl+Alt+Down (Linux/Windows), or
+    /// `Ctrl+End` (both): jump to the live tail (editor / running
+    /// grid). Same chord family as `ScrollToTop`; mirror direction.
     ScrollToBottom,
+    /// `Ctrl+PageUp` (both platforms): scroll the pane's scrollback
+    /// viewport up by one page (toward older output). No-op in
+    /// alt-screen mode. Distinct from bare `PageUp`, which moves the
+    /// editor caret to the buffer start.
+    ScrollPageUp,
+    /// `Ctrl+PageDown` (both platforms): scroll the pane's scrollback
+    /// viewport down by one page (toward the live tail). Mirror of
+    /// `ScrollPageUp`.
+    ScrollPageDown,
     /// Cmd+F (macOS) / Ctrl+Shift+F (Linux/Windows): open the in-pane
     /// find overlay (Phase 8). No-op in alt-screen mode — the running
     /// full-screen program owns the viewport, and the transcript it
@@ -134,6 +143,14 @@ pub struct PaneUiState {
     /// width or the set of sealed blocks changes; read by paint,
     /// hit-testing, and find-highlight. See [`crate::reflow`].
     pub(crate) reflow_cache: crate::reflow::ReflowCache,
+    /// True for the duration of a pointer gesture that opened a link
+    /// (a modifier-click on a URL / file path). Such a gesture must not
+    /// also extend a selection on the drag frames that follow the
+    /// press, so the drag-extend handlers consult this. Set when the
+    /// press opens a link; reset on every fresh primary press. Read
+    /// only by `render_pane`'s grid / sealed drag handlers via
+    /// [`drag_extends_selection`](crate::render_pane).
+    pub(crate) gesture_opened_link: bool,
     /// "Force the scroll area to the bottom on next render." Set by
     /// `render_pane` when the editor's `Enter` submit fires; the
     /// ScrollArea normally only sticks to the bottom when the user
@@ -157,6 +174,29 @@ pub struct PaneUiState {
     /// the user can jump to the oldest sealed block. Mirror of
     /// `scroll_to_bottom_pending`. Cleared after one frame.
     pub(crate) scroll_to_top_pending: bool,
+    /// Pending page-scroll of the scrollback viewport, in pages.
+    /// Positive = scroll up (toward older output, `Ctrl+PageUp`),
+    /// negative = scroll down (`Ctrl+PageDown`). Set by
+    /// `PaneAction::ScrollPage{Up,Down}`; `render_pane` turns it into a
+    /// `Ui::scroll_with_delta` (one page = the measured viewport height
+    /// minus one row) and resets to 0. Accumulates if several fire
+    /// before a render consumes them.
+    pub(crate) scroll_page_pending: i32,
+    /// Countdown of frames to keep `stick_to_bottom` disabled after a
+    /// page-scroll. `scroll_with_delta` *animates* the offset over ~0.1–
+    /// 0.3 s; if `stick_to_bottom` re-engages mid-animation while we
+    /// started pinned at the tail, egui re-snaps to the bottom and the
+    /// page-scroll is cancelled (the same hazard the find overlay
+    /// documents). Holding stick off until the animation settles lets it
+    /// play out; reaching the bottom on a page-down still re-pins via
+    /// egui's `offset == max` check. Decremented each frame in
+    /// `render_pane`.
+    pub(crate) scroll_page_frames: u8,
+    /// The scroll area's visible viewport height as of the last render
+    /// (`inner_rect.height()`), cached so the next `Ctrl+PageUp/PageDown`
+    /// pages by the *actual* visible height (one line of overlap) rather
+    /// than the area's max-height bound, which overshoots.
+    pub(crate) last_scroll_viewport_h: f32,
     /// Last `bell_count` we observed on this pane's terminal. When
     /// the live count exceeds this on a render, a new bell happened
     /// since last frame and the visible flash kicks off.

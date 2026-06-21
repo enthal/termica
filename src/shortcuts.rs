@@ -37,6 +37,22 @@ pub fn match_pane_shortcut(
     modifiers: egui::Modifiers,
     is_macos: bool,
 ) -> Option<PaneAction> {
+    // Scrollback navigation — same on both platforms: `Ctrl` + Home /
+    // End / PageUp / PageDown moves the pane's scrollback viewport
+    // (Home/End jump to the ends; PageUp/PageDown page). These keys are
+    // not terminal control characters and the input encoder drops them
+    // when modified, so claiming them here steals nothing from a
+    // running program. Bare Home/End/PageUp/PageDown are left for the
+    // editor caret (or the PTY in `RawTerminal`).
+    if modifiers.ctrl && !modifiers.alt && !modifiers.shift && !modifiers.mac_cmd {
+        match key {
+            egui::Key::Home => return Some(PaneAction::ScrollToTop),
+            egui::Key::End => return Some(PaneAction::ScrollToBottom),
+            egui::Key::PageUp => return Some(PaneAction::ScrollPageUp),
+            egui::Key::PageDown => return Some(PaneAction::ScrollPageDown),
+            _ => {}
+        }
+    }
     if is_macos {
         // macOS Cmd+Option+Up/Down is the scrollback-jump chord —
         // distinct from the Cmd-only family below because Cmd+Up /
@@ -383,15 +399,48 @@ mod tests {
         );
     }
 
+    // Ctrl (no Alt/Shift/Cmd). On Linux egui also reports `command`.
+    fn ctrl_only(is_macos: bool) -> egui::Modifiers {
+        egui::Modifiers { ctrl: true, command: !is_macos, ..egui::Modifiers::default() }
+    }
+
     #[test]
-    fn linux_ctrl_home_end_do_not_collide_with_scrollback_jump() {
-        // Ctrl+Home / Ctrl+End are editor doc-start / doc-end on
-        // Linux (per spec/04 §"Editing keystrokes" row). The
-        // matcher must not claim them as ScrollToTop/Bottom — the
-        // arrow variant carries Alt to disambiguate.
-        let ctrl_only = egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::default() };
-        assert_eq!(match_pane_shortcut(egui::Key::Home, ctrl_only, false), None);
-        assert_eq!(match_pane_shortcut(egui::Key::End, ctrl_only, false), None);
+    fn ctrl_home_end_page_keys_map_to_scrollback_both_platforms() {
+        // Ctrl + Home/End/PageUp/PageDown navigate the scrollback
+        // viewport on both platforms (Home/End jump to the ends,
+        // PageUp/PageDown page). Bare versions stay with the editor
+        // caret / PTY, so they must carry Ctrl here.
+        for is_macos in [true, false] {
+            let m = ctrl_only(is_macos);
+            assert_eq!(
+                match_pane_shortcut(egui::Key::Home, m, is_macos),
+                Some(PaneAction::ScrollToTop)
+            );
+            assert_eq!(
+                match_pane_shortcut(egui::Key::End, m, is_macos),
+                Some(PaneAction::ScrollToBottom)
+            );
+            assert_eq!(
+                match_pane_shortcut(egui::Key::PageUp, m, is_macos),
+                Some(PaneAction::ScrollPageUp)
+            );
+            assert_eq!(
+                match_pane_shortcut(egui::Key::PageDown, m, is_macos),
+                Some(PaneAction::ScrollPageDown)
+            );
+        }
+    }
+
+    #[test]
+    fn bare_page_keys_are_not_pane_shortcuts() {
+        // Without Ctrl, PageUp/PageDown/Home/End belong to the editor
+        // caret (or the PTY in RawTerminal) — the app matcher must not
+        // claim them.
+        let none = egui::Modifiers::default();
+        for key in [egui::Key::PageUp, egui::Key::PageDown, egui::Key::Home, egui::Key::End] {
+            assert_eq!(match_pane_shortcut(key, none, true), None);
+            assert_eq!(match_pane_shortcut(key, none, false), None);
+        }
     }
 
     #[test]

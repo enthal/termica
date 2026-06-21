@@ -144,38 +144,16 @@ This is the production-tested approach used by [bash-preexec](https://github.com
 
 ### Zsh sidecar
 
-Zsh's completion lives in the `compsys` ("new completion" framework). The procedure is gnarlier than bash but proven by [zsh-autocomplete](https://github.com/marlonrichert/zsh-autocomplete), [fzf-tab](https://github.com/Aloxaf/fzf-tab), and similar projects:
-
-```zsh
-# Sidecar helper.
-__termica_complete() {
-    local line=$1 point=$2 id=$3
-    # ZLE state surrogate. _main_complete is a ZLE widget but the
-    # state it reads (BUFFER, CURSOR, words, CURRENT, compstate) is
-    # all settable from a function.
-    BUFFER=$line
-    CURSOR=$point
-    typeset -a words
-    words=( ${(z)line} )
-    local CURRENT=${#words}
-    typeset -A compstate
-    compstate[insert]=  # don't actually insert into BUFFER
-    compstate[list]=list
-    # Run the system completer. It populates the global `reply`
-    # (and friends) which we extract.
-    _main_complete
-    # Emit JSON. zsh's completion stores results in `_main_complete`'s
-    # internal state; the simplest portable extraction is to scrape
-    # the `compstate[unambiguous]` head + the per-group lists.
-    # (Detailed extraction logic lives in the vendored helper.)
-}
-```
-
-The integration helper is more involved than the bash version. The key insight from fzf-tab et al. is that `_main_complete` populates `compstate` and the result groups via well-defined hooks, even when called outside a real `zle` keypress; the trick is replacing `compadd` with a wrapper that records its arguments instead of inserting them.
-
-**Zsh is the most fragile of the three sidecars.** Different zsh versions (5.x has been stable but minor version differences matter), different theme frameworks (oh-my-zsh, prezto, p10k) installing their own completion overrides, and different `compinit` insecurity warnings all need handling. The sidecar bootstrap runs `autoload -Uz compinit && compinit -i` (the `-i` skips the insecurity prompt; we accept the trade-off because user already trusts their own files); when extraction fails, source 3 (local heuristics) absorbs the gap.
-
-If a particular completion function panics inside our extraction wrapper, the sidecar isolates it: we run each request in a subshell so a bad completion can't poison subsequent ones.
+> **As built (slice 5 — live-shell capture via a warm `zpty` child).** zsh ships as live-shell completion, like fish — answered by the pane's own integration so **runtime-defined** aliases complete — but the mechanism is necessarily different from fish's clean `complete -C`, and the design below (call `_main_complete` from a plain function) **does not work on modern zsh**: `compadd`/`_main_complete` early-return outside a real ZLE widget, producing zero matches. Empirically (zsh 5.9), the reliable mechanism is the one [fzf-tab](https://github.com/Aloxaf/fzf-tab) / [zsh-autocomplete](https://github.com/marlonrichert/zsh-autocomplete) use:
+>
+> 1. **A warm captive child.** The pane shell (which runs with `unsetopt zle`, so it can't host a widget) lazily spawns a persistent `zsh/zpty` child — `zsh -f -i`, ZLE *enabled* — on the first Tab and reuses it. The child is seeded **once** with the user's `$fpath` + `compinit` (so their tools' completions load); it is **never** seeded by re-sourcing dotfiles, which on a slow `.zshrc` would make every Tab as slow as shell startup — the constraint that rules out a fresh `zsh -i -c` per request. Setup and per-request data are delivered by `source`-ing a file (a short command line), because a long command *written* to the child's line editor wraps at the pty width and never executes.
+> 2. **A `compadd` recorder.** Inside the child, `compadd` is wrapped to capture the would-be matches via `compadd -O <array>` (zsh extracts them itself — no fragile option-parsing) and then delegate to the builtin.
+> 3. **A real widget.** A one-shot ZLE widget sets `BUFFER` to the requested line and calls `zle complete-word`; the recorder collects the matches. (Triggered by `^X^X` — **not** `^T`, which BSD/macOS ttys intercept as VSTATUS/SIGINFO before it reaches ZLE.)
+> 4. **Runtime aliases.** Each request replays the live shell's `alias` table into the child, so config *and* interactively-defined aliases complete.
+>
+> The captured **values** go out in a [`completion`](03-shell-integration.md#completion--live-shell-completion) DCS marker, parsed by the same Rust parser as fish's reply. The dispatch (`__termica_complete` sentinel, preexec/precmd guards, history exclusion, `$?` preservation) and mode-inertness are normative in [spec/03 §`completion`](03-shell-integration.md#completion--live-shell-completion); the child's lifetime is tied to the bootstrap process, so it dies with the pane.
+>
+> **v1 emits values only.** zsh descriptions are gated behind `verbose` / format zstyles and are config-dependent and fragile; deferred. **Routing**: a zsh pane keeps the per-tool **cobra drivers authoritative** for the tools that have them (`gh`/`git`/`kubectl`/…, already reliable) and routes only the **long tail** — aliases, functions, built-ins, shell-installed completions — to the live shell (`DriverTool::ZshComplete`, command *and* argument position via `fish_segment`). An **empty** segment never fires. Known limitation: a function defined *as a command* directly in `.zshrc` (not via `$fpath`) may not complete by name in v1, since the warm child loads `$fpath`, not the dotfiles.
 
 ### Fish sidecar
 
@@ -187,15 +165,25 @@ get	Display one or many resources
 …
 ```
 
-No `compsys`-style ZLE state. No `COMPREPLY`. Just one CLI call per request. Our fish sidecar is a thin wrapper that reads JSON requests from stdin, runs `complete -C` for each, formats the response. The whole helper is ~30 lines.
+No `compsys`-style ZLE state. No `COMPREPLY`. Just one CLI call per request.
 
-Fish is the **reference implementation** for the protocol — when in doubt about the wire shape or the lifecycle, look at the fish path first.
+> **As built (slice 3 — one-shot, not a persistent process).** Because fish exposes completion as a plain CLI whose stdout is already `value\tdescription` per line — the **same format cobra `__complete` emits** — the fish sidecar does **not** need the persistent-process / JSON-RPC machinery sketched below for bash/zsh. It rides the existing **CLI-native driver engine** ([Source 1](#source-1--cli-native-drivers)) instead: a new `DriverTool::FishComplete` whose invocation is `fish -c 'complete -C $argv[1]' <line>` (the line passed as a positional arg so quotes/spaces can't break out of the `-c` script; **no** `--no-config`, since the user's aliases and `complete` definitions are the whole point) and whose parser is `parse_fish_complete` (tab-only split — fish always separates value/description with a single literal tab, and a completion *value* may contain spaces). This reuses the engine's per-pane worker thread, 2 s deadline, [result cache](#caching), `paint_searching` spinner, and `TERMICA_DUMP_EVENTS` records for free.
+>
+> **Routing**: in a **fish** pane, `complete -C` is a superset of the per-tool CLI drivers, so `completion::plan_completion` routes *any* completion — in **both command and argument position** — to `FishComplete` (via `drivers::parse::fish_segment`) and never also fires a per-tool driver. Routing the command **name** to fish (not just arguments) is what lets the user's **aliases, functions, and abbreviations** complete, since the local `$PATH` source only knows on-disk executables; the `FishComplete` result is merged with the local sources (the `$PATH` executables at command position, files at argument position) so a command on both collapses to one row. The only thing that does *not* fire the sidecar is an **empty** segment (empty editor, or right after a `|`/`;`), which would otherwise `complete -C ""` the entire command set. Non-fish panes keep the per-tool `driver_target` path unchanged (argument position only; the command name stays local). The shell is read from `PaneSession::shell()`.
+>
+> The persistent-process / JSON-RPC model below remains the plan for **bash** (slice 4). **zsh** shipped (slice 5) on a *different* model — live-shell capture via a warm `zpty` child, not a persistent rc-loaded sidecar process — see [§"Zsh sidecar"](#zsh-sidecar).
+
+> **As built (slice 3b — live-shell completion is now the primary fish path).** The one-shot subprocess above loads the user's *config* but can't see aliases/functions defined **interactively at runtime** (they live in the pane's own fish process). So when a fish pane is **at a prompt with confirmed integration**, completion is answered by the pane's **own live shell**: Termica writes a `complete\t<id>\t<base64-line>` request to the PTY, the bootstrap's read-eval loop runs `complete -C` **in-process** and replies with a [`completion`](03-shell-integration.md#completion--live-shell-completion) DCS marker, and `PaneSession` correlates the reply (by `id`) into the same `AwaitDriver` → `resolve_driver` popup flow the drivers use — so the renderer is unchanged. This reflects the true live shell (runtime aliases, functions, abbreviations, current `cd`) and is *faster* than the one-shot (no `fish -c` startup). The wire/lifecycle/mode-safety is normative in [spec/03 §`completion`](03-shell-integration.md#completion--live-shell-completion); it is **inert to the pane-mode machine** ([spec/05](05-pane-modes.md)).
+>
+> The one-shot `fish -c 'complete -C'` (`DriverTool::FishComplete` via the engine) is kept as the **degraded-mode fallback** — used when the fish pane is *not* at a prompt or integration is unconfirmed (`PaneSession::fish_live_capable()` is false). Routing (`plan_completion` → `fish_segment`, command + argument position) is identical for both transports. A live request the shell never answers times out (~600 ms) and falls back to the local candidate sources. Remaining fish follow-up: **multi-source racing** (show instant locals, then swap the live reply in, rather than waiting on the spinner).
+
+Fish is the **reference implementation** for the protocol — when in doubt about the wire shape or the lifecycle, look at the fish path first. (For the persistent-process bash/zsh sidecars, that means the wire/lifecycle below; fish itself sidesteps it via the one-shot path above.)
 
 ### Sidecar lifecycle
 
 | Phase | Trigger | Action |
 |---|---|---|
-| Spawn | First Tab press in pane | Spawn the matching sidecar (`bash --rcfile`, `zsh -i`, `fish -i`) with stdio pipes. Detect shell from `PaneSession.shell` (the integration bootstrap already records this). |
+| Spawn | First Tab press in pane | Spawn the matching **persistent** sidecar (`bash --rcfile`, `zsh -i`) with stdio pipes. Detect shell from `PaneSession.shell`. **Fish is exempt** — it uses the one-shot driver-engine path above (a fresh `fish -c 'complete -C'` per request, no persistent process), so this lifecycle applies to bash/zsh only. |
 | Steady state | Subsequent Tab presses | Send `COMPLETE` requests; read responses. ~30–80 ms per call after warm-up. |
 | Idle timeout | No request for `SIDECAR_IDLE_SECS = 300` (5 min) | Send `shutdown`; close pipes. Re-spawn on next Tab. |
 | Crash | Sidecar process exits unexpectedly | Drop the handle, fall back to source 3 for this request. Re-spawn on next Tab; rate-limit re-spawn attempts at 1/sec to avoid fork bombs. |

@@ -8,9 +8,7 @@
 
 A real, native terminal emulator in Rust — vim, ssh, htop, tmux all behave exactly as they should — with an editor-driven prompt, structured command history, and a tab-and-split workspace layered on top.
 
-[![Rust](https://img.shields.io/badge/Rust-2024_edition-orange)](rust-toolchain.toml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue)](#license)
-[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-informational)](#platform-support)
+[![Rust](https://img.shields.io/badge/Rust-2024_edition-orange)](rust-toolchain.toml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue)](#license) [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-informational)](#platform-support)
 
 [termica.io](https://termica.io) · [Spec](SPEC.md) · [Roadmap](https://github.com/enthal/termica/issues)
 
@@ -42,7 +40,7 @@ It embeds your existing `zsh`, `bash`, or `fish` — Termica is not a new shell,
 - **Scrollback that survives restarts.** Sealed blocks — their output, command, and exit status — are written to disk as you work. Relaunch (or recover from a crash) and your panes come back with their transcripts intact; a per-pane *Restart shell* brings the live shell back and new output appends below the restored history. Old scrollback is bounded and aged out automatically, never silently dropped.
 - **Command history that remembers.** Backed by SQLite and seeded from your existing shell history. Walk it with ↑/↓ in the prompt, or open a fuzzy-search overlay with Ctrl+R, scoped to the current pane or everywhere.
 - **Find in the transcript.** Cmd+F opens an in-pane find bar that searches your command blocks — match case, regex, and an All / Commands / Outputs filter — highlighting hits over the grid. Enter / Shift+Enter step through matches; ↑/↓ recall previous searches.
-- **Tab completion.** A completion popup sourced from filesystem paths, command history, and executables on your `PATH`.
+- **Tab completion.** A completion popup sourced from filesystem paths, executables on your `PATH`, and environment variables — augmented by CLI-native completion for modern tools (`kubectl`, `gh`, `git`, `docker`, `aws`) and, in a **fish or zsh** pane, by your live shell's own completions (built-ins, installed completions, and aliases / functions — including ones you defined right at the prompt). In a zsh pane the modern tools keep their dedicated completion and the shell fills in the long tail.
 - **Tabs and splits.** A workspace of tabs and drag-to-split panes, each a real PTY session, with per-pane keyboard focus.
 - **Clickable links and paths.** URLs and on-disk file paths in output are detected and openable on Cmd/Ctrl-hover.
 - **Automatic shell integration.** zsh, bash, and fish are detected and wired up on launch — no dotfile edits required (see [below](#shell-integration)).
@@ -103,13 +101,13 @@ Shortcuts use **Cmd** on macOS and **Ctrl+Shift** on Linux.
 | Close tab | Cmd+W | Ctrl+Shift+W |
 | Next / previous tab | Cmd+Shift+] / [ | Ctrl+Shift+] / [ |
 | Clear scrollback | Cmd+K | Ctrl+Shift+K |
-| Scroll through scrollback | Cmd+Option+↑ / ↓ | Ctrl+Alt+↑ / ↓ |
+| Scroll scrollback to top / bottom | Cmd+Option+↑ / ↓ or Ctrl+Home / End | Ctrl+Alt+↑ / ↓ or Ctrl+Home / End |
+| Page scrollback up / down | Ctrl+PgUp / PgDn | Ctrl+PgUp / PgDn |
 | Find in pane | Cmd+F | Ctrl+Shift+F |
 | Keyboard shortcuts | Cmd+/ | Ctrl+/ |
 | Quit | Cmd+Q | Ctrl+Shift+Q |
 
-Press **Cmd+/** (**Ctrl+/** on Linux) any time for the full,
-platform-local cheat-sheet.
+Press **Cmd+/** (**Ctrl+/** on Linux) any time for the full, platform-local cheat-sheet.
 
 At the prompt:
 
@@ -119,6 +117,7 @@ At the prompt:
 | History search | Cmd+R or Ctrl+R |
 | Tab completion | Tab |
 | Caret to line start / end | Ctrl+A / Ctrl+E |
+| Caret to buffer start / end | PgUp / PgDn |
 | Transpose characters | Ctrl+T |
 
 ## How it works
