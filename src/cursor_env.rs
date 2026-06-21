@@ -35,7 +35,12 @@
 //! that drives `wp_cursor_shape_v1` would let the compositor size the
 //! pointer and make this bridge unnecessary.
 
+// Only the Linux re-exec path references these; gate them so the
+// other platforms (where `seed_cursor_env_via_reexec` is cfg'd out)
+// don't trip `dead_code` under `-D warnings`.
+#[cfg(target_os = "linux")]
 const SIZE_VAR: &str = "XCURSOR_SIZE";
+#[cfg(target_os = "linux")]
 const THEME_VAR: &str = "XCURSOR_THEME";
 
 /// What to inject into the environment, computed purely from the
