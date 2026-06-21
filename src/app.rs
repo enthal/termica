@@ -125,7 +125,7 @@ pub struct TermicaApp {
     /// disables dump-events entirely with zero per-pane cost.
     event_recorder: Option<Arc<EventRecorder>>,
     /// Per-process command-history store. `Some` once the on-disk
-    /// SQLite at `<data-dir>/history.sqlite` opens successfully;
+    /// SQLite at `<data-dir>/termica.sqlite` opens successfully;
     /// `None` if the data dir couldn't be resolved or the DB
     /// failed to open — in which case the app degrades gracefully
     /// to "no persisted history" and continues running.
@@ -142,6 +142,11 @@ pub struct TermicaApp {
     /// are infrequent compared to PTY traffic.
     #[allow(dead_code)]
     pub(crate) history: Option<Arc<Mutex<HistoryStore>>>,
+    /// Persistence root (`<data-dir>`) — where scrollback chunk files
+    /// live (`<root>/scrollback/…`). `Some` exactly when `history` is
+    /// (both come from the same `init_history_store`); paired with the
+    /// store to build a [`crate::persist::store::Persistence`] per pane.
+    persist_root: Option<std::path::PathBuf>,
     /// Per-process UUID tagging every captured submit in the
     /// `runs` table. The `↑`/`↓` recall filters by this so a fresh
     /// pane never inherits a closed pane's typing — see
@@ -191,7 +196,42 @@ impl TermicaApp {
     pub fn new_with_options(opts: TermicaAppOptions) -> Self {
         let home = home::home_dir();
         let event_recorder = init_event_recorder();
-        let history = init_history_store(home.as_deref());
+        let (history, persist_root) = match init_history_store(home.as_deref()) {
+            Some((store, root)) => (Some(store), Some(root)),
+            None => (None, None),
+        };
+        // Scrollback gc (9E): enforce the disk + `runs` growth caps on a
+        // background thread so launch never blocks on it. It skips live
+        // sessions (lock-held) and is conservative — see
+        // [`crate::persist::gc`]. Real wall-clock `now` is fine here
+        // (production, not a test).
+        if let (Some(store), Some(root)) = (history.as_ref(), persist_root.as_ref()) {
+            let persist = crate::persist::store::Persistence::new(root.clone(), store.clone());
+            let now_ms = now_unix_ms();
+            std::thread::spawn(move || {
+                match crate::persist::gc::gc(
+                    &persist,
+                    now_ms,
+                    &crate::persist::gc::GcCaps::default(),
+                ) {
+                    Ok(r)
+                        if r.chunks_deleted > 0
+                            || r.runs_trimmed > 0
+                            || r.tmp_files_deleted > 0 =>
+                    {
+                        eprintln!(
+                            "termica: gc reclaimed {} chunks ({} bytes), trimmed {} runs, removed {} temps",
+                            r.chunks_deleted,
+                            r.bytes_reclaimed,
+                            r.runs_trimmed,
+                            r.tmp_files_deleted
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("termica: gc failed: {e}"),
+                }
+            });
+        }
         let app_run_id = uuid::Uuid::new_v4().to_string();
         let mut app = Self {
             panes: HashMap::new(),
@@ -211,6 +251,7 @@ impl TermicaApp {
             about_open: false,
             event_recorder,
             history,
+            persist_root,
             app_run_id,
             chrome_variant: Arc::new(Mutex::new(opts.initial_chrome_variant)),
             picker_viewport_open: Arc::new(AtomicBool::new(opts.open_chrome_picker)),
@@ -232,11 +273,148 @@ impl TermicaApp {
         Some(crate::history::HistoryContext { store, app_run_id: self.app_run_id.clone() })
     }
 
+    /// Build a per-pane [`Persistence`] handle from the shared store +
+    /// data-dir root. `None` in degraded mode (no DB) — panes spawn
+    /// without scrollback persistence and the app stays usable.
+    fn persist(&self) -> Option<crate::persist::store::Persistence> {
+        let store = self.history.clone()?;
+        let root = self.persist_root.clone()?;
+        Some(crate::persist::store::Persistence::new(root, store))
+    }
+
+    /// Save the current window layout + stamp live sessions ended (9F),
+    /// so the next launch can restore. Best-effort: a missing store,
+    /// serialization failure, or DB error degrades to "no restore next
+    /// time", never a crash on quit.
+    fn save_layout_on_quit(&self) {
+        let Some(store) = self.history.as_ref() else { return };
+        // Map every live pane's app id -> its durable db pane row id.
+        let mut db_pane_by_app = std::collections::HashMap::new();
+        for (pane_id, slot) in &self.panes {
+            if let Some(db) = slot.session.persist_pane_row() {
+                db_pane_by_app.insert(pane_id.0, db);
+            }
+        }
+        if db_pane_by_app.is_empty() {
+            return; // nothing persistable (degraded mode)
+        }
+        let layout =
+            crate::persist::layout::SavedLayout { tree: self.tree.clone(), db_pane_by_app };
+        let blob = match layout.to_blob() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("termica: layout serialize failed: {e}");
+                return;
+            }
+        };
+        let now = now_unix_ms();
+        if let Ok(store) = store.lock() {
+            if let Err(e) = store.save_layout(&blob, now) {
+                eprintln!("termica: layout save failed: {e}");
+            }
+            for slot in self.panes.values() {
+                if let Some(sid) = slot.session.persist_session() {
+                    let _ = store.end_session(sid, now, None);
+                }
+            }
+        }
+    }
+
     fn bootstrap(&mut self) {
+        // 9F: try to restore a saved workspace first (panes come back in
+        // `Dead` mode showing their persisted scrollback). Falls through
+        // to a fresh single pane if there's nothing to restore, the
+        // layout is unreadable, or another process still owns it.
+        if self.try_restore_workspace() {
+            return;
+        }
+        self.bootstrap_fresh();
+    }
+
+    /// Rebuild the saved tile layout, recreating each pane in `Dead`
+    /// mode with its persisted scrollback. Returns `false` (so the
+    /// caller spawns a fresh pane) when there's no saved layout, it
+    /// can't be parsed, it has no panes, or any pane's session is still
+    /// locked by a live process (don't steal it).
+    fn try_restore_workspace(&mut self) -> bool {
+        let Some(persist) = self.persist() else { return false };
+        let Some(store) = self.history.clone() else { return false };
+
+        let blob = match store.lock() {
+            Ok(s) => s.latest_layout().ok().flatten(),
+            Err(_) => None,
+        };
+        let Some(blob) = blob else { return false };
+        let layout = match crate::persist::layout::SavedLayout::from_blob(&blob) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("termica: layout parse failed, starting fresh: {e}");
+                return false;
+            }
+        };
+        let leaves = layout.pane_ids();
+        if leaves.is_empty() {
+            return false;
+        }
+        if !leaves.iter().all(|p| layout.db_pane_by_app.contains_key(&p.0)) {
+            eprintln!("termica: saved layout has unmapped panes; starting fresh");
+            return false;
+        }
+
+        // Liveness: if any pane's latest session is still lock-held, the
+        // workspace belongs to a live process — don't adopt it.
+        for &db_pane in layout.db_pane_by_app.values() {
+            let Some(sid) =
+                store.lock().ok().and_then(|s| s.latest_session_for_pane(db_pane).ok().flatten())
+            else {
+                continue;
+            };
+            // `matches!` evaluates and immediately drops any acquired
+            // guard — we only want the verdict, not to hold the lock.
+            if matches!(
+                crate::persist::lock::SessionLock::try_acquire(&persist.session_dir(sid)),
+                Ok(None)
+            ) {
+                return false; // held by a live process -> don't steal it
+            }
+        }
+
+        // Build a Dead pane per leaf, reusing the saved app PaneIds so the
+        // tree's leaves resolve.
+        let mut max_app_id = 0u64;
+        for pane_id in &leaves {
+            let db_pane = layout.db_pane_by_app[&pane_id.0];
+            let blocks = crate::persist::restore::restore_blocks_for_pane(&persist, db_pane);
+            let stack = crate::block::BlockStack::with_restored_sealed(blocks);
+            let cwd = store
+                .lock()
+                .ok()
+                .and_then(|s| s.pane_cwd(db_pane).ok().flatten())
+                .map(std::path::PathBuf::from);
+            let session = PaneSession::restored(
+                MIN_ROWS.max(24),
+                MIN_COLS.max(80),
+                stack,
+                pane_id.0,
+                db_pane,
+                cwd,
+            );
+            self.panes.insert(*pane_id, PaneSlot { session, ui: PaneUiState::default() });
+            max_app_id = max_app_id.max(pane_id.0);
+        }
+        self.tree = layout.tree;
+        self.next_pane_id = max_app_id + 1;
+        true
+    }
+
+    /// Spawn a single fresh managed pane and a one-tab tree — the
+    /// no-restore startup path.
+    fn bootstrap_fresh(&mut self) {
         let pane_id = self.mint_pane_id();
         let shell = resolve_shell_from_env();
         let recorder = self.event_recorder.clone();
         let history = self.history_ctx();
+        let persist = self.persist();
         // First pane's starting cwd. Resolved per
         // spec/06 "Startup cwd and positional argument" — caller
         // (typically `run()`) computes it via `resolve_startup_cwd`
@@ -253,6 +431,8 @@ impl TermicaApp {
             pane_id.0,
             recorder,
             history,
+            persist,
+            None, // fresh pane
         )
         .expect("spawn initial pane");
         self.panes.insert(pane_id, PaneSlot { session, ui: PaneUiState::default() });
@@ -261,6 +441,54 @@ impl TermicaApp {
         let pane_tile = tiles.insert_pane(pane_id);
         let tabs_tile = tiles.insert_tab_tile(vec![pane_tile]);
         self.tree = Tree::new("termica-tree", tabs_tile, tiles);
+    }
+
+    /// Restart a `Dead` pane (9F): spawn a fresh managed shell in the
+    /// pane's last-known cwd and transplant the restored scrollback into
+    /// it, so the new shell's output appends below the old transcript.
+    /// The pane keeps its `PaneId` (and tree slot); only its live half is
+    /// replaced. No-op if the pane is gone or not actually dead.
+    fn restart_pane(&mut self, pane_id: PaneId) {
+        let Some(slot) = self.panes.get(&pane_id) else { return };
+        if !slot.session.is_dead() {
+            return;
+        }
+        let cwd = slot.session.terminal().cwd().map(|p| p.to_path_buf());
+        // Reuse the pane's durable db row so its chunks accumulate across
+        // restarts (the new shell's output continues the same pane's
+        // logical-line sequence, rather than orphaning the old scrollback).
+        let resume_pane_row = slot.session.persist_pane_row();
+
+        // Gather spawn inputs before the mutable borrow of `panes`.
+        let shell = resolve_shell_from_env();
+        let recorder = self.event_recorder.clone();
+        let history = self.history_ctx();
+        let persist = self.persist();
+        let fresh = match PaneSession::spawn_managed(
+            MIN_ROWS.max(24),
+            MIN_COLS.max(80),
+            shell,
+            cwd,
+            pane_id.0,
+            recorder,
+            history,
+            persist,
+            resume_pane_row,
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("termica: restart shell failed: {e}");
+                return;
+            }
+        };
+
+        // Swap the live session in, then move the dead pane's restored
+        // scrollback into the fresh one (no clone — the snapshots move).
+        if let Some(slot) = self.panes.get_mut(&pane_id) {
+            let old = std::mem::replace(&mut slot.session, fresh);
+            slot.session.adopt_restored_scrollback(old.into_sealed_blocks());
+            slot.ui.needs_focus = true;
+        }
     }
 
     fn mint_pane_id(&mut self) -> PaneId {
@@ -412,6 +640,7 @@ impl TermicaApp {
                     slot.ui.needs_focus = true;
                 }
             }
+            PaneAction::RestartShell => self.restart_pane(pane_id),
         }
     }
 
@@ -474,14 +703,16 @@ impl TermicaApp {
         let shell = resolve_shell_from_env();
         let recorder = self.event_recorder.clone();
         let history = self.history_ctx();
-        let session =
-            match PaneSession::spawn_managed(24, 80, shell, cwd, pane_id.0, recorder, history) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("termica: failed to spawn new pane: {e}");
-                    return;
-                }
-            };
+        let persist = self.persist();
+        let session = match PaneSession::spawn_managed(
+            24, 80, shell, cwd, pane_id.0, recorder, history, persist, None,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("termica: failed to spawn new pane: {e}");
+                return;
+            }
+        };
         self.panes.insert(pane_id, PaneSlot { session, ui: PaneUiState::default() });
 
         let pane_tile = self.tree.tiles.insert_pane(pane_id);
@@ -809,6 +1040,10 @@ impl eframe::App for TermicaApp {
         }
 
         if self.should_quit {
+            // Persist the layout (9F) so the next launch can restore it,
+            // and stamp the live sessions ended. Best-effort; never
+            // blocks the close.
+            self.save_layout_on_quit();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
@@ -1036,9 +1271,32 @@ fn init_event_recorder() -> Option<Arc<EventRecorder>> {
 /// Replay is idempotent (see [`crate::history::replay`]) so the
 /// "run on every startup" model is safe: re-reading the same file
 /// doesn't duplicate rows.
-fn init_history_store(home: Option<&std::path::Path>) -> Option<Arc<Mutex<HistoryStore>>> {
+/// Wall-clock Unix-epoch milliseconds. Production only (startup gc
+/// timestamp); tests inject a fixed `now` instead, per the determinism
+/// rule. A pre-epoch clock clamps to 0.
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn init_history_store(
+    home: Option<&std::path::Path>,
+) -> Option<(Arc<Mutex<HistoryStore>>, std::path::PathBuf)> {
+    // `APP_STORAGE_NAME` ("termica") is the on-disk storage namespace,
+    // deliberately distinct from the reverse-DNS GUI `APP_ID` — so the
+    // data dir path is unchanged by the desktop-identity work (#161).
     let dirs = directories::ProjectDirs::from("", "", crate::APP_STORAGE_NAME)?;
-    let path = dirs.data_dir().join("history.sqlite");
+    // One database for everything durable that is not a chunk file —
+    // layout, sessions, runs, the chunk index. The pre-1.0 builds
+    // shipped this as `history.sqlite` (runs-only); the rename is a
+    // one-time manual `mv` on the developer's own machines, NOT an
+    // in-app migration, so we simply open `termica.sqlite`. A missing
+    // file is created fresh and `runs` re-seeds from shell history on
+    // the next start (see spec/08-persistence.md §"One database").
+    let data_dir = dirs.data_dir().to_path_buf();
+    let path = data_dir.join("termica.sqlite");
     let store = match HistoryStore::open(&path) {
         Ok(s) => s,
         Err(e) => {
@@ -1049,7 +1307,9 @@ fn init_history_store(home: Option<&std::path::Path>) -> Option<Arc<Mutex<Histor
     if let Some(h) = home {
         let _stats = replay_into(&store, &ReplayPaths::from_home(h));
     }
-    Some(Arc::new(Mutex::new(store)))
+    // The data dir is also the persistence root: chunk files live under
+    // `<data-dir>/scrollback/…` (9D), index rows in the DB above.
+    Some((Arc::new(Mutex::new(store)), data_dir))
 }
 
 /// Walk the tile tree DFS, collecting `(PaneId, TileId)` for every

@@ -19,7 +19,7 @@ use crate::pane::PaneSession;
 /// from other identifier flavours that arrive in later phases
 /// (`CommandRunId`, `HistoryEntryId`, …). `Copy + Eq + Hash` so it
 /// works as both a tree payload and a HashMap key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PaneId(pub u64);
 
 /// App-level intents staged by `render_pane` when the focused pane
@@ -75,6 +75,10 @@ pub enum PaneAction {
     /// full-screen program owns the viewport, and the transcript it
     /// would search isn't visible.
     OpenFind,
+    /// Restart a `Dead` pane (9F): spawn a fresh shell into it, keeping
+    /// the restored scrollback. Staged when the user clicks the
+    /// "Restart shell" affordance on a restored/exited pane.
+    RestartShell,
 }
 
 /// Per-pane UI interaction state. Each pane gets its own multi-
@@ -133,6 +137,12 @@ pub struct PaneUiState {
     /// the drag handler can union them with the word / line under
     /// the current pointer.
     pub(crate) sealed_drag_anchor: Option<(BlockId, BlockCursor, BlockCursor)>,
+    /// Phase 9B: per-width reflow of each sealed block's logical lines
+    /// into the visual rows painted at the current pane width, plus the
+    /// logical↔visual coordinate map. Rebuilt by `render_pane` when the
+    /// width or the set of sealed blocks changes; read by paint,
+    /// hit-testing, and find-highlight. See [`crate::reflow`].
+    pub(crate) reflow_cache: crate::reflow::ReflowCache,
     /// True for the duration of a pointer gesture that opened a link
     /// (a modifier-click on a URL / file path). Such a gesture must not
     /// also extend a selection on the drag frames that follow the
