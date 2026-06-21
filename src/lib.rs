@@ -88,6 +88,7 @@ pub use shortcuts::match_pane_shortcut;
 pub use tab_title::{active_pane_in_tabs, home_relative_cwd, tab_title_for};
 
 use eframe::egui;
+use std::path::{Path, PathBuf};
 
 /// Minimum cell grid Termica will ever ask a PTY for. Below this,
 /// shells and full-screen TTY programs behave erratically. The
@@ -202,6 +203,37 @@ fn desktop_entry_contents(exec_path: &str) -> String {
     )
 }
 
+/// Resolve the path to record as the desktop entry's `Exec`.
+///
+/// Normally this is `current_exe`. Inside an AppImage, though,
+/// `current_exe` is an ephemeral `/tmp/.mount_*` path that vanishes when
+/// the app exits — recording it would make `Exec` unresolvable on the
+/// next launch (the generic-icon bug `desktop_entry_contents` warns
+/// about). The AppImage runtime exports `$APPIMAGE`, the stable path of
+/// the `.AppImage` file itself, for exactly this case.
+///
+/// `$APPIMAGE` is an *inherited* env var, so it is trusted only when we
+/// are genuinely the AppImage: `current_exe` must live inside `$APPDIR`
+/// (the AppImage mount). That rejects a stray `$APPIMAGE` leaked from a
+/// parent AppImage process (e.g. a dev build launched from a terminal
+/// that was itself spawned by some other AppImage). Any mismatch — env
+/// unset, empty, or `current_exe` outside the mount — falls back to
+/// `current_exe`, i.e. today's behavior.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn resolve_exec_path(
+    appimage: Option<&Path>,
+    appdir: Option<&Path>,
+    current_exe: Option<&Path>,
+) -> Option<PathBuf> {
+    let is_appimage = match (appimage, appdir, current_exe) {
+        (Some(img), Some(dir), Some(exe)) => {
+            !img.as_os_str().is_empty() && !dir.as_os_str().is_empty() && exe.starts_with(dir)
+        }
+        _ => false,
+    };
+    if is_appimage { appimage.map(Path::to_path_buf) } else { current_exe.map(Path::to_path_buf) }
+}
+
 /// On Linux, install the icon and a `.desktop` entry into the user's
 /// XDG data dir (`$XDG_DATA_HOME` or `~/.local/share`) so the app is
 /// identifiable in the launcher and its window carries our icon. Every
@@ -231,12 +263,18 @@ fn install_desktop_entry() {
 
     // The entry's `Exec` must resolve to a real program or GIO refuses
     // to load the whole entry (see `desktop_entry_contents`), so point
-    // it at this binary's absolute path. "Steal on start": rewrite
-    // whenever the content differs, so the most recently launched build
-    // claims the entry. Self-healing (a stale path from a since-deleted
-    // build is replaced) and idempotent (no write when already
-    // correct).
-    let Ok(exe) = std::env::current_exe() else {
+    // it at this binary's absolute path — or, under an AppImage, at the
+    // stable `.AppImage` file rather than its ephemeral mount (see
+    // `resolve_exec_path`). "Steal on start": rewrite whenever the
+    // content differs, so the most recently launched build claims the
+    // entry. Self-healing (a stale path from a since-deleted build is
+    // replaced) and idempotent (no write when already correct).
+    let current_exe = std::env::current_exe().ok();
+    let appimage = std::env::var_os("APPIMAGE").map(PathBuf::from);
+    let appdir = std::env::var_os("APPDIR").map(PathBuf::from);
+    let Some(exe) =
+        resolve_exec_path(appimage.as_deref(), appdir.as_deref(), current_exe.as_deref())
+    else {
         return;
     };
     let desired = desktop_entry_contents(&exe.to_string_lossy());
@@ -397,6 +435,45 @@ mod app_icon_tests {
         // data does not move when the identity changes.
         assert!(APP_ID.contains('.'), "APP_ID should be reverse-DNS");
         assert_ne!(APP_ID, APP_STORAGE_NAME);
+    }
+
+    #[test]
+    fn exec_path_prefers_appimage_only_when_inside_appdir() {
+        let img = Path::new("/home/u/Downloads/Termica.AppImage");
+        let appdir = Path::new("/tmp/.mount_TermicaABC");
+        let mount_exe = Path::new("/tmp/.mount_TermicaABC/usr/bin/termica");
+
+        // Genuine AppImage run: current_exe is inside APPDIR → record the
+        // stable .AppImage path, not the ephemeral mount.
+        assert_eq!(
+            resolve_exec_path(Some(img), Some(appdir), Some(mount_exe)),
+            Some(PathBuf::from("/home/u/Downloads/Termica.AppImage"))
+        );
+
+        // $APPIMAGE leaked from a parent AppImage while we run a normal
+        // build: current_exe is NOT under APPDIR → ignore it, use
+        // current_exe (the spoof guard).
+        let dev_exe = Path::new("/home/u/proj/target/release/termica");
+        assert_eq!(
+            resolve_exec_path(Some(img), Some(appdir), Some(dev_exe)),
+            Some(PathBuf::from("/home/u/proj/target/release/termica"))
+        );
+
+        // Plain .deb / dev: no AppImage env → current_exe.
+        assert_eq!(
+            resolve_exec_path(None, None, Some(Path::new("/usr/bin/termica"))),
+            Some(PathBuf::from("/usr/bin/termica"))
+        );
+
+        // Defensive: empty env values are ignored, not treated as a match.
+        assert_eq!(
+            resolve_exec_path(
+                Some(Path::new("")),
+                Some(Path::new("")),
+                Some(Path::new("/usr/bin/termica"))
+            ),
+            Some(PathBuf::from("/usr/bin/termica"))
+        );
     }
 
     #[test]
