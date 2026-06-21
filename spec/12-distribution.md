@@ -121,6 +121,34 @@ No signing required. AppImage runs as-is; the `.deb` may be installed with
 `sudo apt install ./termica_*.deb`. GPG-signing the `.deb` / publishing an apt
 repo is post-MVP.
 
+#### Cursor size & theme
+
+winit decides the mouse pointer's size and theme **solely** from the
+`XCURSOR_SIZE` / `XCURSOR_THEME` environment variables — on Wayland it loads the
+X cursor theme itself (there are no server-side cursors), and it does not read
+GSettings or the XDG settings portal the way GTK and Electron do. A user who
+enlarged their pointer (GNOME "Cursor Size" / accessibility magnification) would
+therefore see a default-size cursor in Termica while other apps honor the
+preference.
+
+At startup, before the event loop, Termica reads the desktop's configured cursor
+size and theme (today via GNOME `gsettings`; the cross-desktop
+`org.freedesktop.portal.Settings` portal is the follow-up) and, when the env vars
+are not already set, **re-exec**s itself with them populated so winit picks them
+up. Re-exec is used instead of `std::env::set_var` because the latter is `unsafe`
+under edition 2024 and the crate is `#![forbid(unsafe_code)]`; it runs at most
+once per launch and is a no-op when the vars are already set or the desktop
+reports nothing. An explicit `XCURSOR_SIZE` / `XCURSOR_THEME` is always honored
+and never overwritten.
+
+The GSettings probe is gated on a GNOME-family desktop (`XDG_CURRENT_DESKTOP`
+contains `GNOME`/`Unity`) so we never inject a GNOME-schema value on a
+KDE/XFCE/etc. desktop that merely has the schemas installed; those desktops fall
+through untouched. The bridge fails closed everywhere else too — no `gsettings`
+binary, a missing schema, or a sandbox that blocks it all resolve to "no change".
+See `src/cursor_env.rs`. A future winit that drives `wp_cursor_shape_v1` would
+let the compositor size the pointer and retire this bridge.
+
 ## Distribution & download links
 
 The public contract is a set of **version-free URLs** so the site and README
