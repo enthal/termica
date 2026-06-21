@@ -96,6 +96,17 @@ produces every format below from one config; the app icon is generated from
 Flatpak, AUR, Homebrew cask, and Windows packaging are explicitly **post-MVP**
 (see [10 — Roadmap](10-roadmap.md) post-MVP) and added on demand.
 
+> **Cursor-read follow-up tied to sandboxed packaging:** when a Flatpak or Snap
+> package ships, switch the cursor size/theme read in `src/cursor_env.rs` from the
+> `gsettings` subprocess to the XDG `org.freedesktop.portal.Settings` portal.
+> Inside a sandbox `gsettings` is blocked, so today's read simply no-ops there;
+> the portal is the supported path and is a **cheap swap** — `zbus` (blocking API,
+> pure Rust) is already in our dependency tree via `accesskit`, so no new
+> heavyweight dependency. Non-sandboxed GNOME already works via `gsettings`, and
+> KDE almost certainly needs nothing (Plasma exports `XCURSOR_SIZE`, which our
+> existing no-op respects), so this is only worth doing alongside sandboxed
+> packaging — not before.
+
 ## Code signing & notarization
 
 ### macOS
@@ -217,6 +228,8 @@ Each phase is its own PR; downloads exist after Phase 1.
    secrets + signing steps (already gated behind their presence).
 4. **Merge queue** + optional canary channel.
 5. **Post-MVP channels:** Homebrew cask, AUR, Flatpak, Windows — as demand appears.
+   When Flatpak/Snap lands, also do the cursor-read portal swap noted under
+   [Packaging](#packaging).
 
 ---
 
