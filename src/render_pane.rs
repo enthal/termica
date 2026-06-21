@@ -557,6 +557,21 @@ fn pane_body_cursor_icon(
     }
 }
 
+/// Should this frame extend the pane/grid selection?
+///
+/// A modifier-click that opened a link (URL / file path) claims the
+/// whole gesture: it starts no selection, and the drag frames that
+/// follow the press must NOT extend one either — otherwise Cmd-clicking
+/// a link also grows whatever selection happened to be on screen. We
+/// track "this gesture opened a link" across frames in
+/// [`PaneUiState::gesture_opened_link`] (reset on every fresh press),
+/// and suppress the drag-extend while it is set. A deliberate
+/// `Shift`+click extend always wins — a fresh press has already reset
+/// the flag, so `shift_extend` is never poisoned by a prior link-open.
+fn drag_extends_selection(dragged: bool, shift_extend: bool, gesture_opened_link: bool) -> bool {
+    shift_extend || (dragged && !gesture_opened_link)
+}
+
 /// Close every per-pane popup (history / completion / find /
 /// keybindings). Popups are mutually exclusive — opening one calls
 /// this first so two never show at once. The find query history is
@@ -2768,6 +2783,14 @@ pub fn render_pane(
             origin_cursor.col = origin_cursor.col.min(row_len);
         }
 
+        // Link (URL / path) under the press, if any — needed both to
+        // decide a Cmd-click-open and to mark the gesture so its drag
+        // frames don't also extend a selection.
+        let sealed_link =
+            slot.session.sealed_block_links(origin_block_id, home).and_then(|links| {
+                links.iter().find(|l| l.contains(origin_cursor.row, origin_cursor.col)).cloned()
+            });
+
         // Shift+click EXTENDS the existing pane selection (across blocks
         // and into / out of command vs output) instead of starting a new
         // one — falling through to the shared extend branch below, which
@@ -2777,14 +2800,18 @@ pub fn render_pane(
             shift_held,
             slot.session.pane_selection().is_some(),
         );
+
+        // A modifier-click that opens a link claims the whole gesture:
+        // record it on the press (reset every fresh press) so its drag
+        // frames don't also extend the pane selection below. Mirrors the
+        // open condition — a non-shift Cmd-press on a link opens it.
+        if primary_just_pressed {
+            slot.ui.gesture_opened_link = !shift_extend && modifier_held && sealed_link.is_some();
+        }
         if primary_just_pressed && !shift_extend {
             // -------- START a selection in the press block ----
             // Anchor + head both land in the origin block;
             // multi-click expands within that block.
-            let sealed_link =
-                slot.session.sealed_block_links(origin_block_id, home).and_then(|links| {
-                    links.iter().find(|l| l.contains(origin_cursor.row, origin_cursor.col)).cloned()
-                });
             if modifier_held && let Some(link) = &sealed_link {
                 // Cmd-click on a URL / path: open it, don't
                 // start a selection.
@@ -2832,7 +2859,9 @@ pub fn render_pane(
                     }
                 }
             }
-        } else if let Some(sel) = slot.session.pane_selection().copied() {
+        } else if !slot.ui.gesture_opened_link
+            && let Some(sel) = slot.session.pane_selection().copied()
+        {
             // -------- EXTEND the selection -------------------
             //
             // Cross-block: the pointer may be over a different
@@ -2984,6 +3013,17 @@ pub fn render_pane(
         // of starting fresh.
         let shift_extend_grid =
             press_extends_selection(primary_just_pressed, shift_held, selection.is_some());
+
+        // A modifier-click that opens a link claims the whole gesture:
+        // record it on the press (reset every fresh press) so the
+        // drag-extend below is suppressed. The condition mirrors the
+        // open below — a non-shift Cmd-press on a link opens it; a
+        // Shift+click extends instead and never opens. See
+        // `drag_extends_selection`.
+        if primary_just_pressed {
+            slot.ui.gesture_opened_link =
+                !shift_extend_grid && modifier_held && link_under_press.is_some();
+        }
         if primary_just_pressed && !shift_extend_grid {
             if modifier_held && let Some(link) = link_under_press {
                 open_url(&link.url);
@@ -3002,12 +3042,17 @@ pub fn render_pane(
                     slot.session.start_selection(press_pt, mode);
                 }
             }
-        } else if rendered.response.dragged() || shift_extend_grid {
+        } else if drag_extends_selection(
+            rendered.response.dragged(),
+            shift_extend_grid,
+            slot.ui.gesture_opened_link,
+        ) {
             // EXTEND. Egui's `dragged()` is the canonical
             // "this widget is being dragged" signal once the
             // drag threshold is met; `shift_extend_grid` is the
             // discrete Shift+click extend. Both keep the mode the
-            // selection was started in.
+            // selection was started in — but a gesture that opened a
+            // link extends nothing (`drag_extends_selection`).
             slot.session.extend_selection(press_pt);
         }
     }
@@ -4359,6 +4404,41 @@ mod tests {
     fn cursor_is_default_off_content() {
         // Over chrome / gutters / empty space: leave egui's arrow.
         assert_eq!(pane_body_cursor_icon(false, false), None);
+    }
+
+    // ---- drag_extends_selection (Cmd-click-open supersedes extend) ----
+    //
+    // Bug: a modifier-click that opens a URL/path also extended the text
+    // selection, because the drag frames that follow the press hit the
+    // EXTEND branch. The gesture that opened a link must claim the whole
+    // press: no extend until the next press.
+
+    #[test]
+    fn link_open_gesture_does_not_extend_on_drag() {
+        // THE FIX: the press opened a link, so a following drag frame
+        // must NOT extend the selection. (Pre-fix this was `true`.)
+        assert!(!drag_extends_selection(true, false, true));
+    }
+
+    #[test]
+    fn normal_drag_extends() {
+        // A plain selection drag (gesture did not open a link) extends.
+        assert!(drag_extends_selection(true, false, false));
+    }
+
+    #[test]
+    fn shift_extend_always_extends() {
+        // A deliberate Shift+click extend wins regardless of the
+        // link-gesture flag (which a fresh press has already reset).
+        assert!(drag_extends_selection(false, true, false));
+        assert!(drag_extends_selection(false, true, true));
+        assert!(drag_extends_selection(true, true, true));
+    }
+
+    #[test]
+    fn no_drag_no_shift_does_not_extend() {
+        assert!(!drag_extends_selection(false, false, false));
+        assert!(!drag_extends_selection(false, false, true));
     }
 
     #[test]
