@@ -140,3 +140,5 @@ Commits should be small and reviewable. A commit that touches >1 crate without a
 - Use relative paths in shell commands, not absolute paths.
 - Avoid `git -C <abs-path>`; it breaks project-level Claude permissions.
 - Don't skip hooks (`--no-verify`) or bypass signing unless the user explicitly asks. If a hook fails, fix the underlying issue.
+- **Only kill processes you started.** When you launch a process (e.g. `termica` for validation), capture its PID and kill *only* that PID. Never `pkill`/`kill` by name or pattern — you will hit instances the user (or another agent) started, and a name pattern can even match your own shell. Keep the PID in your working context, not a shared file like `/tmp/foo.pid` — a concurrent session can overwrite it and you'd kill the wrong process.
+- **Worktrees live under `./.claude/worktrees/<slug>`.** Create them there (`git worktree add .claude/worktrees/<slug> …`), not in sibling directories. When operating inside a worktree, use its explicit path since the shell cwd may reset between commands.
