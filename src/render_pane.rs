@@ -533,6 +533,30 @@ fn pty_passthrough_allowed(event: &egui::Event, editor_active: bool, editor_empt
     editor_empty && is_eof_chord(event)
 }
 
+/// Pick the mouse cursor for the pane body from what the pointer is
+/// over. A Cmd-hovered link affordance (URL / file path) wins with the
+/// pointing hand — that's what a Cmd-click would activate. Otherwise
+/// selectable terminal content (the live grid, a sealed block, the
+/// prompt editor) shows the I-beam, matching every other terminal and
+/// text surface. `None` leaves egui's default arrow (chrome, gutters).
+///
+/// Centralizing the precedence here keeps the scattered hover sites
+/// from disagreeing about what beats what. Selection — and therefore
+/// the I-beam — is available whenever the terminal has not enabled
+/// mouse reporting, which is currently always (spec/02 §"selection").
+fn pane_body_cursor_icon(
+    over_selectable_text: bool,
+    over_link_affordance: bool,
+) -> Option<egui::CursorIcon> {
+    if over_link_affordance {
+        Some(egui::CursorIcon::PointingHand)
+    } else if over_selectable_text {
+        Some(egui::CursorIcon::Text)
+    } else {
+        None
+    }
+}
+
 /// Close every per-pane popup (history / completion / find /
 /// keybindings). Popups are mutually exclusive — opening one calls
 /// this first so two never show at once. The find query history is
@@ -2047,8 +2071,17 @@ pub fn render_pane(
             sticky_command = Some((sticky_id, resp));
         }
     }
-    if highlighted_link.is_some() {
-        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+    // Cursor over the live grid or any sealed block: I-beam for
+    // selectable text, or the pointing hand when a Cmd-hovered link
+    // sits under the pointer. The sealed-link case below may upgrade
+    // this to the hand too (last writer wins).
+    let over_selectable_text = rendered.response.contains_pointer()
+        || sealed_block_renders.iter().any(|(_, r)| {
+            r.snapshot.contains_pointer()
+                || r.command.as_ref().is_some_and(|c| c.contains_pointer())
+        });
+    if let Some(icon) = pane_body_cursor_icon(over_selectable_text, highlighted_link.is_some()) {
+        ctx.set_cursor_icon(icon);
     }
 
     // Sealed-block link hover: when Cmd is held and the pointer is
@@ -2191,6 +2224,14 @@ pub fn render_pane(
             ui.id().with(("editor-footer", slot.session.pane_id())),
             egui::Sense::click_and_drag(),
         ));
+        // I-beam over the editable prompt text — a text surface like
+        // the terminal body. No link affordance competes in the footer.
+        if let Some(icon) = pane_body_cursor_icon(
+            editor_response.as_ref().is_some_and(|r| r.contains_pointer()),
+            false,
+        ) {
+            ctx.set_cursor_icon(icon);
+        }
 
         if let Some(editor) = slot.session.blocks().editor_on_tail() {
             let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
@@ -4293,6 +4334,31 @@ mod tests {
         assert!(pty_passthrough_allowed(&key_ev(egui::Key::D, ctrl), true, true));
         // On a typed line it's swallowed — the editor owns the line.
         assert!(!pty_passthrough_allowed(&key_ev(egui::Key::D, ctrl), true, false));
+    }
+
+    // ---- pane_body_cursor_icon (I-beam vs hand vs default) -----------
+
+    #[test]
+    fn cursor_is_ibeam_over_selectable_text() {
+        // Plain hover over the grid / a sealed block / the editor with
+        // no link under the pointer shows the text caret.
+        assert_eq!(pane_body_cursor_icon(true, false), Some(egui::CursorIcon::Text));
+    }
+
+    #[test]
+    fn cursor_is_hand_over_a_link_affordance() {
+        // A Cmd-hovered URL / path beats the I-beam — that's what a
+        // Cmd-click would activate.
+        assert_eq!(pane_body_cursor_icon(true, true), Some(egui::CursorIcon::PointingHand));
+        // The link wins even if we somehow didn't flag the text (the
+        // affordance only arises over content anyway).
+        assert_eq!(pane_body_cursor_icon(false, true), Some(egui::CursorIcon::PointingHand));
+    }
+
+    #[test]
+    fn cursor_is_default_off_content() {
+        // Over chrome / gutters / empty space: leave egui's arrow.
+        assert_eq!(pane_body_cursor_icon(false, false), None);
     }
 
     #[test]
