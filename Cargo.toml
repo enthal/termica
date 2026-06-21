@@ -16,7 +16,7 @@ publish = false
 # Output formats are selected per-platform on the CLI in release.yml.
 [package.metadata.packager]
 product-name = "Termica"
-identifier = "io.termica.termica"
+identifier = "io.termica.Termica"
 icons = ["assets/app_icon.png"]
 before-packaging-command = "cargo build --release"
 out-dir = "dist"
