@@ -119,9 +119,38 @@ fn load_app_icon() -> Option<egui::IconData> {
     Some(egui::IconData { rgba: image.into_raw(), width, height })
 }
 
+/// Quote a path for the `Exec=` key of a freedesktop `.desktop` entry.
+/// Per the spec an argument is wrapped in double quotes and the reserved
+/// characters `"`, `` ` ``, `$` and `\` are escaped with a preceding
+/// backslash. We always quote: it is valid for any path and spares us
+/// from classifying which characters are "reserved".
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn desktop_exec_field(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 2);
+    out.push('"');
+    for c in path.chars() {
+        if matches!(c, '"' | '`' | '$' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
 /// Contents of the freedesktop `.desktop` entry installed on Linux so
 /// desktop environments (GNOME, KDE, Sway, …) can match the running
 /// window to a name and icon in task switchers and docks.
+///
+/// `exec_path` MUST be the **absolute path to a program that resolves**
+/// (normally this binary, via `std::env::current_exe`). This is not
+/// cosmetic: GIO's `GDesktopAppInfo` loader — which gnome-shell's
+/// `shell-window-tracker` calls to turn a window's `app_id` into an app
+/// (and thus an icon) — runs `g_find_program_in_path` on `Exec` and
+/// returns NULL for the *entire entry* if it does not resolve. A bare
+/// `Exec=termica` is not on `PATH` for a dev/cargo build, so the entry
+/// silently fails to load and the window falls back to a generic icon,
+/// even though every other field is correct.
 ///
 /// Kept pure — no `cfg`, no filesystem — so it is unit-testable on
 /// every platform. `StartupWMClass` MUST equal the `app_id` we set on
@@ -130,13 +159,14 @@ fn load_app_icon() -> Option<egui::IconData> {
 // Non-Linux production builds have no caller (the installer is
 // Linux-gated); the tests below still exercise it on every platform.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn desktop_entry_contents() -> String {
+fn desktop_entry_contents(exec_path: &str) -> String {
+    let exec = desktop_exec_field(exec_path);
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
          Name=Termica\n\
          Comment=Native terminal workspace\n\
-         Exec={APP_ID}\n\
+         Exec={exec}\n\
          Icon={APP_ID}\n\
          Terminal=false\n\
          StartupWMClass={APP_ID}\n\
@@ -146,10 +176,9 @@ fn desktop_entry_contents() -> String {
 
 /// On Linux, install the icon and a `.desktop` entry into the user's
 /// XDG data dir (`$XDG_DATA_HOME` or `~/.local/share`) so the app is
-/// identifiable in the launcher and its window carries our icon. Both
-/// writes are skipped if the target already exists, and every step is
-/// best-effort: a failure here never blocks startup, it just means
-/// the desktop environment falls back to a generic icon.
+/// identifiable in the launcher and its window carries our icon. Every
+/// step is best-effort: a failure here never blocks startup, it just
+/// means the desktop environment falls back to a generic icon.
 #[cfg(target_os = "linux")]
 fn install_desktop_entry() {
     let Some(base) = directories::BaseDirs::new() else {
@@ -157,16 +186,39 @@ fn install_desktop_entry() {
     };
     let data_home = base.data_dir();
 
+    // The icon bytes are constant, so write-if-missing is enough.
     let icon_dir = data_home.join("icons/hicolor/256x256/apps");
     let icon_path = icon_dir.join(format!("{APP_ID}.png"));
     if !icon_path.exists() && std::fs::create_dir_all(&icon_dir).is_ok() {
         let _ = std::fs::write(&icon_path, APP_ICON_PNG);
     }
 
+    // The entry's `Exec` must resolve to a real program or GIO refuses
+    // to load the whole entry (see `desktop_entry_contents`), so point
+    // it at this binary's absolute path. "Steal on start": rewrite
+    // whenever the content differs, so the most recently launched build
+    // claims the entry. Self-healing (a stale path from a since-deleted
+    // build is replaced) and idempotent (no write when already
+    // correct).
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let desired = desktop_entry_contents(&exe.to_string_lossy());
     let app_dir = data_home.join("applications");
     let desktop_path = app_dir.join(format!("{APP_ID}.desktop"));
-    if !desktop_path.exists() && std::fs::create_dir_all(&app_dir).is_ok() {
-        let _ = std::fs::write(&desktop_path, desktop_entry_contents());
+    let up_to_date = std::fs::read_to_string(&desktop_path).is_ok_and(|cur| cur == desired);
+    if !up_to_date
+        && std::fs::create_dir_all(&app_dir).is_ok()
+        && std::fs::write(&desktop_path, &desired).is_ok()
+    {
+        // Best-effort nudge so an already-running shell re-reads the
+        // entry without a re-login. Failure (tool absent) is fine: the
+        // shell's own file monitor still catches the write.
+        let _ = std::process::Command::new("update-desktop-database")
+            .arg(&app_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
     }
 }
 
@@ -287,14 +339,37 @@ mod app_icon_tests {
 
     #[test]
     fn desktop_entry_wm_class_matches_app_id() {
-        let entry = desktop_entry_contents();
+        let entry = desktop_entry_contents("/opt/termica/bin/termica");
         // The compositor keys icon lookup on StartupWMClass; it must
         // equal the app_id we set on the viewport, or Linux desktops
         // fall back to a generic icon.
         assert!(entry.contains(&format!("StartupWMClass={APP_ID}\n")));
-        assert!(entry.contains(&format!("Exec={APP_ID}\n")));
         assert!(entry.contains(&format!("Icon={APP_ID}\n")));
         assert!(entry.starts_with("[Desktop Entry]\n"));
         assert!(entry.contains("Type=Application\n"));
+    }
+
+    #[test]
+    fn desktop_entry_exec_is_the_absolute_binary_path_not_bare_name() {
+        // Regression guard for the generic-icon bug: a bare
+        // `Exec=termica` is not on PATH for a dev/cargo build, so GIO's
+        // GDesktopAppInfo loader rejects the whole entry
+        // (g_find_program_in_path fails) and gnome-shell cannot map the
+        // window's app_id to an app — generic icon. `Exec` must be the
+        // resolvable absolute path to this binary.
+        let entry = desktop_entry_contents("/home/u/wt/target/release/termica");
+        assert!(entry.contains("Exec=\"/home/u/wt/target/release/termica\"\n"), "got: {entry}");
+        assert!(
+            !entry.contains(&format!("Exec={APP_ID}\n")),
+            "must never emit the bare, unresolvable Exec={APP_ID}"
+        );
+    }
+
+    #[test]
+    fn desktop_entry_exec_quotes_spaces_and_escapes_reserved_chars() {
+        // Worktrees / homes can contain spaces and shell metacharacters;
+        // the Exec field must stay a single, spec-valid quoted argument.
+        let entry = desktop_entry_contents("/home/a b/$x/termica");
+        assert!(entry.contains("Exec=\"/home/a b/\\$x/termica\"\n"), "got: {entry}");
     }
 }
