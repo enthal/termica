@@ -1284,7 +1284,10 @@ fn now_unix_ms() -> i64 {
 fn init_history_store(
     home: Option<&std::path::Path>,
 ) -> Option<(Arc<Mutex<HistoryStore>>, std::path::PathBuf)> {
-    let dirs = directories::ProjectDirs::from("", "", "termica")?;
+    // `APP_STORAGE_NAME` ("termica") is the on-disk storage namespace,
+    // deliberately distinct from the reverse-DNS GUI `APP_ID` — so the
+    // data dir path is unchanged by the desktop-identity work (#161).
+    let dirs = directories::ProjectDirs::from("", "", crate::APP_STORAGE_NAME)?;
     // One database for everything durable that is not a chunk file —
     // layout, sessions, runs, the chunk index. The pre-1.0 builds
     // shipped this as `history.sqlite` (runs-only); the rename is a
