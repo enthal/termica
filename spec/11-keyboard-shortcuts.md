@@ -63,11 +63,7 @@ PC keyboards have keys Apple keyboards lack. Behavior:
 | `Cmd+/` | `Ctrl+/` | Open the keyboard-shortcuts cheat-sheet (this list, platform-local; modifier key-caps are painter-drawn, ⌘ for Command). | ✅ |
 | `Cmd++` / `Cmd+-` / `Cmd+0` | `Ctrl++` / `Ctrl+-` / `Ctrl+0` | Zoom the whole UI in / out / reset. **Inherited** from egui's built-in `zoom_with_keyboard` (on by default) — it scales the egui zoom factor (`pixels_per_point`), which reflows the terminal grid. We do not wire our own; the chords are consumed by egui at end-of-frame and never reach the PTY. | egui default |
 
-**Popups are mutually exclusive.** The find overlay, the `Ctrl/Cmd+R`
-history overlay, the `Tab` completion popup, and the `Cmd+/`
-cheat-sheet never show two at once: invoking one closes whichever is
-open and opens the requested one. Each is modal — while it's up,
-keystrokes route to the popup, not the editor or PTY.
+**Popups are mutually exclusive.** The find overlay, the `Ctrl/Cmd+R` history overlay, the `Tab` completion popup, and the `Cmd+/` cheat-sheet never show two at once: invoking one closes whichever is open and opens the requested one. Each is modal — while it's up, keystrokes route to the popup, not the editor or PTY.
 
 Mouse:
 

@@ -1,7 +1,6 @@
 # media-src — raw homepage captures
 
-Drop full-resolution (2× / retina) PNG screenshots here, then run the
-optimizer to generate the web variants the page actually serves:
+Drop full-resolution (2× / retina) PNG screenshots here, then run the optimizer to generate the web variants the page actually serves:
 
 ```sh
 python3 infra/optimize-media.py   # reads this dir → writes src/img/
@@ -16,5 +15,4 @@ Expected files (drop what you have; missing ones are skipped):
 | `history.png` | the Ctrl+R history overlay feature row |
 | `completion.png` | the Tab-completion popup feature row |
 
-These originals are the source of truth; everything in `src/img/` is generated
-from them and can be regenerated at any time.
+These originals are the source of truth; everything in `src/img/` is generated from them and can be regenerated at any time.
