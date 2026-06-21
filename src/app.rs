@@ -1037,7 +1037,7 @@ fn init_event_recorder() -> Option<Arc<EventRecorder>> {
 /// "run on every startup" model is safe: re-reading the same file
 /// doesn't duplicate rows.
 fn init_history_store(home: Option<&std::path::Path>) -> Option<Arc<Mutex<HistoryStore>>> {
-    let dirs = directories::ProjectDirs::from("", "", "termica")?;
+    let dirs = directories::ProjectDirs::from("", "", crate::APP_STORAGE_NAME)?;
     let path = dirs.data_dir().join("history.sqlite");
     let store = match HistoryStore::open(&path) {
         Ok(s) => s,

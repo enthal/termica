@@ -96,12 +96,29 @@ use eframe::egui;
 pub(crate) const MIN_ROWS: u16 = 5;
 pub(crate) const MIN_COLS: u16 = 20;
 
-/// Stable application identifier. Used as the eframe app name, the
-/// Wayland/X11 `app_id` (which becomes the window's `StartupWMClass`
-/// for icon matching), and the basename of the Linux `.desktop` +
-/// icon files we install. Must stay in sync with `StartupWMClass`
-/// in [`desktop_entry_contents`].
-const APP_ID: &str = "termica";
+/// Reverse-DNS application identifier — the single identity the desktop
+/// environment keys on. It is the Wayland/X11 `app_id` (→ the window's
+/// `StartupWMClass`) AND the basename of the Linux `.desktop` + icon
+/// files we install, so the *running window* and the *installed
+/// launcher* resolve to the same app (icon on the window, launcher
+/// merges with its window, single app-grid entry). Capitalized app
+/// component per the prevailing convention (`dev.warp.Warp`,
+/// `dev.zed.Zed`).
+///
+/// MUST equal the `[package.metadata.packager] identifier` in
+/// `Cargo.toml` (the basename of the packaged `.deb`/AppImage entry +
+/// icon) — see `app_id_matches_packaged_identifier`. This is NOT the
+/// storage namespace; that is [`APP_STORAGE_NAME`], deliberately kept
+/// short and stable so user data does not move.
+const APP_ID: &str = "io.termica.Termica";
+
+/// Where on-disk state lives: `$XDG_DATA_HOME/<APP_STORAGE_NAME>/`
+/// (eframe window state) and the history SQLite. Kept as the short,
+/// stable `termica` — distinct from the reverse-DNS [`APP_ID`] — because
+/// it names a directory holding real user data (command history); moving
+/// it would orphan that data. The desktop *identity* and the storage
+/// *namespace* are different concerns.
+pub(crate) const APP_STORAGE_NAME: &str = "termica";
 
 /// The window/dock/taskbar icon, embedded in the binary so there is
 /// no runtime file dependency. Decoded by [`load_app_icon`]; written
@@ -196,6 +213,14 @@ fn install_desktop_entry() {
         return;
     };
     let data_home = base.data_dir();
+
+    // One-time migration: earlier builds installed under the bare
+    // `termica` basename, before we unified on the reverse-DNS
+    // [`APP_ID`]. Leaving those behind would shadow/duplicate the new
+    // entry, so drop the files we used to write. Best-effort; absent is
+    // fine.
+    let _ = std::fs::remove_file(data_home.join("applications/termica.desktop"));
+    let _ = std::fs::remove_file(data_home.join("icons/hicolor/256x256/apps/termica.png"));
 
     // The icon bytes are constant, so write-if-missing is enough.
     let icon_dir = data_home.join("icons/hicolor/256x256/apps");
@@ -312,7 +337,10 @@ pub fn run() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        APP_ID,
+        // eframe's app name is its storage key, NOT the desktop app_id
+        // (that is set via `with_app_id` above). Keep it on the stable
+        // storage namespace so window state stays put.
+        APP_STORAGE_NAME,
         options,
         Box::new(|cc| {
             // Force dark theme always, regardless of the system
@@ -346,6 +374,29 @@ mod app_icon_tests {
         assert!(icon.width > 0, "app icon must have nonzero dimensions");
         // RGBA: four bytes per pixel, exactly width*height pixels.
         assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
+    }
+
+    #[test]
+    fn app_id_matches_packaged_identifier() {
+        // The runtime `app_id` is the desktop-file basename gnome-shell
+        // matches a window to; the packager `identifier` is the basename
+        // of the installed `.deb`/AppImage entry + icon. If they drift,
+        // the running window and the installed launcher are two different
+        // apps to the desktop environment (generic icon / duplicate
+        // launcher). Pin them together.
+        let cargo_toml = include_str!("../Cargo.toml");
+        assert!(
+            cargo_toml.contains(&format!("identifier = \"{APP_ID}\"")),
+            "packager identifier in Cargo.toml must equal APP_ID = {APP_ID:?}"
+        );
+    }
+
+    #[test]
+    fn app_id_is_reverse_dns_distinct_from_storage_namespace() {
+        // Desktop identity is reverse-DNS; storage stays short so user
+        // data does not move when the identity changes.
+        assert!(APP_ID.contains('.'), "APP_ID should be reverse-DNS");
+        assert_ne!(APP_ID, APP_STORAGE_NAME);
     }
 
     #[test]
