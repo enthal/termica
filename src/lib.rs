@@ -120,19 +120,30 @@ fn load_app_icon() -> Option<egui::IconData> {
 }
 
 /// Quote a path for the `Exec=` key of a freedesktop `.desktop` entry.
-/// Per the spec an argument is wrapped in double quotes and the reserved
-/// characters `"`, `` ` ``, `$` and `\` are escaped with a preceding
-/// backslash. We always quote: it is valid for any path and spares us
-/// from classifying which characters are "reserved".
+///
+/// Two independent escaping layers apply, and we must satisfy both:
+/// 1. **Quoting** — the argument is wrapped in double quotes and the
+///    reserved characters `"`, `` ` ``, `$` and `\` are escaped with a
+///    preceding backslash. We always quote: it is valid for any path
+///    and spares us from classifying which characters are "reserved".
+/// 2. **Field codes** — the launcher expands `%f`, `%u`, `%i`, … in
+///    `Exec`, so a *literal* percent must be written `%%` or a path
+///    containing `%` is misread as a (possibly garbage) field code.
+///    This layer is outside the quotes; double-quoting does not exempt
+///    it.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn desktop_exec_field(path: &str) -> String {
     let mut out = String::with_capacity(path.len() + 2);
     out.push('"');
     for c in path.chars() {
-        if matches!(c, '"' | '`' | '$' | '\\') {
-            out.push('\\');
+        match c {
+            '"' | '`' | '$' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '%' => out.push_str("%%"),
+            _ => out.push(c),
         }
-        out.push(c);
     }
     out.push('"');
     out
@@ -371,5 +382,14 @@ mod app_icon_tests {
         // the Exec field must stay a single, spec-valid quoted argument.
         let entry = desktop_entry_contents("/home/a b/$x/termica");
         assert!(entry.contains("Exec=\"/home/a b/\\$x/termica\"\n"), "got: {entry}");
+    }
+
+    #[test]
+    fn desktop_entry_exec_doubles_literal_percent_for_field_codes() {
+        // `%` is the desktop-entry field-code marker (%f, %u, …), a layer
+        // separate from quoting: a literal percent in the path must be
+        // written `%%` or the launcher reads it as a (garbage) field code.
+        let entry = desktop_entry_contents("/home/u/50%off/termica");
+        assert!(entry.contains("Exec=\"/home/u/50%%off/termica\"\n"), "got: {entry}");
     }
 }
