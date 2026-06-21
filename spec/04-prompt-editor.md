@@ -86,7 +86,7 @@ Standard text-editor mapping, OS-aware. macOS uses `Option`/`Cmd`; Linux/Windows
 | Move cursor one line | Arrow ↑ / ↓ | Arrow ↑ / ↓ |
 | Move to line start / end | `Home` / `End` (also `Cmd + ←` / `Cmd + →`) | `Home` / `End` |
 | Move by word | `Option + ← / →` | `Ctrl + ← / →` |
-| Move to document start / end | `Cmd + ↑` / `Cmd + ↓` | `Ctrl + Home` / `Ctrl + End` |
+| Move to buffer start / end | `Cmd + ↑` / `Cmd + ↓`, or `PageUp` / `PageDown` | `PageUp` / `PageDown` |
 | Select all | `Cmd + A` | `Ctrl + A` |
 | Undo / redo (Phase 4 polish) | `Cmd + Z` / `Cmd + Shift + Z` | `Ctrl + Z` / `Ctrl + Shift + Z` |
 | Copy / paste / cut | `Cmd + C / V / X` | `Ctrl + C / V / X` |
@@ -102,7 +102,12 @@ Standard text-editor mapping, OS-aware. macOS uses `Option`/`Cmd`; Linux/Windows
 
 The matching matrix lives in [`classify_editor_motion`](../src/render_pane.rs); both branches are unit-tested with the `is_macos` flag flipped explicitly so each OS's convention is verified on every CI run, not only on the host that runs CI. New motion keys are added there first, with tests, before any new row appears above.
 
-**Note on Cmd+↑/↓ vs scrollback nav.** Cmd+↑ / Cmd+↓ (macOS) and Ctrl+Home / Ctrl+End (Linux/Windows) are *editor* caret motions per the row above. Adding the Option / Alt modifier — `Cmd+Option+↑/↓` (macOS) / `Ctrl+Alt+↑/↓` (Linux/Windows) — escapes the editor and jumps the pane's scroll position to the top / bottom of the sealed-block stack instead. See [spec/11 §Shipped](11-keyboard-shortcuts.md#shipped-phase-1--phase-2) for the pane-level binding. The disambiguating modifier is intentional: a pane has both an editor and a scrollback that need independent "jump to ends" chords; Option / Alt is the standard way to layer an additional gesture on a chord without ambiguity.
+**Note on caret motion vs scrollback nav.** A pane has both an *editor* caret and a *scrollback* viewport that each need "go to start / end" and "page" gestures, so they're split by modifier:
+
+- **Editor caret** — `Cmd+↑/↓` (macOS) and bare `PageUp`/`PageDown` (both platforms) move the caret to the buffer start / end; `Shift` extends.
+- **Scrollback viewport** — `Ctrl+Home`/`Ctrl+End` jump to the top / bottom of the sealed-block stack and `Ctrl+PageUp`/`Ctrl+PageDown` page it (both platforms); `Cmd+Option+↑/↓` (macOS) / `Ctrl+Alt+↑/↓` (Linux) are the equivalent jump chords. These are *app-level* — they fire in `RawTerminal` (a running command) too, and are no-ops in alt-screen. See [spec/11 §Shipped](11-keyboard-shortcuts.md#shipped-phase-1--phase-2) and [§Per-mode keyboard routing](11-keyboard-shortcuts.md#per-mode-keyboard-routing).
+
+`Ctrl+Home`/`Ctrl+End` are deliberately *not* editor caret motions (an earlier draft mapped them to caret-to-doc-start/-end on Linux); the caret reaches the buffer ends via `PageUp`/`PageDown` instead, leaving `Ctrl+Home/End` free for the scrollback.
 
 Shell-binding keys (`Ctrl+R`, `Ctrl+P`, `Ctrl+N`, `Ctrl+S`, `Ctrl+G`) are **consumed without effect** in the editor today: they don't reach the PTY (the editor swallows them) and they don't fire any app behaviour either, until [4J](10-roadmap.md#phase-4--editor-at-prompt-block-model-pivot) ships history walk and Ctrl+R popup. This is deliberate: forwarding them would leak literal `^R` glyphs into the editor while the user's muscle memory hasn't been wired up yet.
 
