@@ -246,6 +246,30 @@ fn effective_var_names<'a>(shell: Option<&'a [String]>, snapshot: &'a [String]) 
     shell.unwrap_or(snapshot)
 }
 
+/// The text to actually write to the PTY for a submit, given the pane's
+/// `shell`, any prior `last_submitted` (set ⟺ a multi-line continuation is in
+/// progress), and the current full editor `text`.
+///
+/// **zsh / bash** buffer the already-sent prefix at the tty: after an
+/// incomplete submit their parser holds `<prev>\n` and waits at `PS2`, so the
+/// re-submit must send only the **new suffix** — sending the whole buffer
+/// would feed `<prev>` twice. **fish** holds no partial command (its read-eval
+/// loop `eval`s each line as a whole unit and loops back to a fresh `read`),
+/// so a continuation re-submit must resend the **whole buffer** — there is no
+/// buffered prefix to avoid duplicating, and the bootstrap re-checks
+/// completeness of the cumulative command each time. Pure + tested.
+fn continuation_to_send(shell: ShellSpec, last_submitted: Option<&str>, text: &str) -> String {
+    match last_submitted {
+        Some(prev) if shell != ShellSpec::Fish && text.starts_with(prev) => {
+            // Strip the already-sent prefix + the separator `\n` the
+            // restore-on-continuation logic inserted.
+            let after = &text[prev.len()..];
+            after.strip_prefix('\n').unwrap_or(after).to_string()
+        }
+        _ => text.to_string(),
+    }
+}
+
 impl PaneSession {
     /// Spawn a shell, attach a freshly sized [`TerminalState`], and
     /// start the background reader thread. Low-level constructor;
@@ -1091,15 +1115,7 @@ impl PaneSession {
         //   submit and is waiting for more); we only need to send
         //   `<new_lines>\r` — sending the whole thing would feed
         //   `<prev_sent>` to the shell TWICE.
-        let to_send: String = match self.last_submitted.as_deref() {
-            Some(prev) if text.starts_with(prev) => {
-                // Strip the already-sent prefix + the separator \n
-                // the restore-on-continuation logic inserted.
-                let after = &text[prev.len()..];
-                after.strip_prefix('\n').unwrap_or(after).to_string()
-            }
-            _ => text.clone(),
-        };
+        let to_send = continuation_to_send(self.shell, self.last_submitted.as_deref(), &text);
         // Track the full editor text (not `to_send`) so the next
         // Continuation restore can put the right cumulative text
         // back into the editor.
@@ -2001,6 +2017,40 @@ mod tests {
 
         // Bring the shell down quickly.
         let _ = session.write(b"\x03");
+    }
+
+    #[test]
+    fn continuation_to_send_first_submit_sends_full_text() {
+        // No prior continuation: every shell sends the whole editor text.
+        for shell in [ShellSpec::Zsh, ShellSpec::Bash, ShellSpec::Fish] {
+            assert_eq!(continuation_to_send(shell, None, "echo 1 &&"), "echo 1 &&");
+        }
+    }
+
+    #[test]
+    fn continuation_to_send_zsh_bash_send_only_the_suffix() {
+        // zsh/bash buffer `<prev>\n` at the tty (PS2), so a continuation
+        // re-submit sends only the new suffix beyond `last_submitted`.
+        for shell in [ShellSpec::Zsh, ShellSpec::Bash] {
+            assert_eq!(
+                continuation_to_send(shell, Some("echo 1 &&"), "echo 1 &&\necho 2"),
+                "echo 2",
+                "{shell:?} sends only the suffix"
+            );
+        }
+    }
+
+    #[test]
+    fn continuation_to_send_fish_sends_the_whole_buffer() {
+        // fish holds NO partial command across submits (it evals whole lines),
+        // so a continuation re-submit must resend the cumulative buffer — the
+        // suffix-diff that zsh/bash use would drop the prefix and run only
+        // `echo 2`, losing the `echo 1 &&` the user is continuing.
+        assert_eq!(
+            continuation_to_send(ShellSpec::Fish, Some("echo 1 &&"), "echo 1 &&\necho 2"),
+            "echo 1 &&\necho 2",
+            "fish resends the whole buffer, not the suffix"
+        );
     }
 
     #[test]
