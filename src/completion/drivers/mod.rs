@@ -109,6 +109,16 @@ pub enum DriverTool {
     /// the same `value\tdescription` per line as cobra's `__complete`
     /// ([spec/04a §"Source 2"](../../../spec/04a-completion.md)).
     FishComplete,
+    /// The zsh **live-shell** completion source. Unlike [`Self::FishComplete`]
+    /// there is NO one-shot subprocess form (a fresh `zsh -i -c` would
+    /// re-source the user's dotfiles on every Tab — unacceptably slow). It
+    /// exists ONLY as a live-shell tool: the pane's warm completion child
+    /// answers a PTY request and replies with a `completion` marker, parsed
+    /// the same way as fish's. So it never reaches the one-shot engine's
+    /// `invocation` / worker; those arms are defensive no-ops. v1 emits
+    /// **values only** (zsh descriptions are config-gated and fragile) — see
+    /// [spec/04a §"Zsh sidecar"](../../../spec/04a-completion.md).
+    ZshComplete,
 }
 
 impl DriverTool {
@@ -121,6 +131,7 @@ impl DriverTool {
             DriverTool::Aws => "aws",
             DriverTool::Git => "git",
             DriverTool::FishComplete => "fish",
+            DriverTool::ZshComplete => "zsh",
         }
     }
 }
@@ -241,6 +252,13 @@ fn invocation(req: &DriverRequest) -> (&'static str, Vec<String>, Vec<(String, S
             vec!["-c".to_string(), "complete -C $argv[1]".to_string(), req.line.clone()],
             Vec::new(),
         ),
+        // Defensive only: `ZshComplete` is a live-shell tool with no one-shot
+        // form, so routing never sends it to the worker (it goes to the pane's
+        // PTY request path instead). If it somehow arrives here — a zsh pane
+        // whose integration isn't confirmed — `false` yields no stdout, hence
+        // zero candidates, gracefully (shell integration is the only source of
+        // truth for live completion; without it, none).
+        DriverTool::ZshComplete => ("false", Vec::new(), Vec::new()),
     }
 }
 

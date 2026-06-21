@@ -1095,6 +1095,46 @@ fn plan_event(
 /// so the 3px red stripe sits flush-left in the gutter, never over text.
 const LEFT_GUTTER: f32 = 10.0;
 
+/// The pane's left gutter and the cell grid that fits to the RIGHT of
+/// it, for a pane of `avail` logical pixels at the given cell metrics.
+///
+/// Bundling the two is the structural fix for the alt-screen right-clip
+/// bug: the column count was computed from the *full* pane width while
+/// the grid was painted shifted right by [`LEFT_GUTTER`], so the grid's
+/// right edge (`gutter + cols*cell_w`) overflowed the pane and the
+/// rightmost column — a full-screen program's right border — was clipped.
+/// Deriving `cols` and the paint gutter from one call makes that drift
+/// unrepresentable: the grid is always sized to the width it's painted
+/// into.
+///
+/// In alt-screen mode (vim / htop / less / fzf / ssh-with-TUI) there are
+/// no blocks and so no failed-block stripe to host; the gutter collapses
+/// to zero and the full-screen program sits flush against the left edge
+/// and uses the whole pane width.
+///
+/// Pure function so the gutter / clamp policy is unit-testable without
+/// egui or a PTY.
+pub(crate) fn pane_grid_layout(
+    avail: egui::Vec2,
+    cell_w: f32,
+    row_h: f32,
+    in_alt_screen: bool,
+) -> PaneGridLayout {
+    let gutter = if in_alt_screen { 0.0 } else { LEFT_GUTTER };
+    let (rows, cols) = cells_from_pixels(egui::Vec2::new(avail.x - gutter, avail.y), cell_w, row_h);
+    PaneGridLayout { gutter, rows, cols }
+}
+
+/// Result of [`pane_grid_layout`]: the left gutter (logical px) the pane
+/// content is inset by, and the `(rows, cols)` cell grid that fits in the
+/// width remaining to its right.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PaneGridLayout {
+    pub gutter: f32,
+    pub rows: u16,
+    pub cols: u16,
+}
+
 pub fn render_pane(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -1142,7 +1182,11 @@ pub fn render_pane(
         let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
         let (cell_w, row_h) =
             ui.fonts_mut(|f| (f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
-        let (rows, cols) = cells_from_pixels(avail, cell_w, row_h);
+        // Size the bootstrap PTY to the same gutter-adjusted grid the
+        // first prompt will use, so the shell isn't resized again the
+        // instant bootstrap completes. Bootstrapping is never alt-screen.
+        let layout = pane_grid_layout(avail, cell_w, row_h, false);
+        let (rows, cols) = (layout.rows, layout.cols);
         if slot.ui.last_size != Some((rows, cols)) {
             let _ = slot.session.resize(rows, cols);
             slot.ui.last_size = Some((rows, cols));
@@ -1170,7 +1214,12 @@ pub fn render_pane(
     let avail = ui.available_size();
     let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
     let (cell_w, row_h) = ui.fonts_mut(|f| (f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
-    let (rows, cols) = cells_from_pixels(avail, cell_w, row_h);
+    // `cols` is computed from the width to the RIGHT of the gutter so the
+    // grid never overflows the pane — see `pane_grid_layout`. The same
+    // `gutter` value feeds the scroll-area inner margin below, so the
+    // column count and the paint origin can't drift apart.
+    let grid_layout = pane_grid_layout(avail, cell_w, row_h, view.alt_screen);
+    let (rows, cols) = (grid_layout.rows, grid_layout.cols);
     // Debounce: an interactive window drag recomputes this size every
     // frame; committing each one storms the child with SIGWINCHs and
     // piles orphaned repaint frames into scrollback. Only resize once
@@ -1528,7 +1577,7 @@ pub fn render_pane(
     let pr_ctx = slot.session.pr_context().copied();
     let scroll_inner = scroll_area.show(ui, |ui| {
         egui::Frame::NONE
-            .inner_margin(egui::Margin { left: LEFT_GUTTER as i8, ..egui::Margin::ZERO })
+            .inner_margin(egui::Margin { left: grid_layout.gutter as i8, ..egui::Margin::ZERO })
             .show(ui, |ui| {
                 // Scrollback-jump-to-top (Cmd+Option+Up / Ctrl+Alt+Up): snap
                 // the next-widget-position (= top of content) to the TOP
@@ -4405,5 +4454,40 @@ mod tests {
         let (rows2, _cols2) = cells_from_pixels(egui::Vec2::new(800.0, 400.0), 10.0, 0.0);
         assert_eq!(rows2, MIN_ROWS);
         let _ = rows;
+    }
+
+    #[test]
+    fn pane_grid_layout_alt_screen_has_no_gutter() {
+        let l = pane_grid_layout(egui::Vec2::new(521.0, 400.0), 8.4, 17.0, true);
+        assert_eq!(l.gutter, 0.0, "alt-screen grid must sit flush against the left edge");
+    }
+
+    #[test]
+    fn pane_grid_layout_normal_keeps_gutter() {
+        let l = pane_grid_layout(egui::Vec2::new(521.0, 400.0), 8.4, 17.0, false);
+        assert_eq!(l.gutter, LEFT_GUTTER, "non-alt panes keep the block-chrome gutter");
+    }
+
+    // The right-clip bug: `cols` was computed from the full pane width
+    // while the grid was painted shifted right by the gutter, so the
+    // grid's right edge (gutter + cols*cell_w) overflowed the pane and
+    // the rightmost column — htop's blue border — was clipped. The
+    // layout must guarantee the painted grid fits within the pane in
+    // BOTH modes, for any cell width / pane width.
+    #[test]
+    fn pane_grid_layout_never_overflows_pane_right_edge() {
+        for &pane_w in &[521.0_f32, 800.0, 1280.3, 333.7] {
+            for &cell_w in &[6.0_f32, 8.4, 9.6, 11.0] {
+                for &alt in &[true, false] {
+                    let l = pane_grid_layout(egui::Vec2::new(pane_w, 400.0), cell_w, 17.0, alt);
+                    let grid_right = l.gutter + l.cols as f32 * cell_w;
+                    assert!(
+                        grid_right <= pane_w + 0.001,
+                        "alt={alt} pane_w={pane_w} cell_w={cell_w}: grid right {grid_right} \
+                         overflows pane width {pane_w}",
+                    );
+                }
+            }
+        }
     }
 }

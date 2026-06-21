@@ -307,14 +307,15 @@ impl PromptController {
             LifecycleEvent::Completion { .. } => {
                 // Routed to the pane's completion popup (`PaneSession`),
                 // never a mode transition. Mode safety: a completion reply
-                // says nothing about whether we're at a prompt — the
-                // request is only ever sent while already in
-                // `ShellPromptEditor`, and the shell emits the reply and
-                // loops straight back to its read prompt without a
-                // preexec/precmd. Promotion is gated solely on `Precmd`
-                // (above) and demotion on submit; `Completion` is in
-                // neither set, so the machine is provably inert here
-                // (spec/05 safety rules).
+                // says nothing about whether we're at a prompt — the request
+                // is only ever sent while already in `ShellPromptEditor`, and
+                // the shell answers WITHOUT a preexec/precmd (fish's read-eval
+                // loop emits the reply and reads again; zsh's
+                // `__termica_complete` sentinel is guarded out of
+                // `termica_preexec`/`termica_precmd`). Promotion is gated
+                // solely on `Precmd` (above) and demotion on submit;
+                // `Completion` is in neither set, so the machine is provably
+                // inert here (spec/05 safety rules).
             }
         }
     }

@@ -118,8 +118,25 @@ termica_emit_vars() {
 
 # ----- lifecycle hooks ---------------------------------------------------
 
+# True if `$1` is Termica's own completion sentinel command
+# (`__termica_complete <id> <b64>`, optionally leading-spaced). The sentinel
+# is dispatched as a real command (zsh has no read-eval loop to field a
+# framed request — see the live-completion machinery below), so the hooks
+# must recognise and IGNORE it: emitting a preexec / command_finished /
+# precmd for it would corrupt the block model and — via precmd, the
+# promotion trigger — risk a spurious mode transition (spec/05). It is thus
+# inert to the pane-mode machine, exactly like fish's read-loop request.
+termica_is_completion_sentinel() {
+    [[ "${1## }" == __termica_complete\ * ]]
+}
+
 termica_preexec() {
     # $1 is the expanded command line zsh is about to run.
+    if termica_is_completion_sentinel "$1"; then
+        # Skip the marker AND tell precmd to stay quiet for this command.
+        __termica_skip_next_precmd=1
+        return
+    fi
     termica_emit_string "preexec" "$1"
 }
 
@@ -127,10 +144,26 @@ termica_precmd() {
     # CAPTURE EXIT STATUS FIRST — must run before any helper command
     # would clobber $?.
     local exit_status=$?
+    # Stay inert after the completion sentinel (flag set in preexec, and
+    # defensively in `__termica_complete` itself in case preexec didn't run).
+    if [[ -n "${__termica_skip_next_precmd:-}" ]]; then
+        unset __termica_skip_next_precmd
+        return
+    fi
     termica_emit_int "command_finished" "$exit_status"
     termica_emit_string "precmd" "$PWD"
     # Live `$VAR`-completion source (change-gated, names only).
     termica_emit_vars
+}
+
+# Keep the completion sentinel out of the user's shell history (in-memory
+# AND the history file): a `zshaddhistory` hook returning non-zero drops the
+# line before it's ever recorded. More surgical than toggling a global
+# option like `hist_ignore_space`, which would change the user's own
+# space-prefixed-command behaviour.
+termica_zshaddhistory() {
+    termica_is_completion_sentinel "${1%%$'\n'}" && return 1
+    return 0
 }
 
 # Idempotent hook installation. Registers our hooks if (and only if)
@@ -141,6 +174,192 @@ termica_ensure_hooks() {
     # twice is a no-op.
     add-zsh-hook preexec termica_preexec
     add-zsh-hook precmd termica_precmd
+    add-zsh-hook zshaddhistory termica_zshaddhistory
+    # Remove the completion scratch files when this shell exits cleanly.
+    add-zsh-hook zshexit __termica_zc_cleanup
+}
+
+# ----- live-shell Tab completion -----------------------------------------
+#
+# zsh has no clean `complete -C <line>` like fish, and its completion system
+# (`_main_complete` → `compadd`) only produces matches inside a REAL ZLE
+# widget — which the pane's own shell can't host (it runs with `unsetopt
+# zle`). So Termica answers completion from a WARM captive child:
+#
+#   - A persistent `zsh/zpty` child (`zsh -f -i`, ZLE enabled) is spawned
+#     lazily on the first Tab and reused. It is seeded ONCE with the user's
+#     `$fpath` + `compinit` (so their tools' completions work) — NEVER by
+#     re-sourcing dotfiles, which on a slow `.zshrc` would make every Tab as
+#     slow as shell startup. Spawning `zsh -f` + `compinit -C` is cheap.
+#   - Each request replays the live shell's `alias` table into the child, so
+#     config AND runtime-defined aliases complete (the headline capability).
+#   - A `compadd` wrapper records the would-be matches via `compadd -O`
+#     (zsh extracts them itself — no fragile option-parsing); a one-shot
+#     widget drives `complete-word` for the requested buffer.
+#
+# v1 emits **values only** (zsh descriptions are gated behind `verbose` /
+# format zstyles and are config-dependent and fragile). The raw value lines
+# go out in a `completion` DCS marker, parsed by the SAME Rust parser as
+# fish's reply (spec/04a §"Zsh sidecar"). The child's lifetime is tied to
+# this bootstrap process, so it dies with the pane — no explicit teardown.
+
+# The captive child's setup program. Delivered by writing it to a file and
+# `source`-ing that file in the child (a SHORT command line): the child runs
+# `zsh -f -i` with ZLE enabled, and a long command WRITTEN to its line editor
+# wraps at the pty width and never executes. `source <file>` sidesteps the
+# line editor entirely AND keeps our `TZ*` sentinels out of the pty's input
+# echo (file contents aren't echoed), so the reader stays in sync. `$fpath`
+# is prepended per-spawn by `__termica_zc_ensure`.
+typeset -g __TERMICA_ZC_PROG
+read -r -d '' __TERMICA_ZC_PROG <<'TZPROG'
+PS1='' PS2='' RPS1='' PROMPT='' RPROMPT=''
+setopt no_beep no_always_last_prompt
+autoload -Uz compinit
+compinit -u -d "${TMPDIR:-/tmp}/termica-zsh-compdump" 2>/dev/null
+typeset -ga TZCAP
+# Record the would-be matches: `compadd -O` asks zsh to extract just the
+# match words (matchers applied) into an array, with no side effects; then
+# delegate to the real builtin so completion still proceeds.
+compadd() {
+  local -a __m
+  builtin compadd -O __m "$@" 2>/dev/null
+  TZCAP+=("${__m[@]}")
+  builtin compadd "$@"
+}
+zstyle ':completion:*' completer _complete
+zstyle ':completion:*' menu no
+# Drive completion for $TZBUF inside a real widget, then abort the line.
+# Trigger is `^X^X` — NOT `^T`, which BSD/macOS ttys intercept as VSTATUS
+# (SIGINFO) so it never reaches ZLE. `^X` is not a tty control char.
+_tzgo() { TZCAP=(); BUFFER="$TZBUF"; CURSOR=$#BUFFER; { zle complete-word } always { : }; BUFFER=''; zle send-break }
+zle -N _tzgo
+bindkey '^X^X' _tzgo
+# Dump the recorded matches (deduped) bracketed by sentinels, tab-joined —
+# the shape the Rust parser reads. Defined here (sourced, never echoed) so
+# the literal sentinels never enter the reader's input stream.
+_tzdump() {
+  local t=$'\t' __r
+  print -r -- TZSTART
+  for __r in "${(u)TZCAP[@]}"; do print -r -- "TZROW$t$__r"; done
+  print -r -- TZEND
+}
+print -r -- TZREADY
+TZPROG
+
+# Read from the captive child until a line CONTAINS `$1`, collecting any
+# `TZROW\t<value>` lines into `__termica_zc_rows`. Non-blocking polls
+# (`zpty -r -t`) bounded so a wedged child can never hang the prompt; the
+# ~600ms cap matches the Rust-side live-completion timeout.
+typeset -ga __termica_zc_rows
+__termica_zc_read_until() {
+    local token="$1" i chunk l
+    for (( i = 0; i < 120; i++ )); do
+        if zpty -r -t __termica_zc chunk 2>/dev/null; then
+            for l in "${(@f)chunk}"; do
+                l="${l%$'\r'}"
+                [[ "$l" == TZROW$'\t'* ]] && __termica_zc_rows+=("${l#TZROW$'\t'}")
+                [[ "$l" == *"$token"* ]] && return 0
+            done
+        else
+            sleep 0.005
+        fi
+    done
+    return 1
+}
+
+# Per-pane scratch files (sourced into the child). `$$` is the bootstrap
+# pid, so panes don't collide; removed on shell exit by `__termica_zc_cleanup`.
+typeset -g __termica_zc_setup_file="${TMPDIR:-/tmp}/termica-zc-$$-setup.zsh"
+typeset -g __termica_zc_req_file="${TMPDIR:-/tmp}/termica-zc-$$-req.zsh"
+
+__termica_zc_cleanup() {
+    rm -f "$__termica_zc_setup_file" "$__termica_zc_req_file" 2>/dev/null
+}
+
+# Spawn-and-seed the warm captive child if it isn't already running. Returns
+# non-zero if zpty is unavailable or the child won't come up (→ the pane
+# silently has no shell completion, still a usable terminal).
+__termica_zc_ensure() {
+    zmodload zsh/zpty 2>/dev/null || return 1
+    zpty -t __termica_zc 2>/dev/null && return 0   # already alive
+    zpty -d __termica_zc 2>/dev/null               # clear any dead remnant
+    # Write the setup file with the user's live $fpath prepended (so their
+    # installed completions load), then have the child source it. The fpath
+    # is emitted as a MULTI-LINE array assignment (one q-quoted entry per
+    # line) — `"fpath=(${(q)fpath})"` in double quotes would collapse the
+    # array into one escaped-space blob (a single bogus entry).
+    {
+        print -rl -- "fpath=(" ${(q)fpath} ")"
+        print -r -- "$__TERMICA_ZC_PROG"
+    } > "$__termica_zc_setup_file" 2>/dev/null || return 1
+    zpty __termica_zc 'zsh -f -i' 2>/dev/null || return 1
+    zpty -w __termica_zc "source ${(q)__termica_zc_setup_file}" 2>/dev/null
+    if ! __termica_zc_read_until "TZREADY"; then
+        zpty -d __termica_zc 2>/dev/null
+        return 1
+    fi
+    return 0
+}
+
+# Capture completion candidates for `$1` (the command line up to the
+# cursor) into `__termica_zc_rows` (values only, deduped). Best-effort: on
+# any failure the rows are left empty and the popup falls back to locals.
+__termica_zc_capture() {
+    local line="$1"
+    __termica_zc_rows=()
+    __termica_zc_ensure || return 1
+    # Per-request file (sourced, not typed): replay the live shell's aliases
+    # — config AND runtime-defined — so they complete, and set the buffer.
+    # A long / multi-line value here would jam the child's line editor; a
+    # file bypasses it.
+    {
+        alias -L 2>/dev/null
+        print -r -- "TZBUF=${(qqq)line}"
+    } > "$__termica_zc_req_file" 2>/dev/null || return 1
+    zpty -w __termica_zc "source ${(q)__termica_zc_req_file}" 2>/dev/null
+    # Fire the completion widget (^X^X), then call the dump function.
+    zpty -w -n __termica_zc $'\C-x\C-x' 2>/dev/null
+    __termica_zc_rows=()
+    zpty -w __termica_zc '_tzdump' 2>/dev/null
+    if ! __termica_zc_read_until "TZEND"; then
+        zpty -d __termica_zc 2>/dev/null   # wedged → respawn next time
+    fi
+    return 0
+}
+
+# Emit the `completion` DCS marker carrying `$1` (the correlation id) and
+# the captured rows as a JSON string array — the same shape fish emits, so
+# Rust's shared parser handles both. Note the extra top-level `id` field, so
+# this can't reuse `termica_emit_raw`.
+__termica_emit_completion() {
+    local id="$1"
+    local json="[" first=1 c
+    for c in "${__termica_zc_rows[@]}"; do
+        if (( first )); then first=0; else json+=","; fi
+        json+="\"$(termica_escape_json "$c")\""
+    done
+    json+="]"
+    local session="${TERMICA_SESSION_ID:-}"
+    printf '\033PTermica;{"type":"completion","session":"%s","id":%s,"value":%s}\033\\' \
+        "$session" "$id" "$json"
+}
+
+# The completion sentinel dispatched by Termica as a real command:
+# `__termica_complete <id> <base64(line)>`. Decodes the line, captures
+# candidates from the warm child, and emits the reply marker. Kept INERT to
+# the mode machine by `termica_preexec`/`termica_precmd` (which recognise the
+# sentinel) and out of history by `termica_zshaddhistory`. Preserves the
+# user's last `$?` so a later real `precmd` reports the right status; sets the
+# precmd-skip flag defensively in case preexec didn't run.
+__termica_complete() {
+    local __exit=$?
+    __termica_skip_next_precmd=1
+    emulate -L zsh
+    local id="$1" line
+    line=$(printf '%s' "$2" | base64 -d 2>/dev/null)
+    __termica_zc_capture "$line"
+    __termica_emit_completion "$id"
+    return $__exit
 }
 
 # ----- bootstrap sequence ------------------------------------------------
