@@ -200,29 +200,14 @@ The foundational block model was pulled forward into Phase 4 (the block-model pi
 
 ### Phase 8 — In-pane search ⏳
 
-- ✅ Cmd/Ctrl+F overlay with literal + case-insensitive + regex modes
-  (`Aa` + `.*` toggles); `All` / `Commands` / `Outputs` filter chip.
-- ✅ Match highlights paint over the cell grid (translucent amber;
-  current match brighter), with Prev / Next (or Enter / Shift+Enter)
-  navigation, a live `N of M` count, and scroll-to-match.
-- ✅ Find-query history: `↑` / `↓` walk prior searches while the field
-  has the caret; a `▾` button opens a dropdown of recent queries.
-  Per-pane, in-memory for the session (Termica-only addition — not in
-  the original spec/07 sketch).
+- ✅ Cmd/Ctrl+F overlay with literal + case-insensitive + regex modes (`Aa` + `.*` toggles); `All` / `Commands` / `Outputs` filter chip.
+- ✅ Match highlights paint over the cell grid (translucent amber; current match brighter), with Prev / Next (or Enter / Shift+Enter) navigation, a live `N of M` count, and scroll-to-match.
+- ✅ Find-query history: `↑` / `↓` walk prior searches while the field has the caret; a `▾` button opens a dropdown of recent queries. Per-pane, in-memory for the session (Termica-only addition — not in the original spec/07 sketch).
 - ✅ Esc / Done dismiss.
 
-**Scope landed (focused-pane v1).** Search covers the focused pane's
-**sealed** blocks (command lines + frozen output snapshots) — the
-roadmap acceptance ("in-memory scrollback + sealed chunks"). The live
-`Prompt` / `Running` tail is excluded (its output isn't frozen yet),
-and the cross-pane `CurrentTab` scope plus `SelectedBlocks` from
-[spec/07](07-history-and-search.md#scope-model) are deferred —
-`SelectedBlocks` additionally needs block-object selection
-([#120](https://github.com/enthal/termica/issues/120)). Fuzzy (`nucleo`)
-and Tantivy global search stay post-MVP.
+**Scope landed (focused-pane v1).** Search covers the focused pane's **sealed** blocks (command lines + frozen output snapshots) — the roadmap acceptance ("in-memory scrollback + sealed chunks"). The live `Prompt` / `Running` tail is excluded (its output isn't frozen yet), and the cross-pane `CurrentTab` scope plus `SelectedBlocks` from [spec/07](07-history-and-search.md#scope-model) are deferred — `SelectedBlocks` additionally needs block-object selection ([#120](https://github.com/enthal/termica/issues/120)). Fuzzy (`nucleo`) and Tantivy global search stay post-MVP.
 
-**Acceptance:** ✅ find-in-pane works on the in-memory scrollback +
-sealed chunks. Shipped on branch `feat/in-pane-search`.
+**Acceptance:** ✅ find-in-pane works on the in-memory scrollback + sealed chunks. Shipped on branch `feat/in-pane-search`.
 
 ### Phase 9 — Scrollback persistence + restore
 

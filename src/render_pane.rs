@@ -24,6 +24,12 @@ const MULTI_CLICK_WINDOW_SECS: f64 = 0.5;
 /// still register as a multi-click.
 const MULTI_CLICK_DISTANCE_PX: f32 = 8.0;
 
+/// Frames to keep `stick_to_bottom` disabled after a `Ctrl+PageUp/Down`
+/// so the `scroll_with_delta` animation (≤ 0.3 s ≈ 18 frames at 60 Hz)
+/// plays out instead of being re-snapped to the tail. See
+/// [`crate::pane_slot::PaneUiState::scroll_page_frames`].
+const PAGE_SCROLL_STICK_OFF_FRAMES: u8 = 24;
+
 /// Color of the 1px border painted around the cell grid while a pane
 /// is in alternate-screen mode (vim / htop / less / fzf / ssh-with-
 /// TUI). A muted teal that's clearly visible against the dark
@@ -423,6 +429,17 @@ fn classify_editor_motion(
 ) -> Option<(EditorMotion, bool)> {
     use egui::Key;
     let extending = modifiers.shift;
+    // Page Up / Page Down move the caret to the buffer start / end on
+    // both platforms (Shift extends). No other modifier may be held —
+    // `Ctrl+PageUp` / `Ctrl+PageDown` is a scrollback shortcut owned by
+    // `match_pane_shortcut`, not an editor caret motion.
+    if !modifiers.command && !modifiers.ctrl && !modifiers.alt {
+        match key {
+            Key::PageUp => return Some((EditorMotion::DocStart, extending)),
+            Key::PageDown => return Some((EditorMotion::DocEnd, extending)),
+            _ => {}
+        }
+    }
     if is_macos {
         // macOS: Option (alt) without Cmd → word. Cmd (command)
         // without Option → line / doc.
@@ -443,14 +460,14 @@ fn classify_editor_motion(
             };
         }
     } else {
-        // Linux / Windows: Ctrl drives both. Distinguish by key:
-        // arrows = word, Home / End = doc.
+        // Linux / Windows: Ctrl + arrows = word motion. (Ctrl+Home /
+        // Ctrl+End are NOT editor motions — they scroll the pane
+        // viewport via `match_pane_shortcut`; caret-to-doc-start/end is
+        // PageUp / PageDown above.)
         if modifiers.ctrl && !modifiers.alt {
             return match key {
                 Key::ArrowLeft => Some((EditorMotion::WordLeft, extending)),
                 Key::ArrowRight => Some((EditorMotion::WordRight, extending)),
-                Key::Home => Some((EditorMotion::DocStart, extending)),
-                Key::End => Some((EditorMotion::DocEnd, extending)),
                 _ => None,
             };
         }
@@ -516,6 +533,45 @@ fn pty_passthrough_allowed(event: &egui::Event, editor_active: bool, editor_empt
     editor_empty && is_eof_chord(event)
 }
 
+/// Pick the mouse cursor for the pane body from what the pointer is
+/// over. A Cmd-hovered link affordance (URL / file path) wins with the
+/// pointing hand — that's what a Cmd-click would activate. Otherwise
+/// selectable terminal content (the live grid, a sealed block, the
+/// prompt editor) shows the I-beam, matching every other terminal and
+/// text surface. `None` leaves egui's default arrow (chrome, gutters).
+///
+/// Centralizing the precedence here keeps the scattered hover sites
+/// from disagreeing about what beats what. Selection — and therefore
+/// the I-beam — is available whenever the terminal has not enabled
+/// mouse reporting, which is currently always (spec/02 §"selection").
+fn pane_body_cursor_icon(
+    over_selectable_text: bool,
+    over_link_affordance: bool,
+) -> Option<egui::CursorIcon> {
+    if over_link_affordance {
+        Some(egui::CursorIcon::PointingHand)
+    } else if over_selectable_text {
+        Some(egui::CursorIcon::Text)
+    } else {
+        None
+    }
+}
+
+/// Should this frame extend the pane/grid selection?
+///
+/// A modifier-click that opened a link (URL / file path) claims the
+/// whole gesture: it starts no selection, and the drag frames that
+/// follow the press must NOT extend one either — otherwise Cmd-clicking
+/// a link also grows whatever selection happened to be on screen. We
+/// track "this gesture opened a link" across frames in
+/// [`PaneUiState::gesture_opened_link`] (reset on every fresh press),
+/// and suppress the drag-extend while it is set. A deliberate
+/// `Shift`+click extend always wins — a fresh press has already reset
+/// the flag, so `shift_extend` is never poisoned by a prior link-open.
+fn drag_extends_selection(dragged: bool, shift_extend: bool, gesture_opened_link: bool) -> bool {
+    shift_extend || (dragged && !gesture_opened_link)
+}
+
 /// Close every per-pane popup (history / completion / find /
 /// keybindings). Popups are mutually exclusive — opening one calls
 /// this first so two never show at once. The find query history is
@@ -559,7 +615,11 @@ fn open_history_overlay(slot: &mut PaneSlot) {
 /// the placeholder `Enter`, and `Esc` (which demotes via
 /// `PaneSession::leave_editor_esc`). History walk (Up/Down) and
 /// shift-selection are deferred to 4F/4J.
-fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
+fn apply_event_to_editor(
+    event: &egui::Event,
+    frame_modifiers: egui::Modifiers,
+    slot: &mut PaneSlot,
+) -> bool {
     use egui::{Event, Key};
     match event {
         // Plain printable text from the OS IME / keyboard layout.
@@ -574,6 +634,21 @@ fn apply_event_to_editor(event: &egui::Event, slot: &mut PaneSlot) -> bool {
         // replacement, etc.) goes through `insert_str` as a single
         // `OpKind::Other` entry — one paste, one undo.
         Event::Text(s) => {
+            // Modifier gate — the same invariant the encoder enforces in
+            // `input::encode_key`: a held modifier must never be silently
+            // dropped into bare text. egui-winit suppresses `Event::Text`
+            // under Ctrl/Cmd but NOT under Alt, so on Linux/Windows an
+            // Alt+letter press still arrives here as a bare `Event::Text`
+            // (the sibling `Event::Key { alt }` is correctly rejected by
+            // the `command || alt` gate below). Drop it so Alt+letter is
+            // inert, matching the `Event::Key` path. Exemptions:
+            //   - macOS: Option+letter is intentional compose input
+            //     (Option+E E → é); it must pass through.
+            //   - AltGr (= Ctrl+Alt on Windows) produces legitimate text;
+            //     `!ctrl` keeps it working.
+            if !cfg!(target_os = "macos") && frame_modifiers.alt && !frame_modifiers.ctrl {
+                return false;
+            }
             slot.session.clear_history_recall();
             if let Some(editor) = slot.session.editor_mut() {
                 let mut chars = s.chars();
@@ -1059,6 +1134,46 @@ fn plan_event(
 /// so the 3px red stripe sits flush-left in the gutter, never over text.
 const LEFT_GUTTER: f32 = 10.0;
 
+/// The pane's left gutter and the cell grid that fits to the RIGHT of
+/// it, for a pane of `avail` logical pixels at the given cell metrics.
+///
+/// Bundling the two is the structural fix for the alt-screen right-clip
+/// bug: the column count was computed from the *full* pane width while
+/// the grid was painted shifted right by [`LEFT_GUTTER`], so the grid's
+/// right edge (`gutter + cols*cell_w`) overflowed the pane and the
+/// rightmost column — a full-screen program's right border — was clipped.
+/// Deriving `cols` and the paint gutter from one call makes that drift
+/// unrepresentable: the grid is always sized to the width it's painted
+/// into.
+///
+/// In alt-screen mode (vim / htop / less / fzf / ssh-with-TUI) there are
+/// no blocks and so no failed-block stripe to host; the gutter collapses
+/// to zero and the full-screen program sits flush against the left edge
+/// and uses the whole pane width.
+///
+/// Pure function so the gutter / clamp policy is unit-testable without
+/// egui or a PTY.
+pub(crate) fn pane_grid_layout(
+    avail: egui::Vec2,
+    cell_w: f32,
+    row_h: f32,
+    in_alt_screen: bool,
+) -> PaneGridLayout {
+    let gutter = if in_alt_screen { 0.0 } else { LEFT_GUTTER };
+    let (rows, cols) = cells_from_pixels(egui::Vec2::new(avail.x - gutter, avail.y), cell_w, row_h);
+    PaneGridLayout { gutter, rows, cols }
+}
+
+/// Result of [`pane_grid_layout`]: the left gutter (logical px) the pane
+/// content is inset by, and the `(rows, cols)` cell grid that fits in the
+/// width remaining to its right.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PaneGridLayout {
+    pub gutter: f32,
+    pub rows: u16,
+    pub cols: u16,
+}
+
 pub fn render_pane(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -1106,7 +1221,11 @@ pub fn render_pane(
         let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
         let (cell_w, row_h) =
             ui.fonts_mut(|f| (f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
-        let (rows, cols) = cells_from_pixels(avail, cell_w, row_h);
+        // Size the bootstrap PTY to the same gutter-adjusted grid the
+        // first prompt will use, so the shell isn't resized again the
+        // instant bootstrap completes. Bootstrapping is never alt-screen.
+        let layout = pane_grid_layout(avail, cell_w, row_h, false);
+        let (rows, cols) = (layout.rows, layout.cols);
         if slot.ui.last_size != Some((rows, cols)) {
             let _ = slot.session.resize(rows, cols);
             slot.ui.last_size = Some((rows, cols));
@@ -1134,7 +1253,12 @@ pub fn render_pane(
     let avail = ui.available_size();
     let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
     let (cell_w, row_h) = ui.fonts_mut(|f| (f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
-    let (rows, cols) = cells_from_pixels(avail, cell_w, row_h);
+    // `cols` is computed from the width to the RIGHT of the gutter so the
+    // grid never overflows the pane — see `pane_grid_layout`. The same
+    // `gutter` value feeds the scroll-area inner margin below, so the
+    // column count and the paint origin can't drift apart.
+    let grid_layout = pane_grid_layout(avail, cell_w, row_h, view.alt_screen);
+    let (rows, cols) = (grid_layout.rows, grid_layout.cols);
     // Debounce: an interactive window drag recomputes this size every
     // frame; committing each one storms the child with SIGWINCHs and
     // piles orphaned repaint frames into scrollback. Only resize once
@@ -1362,6 +1486,38 @@ pub fn render_pane(
     }
     let force_to_bottom = one_shot_bottom || multi_frame_bottom;
     let force_to_top = std::mem::take(&mut slot.ui.scroll_to_top_pending);
+    // Ctrl+PageUp/PageDown page-scroll. Convert the pending page count
+    // into a `scroll_with_delta` (applied in the scroll closure). One
+    // page = the *measured* viewport height (`last_scroll_viewport_h`)
+    // minus one row, so consecutive pages overlap by a line. egui's
+    // `scroll_with_delta` is inverted (positive moves toward older
+    // output, i.e. up), matching positive `pending_pages` = PageUp.
+    // Sizing off the area's max-height instead overshoots the visible
+    // height and leaves gaps between pages.
+    let pending_pages = std::mem::take(&mut slot.ui.scroll_page_pending);
+    let page_scroll_delta = if pending_pages != 0 {
+        let viewport = slot.ui.last_scroll_viewport_h;
+        // First-ever page (no measurement yet) falls back to the max
+        // bound; it self-corrects next frame once `inner_rect` is known.
+        let viewport = if viewport > 0.0 { viewport } else { scroll_max_h };
+        // One row of overlap for context — plus ~3 more, because the
+        // measured viewport height over-reports the genuinely-visible
+        // scrollback by about that much (the bottom prompt-footer chrome
+        // sits inside the scroll area's `inner_rect`). Tuned against the
+        // running app; without it consecutive pages leave a ~3-line gap.
+        let page = (viewport - 4.0 * row_h).max(viewport * 0.5);
+        // Re-arm the stick-off window so the animation isn't cancelled
+        // by stick_to_bottom re-engaging mid-flight (see the field doc).
+        slot.ui.scroll_page_frames = PAGE_SCROLL_STICK_OFF_FRAMES;
+        Some(pending_pages as f32 * page)
+    } else {
+        None
+    };
+    let page_animating = slot.ui.scroll_page_frames > 0;
+    if page_animating {
+        slot.ui.scroll_page_frames -= 1;
+        ctx.request_repaint();
+    }
 
     // ---- Phase 8 in-pane find: recompute + highlight map ----------
     //
@@ -1413,9 +1569,20 @@ pub fn render_pane(
     // commands). Disable it when `force_to_top` (the user is asking to
     // leave the bottom) or while find is open (see above); `force_to_top`
     // additionally overrides the persisted offset directly below.
+    //
+    // It must ALSO be off while a page-scroll animation is in flight.
+    // `scroll_with_delta` animates `state.offset` over ~0.1–0.3 s; if
+    // stick re-engages mid-animation while we started pinned at the tail,
+    // ScrollArea re-snaps to the end (egui scroll_area.rs: `if
+    // stick_to_end && scroll_stuck_to_end`) and cancels the page-scroll.
+    // (Ctrl+Home dodged this — it goes through the `force_to_top` instant
+    // override.) Holding stick off for the animation window lets the
+    // delta play out; once it settles, the end-of-frame recompute sets
+    // `scroll_stuck_to_end` from where we ended (false after a page-up;
+    // true again if a page-down reaches the bottom, re-pinning the tail).
     let scroll_area = egui::ScrollArea::vertical()
         .id_salt(("pane-blocks", slot.session.pane_id()))
-        .stick_to_bottom(!force_to_top && !find_open)
+        .stick_to_bottom(!force_to_top && !find_open && !page_animating)
         .auto_shrink([false, false])
         .max_height(scroll_max_h);
     // `force_to_top` uses a direct offset override (0.0) because
@@ -1449,7 +1616,7 @@ pub fn render_pane(
     let pr_ctx = slot.session.pr_context().copied();
     let scroll_inner = scroll_area.show(ui, |ui| {
         egui::Frame::NONE
-            .inner_margin(egui::Margin { left: LEFT_GUTTER as i8, ..egui::Margin::ZERO })
+            .inner_margin(egui::Margin { left: grid_layout.gutter as i8, ..egui::Margin::ZERO })
             .show(ui, |ui| {
                 // Scrollback-jump-to-top (Cmd+Option+Up / Ctrl+Alt+Up): snap
                 // the next-widget-position (= top of content) to the TOP
@@ -1459,6 +1626,16 @@ pub fn render_pane(
                 // is laid out there.
                 if force_to_top && !in_alt_screen {
                     ui.scroll_to_cursor(Some(egui::Align::TOP));
+                }
+                // Ctrl+PageUp / Ctrl+PageDown: animate the viewport by a
+                // page (positive = toward older output). `stick_to_bottom`
+                // is held off for the animation window above so this
+                // isn't re-snapped when we started pinned. No-op in
+                // alt-screen (no block stack is laid out).
+                if let Some(delta) = page_scroll_delta
+                    && !in_alt_screen
+                {
+                    ui.scroll_with_delta(egui::Vec2::new(0.0, delta));
                 }
                 // Top spacer bottom-aligns short content (computed
                 // above). In alt-screen mode `content_h` is 0 and the
@@ -1815,6 +1992,10 @@ pub fn render_pane(
             .inner
     });
     let scroll_viewport = scroll_inner.inner_rect;
+    // Remember the visible viewport height so the next frame's
+    // Ctrl+PageUp/PageDown pages by the actual visible height (see
+    // `PaneUiState::last_scroll_viewport_h`).
+    slot.ui.last_scroll_viewport_h = scroll_viewport.height();
     let (rendered, links_in_view, highlighted_link) = scroll_inner.inner;
     let highlighted_link = highlighted_link.as_ref();
 
@@ -1905,8 +2086,17 @@ pub fn render_pane(
             sticky_command = Some((sticky_id, resp));
         }
     }
-    if highlighted_link.is_some() {
-        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+    // Cursor over the live grid or any sealed block: I-beam for
+    // selectable text, or the pointing hand when a Cmd-hovered link
+    // sits under the pointer. The sealed-link case below may upgrade
+    // this to the hand too (last writer wins).
+    let over_selectable_text = rendered.response.contains_pointer()
+        || sealed_block_renders.iter().any(|(_, r)| {
+            r.snapshot.contains_pointer()
+                || r.command.as_ref().is_some_and(|c| c.contains_pointer())
+        });
+    if let Some(icon) = pane_body_cursor_icon(over_selectable_text, highlighted_link.is_some()) {
+        ctx.set_cursor_icon(icon);
     }
 
     // Sealed-block link hover: when Cmd is held and the pointer is
@@ -2049,6 +2239,14 @@ pub fn render_pane(
             ui.id().with(("editor-footer", slot.session.pane_id())),
             egui::Sense::click_and_drag(),
         ));
+        // I-beam over the editable prompt text — a text surface like
+        // the terminal body. No link affordance competes in the footer.
+        if let Some(icon) = pane_body_cursor_icon(
+            editor_response.as_ref().is_some_and(|r| r.contains_pointer()),
+            false,
+        ) {
+            ctx.set_cursor_icon(icon);
+        }
 
         if let Some(editor) = slot.session.blocks().editor_on_tail() {
             let font_id = egui::FontId::monospace(render::DEFAULT_FONT_SIZE);
@@ -2585,6 +2783,14 @@ pub fn render_pane(
             origin_cursor.col = origin_cursor.col.min(row_len);
         }
 
+        // Link (URL / path) under the press, if any — needed both to
+        // decide a Cmd-click-open and to mark the gesture so its drag
+        // frames don't also extend a selection.
+        let sealed_link =
+            slot.session.sealed_block_links(origin_block_id, home).and_then(|links| {
+                links.iter().find(|l| l.contains(origin_cursor.row, origin_cursor.col)).cloned()
+            });
+
         // Shift+click EXTENDS the existing pane selection (across blocks
         // and into / out of command vs output) instead of starting a new
         // one — falling through to the shared extend branch below, which
@@ -2594,14 +2800,18 @@ pub fn render_pane(
             shift_held,
             slot.session.pane_selection().is_some(),
         );
+
+        // A modifier-click that opens a link claims the whole gesture:
+        // record it on the press (reset every fresh press) so its drag
+        // frames don't also extend the pane selection below. Mirrors the
+        // open condition — a non-shift Cmd-press on a link opens it.
+        if primary_just_pressed {
+            slot.ui.gesture_opened_link = !shift_extend && modifier_held && sealed_link.is_some();
+        }
         if primary_just_pressed && !shift_extend {
             // -------- START a selection in the press block ----
             // Anchor + head both land in the origin block;
             // multi-click expands within that block.
-            let sealed_link =
-                slot.session.sealed_block_links(origin_block_id, home).and_then(|links| {
-                    links.iter().find(|l| l.contains(origin_cursor.row, origin_cursor.col)).cloned()
-                });
             if modifier_held && let Some(link) = &sealed_link {
                 // Cmd-click on a URL / path: open it, don't
                 // start a selection.
@@ -2649,7 +2859,9 @@ pub fn render_pane(
                     }
                 }
             }
-        } else if let Some(sel) = slot.session.pane_selection().copied() {
+        } else if !slot.ui.gesture_opened_link
+            && let Some(sel) = slot.session.pane_selection().copied()
+        {
             // -------- EXTEND the selection -------------------
             //
             // Cross-block: the pointer may be over a different
@@ -2801,6 +3013,17 @@ pub fn render_pane(
         // of starting fresh.
         let shift_extend_grid =
             press_extends_selection(primary_just_pressed, shift_held, selection.is_some());
+
+        // A modifier-click that opens a link claims the whole gesture:
+        // record it on the press (reset every fresh press) so the
+        // drag-extend below is suppressed. The condition mirrors the
+        // open below — a non-shift Cmd-press on a link opens it; a
+        // Shift+click extends instead and never opens. See
+        // `drag_extends_selection`.
+        if primary_just_pressed {
+            slot.ui.gesture_opened_link =
+                !shift_extend_grid && modifier_held && link_under_press.is_some();
+        }
         if primary_just_pressed && !shift_extend_grid {
             if modifier_held && let Some(link) = link_under_press {
                 open_url(&link.url);
@@ -2819,12 +3042,17 @@ pub fn render_pane(
                     slot.session.start_selection(press_pt, mode);
                 }
             }
-        } else if rendered.response.dragged() || shift_extend_grid {
+        } else if drag_extends_selection(
+            rendered.response.dragged(),
+            shift_extend_grid,
+            slot.ui.gesture_opened_link,
+        ) {
             // EXTEND. Egui's `dragged()` is the canonical
             // "this widget is being dragged" signal once the
             // drag threshold is met; `shift_extend_grid` is the
             // discrete Shift+click extend. Both keep the mode the
-            // selection was started in.
+            // selection was started in — but a gesture that opened a
+            // link extends nothing (`drag_extends_selection`).
             slot.session.extend_selection(press_pt);
         }
     }
@@ -3376,7 +3604,7 @@ pub fn render_pane(
                     continue;
                 }
             }
-            if editor_active && apply_event_to_editor(event, slot) {
+            if editor_active && apply_event_to_editor(event, ctx.input(|i| i.modifiers), slot) {
                 continue;
             }
             // Boundary gate (spec/04): while the editor owns the line,
@@ -4037,16 +4265,54 @@ mod tests {
     }
 
     #[test]
-    fn classify_linux_ctrl_home_end_is_doc_move() {
-        let m = mods(true, false, false, false);
-        assert_eq!(
-            classify_editor_motion(egui::Key::Home, m, false),
-            Some((EditorMotion::DocStart, false))
-        );
-        assert_eq!(
-            classify_editor_motion(egui::Key::End, m, false),
-            Some((EditorMotion::DocEnd, false))
-        );
+    fn classify_ctrl_home_end_is_not_an_editor_motion() {
+        // Ctrl+Home / Ctrl+End were reassigned to scrollback navigation
+        // (`match_pane_shortcut` → ScrollToTop/Bottom); they no longer
+        // move the editor caret on either platform. Caret-to-doc-start /
+        // -end is now bare PageUp / PageDown (below) and, on macOS, the
+        // existing Cmd+Up / Cmd+Down.
+        let ctrl = mods(true, false, false, false);
+        assert_eq!(classify_editor_motion(egui::Key::Home, ctrl, false), None);
+        assert_eq!(classify_editor_motion(egui::Key::End, ctrl, false), None);
+        assert_eq!(classify_editor_motion(egui::Key::Home, ctrl, true), None);
+        assert_eq!(classify_editor_motion(egui::Key::End, ctrl, true), None);
+    }
+
+    #[test]
+    fn classify_page_keys_are_doc_move_both_platforms() {
+        // Bare PageUp / PageDown move the caret to the buffer start /
+        // end on both platforms; Shift extends the selection.
+        for is_macos in [true, false] {
+            let bare = mods(false, false, false, false);
+            assert_eq!(
+                classify_editor_motion(egui::Key::PageUp, bare, is_macos),
+                Some((EditorMotion::DocStart, false))
+            );
+            assert_eq!(
+                classify_editor_motion(egui::Key::PageDown, bare, is_macos),
+                Some((EditorMotion::DocEnd, false))
+            );
+            let shift = mods(false, false, true, false);
+            assert_eq!(
+                classify_editor_motion(egui::Key::PageUp, shift, is_macos),
+                Some((EditorMotion::DocStart, true))
+            );
+            assert_eq!(
+                classify_editor_motion(egui::Key::PageDown, shift, is_macos),
+                Some((EditorMotion::DocEnd, true))
+            );
+        }
+    }
+
+    #[test]
+    fn classify_ctrl_page_keys_are_not_editor_motions() {
+        // Ctrl+PageUp / Ctrl+PageDown are scrollback page shortcuts, not
+        // caret motions — the editor must not claim them.
+        let ctrl = mods(true, false, false, false);
+        assert_eq!(classify_editor_motion(egui::Key::PageUp, ctrl, false), None);
+        assert_eq!(classify_editor_motion(egui::Key::PageDown, ctrl, false), None);
+        assert_eq!(classify_editor_motion(egui::Key::PageUp, ctrl, true), None);
+        assert_eq!(classify_editor_motion(egui::Key::PageDown, ctrl, true), None);
     }
 
     #[test]
@@ -4113,6 +4379,66 @@ mod tests {
         assert!(pty_passthrough_allowed(&key_ev(egui::Key::D, ctrl), true, true));
         // On a typed line it's swallowed — the editor owns the line.
         assert!(!pty_passthrough_allowed(&key_ev(egui::Key::D, ctrl), true, false));
+    }
+
+    // ---- pane_body_cursor_icon (I-beam vs hand vs default) -----------
+
+    #[test]
+    fn cursor_is_ibeam_over_selectable_text() {
+        // Plain hover over the grid / a sealed block / the editor with
+        // no link under the pointer shows the text caret.
+        assert_eq!(pane_body_cursor_icon(true, false), Some(egui::CursorIcon::Text));
+    }
+
+    #[test]
+    fn cursor_is_hand_over_a_link_affordance() {
+        // A Cmd-hovered URL / path beats the I-beam — that's what a
+        // Cmd-click would activate.
+        assert_eq!(pane_body_cursor_icon(true, true), Some(egui::CursorIcon::PointingHand));
+        // The link wins even if we somehow didn't flag the text (the
+        // affordance only arises over content anyway).
+        assert_eq!(pane_body_cursor_icon(false, true), Some(egui::CursorIcon::PointingHand));
+    }
+
+    #[test]
+    fn cursor_is_default_off_content() {
+        // Over chrome / gutters / empty space: leave egui's arrow.
+        assert_eq!(pane_body_cursor_icon(false, false), None);
+    }
+
+    // ---- drag_extends_selection (Cmd-click-open supersedes extend) ----
+    //
+    // Bug: a modifier-click that opens a URL/path also extended the text
+    // selection, because the drag frames that follow the press hit the
+    // EXTEND branch. The gesture that opened a link must claim the whole
+    // press: no extend until the next press.
+
+    #[test]
+    fn link_open_gesture_does_not_extend_on_drag() {
+        // THE FIX: the press opened a link, so a following drag frame
+        // must NOT extend the selection. (Pre-fix this was `true`.)
+        assert!(!drag_extends_selection(true, false, true));
+    }
+
+    #[test]
+    fn normal_drag_extends() {
+        // A plain selection drag (gesture did not open a link) extends.
+        assert!(drag_extends_selection(true, false, false));
+    }
+
+    #[test]
+    fn shift_extend_always_extends() {
+        // A deliberate Shift+click extend wins regardless of the
+        // link-gesture flag (which a fresh press has already reset).
+        assert!(drag_extends_selection(false, true, false));
+        assert!(drag_extends_selection(false, true, true));
+        assert!(drag_extends_selection(true, true, true));
+    }
+
+    #[test]
+    fn no_drag_no_shift_does_not_extend() {
+        assert!(!drag_extends_selection(false, false, false));
+        assert!(!drag_extends_selection(false, false, true));
     }
 
     #[test]
@@ -4183,12 +4509,13 @@ mod tests {
     fn ctrl_c_on_typed_line_leaves_text_untouched() {
         let mut slot = spawn_editor_active_slot();
         slot.session.editor_mut().unwrap().insert_str("echo too bad");
-        let ctrl_c = key_ev(egui::Key::C, mods(true, false, false, false));
+        let ctrl = mods(true, false, false, false);
+        let ctrl_c = key_ev(egui::Key::C, ctrl);
         // The editor does NOT consume it (falls through to the gate,
         // which swallows it because the editor is non-empty) and the
         // typed line is left exactly as it was — Ctrl+C is a no-op on a
         // typed line, never a line-discard.
-        assert!(!apply_event_to_editor(&ctrl_c, &mut slot));
+        assert!(!apply_event_to_editor(&ctrl_c, ctrl, &mut slot));
         assert_eq!(slot.session.blocks().editor_on_tail().unwrap().text(), "echo too bad");
     }
 
@@ -4196,12 +4523,13 @@ mod tests {
     fn ctrl_c_on_empty_editor_is_inert() {
         let mut slot = spawn_editor_active_slot();
         assert!(slot.session.blocks().editor_on_tail().unwrap().is_empty());
-        let ctrl_c = key_ev(egui::Key::C, mods(true, false, false, false));
+        let ctrl = mods(true, false, false, false);
+        let ctrl_c = key_ev(egui::Key::C, ctrl);
         // apply_event_to_editor doesn't consume it; the boundary gate
         // then swallows it (Ctrl+C is not the EOF chord), so no `\x03`
         // reaches the shell — no cosmetic `^C` at an idle prompt. The
         // editor is left empty and active.
-        assert!(!apply_event_to_editor(&ctrl_c, &mut slot));
+        assert!(!apply_event_to_editor(&ctrl_c, ctrl, &mut slot));
         assert!(!pty_passthrough_allowed(&ctrl_c, true, true));
         assert!(slot.session.editor_is_active());
         assert!(slot.session.blocks().editor_on_tail().unwrap().is_empty());
@@ -4216,10 +4544,35 @@ mod tests {
         let mut slot = spawn_editor_active_slot();
         slot.session.editor_mut().unwrap().insert_str("echo hi");
         assert!(slot.session.editor_is_active());
-        let esc = key_ev(egui::Key::Escape, mods(false, false, false, false));
-        assert!(apply_event_to_editor(&esc, &mut slot)); // consumed, no PTY leak
+        let none = mods(false, false, false, false);
+        let esc = key_ev(egui::Key::Escape, none);
+        assert!(apply_event_to_editor(&esc, none, &mut slot)); // consumed, no PTY leak
         assert!(slot.session.editor_is_active(), "Esc must not demote out of the editor");
         assert_eq!(slot.session.blocks().editor_on_tail().unwrap().text(), "echo hi");
+    }
+
+    #[test]
+    fn alt_letter_text_event_is_inert_off_macos() {
+        // egui-winit suppresses Event::Text under Ctrl/Cmd but NOT under
+        // Alt, so on Linux/Windows an Alt+letter press still arrives as a
+        // bare Event::Text("b"). It must be dropped (a held modifier is
+        // never silently turned into typed text) so Alt+letter is inert,
+        // matching the rejected sibling Event::Key. macOS exempts it:
+        // Option+letter is intentional compose input.
+        let mut slot = spawn_editor_active_slot();
+        let alt = mods(false, true, false, false); // (ctrl, alt, shift, command)
+        let text = egui::Event::Text("b".to_string());
+        let consumed = apply_event_to_editor(&text, alt, &mut slot);
+        if cfg!(target_os = "macos") {
+            assert!(consumed, "macOS Option-compose text must pass through");
+            assert_eq!(slot.session.blocks().editor_on_tail().unwrap().text(), "b");
+        } else {
+            assert!(!consumed, "Alt+letter text must not be consumed");
+            assert!(
+                slot.session.blocks().editor_on_tail().unwrap().is_empty(),
+                "Alt+letter must not insert the bare letter"
+            );
+        }
     }
 
     #[test]
@@ -4247,5 +4600,40 @@ mod tests {
         let (rows2, _cols2) = cells_from_pixels(egui::Vec2::new(800.0, 400.0), 10.0, 0.0);
         assert_eq!(rows2, MIN_ROWS);
         let _ = rows;
+    }
+
+    #[test]
+    fn pane_grid_layout_alt_screen_has_no_gutter() {
+        let l = pane_grid_layout(egui::Vec2::new(521.0, 400.0), 8.4, 17.0, true);
+        assert_eq!(l.gutter, 0.0, "alt-screen grid must sit flush against the left edge");
+    }
+
+    #[test]
+    fn pane_grid_layout_normal_keeps_gutter() {
+        let l = pane_grid_layout(egui::Vec2::new(521.0, 400.0), 8.4, 17.0, false);
+        assert_eq!(l.gutter, LEFT_GUTTER, "non-alt panes keep the block-chrome gutter");
+    }
+
+    // The right-clip bug: `cols` was computed from the full pane width
+    // while the grid was painted shifted right by the gutter, so the
+    // grid's right edge (gutter + cols*cell_w) overflowed the pane and
+    // the rightmost column — htop's blue border — was clipped. The
+    // layout must guarantee the painted grid fits within the pane in
+    // BOTH modes, for any cell width / pane width.
+    #[test]
+    fn pane_grid_layout_never_overflows_pane_right_edge() {
+        for &pane_w in &[521.0_f32, 800.0, 1280.3, 333.7] {
+            for &cell_w in &[6.0_f32, 8.4, 9.6, 11.0] {
+                for &alt in &[true, false] {
+                    let l = pane_grid_layout(egui::Vec2::new(pane_w, 400.0), cell_w, 17.0, alt);
+                    let grid_right = l.gutter + l.cols as f32 * cell_w;
+                    assert!(
+                        grid_right <= pane_w + 0.001,
+                        "alt={alt} pane_w={pane_w} cell_w={cell_w}: grid right {grid_right} \
+                         overflows pane width {pane_w}",
+                    );
+                }
+            }
+        }
     }
 }
