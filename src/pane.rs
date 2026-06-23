@@ -1235,26 +1235,46 @@ impl PaneSession {
     /// "no editor" / "editor empty" no-ops. A `Err(PtyError)` is
     /// only returned when the PTY write itself fails.
     pub fn submit_editor_command(&mut self) -> Result<(), PtyError> {
-        // 1. Take the editor text. If there's no editor (the tail
-        //    isn't a `Prompt`), submit is a no-op. If the editor is
-        //    empty, we still send a bare `\r` so the shell sees a
-        //    blank line and emits the next prompt — that's what
+        // 1. Peek the editor text (without consuming yet). If there's no
+        //    editor (the tail isn't a `Prompt`), submit is a no-op. If
+        //    the editor is empty, we still send a bare `\r` so the shell
+        //    sees a blank line and emits the next prompt — that's what
         //    pressing Enter on an empty shell prompt does in every
         //    terminal.
-        let text = match self.blocks.editor_on_tail_mut() {
-            Some(editor) => {
-                let t = editor.text().to_string();
-                editor.clear();
-                // Per spec/04 §"Undo / redo" reset-on-submit: the
-                // previous command's undo history doesn't follow into
-                // the next prompt. Done AFTER `clear` because `clear`
-                // pushes one undo entry (the pre-clear state), which
-                // we promptly throw away.
-                editor.reset_undo();
-                t
-            }
+        let text = match self.blocks.editor_on_tail() {
+            Some(editor) => editor.text().to_string(),
             None => return Ok(()),
         };
+
+        // 2-Enter continuation heal. We're mid-continuation — the shell
+        // is still waiting to finish a previously-submitted, incomplete
+        // line (e.g. the unmatched quote `echo "!"` leaves behind) — and
+        // the editor text no longer EXTENDS that line: the user cleared
+        // it and/or retyped something different. Submitting it as-is
+        // would feed the dangling line and re-lock the pane (every later
+        // submit just continues the same broken line). So abort the
+        // stuck line with SIGINT and reset the continuation state, but
+        // KEEP the editor text: the next Enter, now at a fresh prompt,
+        // submits it as a clean first command. (An empty editor counts
+        // as abandonment too — clearing the line and pressing Enter once
+        // is the "just get me out" gesture.) The legitimate multi-line
+        // case (the user APPENDED, so `text` still starts with
+        // `last_submitted`) falls through to the normal diff-submit.
+        if self.awaiting_continuation()
+            && !self.last_submitted.as_deref().is_some_and(|prev| text.starts_with(prev))
+        {
+            return self.abort_continuation_line();
+        }
+
+        // Consume the editor now that we're committing to a real submit.
+        if let Some(editor) = self.blocks.editor_on_tail_mut() {
+            editor.clear();
+            // Per spec/04 §"Undo / redo" reset-on-submit: the previous
+            // command's undo history doesn't follow into the next prompt.
+            // Done AFTER `clear` because `clear` pushes one undo entry
+            // (the pre-clear state), which we promptly throw away.
+            editor.reset_undo();
+        }
 
         // Reset history-recall state: the next `↑` should start a
         // fresh walk from the most-recent entry, not from wherever
@@ -1312,6 +1332,53 @@ impl PaneSession {
             pty.write(&bytes)?;
         }
         Ok(())
+    }
+
+    /// True when a multi-line continuation is pending: we're back in the
+    /// editor after a submit the shell considered incomplete (PS2 fired,
+    /// `last_submitted` still set — it's cleared on `Preexec`/`Precmd`).
+    /// In this sub-state the shell is mid-line-read, NOT idle at a
+    /// confirmed prompt, so Ctrl+C must reach it as SIGINT to abort the
+    /// dangling line rather than being swallowed as inert.
+    pub fn awaiting_continuation(&self) -> bool {
+        self.editor_is_active() && self.last_submitted.is_some()
+    }
+
+    /// Abort a pending PS2 continuation and clear the editor — the
+    /// explicit "give up entirely" gesture, bound to Ctrl+C. The shell is
+    /// mid-line-read after a submit it deemed incomplete (e.g. the
+    /// unmatched quote zsh derives from `echo "!"`), so a plain submit
+    /// can't recover — it only feeds more text into the dangling line,
+    /// and Termica's continuation-restore masks that the pane is stuck.
+    /// This clears the restored editor text, then aborts the stuck line
+    /// (see [`Self::abort_continuation_line`]). No-op when no continuation
+    /// is pending, so Ctrl+C stays inert at an idle prompt (spec/04). The
+    /// "abort but keep my retyped text" variant is the 2-Enter heal in
+    /// [`Self::submit_editor_command`], which reuses the same primitive.
+    pub fn abort_continuation(&mut self) -> Result<(), PtyError> {
+        if !self.awaiting_continuation() {
+            return Ok(());
+        }
+        if let Some(editor) = self.blocks.editor_on_tail_mut() {
+            editor.clear();
+            editor.reset_undo();
+        }
+        self.abort_continuation_line()
+    }
+
+    /// Send SIGINT (`\x03`) to abort the shell's dangling continuation
+    /// line and reset the continuation state. The shell prints `^C` and a
+    /// fresh prompt — exactly like Ctrl+C at a PS2 prompt in any
+    /// terminal. Resets `last_submitted` BEFORE the write so the pane
+    /// can't be observed mid-abort with a stale value (which would
+    /// corrupt the next submit's diff) — the same
+    /// make-wrong-states-unrepresentable ordering as `submit`. Leaves the
+    /// editor buffer untouched; callers decide whether to clear it
+    /// (Ctrl+C does; the 2-Enter heal keeps the retyped text).
+    fn abort_continuation_line(&mut self) -> Result<(), PtyError> {
+        self.last_submitted = None;
+        self.recall.abandon();
+        self.write(b"\x03")
     }
 
     /// Demote the pane out of `ShellPromptEditor` back to
@@ -2234,6 +2301,189 @@ mod tests {
 
         // Bring the shell down quickly.
         let _ = session.write(b"\x03");
+    }
+
+    #[test]
+    fn ctrl_c_aborts_pending_continuation_and_unlocks_the_pane() {
+        // Repro for the `echo "!"` lock. zsh's history expansion turns
+        // the double-quoted `!` into an unmatched quote, so the shell
+        // emits PS2 (our `continuation` marker) and stays mid-line-read.
+        // Termica restores the editor and re-promotes — but the shell is
+        // NOT idle at a confirmed prompt, it's waiting to finish the
+        // line, and a gate-swallowed Ctrl+C left no way out: every later
+        // submit just fed more text into the dangling line. Ctrl+C while
+        // a continuation is pending must abort it — SIGINT to unstick the
+        // shell, plus a reset of the continuation state so the next
+        // prompt starts clean.
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c(&dcs_promote_to_editor_cmd()), "t".into(), 0, None)
+                .expect("spawn");
+        // Reach ShellPromptEditor.
+        let stop = Instant::now() + Duration::from_secs(3);
+        loop {
+            session.drain();
+            if session.editor_is_active() {
+                break;
+            }
+            if Instant::now() >= stop {
+                panic!("editor never active");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Submit a command the shell deems incomplete, then inject the
+        // continuation marker the shell's PS2 would emit (direct parser
+        // feed — same path real shell-emitted bytes hit; see the sibling
+        // continuation test for why we can't get `/bin/sh` to emit PS2).
+        session.editor_mut().unwrap().insert_str("echo \"!\"");
+        session.submit_editor_command().expect("submit");
+        assert!(session.last_submitted.is_some());
+        let cont_bytes =
+            b"\x1bPTermica;{\"type\":\"continuation\",\"session\":\"t\",\"value\":\"\"}\x1b\\";
+        session.terminal_mut().feed(cont_bytes);
+        let stop = Instant::now() + Duration::from_secs(3);
+        loop {
+            session.drain();
+            if session.controller.last_transition().reason
+                == crate::shell::TransitionReason::ContinuationMarker
+            {
+                break;
+            }
+            if Instant::now() >= stop {
+                panic!("continuation never observed");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        // The pane is now in the continuation sub-state: editor active,
+        // restored text, `last_submitted` still set.
+        assert!(session.awaiting_continuation(), "should be awaiting continuation");
+        assert_eq!(session.blocks.editor_on_tail().unwrap().text(), "echo \"!\"\n");
+
+        // Ctrl+C aborts. State resets so the next submit is a clean
+        // first-submit, not a stale-prefix diff.
+        session.abort_continuation().expect("abort");
+        assert!(!session.awaiting_continuation(), "continuation must be cleared");
+        assert!(session.last_submitted.is_none(), "last_submitted must be cleared");
+        assert!(
+            session.blocks.editor_on_tail().unwrap().is_empty(),
+            "editor must be cleared back to a fresh prompt"
+        );
+
+        // The `\x03` actually reached the PTY and interrupted the
+        // foreground line: the shell child takes the SIGINT and exits.
+        // This is what proves the abort unsticks the shell, not just our
+        // local state.
+        let stop = Instant::now() + Duration::from_secs(3);
+        while !session.is_exited() && Instant::now() < stop {
+            session.drain();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(session.is_exited(), "SIGINT from abort should have ended the shell line");
+    }
+
+    #[test]
+    fn retyping_a_different_command_during_continuation_heals_the_pane() {
+        // 2-Enter recovery. After `echo "!"` leaves the shell stuck at
+        // PS2, clearing the editor and submitting DIFFERENT text (text
+        // that no longer EXTENDS the half-sent line) must NOT feed the
+        // dangling line — that only re-locks the pane. Instead it aborts
+        // the stuck line (SIGINT), resets the continuation state, and
+        // KEEPS the retyped text in the editor so the next Enter — now at
+        // a fresh prompt — runs it as a clean first submit.
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c(&dcs_promote_to_editor_cmd()), "t".into(), 0, None)
+                .expect("spawn");
+        let stop = Instant::now() + Duration::from_secs(3);
+        loop {
+            session.drain();
+            if session.editor_is_active() {
+                break;
+            }
+            if Instant::now() >= stop {
+                panic!("editor never active");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        session.editor_mut().unwrap().insert_str("echo \"!\"");
+        session.submit_editor_command().expect("submit");
+        let cont_bytes =
+            b"\x1bPTermica;{\"type\":\"continuation\",\"session\":\"t\",\"value\":\"\"}\x1b\\";
+        session.terminal_mut().feed(cont_bytes);
+        let stop = Instant::now() + Duration::from_secs(3);
+        loop {
+            session.drain();
+            if session.controller.last_transition().reason
+                == crate::shell::TransitionReason::ContinuationMarker
+            {
+                break;
+            }
+            if Instant::now() >= stop {
+                panic!("continuation never observed");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(session.awaiting_continuation());
+
+        // Abandon the half-sent line: clear and retype something else.
+        let editor = session.editor_mut().unwrap();
+        editor.clear();
+        editor.insert_str("ls");
+        session.submit_editor_command().expect("heal submit");
+
+        // The continuation is aborted and reset; crucially the retyped
+        // text is KEPT (not consumed) so the next Enter submits it, and
+        // `last_submitted` is cleared so that next submit sends the full
+        // `ls` rather than a stale-prefix diff.
+        assert!(!session.awaiting_continuation(), "continuation must be reset");
+        assert!(session.last_submitted.is_none(), "last_submitted must be cleared, not diffed");
+        assert_eq!(
+            session.blocks.editor_on_tail().unwrap().text(),
+            "ls",
+            "retyped text must be kept in the editor for the 2nd Enter"
+        );
+        assert_eq!(
+            session.controller.mode(),
+            PaneMode::ShellPromptEditor,
+            "abort stays in the editor at the fresh prompt — no demote"
+        );
+
+        // The `\x03` reached the shell and aborted the foreground line.
+        let stop = Instant::now() + Duration::from_secs(3);
+        while !session.is_exited() && Instant::now() < stop {
+            session.drain();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(session.is_exited(), "SIGINT from the heal should have ended the shell line");
+    }
+
+    #[test]
+    fn abort_continuation_is_a_noop_at_an_idle_prompt() {
+        // No continuation pending (`last_submitted` is `None` at a fresh
+        // prompt), so abort must NOT send a stray `\x03` or clear the
+        // user's in-progress line — Ctrl+C stays inert at an idle prompt
+        // per spec/04.
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c(&dcs_promote_to_editor_cmd()), "t".into(), 0, None)
+                .expect("spawn");
+        let stop = Instant::now() + Duration::from_secs(3);
+        loop {
+            session.drain();
+            if session.editor_is_active() {
+                break;
+            }
+            if Instant::now() >= stop {
+                panic!("editor never active");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        session.editor_mut().unwrap().insert_str("echo keep me");
+        assert!(!session.awaiting_continuation());
+        session.abort_continuation().expect("abort");
+        assert_eq!(
+            session.blocks.editor_on_tail().unwrap().text(),
+            "echo keep me",
+            "abort at an idle prompt must not discard the typed line"
+        );
+        let _ = session.write(b"\x03"); // bring the shell down quickly
     }
 
     #[test]
