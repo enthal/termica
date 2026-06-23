@@ -217,6 +217,10 @@ pub enum CompletionPlan {
         origin_byte: usize,
         token: String,
         locals: Vec<CompletionCandidate>,
+        /// The quote context at the cursor ([`local::CompletionContext::quote`]),
+        /// carried so the driver result's values can be escaped for the same
+        /// context the local source already escaped for ([`resolve_driver`]).
+        quote: Option<char>,
         target: (DriverTool, String, usize),
     },
     /// Nothing to show (no driver, no local candidates).
@@ -232,6 +236,9 @@ pub struct PendingCompletion {
     pub origin_byte: usize,
     pub token: String,
     pub locals: Vec<CompletionCandidate>,
+    /// Quote context at the cursor, threaded to [`resolve_driver`] so the
+    /// driver values escape into the same context as the local candidates.
+    pub quote: Option<char>,
     /// `true` when this completion session was opened by an explicit `Tab`
     /// press, so a lone result may auto-accept. `false` for a live
     /// re-filter driven by typing — there the user stays in control and
@@ -257,7 +264,10 @@ pub fn plan_completion(
     let (origin, token, locals) =
         local_candidates_at(editor_text, cursor, cwd, home, env_var_names, history_lookup);
     if let Some(target) = driver_target_for_shell(editor_text, cursor, shell) {
-        return CompletionPlan::AwaitDriver { origin_byte: origin, token, locals, target };
+        // Recompute the (pure, cheap) quote context so the driver result can
+        // be escaped for the same context the local source escaped for.
+        let quote = local::completion_context(editor_text, cursor).quote;
+        return CompletionPlan::AwaitDriver { origin_byte: origin, token, locals, quote, target };
     }
     match CompletionPopup::new(origin, token, locals) {
         Some(popup) => CompletionPlan::Open(popup),
@@ -316,10 +326,11 @@ fn driver_target_for_shell(
 pub fn resolve_driver(
     origin_byte: usize,
     token: &str,
+    quote: Option<char>,
     locals: Vec<CompletionCandidate>,
     driver: Vec<CompletionCandidate>,
 ) -> Option<CompletionPopup> {
-    let driver = realign_driver_path_candidates(token, &locals, driver);
+    let driver = realign_driver_path_candidates(token, quote, &locals, driver);
     let merged = ranking::merge_ranked(vec![locals, driver], 200);
     CompletionPopup::new(origin_byte, token, merged)
 }
@@ -348,16 +359,25 @@ pub fn resolve_driver(
 ///   that, if accepted, would lose the `/`; drop it so the local dir row
 ///   wins (and the original double-row collapses to one).
 ///
-/// Non-path tokens (command names, subcommands, flags — no `/`) are passed
-/// through untouched: fuzzy/substring command completions must survive, and
-/// a command on both `$PATH` and the sidecar still collapses via the ranker.
+/// Every surviving driver value is then **escaped for the shell context**
+/// (`quote`) exactly as the local path source escapes its own values — so a
+/// completed name with a space round-trips (`Application Support` →
+/// `Application\ Support`) AND the redundancy check / ranker dedup compare
+/// like-for-like against the already-escaped local values.
+///
+/// Non-path tokens (command names, subcommands, flags — no `/`) skip the
+/// three path filters — fuzzy/substring command completions must survive —
+/// but are still escaped, so an argument-position filename with a space
+/// (`vim my fi<Tab>`) also round-trips.
 fn realign_driver_path_candidates(
     token: &str,
+    quote: Option<char>,
     locals: &[CompletionCandidate],
     driver: Vec<CompletionCandidate>,
 ) -> Vec<CompletionCandidate> {
     let path_shaped = token.contains('/');
-    // Local path values, trailing `/` trimmed, for the redundancy check.
+    // Local path values (already escaped), trailing `/` trimmed, for the
+    // redundancy check — the driver value is escaped before comparison.
     let local_keys: std::collections::HashSet<&str> = if path_shaped {
         locals.iter().map(|c| c.value.trim_end_matches('/')).collect()
     } else {
@@ -380,25 +400,29 @@ fn realign_driver_path_candidates(
     driver
         .into_iter()
         .filter_map(|mut c| {
-            c.value = align_driver_value_to_token(token, &c.value);
+            // Filters run on the UNESCAPED aligned value (the token is also
+            // unescaped, so prefix / component checks line up).
+            let aligned = align_driver_value_to_token(token, &c.value);
             if path_shaped {
                 // Must extend the typed token (case-insensitive — the local
                 // source is case-sensitive, but a tolerant check here only
                 // ever keeps more legitimate matches while still culling the
                 // ancestor-component garbage, whose leaf shares no prefix).
-                if !c.value.to_lowercase().starts_with(&token_lower) {
+                if !aligned.to_lowercase().starts_with(&token_lower) {
                     return None;
                 }
                 // Drop an ancestor-component match (`/usr/` → `usr`): its leaf
                 // is a directory the token already names, never a real child.
-                let leaf = c.value.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+                let leaf = aligned.trim_end_matches('/').rsplit('/').next().unwrap_or("");
                 if token_components.contains(leaf) {
                     return None;
                 }
-                // Drop the slash-less twin of a local directory candidate.
-                if local_keys.contains(c.value.trim_end_matches('/')) {
-                    return None;
-                }
+            }
+            // Escape for the shell context, mirroring the local path source.
+            c.value = local::escape_for_context(&aligned, quote);
+            // Drop the (now like-for-like) twin of a local directory candidate.
+            if path_shaped && local_keys.contains(c.value.trim_end_matches('/')) {
+                return None;
             }
             Some(c)
         })
@@ -845,13 +869,13 @@ mod tests {
             "checkout",
             CompletionSource::Driver(DriverTool::Git),
         )];
-        let popup = resolve_driver(4, "ch", locals, driver).expect("merged popup");
+        let popup = resolve_driver(4, "ch", None, locals, driver).expect("merged popup");
         assert_eq!(popup.candidates[0].value, "checkout", "driver ranks above locals");
     }
 
     #[test]
     fn resolve_driver_empty_everything_is_none() {
-        assert!(resolve_driver(0, "", vec![], vec![]).is_none());
+        assert!(resolve_driver(0, "", None, vec![], vec![]).is_none());
     }
 
     // ---- bare-segment driver values get the token's dir prefix --------
@@ -871,7 +895,8 @@ mod tests {
     #[test]
     fn resolve_driver_prefixes_bare_segment_with_tilde_dir() {
         // Token `~/Lib`; sidecar returns the bare segment `Library`.
-        let popup = resolve_driver(3, "~/Lib", vec![], vec![driver("Library")]).expect("popup");
+        let popup =
+            resolve_driver(3, "~/Lib", None, vec![], vec![driver("Library")]).expect("popup");
         assert_eq!(popup.candidates[0].value, "~/Library", "dir prefix `~/` prepended");
         // The menu still shows the bare segment — nicer, and matches a shell.
         assert_eq!(popup.candidates[0].display, "Library");
@@ -880,13 +905,14 @@ mod tests {
     #[test]
     fn resolve_driver_prefixes_bare_segment_under_absolute_dir() {
         // The same generalises to `/us<Tab>` → `usr` (broken) vs `/usr`.
-        let popup = resolve_driver(3, "/us", vec![], vec![driver("usr")]).expect("popup");
+        let popup = resolve_driver(3, "/us", None, vec![], vec![driver("usr")]).expect("popup");
         assert_eq!(popup.candidates[0].value, "/usr");
     }
 
     #[test]
     fn resolve_driver_prefixes_bare_segment_under_relative_dir() {
-        let popup = resolve_driver(3, "src/Ca", vec![], vec![driver("Cargo.toml")]).expect("popup");
+        let popup =
+            resolve_driver(3, "src/Ca", None, vec![], vec![driver("Cargo.toml")]).expect("popup");
         assert_eq!(popup.candidates[0].value, "src/Cargo.toml");
     }
 
@@ -894,7 +920,8 @@ mod tests {
     fn resolve_driver_leaves_full_word_value_untouched() {
         // fish's `complete -C` returns the FULL word (`~/Library/`); it
         // already carries the dir prefix, so it must not be double-prefixed.
-        let popup = resolve_driver(3, "~/Lib", vec![], vec![driver("~/Library/")]).expect("popup");
+        let popup =
+            resolve_driver(3, "~/Lib", None, vec![], vec![driver("~/Library/")]).expect("popup");
         assert_eq!(popup.candidates[0].value, "~/Library/");
     }
 
@@ -902,7 +929,8 @@ mod tests {
     fn resolve_driver_leaves_non_path_token_untouched() {
         // No `/` in the token: command names, subcommands, flags, branches
         // — the whole token IS the segment. `git che` → `checkout`.
-        let popup = resolve_driver(4, "che", vec![], vec![driver("checkout")]).expect("popup");
+        let popup =
+            resolve_driver(4, "che", None, vec![], vec![driver("checkout")]).expect("popup");
         assert_eq!(popup.candidates[0].value, "checkout");
     }
 
@@ -913,7 +941,8 @@ mod tests {
         // twin here, so the sidecar row is what's accepted.)
         let mut e = crate::prompt_editor::PromptEditor::new();
         e.insert_str("cd ~/Lib");
-        let popup = resolve_driver(3, "~/Lib", vec![], vec![driver("Library")]).expect("popup");
+        let popup =
+            resolve_driver(3, "~/Lib", None, vec![], vec![driver("Library")]).expect("popup");
         // Token `~/Lib` starts at byte 3, length 5.
         popup.accept(&mut e, 5);
         assert_eq!(e.text(), "cd ~/Library ");
@@ -939,6 +968,7 @@ mod tests {
         let popup = resolve_driver(
             3,
             "/usr/bin/af",
+            None,
             vec![],
             vec![driver("usr"), driver("bin"), driver("afclip")],
         )
@@ -952,8 +982,9 @@ mod tests {
         // The extend filter is path-only: a non-path token (no `/`) routes
         // every candidate through the normal merge — fuzzy/substring command
         // and flag completions must not be culled.
-        let popup = resolve_driver(0, "co", vec![], vec![driver("checkout"), driver("commit")])
-            .expect("popup");
+        let popup =
+            resolve_driver(0, "co", None, vec![], vec![driver("checkout"), driver("commit")])
+                .expect("popup");
         assert_eq!(popup.candidates.len(), 2);
     }
 
@@ -965,7 +996,8 @@ mod tests {
         // single surviving row carries the `/` (and accepting a directory
         // ends in `/`, not a space).
         let locals = vec![local_path("~/Library/")];
-        let popup = resolve_driver(3, "~/Lib", locals, vec![driver("Library")]).expect("popup");
+        let popup =
+            resolve_driver(3, "~/Lib", None, locals, vec![driver("Library")]).expect("popup");
         let values: Vec<&str> = popup.candidates.iter().map(|c| c.value.as_str()).collect();
         assert_eq!(values, vec!["~/Library/"], "the slash-bearing local dir row wins");
     }
@@ -979,9 +1011,14 @@ mod tests {
         // segment) and has no local twin — so it would survive without an
         // ancestor-component filter. It must be dropped.
         let locals = vec![local_path("/usr/bin/"), local_path("/usr/lib/")];
-        let popup =
-            resolve_driver(3, "/usr/", locals, vec![driver("usr"), driver("bin"), driver("lib")])
-                .expect("popup");
+        let popup = resolve_driver(
+            3,
+            "/usr/",
+            None,
+            locals,
+            vec![driver("usr"), driver("bin"), driver("lib")],
+        )
+        .expect("popup");
         let values: Vec<&str> = popup.candidates.iter().map(|c| c.value.as_str()).collect();
         assert_eq!(values, vec!["/usr/bin/", "/usr/lib/"], "ancestor `usr` gone, children deduped");
     }
@@ -990,10 +1027,63 @@ mod tests {
     fn resolve_driver_drops_ancestor_component_with_partial_segment() {
         // `cd /usr/lo<Tab>`: zsh captures `usr` (ancestor) + `local` (real).
         let locals = vec![local_path("/usr/local/")];
-        let popup = resolve_driver(3, "/usr/lo", locals, vec![driver("usr"), driver("local")])
-            .expect("popup");
+        let popup =
+            resolve_driver(3, "/usr/lo", None, locals, vec![driver("usr"), driver("local")])
+                .expect("popup");
         let values: Vec<&str> = popup.candidates.iter().map(|c| c.value.as_str()).collect();
         assert_eq!(values, vec!["/usr/local/"]);
+    }
+
+    // ---- escaping driver path values (spaces / metacharacters) --------
+    //
+    // The local path source escapes its values (`Application Support` →
+    // `Application\ Support`) but the sidecar returns the raw name. Driver
+    // values must be escaped the same way so (a) a name with a space round-
+    // trips into the shell and (b) the redundancy check compares like-for-
+    // like against the escaped local value.
+
+    #[test]
+    fn resolve_driver_escapes_path_value_with_space() {
+        // No local twin: the surviving sidecar value must be shell-escaped.
+        let popup = resolve_driver(
+            3,
+            "~/Library/Application",
+            None,
+            vec![],
+            vec![driver("Application Support")],
+        )
+        .expect("popup");
+        assert_eq!(popup.candidates[0].value, "~/Library/Application\\ Support");
+    }
+
+    #[test]
+    fn resolve_driver_dedupes_escaped_path_value_against_local_dir() {
+        // The reported case: `cd ~/Library/Application<Tab>` — the local
+        // source already produced the escaped, slash-terminated directory, so
+        // the sidecar's raw twin is redundant and the path row (with its `/`)
+        // wins. Without escaping the driver value, the slash-insensitive dedup
+        // would miss (`Application Support` vs `Application\ Support`).
+        let locals = vec![local_path("~/Library/Application\\ Support/")];
+        let popup = resolve_driver(
+            3,
+            "~/Library/Application",
+            None,
+            locals,
+            vec![driver("Application Support")],
+        )
+        .expect("popup");
+        let values: Vec<&str> = popup.candidates.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(values, vec!["~/Library/Application\\ Support/"], "escaped local dir row wins");
+    }
+
+    #[test]
+    fn resolve_driver_escapes_argument_filename_with_space_non_path_token() {
+        // A non-path token (`my fi`, no `/`) skips the path filters but still
+        // gets escaped — an argument-position filename with a space must round-
+        // trip (`vim my fi<Tab>` → `my\ file.txt`).
+        let popup =
+            resolve_driver(0, "my fi", None, vec![], vec![driver("my file.txt")]).expect("popup");
+        assert_eq!(popup.candidates[0].value, "my\\ file.txt");
     }
 
     #[test]
@@ -1003,7 +1093,8 @@ mod tests {
         let mut e = crate::prompt_editor::PromptEditor::new();
         e.insert_str("cd ~/Lib");
         let locals = vec![local_path("~/Library/")];
-        let popup = resolve_driver(3, "~/Lib", locals, vec![driver("Library")]).expect("popup");
+        let popup =
+            resolve_driver(3, "~/Lib", None, locals, vec![driver("Library")]).expect("popup");
         popup.accept(&mut e, 5);
         assert_eq!(e.text(), "cd ~/Library/");
     }
