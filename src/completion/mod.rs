@@ -333,6 +333,15 @@ pub fn resolve_driver(
 ///   directory matching the typed partial segment, falls back to emitting
 ///   the ancestor path components (`cd /usr/bin/af<Tab>` → `usr`, `bin`);
 ///   aligned, those are `/usr/bin/usr`, `/usr/bin/bin` — nonsense rows.
+/// - **Ancestor component** — zsh prepends the typed path's own directory
+///   components to the match set: `cd /usr/<Tab>` captures `usr` (not just
+///   the real children); `cd /usr/bin/af<Tab>` captures `usr` and `bin`
+///   (verified against the live captive child). Aligned, those leaves equal
+///   a component the token already contains (`/usr/usr`, `/usr/bin/bin`) —
+///   never a real child. Drop any candidate whose leaf is one of the token's
+///   own directory components. (The extend filter alone misses this for a
+///   trailing-slash token, where the empty partial segment makes the
+///   prefix check vacuous.)
 /// - **Redundant** — the local path source is authoritative for on-disk
 ///   paths and already lists the directory WITH its trailing `/`
 ///   (`~/Library/`). A slash-less sidecar twin (`~/Library`) is a duplicate
@@ -354,6 +363,19 @@ fn realign_driver_path_candidates(
     } else {
         std::collections::HashSet::new()
     };
+    // The token's own directory components (`/usr/bin/af` → {usr, bin}), for
+    // the ancestor-component check.
+    let token_components: std::collections::HashSet<&str> = if path_shaped {
+        token
+            .rsplit_once('/')
+            .map(|(dir, _)| dir)
+            .unwrap_or("")
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
     let token_lower = token.to_lowercase();
     driver
         .into_iter()
@@ -365,6 +387,12 @@ fn realign_driver_path_candidates(
                 // ever keeps more legitimate matches while still culling the
                 // ancestor-component garbage, whose leaf shares no prefix).
                 if !c.value.to_lowercase().starts_with(&token_lower) {
+                    return None;
+                }
+                // Drop an ancestor-component match (`/usr/` → `usr`): its leaf
+                // is a directory the token already names, never a real child.
+                let leaf = c.value.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+                if token_components.contains(leaf) {
                     return None;
                 }
                 // Drop the slash-less twin of a local directory candidate.
@@ -940,6 +968,32 @@ mod tests {
         let popup = resolve_driver(3, "~/Lib", locals, vec![driver("Library")]).expect("popup");
         let values: Vec<&str> = popup.candidates.iter().map(|c| c.value.as_str()).collect();
         assert_eq!(values, vec!["~/Library/"], "the slash-bearing local dir row wins");
+    }
+
+    #[test]
+    fn resolve_driver_drops_ancestor_component_on_trailing_slash_token() {
+        // `cd /usr/<Tab>`: zsh captures the immediate parent component `usr`
+        // (verified live) ALONGSIDE the real children. The real children are
+        // deduped against the local dir rows; the ancestor `usr` aligns to
+        // `/usr/usr`, which vacuously "extends" `/usr/` (empty partial
+        // segment) and has no local twin — so it would survive without an
+        // ancestor-component filter. It must be dropped.
+        let locals = vec![local_path("/usr/bin/"), local_path("/usr/lib/")];
+        let popup =
+            resolve_driver(3, "/usr/", locals, vec![driver("usr"), driver("bin"), driver("lib")])
+                .expect("popup");
+        let values: Vec<&str> = popup.candidates.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(values, vec!["/usr/bin/", "/usr/lib/"], "ancestor `usr` gone, children deduped");
+    }
+
+    #[test]
+    fn resolve_driver_drops_ancestor_component_with_partial_segment() {
+        // `cd /usr/lo<Tab>`: zsh captures `usr` (ancestor) + `local` (real).
+        let locals = vec![local_path("/usr/local/")];
+        let popup = resolve_driver(3, "/usr/lo", locals, vec![driver("usr"), driver("local")])
+            .expect("popup");
+        let values: Vec<&str> = popup.candidates.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(values, vec!["/usr/local/"]);
     }
 
     #[test]
