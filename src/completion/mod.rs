@@ -400,9 +400,15 @@ fn realign_driver_path_candidates(
     driver
         .into_iter()
         .filter_map(|mut c| {
+            // Canonicalise first: zsh's capture emits the SAME match both raw
+            // (`Application Scripts`) and pre-escaped (`Application\ Scripts`);
+            // unescaping both to the literal lets them collapse and re-escape
+            // to one value (otherwise the pre-escaped one double-escapes).
+            let literal = local::unescape(&c.value);
+            c.display = literal.clone();
             // Filters run on the UNESCAPED aligned value (the token is also
             // unescaped, so prefix / component checks line up).
-            let aligned = align_driver_value_to_token(token, &c.value);
+            let aligned = align_driver_value_to_token(token, &literal);
             if path_shaped {
                 // Must extend the typed token (case-insensitive — the local
                 // source is case-sensitive, but a tolerant check here only
@@ -1074,6 +1080,46 @@ mod tests {
         .expect("popup");
         let values: Vec<&str> = popup.candidates.iter().map(|c| c.value.as_str()).collect();
         assert_eq!(values, vec!["~/Library/Application\\ Support/"], "escaped local dir row wins");
+    }
+
+    #[test]
+    fn resolve_driver_canonicalises_mixed_raw_and_preescaped_values() {
+        // zsh's capture emits the SAME match BOTH raw and pre-escaped
+        // (verified live: `Application Support` AND `Application\ Support`).
+        // Both must canonicalise to one value — the pre-escaped one must NOT
+        // double-escape (`Application\\\ Support`) — and dedupe to a single
+        // row, which (with a local twin) is the slash-bearing path row.
+        let locals = vec![local_path("~/Library/Application\\ Support/")];
+        let popup = resolve_driver(
+            3,
+            "~/Library/Application",
+            None,
+            locals,
+            vec![driver("Application Support"), driver("Application\\ Support")],
+        )
+        .expect("popup");
+        let values: Vec<&str> = popup.candidates.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(
+            values,
+            vec!["~/Library/Application\\ Support/"],
+            "both forms collapse, path wins"
+        );
+    }
+
+    #[test]
+    fn resolve_driver_canonicalises_preescaped_value_without_local_twin() {
+        // No local twin: the two forms still collapse to ONE single-escaped
+        // row (not a double-escaped duplicate).
+        let popup = resolve_driver(
+            3,
+            "~/Library/Application",
+            None,
+            vec![],
+            vec![driver("Application Support"), driver("Application\\ Support")],
+        )
+        .expect("popup");
+        let values: Vec<&str> = popup.candidates.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(values, vec!["~/Library/Application\\ Support"]);
     }
 
     #[test]
