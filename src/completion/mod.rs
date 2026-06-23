@@ -319,8 +319,51 @@ pub fn resolve_driver(
     locals: Vec<CompletionCandidate>,
     driver: Vec<CompletionCandidate>,
 ) -> Option<CompletionPopup> {
+    // Realign each driver value to the whole-token convention the local
+    // path source already uses ([`local_candidates_at`] path-source
+    // rewrite) before merging — so accept / tab-extend / dedup all see one
+    // consistent meaning of `value`.
+    let driver: Vec<CompletionCandidate> = driver
+        .into_iter()
+        .map(|mut c| {
+            c.value = align_driver_value_to_token(token, &c.value);
+            c
+        })
+        .collect();
     let merged = ranking::merge_ranked(vec![locals, driver], 200);
     CompletionPopup::new(origin_byte, token, merged)
+}
+
+/// Rewrite a driver candidate's `value` so it is the full replacement for
+/// the whole completion `token`, matching the convention the local path
+/// source uses.
+///
+/// Shell sidecars complete the **last path segment**: for the word `~/Lib`
+/// a sidecar returns `Library`, not `~/Library`. The popup replaces the
+/// entire token on accept, so a bare-segment value would drop the `~/`
+/// directory prefix the user typed (`cd ~/Lib<Tab>` → `cd Library`, which
+/// points at the wrong directory when cwd isn't `~`). Prepend the token's
+/// directory prefix — everything up to and including its last `/` — so the
+/// value only effectively replaces the partial last segment.
+///
+/// Leaves the value untouched when:
+/// - the token has no `/` (the whole token IS the segment: command names,
+///   subcommands, flags, git branches — `git che` → `checkout`); or
+/// - the value already carries the dir prefix (fish's `complete -C`
+///   returns the full word `~/Library/`) or is itself absolute (a path the
+///   sidecar already resolved) — both already full-token replacements.
+fn align_driver_value_to_token(token: &str, value: &str) -> String {
+    let Some(slash) = token.rfind('/') else {
+        return value.to_string();
+    };
+    // Up to and including the last `/` (`~/`, `/`, `src/`). `slash` is a
+    // byte index at an ASCII `/`, so `..=slash` is on a char boundary.
+    let dir_prefix = &token[..=slash];
+    if value.starts_with(dir_prefix) || value.starts_with('/') {
+        value.to_string()
+    } else {
+        format!("{dir_prefix}{value}")
+    }
 }
 
 /// Resolve a path-token's `dir_part` into a real filesystem path
@@ -738,6 +781,70 @@ mod tests {
     #[test]
     fn resolve_driver_empty_everything_is_none() {
         assert!(resolve_driver(0, "", vec![], vec![]).is_none());
+    }
+
+    // ---- bare-segment driver values get the token's dir prefix --------
+    //
+    // Shell sidecars complete the LAST path segment: `complete -C` / zsh
+    // capture return `Library` for the word `~/Lib`, not `~/Library`. The
+    // popup replaces the whole token on accept, so an un-prefixed value
+    // would drop the `~/` the user typed (`cd ~/Lib<Tab>` → `cd Library`,
+    // a path that doesn't exist relative to cwd). `resolve_driver` must
+    // realign such values to the convention the local path source already
+    // uses: the value is the full replacement for the whole token.
+
+    fn driver(value: &str) -> CompletionCandidate {
+        CompletionCandidate::simple(value, CompletionSource::Driver(DriverTool::ZshComplete))
+    }
+
+    #[test]
+    fn resolve_driver_prefixes_bare_segment_with_tilde_dir() {
+        // Token `~/Lib`; sidecar returns the bare segment `Library`.
+        let popup = resolve_driver(3, "~/Lib", vec![], vec![driver("Library")]).expect("popup");
+        assert_eq!(popup.candidates[0].value, "~/Library", "dir prefix `~/` prepended");
+        // The menu still shows the bare segment — nicer, and matches a shell.
+        assert_eq!(popup.candidates[0].display, "Library");
+    }
+
+    #[test]
+    fn resolve_driver_prefixes_bare_segment_under_absolute_dir() {
+        // The same generalises to `/us<Tab>` → `usr` (broken) vs `/usr`.
+        let popup = resolve_driver(3, "/us", vec![], vec![driver("usr")]).expect("popup");
+        assert_eq!(popup.candidates[0].value, "/usr");
+    }
+
+    #[test]
+    fn resolve_driver_prefixes_bare_segment_under_relative_dir() {
+        let popup = resolve_driver(3, "src/Ca", vec![], vec![driver("Cargo.toml")]).expect("popup");
+        assert_eq!(popup.candidates[0].value, "src/Cargo.toml");
+    }
+
+    #[test]
+    fn resolve_driver_leaves_full_word_value_untouched() {
+        // fish's `complete -C` returns the FULL word (`~/Library/`); it
+        // already carries the dir prefix, so it must not be double-prefixed.
+        let popup = resolve_driver(3, "~/Lib", vec![], vec![driver("~/Library/")]).expect("popup");
+        assert_eq!(popup.candidates[0].value, "~/Library/");
+    }
+
+    #[test]
+    fn resolve_driver_leaves_non_path_token_untouched() {
+        // No `/` in the token: command names, subcommands, flags, branches
+        // — the whole token IS the segment. `git che` → `checkout`.
+        let popup = resolve_driver(4, "che", vec![], vec![driver("checkout")]).expect("popup");
+        assert_eq!(popup.candidates[0].value, "checkout");
+    }
+
+    #[test]
+    fn resolve_driver_realigned_value_accepts_to_correct_path() {
+        // End-to-end: the reported bug. `cd ~/Lib<Tab>`, accept the sidecar
+        // candidate → the `~/` prefix survives, not `cd Library`.
+        let mut e = crate::prompt_editor::PromptEditor::new();
+        e.insert_str("cd ~/Lib");
+        let popup = resolve_driver(3, "~/Lib", vec![], vec![driver("Library")]).expect("popup");
+        // Token `~/Lib` starts at byte 3, length 5.
+        popup.accept(&mut e, 5);
+        assert_eq!(e.text(), "cd ~/Library ");
     }
 
     #[test]
