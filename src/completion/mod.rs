@@ -319,19 +319,62 @@ pub fn resolve_driver(
     locals: Vec<CompletionCandidate>,
     driver: Vec<CompletionCandidate>,
 ) -> Option<CompletionPopup> {
-    // Realign each driver value to the whole-token convention the local
-    // path source already uses ([`local_candidates_at`] path-source
-    // rewrite) before merging — so accept / tab-extend / dedup all see one
-    // consistent meaning of `value`.
-    let driver: Vec<CompletionCandidate> = driver
-        .into_iter()
-        .map(|mut c| {
-            c.value = align_driver_value_to_token(token, &c.value);
-            c
-        })
-        .collect();
+    let driver = realign_driver_path_candidates(token, &locals, driver);
     let merged = ranking::merge_ranked(vec![locals, driver], 200);
     CompletionPopup::new(origin_byte, token, merged)
+}
+
+/// Realign each driver/sidecar value to the whole-token convention the local
+/// path source uses ([`align_driver_value_to_token`]) and, for a **path-
+/// shaped** token, drop the two kinds of bad sidecar path candidate:
+///
+/// - **Non-extending** — a real completion of a path token must extend it
+///   (case-insensitively). zsh's `cd` (directories-only) completion, with no
+///   directory matching the typed partial segment, falls back to emitting
+///   the ancestor path components (`cd /usr/bin/af<Tab>` → `usr`, `bin`);
+///   aligned, those are `/usr/bin/usr`, `/usr/bin/bin` — nonsense rows.
+/// - **Redundant** — the local path source is authoritative for on-disk
+///   paths and already lists the directory WITH its trailing `/`
+///   (`~/Library/`). A slash-less sidecar twin (`~/Library`) is a duplicate
+///   that, if accepted, would lose the `/`; drop it so the local dir row
+///   wins (and the original double-row collapses to one).
+///
+/// Non-path tokens (command names, subcommands, flags — no `/`) are passed
+/// through untouched: fuzzy/substring command completions must survive, and
+/// a command on both `$PATH` and the sidecar still collapses via the ranker.
+fn realign_driver_path_candidates(
+    token: &str,
+    locals: &[CompletionCandidate],
+    driver: Vec<CompletionCandidate>,
+) -> Vec<CompletionCandidate> {
+    let path_shaped = token.contains('/');
+    // Local path values, trailing `/` trimmed, for the redundancy check.
+    let local_keys: std::collections::HashSet<&str> = if path_shaped {
+        locals.iter().map(|c| c.value.trim_end_matches('/')).collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+    let token_lower = token.to_lowercase();
+    driver
+        .into_iter()
+        .filter_map(|mut c| {
+            c.value = align_driver_value_to_token(token, &c.value);
+            if path_shaped {
+                // Must extend the typed token (case-insensitive — the local
+                // source is case-sensitive, but a tolerant check here only
+                // ever keeps more legitimate matches while still culling the
+                // ancestor-component garbage, whose leaf shares no prefix).
+                if !c.value.to_lowercase().starts_with(&token_lower) {
+                    return None;
+                }
+                // Drop the slash-less twin of a local directory candidate.
+                if local_keys.contains(c.value.trim_end_matches('/')) {
+                    return None;
+                }
+            }
+            Some(c)
+        })
+        .collect()
 }
 
 /// Rewrite a driver candidate's `value` so it is the full replacement for
@@ -838,13 +881,77 @@ mod tests {
     #[test]
     fn resolve_driver_realigned_value_accepts_to_correct_path() {
         // End-to-end: the reported bug. `cd ~/Lib<Tab>`, accept the sidecar
-        // candidate → the `~/` prefix survives, not `cd Library`.
+        // candidate → the `~/` prefix survives, not `cd Library`. (No local
+        // twin here, so the sidecar row is what's accepted.)
         let mut e = crate::prompt_editor::PromptEditor::new();
         e.insert_str("cd ~/Lib");
         let popup = resolve_driver(3, "~/Lib", vec![], vec![driver("Library")]).expect("popup");
         // Token `~/Lib` starts at byte 3, length 5.
         popup.accept(&mut e, 5);
         assert_eq!(e.text(), "cd ~/Library ");
+    }
+
+    // ---- spurious / redundant sidecar path candidates -----------------
+    //
+    // zsh's `cd` (directories-only) completion, when no directory matches
+    // the typed partial segment, falls back to emitting the ANCESTOR path
+    // components: `cd /usr/bin/af<Tab>` captures `usr` and `bin`, not the
+    // real `af*` leaves (verified against the live captive child). Aligned
+    // to the token those become `/usr/bin/usr`, `/usr/bin/bin` — garbage
+    // rows. A real completion of a path token must EXTEND it, so drop any
+    // driver value that doesn't.
+
+    fn local_path(value: &str) -> CompletionCandidate {
+        CompletionCandidate::simple(value, CompletionSource::Path)
+    }
+
+    #[test]
+    fn resolve_driver_drops_path_values_that_do_not_extend_the_token() {
+        // `usr` / `bin` don't extend `/usr/bin/af`; `afclip` does.
+        let popup = resolve_driver(
+            3,
+            "/usr/bin/af",
+            vec![],
+            vec![driver("usr"), driver("bin"), driver("afclip")],
+        )
+        .expect("popup");
+        let values: Vec<&str> = popup.candidates.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(values, vec!["/usr/bin/afclip"], "only the extending leaf survives");
+    }
+
+    #[test]
+    fn resolve_driver_keeps_non_extending_values_for_non_path_tokens() {
+        // The extend filter is path-only: a non-path token (no `/`) routes
+        // every candidate through the normal merge — fuzzy/substring command
+        // and flag completions must not be culled.
+        let popup = resolve_driver(0, "co", vec![], vec![driver("checkout"), driver("commit")])
+            .expect("popup");
+        assert_eq!(popup.candidates.len(), 2);
+    }
+
+    #[test]
+    fn resolve_driver_dedupes_sidecar_path_value_against_local_dir() {
+        // The local path source is authoritative for on-disk paths: it
+        // already produced `~/Library/` (trailing `/`, known directory). The
+        // sidecar's slash-less `~/Library` twin is redundant — drop it so the
+        // single surviving row carries the `/` (and accepting a directory
+        // ends in `/`, not a space).
+        let locals = vec![local_path("~/Library/")];
+        let popup = resolve_driver(3, "~/Lib", locals, vec![driver("Library")]).expect("popup");
+        let values: Vec<&str> = popup.candidates.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(values, vec!["~/Library/"], "the slash-bearing local dir row wins");
+    }
+
+    #[test]
+    fn resolve_driver_dedupes_directory_accepts_with_trailing_slash() {
+        // End-to-end of the dedup: accepting the surviving directory row ends
+        // in `/` (keep completing into the path), never a space.
+        let mut e = crate::prompt_editor::PromptEditor::new();
+        e.insert_str("cd ~/Lib");
+        let locals = vec![local_path("~/Library/")];
+        let popup = resolve_driver(3, "~/Lib", locals, vec![driver("Library")]).expect("popup");
+        popup.accept(&mut e, 5);
+        assert_eq!(e.text(), "cd ~/Library/");
     }
 
     #[test]
