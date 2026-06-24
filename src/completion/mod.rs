@@ -337,38 +337,37 @@ pub fn resolve_driver(
 
 /// Realign each driver/sidecar value to the whole-token convention the local
 /// path source uses ([`align_driver_value_to_token`]) and, for a **path-
-/// shaped** token, drop the two kinds of bad sidecar path candidate:
+/// shaped** token, suppress bad sidecar path candidates so the completion
+/// never extends to a path that isn't real.
 ///
-/// - **Non-extending** — a real completion of a path token must extend it
-///   (case-insensitively). zsh's `cd` (directories-only) completion, with no
-///   directory matching the typed partial segment, falls back to emitting
-///   the ancestor path components (`cd /usr/bin/af<Tab>` → `usr`, `bin`);
-///   aligned, those are `/usr/bin/usr`, `/usr/bin/bin` — nonsense rows.
-/// - **Ancestor component** — zsh prepends the typed path's own directory
-///   components to the match set: `cd /usr/<Tab>` captures `usr` (not just
-///   the real children); `cd /usr/bin/af<Tab>` captures `usr` and `bin`
-///   (verified against the live captive child). Aligned, those leaves equal
-///   a component the token already contains (`/usr/usr`, `/usr/bin/bin`) —
-///   never a real child. Drop any candidate whose leaf is one of the token's
-///   own directory components. (The extend filter alone misses this for a
-///   trailing-slash token, where the empty partial segment makes the
-///   prefix check vacuous.)
-/// - **Redundant** — the local path source is authoritative for on-disk
-///   paths and already lists the directory WITH its trailing `/`
-///   (`~/Library/`). A slash-less sidecar twin (`~/Library`) is a duplicate
-///   that, if accepted, would lose the `/`; drop it so the local dir row
-///   wins (and the original double-row collapses to one).
+/// The key asymmetry: the local path source is the **authoritative, complete
+/// listing** of the directory under the cursor, while zsh's path completion
+/// is noisy — it emits the typed path's own ancestor components (`cd /usr/`
+/// → `usr`), and *alternative names for ambiguous intermediate components*
+/// (`cd /usr/lib/dtrace/arm/` → `libexec`, `arm64` — from `lib`/`libexec`
+/// and `arm`/`arm64`), all verified against the live captive child. Aligned,
+/// those become paths that don't exist (`/usr/lib/dtrace/arm/libexec`).
 ///
-/// Every surviving driver value is then **escaped for the shell context**
-/// (`quote`) exactly as the local path source escapes its own values — so a
-/// completed name with a space round-trips (`Application Support` →
-/// `Application\ Support`) AND the redundancy check / ranker dedup compare
-/// like-for-like against the already-escaped local values.
+/// So **when the local listing succeeded** (path-shaped token, `locals`
+/// non-empty), every driver path candidate is dropped: a match is redundant
+/// with the local row (which carries the trailing `/` and the full-path
+/// display), and a non-match is junk. The local rows are exactly what we
+/// want. **When there is no local listing** (the directory couldn't be read,
+/// or it isn't a filesystem path at all), fall back to two cheap heuristics
+/// that cull the self-evident junk: the value must extend the token, and its
+/// leaf must not be one of the token's own directory components.
 ///
-/// Non-path tokens (command names, subcommands, flags — no `/`) skip the
-/// three path filters — fuzzy/substring command completions must survive —
-/// but are still escaped, so an argument-position filename with a space
-/// (`vim my fi<Tab>`) also round-trips.
+/// Every surviving value is **canonicalised then escaped for the shell
+/// context** (`quote`), mirroring the local path source: zsh's capture emits
+/// the SAME match both raw (`Application Support`) and pre-escaped
+/// (`Application\ Support`), so unescaping to the literal collapses the two
+/// (otherwise the pre-escaped form double-escapes), and re-escaping makes a
+/// name with a space round-trip.
+///
+/// Non-path tokens (command names, subcommands, flags — no `/`) skip the path
+/// suppression entirely — fuzzy/substring command completions must survive —
+/// but are still canonicalised + escaped, so an argument-position filename
+/// with a space (`vim my fi<Tab>`) round-trips too.
 fn realign_driver_path_candidates(
     token: &str,
     quote: Option<char>,
@@ -376,15 +375,10 @@ fn realign_driver_path_candidates(
     driver: Vec<CompletionCandidate>,
 ) -> Vec<CompletionCandidate> {
     let path_shaped = token.contains('/');
-    // Local path values (already escaped), trailing `/` trimmed, for the
-    // redundancy check — the driver value is escaped before comparison.
-    let local_keys: std::collections::HashSet<&str> = if path_shaped {
-        locals.iter().map(|c| c.value.trim_end_matches('/')).collect()
-    } else {
-        std::collections::HashSet::new()
-    };
+    // A successful local listing is the authoritative directory contents.
+    let local_listing_present = path_shaped && !locals.is_empty();
     // The token's own directory components (`/usr/bin/af` → {usr, bin}), for
-    // the ancestor-component check.
+    // the no-local-listing fallback's ancestor-component check.
     let token_components: std::collections::HashSet<&str> = if path_shaped {
         token
             .rsplit_once('/')
@@ -410,10 +404,14 @@ fn realign_driver_path_candidates(
             // unescaped, so prefix / component checks line up).
             let aligned = align_driver_value_to_token(token, &literal);
             if path_shaped {
-                // Must extend the typed token (case-insensitive — the local
-                // source is case-sensitive, but a tolerant check here only
-                // ever keeps more legitimate matches while still culling the
-                // ancestor-component garbage, whose leaf shares no prefix).
+                if local_listing_present {
+                    // Authoritative local listing — drop every driver path
+                    // candidate (redundant matches and junk non-matches alike).
+                    return None;
+                }
+                // No local listing: cull the self-evident junk. Must extend
+                // the typed token (case-insensitive — tolerant, only ever
+                // keeping more legitimate matches).
                 if !aligned.to_lowercase().starts_with(&token_lower) {
                     return None;
                 }
@@ -426,10 +424,6 @@ fn realign_driver_path_candidates(
             }
             // Escape for the shell context, mirroring the local path source.
             c.value = local::escape_for_context(&aligned, quote);
-            // Drop the (now like-for-like) twin of a local directory candidate.
-            if path_shaped && local_keys.contains(c.value.trim_end_matches('/')) {
-                return None;
-            }
             Some(c)
         })
         .collect()
@@ -1009,13 +1003,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_driver_drops_ancestor_component_on_trailing_slash_token() {
-        // `cd /usr/<Tab>`: zsh captures the immediate parent component `usr`
-        // (verified live) ALONGSIDE the real children. The real children are
-        // deduped against the local dir rows; the ancestor `usr` aligns to
-        // `/usr/usr`, which vacuously "extends" `/usr/` (empty partial
-        // segment) and has no local twin — so it would survive without an
-        // ancestor-component filter. It must be dropped.
+    fn resolve_driver_drops_all_driver_path_rows_when_local_listing_present() {
+        // `cd /usr/<Tab>`: zsh captures `usr` (parent component) plus the real
+        // children (verified live). With the authoritative local listing
+        // present, every driver path row is dropped — the children are
+        // redundant, `usr` is junk — leaving the local dir rows.
         let locals = vec![local_path("/usr/bin/"), local_path("/usr/lib/")];
         let popup = resolve_driver(
             3,
@@ -1030,14 +1022,35 @@ mod tests {
     }
 
     #[test]
-    fn resolve_driver_drops_ancestor_component_with_partial_segment() {
-        // `cd /usr/lo<Tab>`: zsh captures `usr` (ancestor) + `local` (real).
-        let locals = vec![local_path("/usr/local/")];
-        let popup =
-            resolve_driver(3, "/usr/lo", None, locals, vec![driver("usr"), driver("local")])
-                .expect("popup");
+    fn resolve_driver_drops_ambiguous_intermediate_component_junk() {
+        // `cd /usr/lib/dtrace/arm/<Tab>`: zsh emits alternative names for
+        // ambiguous intermediate components (`lib`/`libexec`, `arm`/`arm64`)
+        // → `libexec`, `arm64`. These are NOT ancestor components and DO
+        // vacuously extend the trailing-slash token, so only the authoritative
+        // local listing can reject them. With a real local entry present,
+        // every driver candidate is dropped.
+        let locals = vec![local_path("/usr/lib/dtrace/arm/swift_arm.d")];
+        let popup = resolve_driver(
+            3,
+            "/usr/lib/dtrace/arm/",
+            None,
+            locals,
+            vec![driver("libexec"), driver("arm64")],
+        )
+        .expect("popup");
         let values: Vec<&str> = popup.candidates.iter().map(|c| c.value.as_str()).collect();
-        assert_eq!(values, vec!["/usr/local/"]);
+        assert_eq!(values, vec!["/usr/lib/dtrace/arm/swift_arm.d"], "junk gone, local row only");
+    }
+
+    #[test]
+    fn resolve_driver_drops_ancestor_component_fallback_without_local_listing() {
+        // No local listing (the dir couldn't be read): the ancestor-component
+        // heuristic still fires. `/usr/` → `usr` aligns to `/usr/usr` (leaf is
+        // the token's own component) → dropped; a real-looking leaf survives.
+        let popup = resolve_driver(3, "/usr/", None, vec![], vec![driver("usr"), driver("share")])
+            .expect("popup");
+        let values: Vec<&str> = popup.candidates.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(values, vec!["/usr/share"], "ancestor `usr` culled, real leaf kept");
     }
 
     // ---- escaping driver path values (spaces / metacharacters) --------
