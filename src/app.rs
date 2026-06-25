@@ -286,6 +286,17 @@ impl TermicaApp {
     /// so the next launch can restore. Best-effort: a missing store,
     /// serialization failure, or DB error degrades to "no restore next
     /// time", never a crash on quit.
+    /// Drain every pane's background scrollback writer before the process
+    /// exits, so all queued chunk writes and Cmd+K/close `Clear` deletes
+    /// are applied (not lost to a fast quit). Must run *before* the store
+    /// lock is taken in [`Self::save_layout_on_quit`] — the writer threads
+    /// need that lock to finish draining.
+    fn flush_persisted_writers(&mut self) {
+        for slot in self.panes.values_mut() {
+            slot.session.flush_chunk_writer();
+        }
+    }
+
     fn save_layout_on_quit(&self) {
         let Some(store) = self.history.as_ref() else { return };
         // Map every live pane's app id -> its durable db pane row id.
@@ -1040,6 +1051,13 @@ impl eframe::App for TermicaApp {
         }
 
         if self.should_quit {
+            // Flush every pane's scrollback writer FIRST: a Cmd+K / close
+            // queues an async transcript-delete on the writer thread, and
+            // pending chunk writes are async too. Draining them here is
+            // the teardown flush (spec/08 §Teardown) — without it, a quit
+            // right after Cmd+K exits before the delete lands and the
+            // "cleared" transcript resurrects on next launch.
+            self.flush_persisted_writers();
             // Persist the layout (9F) so the next launch can restore it,
             // and stamp the live sessions ended. Best-effort; never
             // blocks the close.

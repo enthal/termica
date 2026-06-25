@@ -487,6 +487,7 @@ impl PaneSession {
             match begun {
                 Ok(record) => {
                     session.chunk_writer = Some(crate::persist::writer::ChunkWriter::spawn(
+                        persist.root().to_path_buf(),
                         record.dir,
                         persist.store_handle(),
                         record.session,
@@ -923,9 +924,32 @@ impl PaneSession {
     /// blank the live terminal grid. The shell process is
     /// untouched — it'll redraw its prompt on the next prompt
     /// cycle, or when the user presses Enter.
+    ///
+    /// This is an **explicit discard**: it also deletes the pane's
+    /// persisted transcript from disk (chunk files + index rows + chips)
+    /// so the cleared content does not reappear on the next launch. The
+    /// pane's command history (`runs`) is deliberately kept — clearing
+    /// the screen never wipes `~/.zsh_history`. The disk delete runs on
+    /// the writer thread, serialized behind any in-flight block writes.
     pub fn clear_scrollback(&mut self) {
         self.blocks.clear_sealed();
         self.terminal.clear_all();
+        if let Some(writer) = &self.chunk_writer {
+            writer.clear();
+        }
+    }
+
+    /// Drain this pane's background scrollback writer before teardown:
+    /// block until every queued chunk write AND `Clear` delete (Cmd+K /
+    /// close) has been applied, then drop the writer. Without this, a
+    /// quit immediately after a Cmd+K can exit before the async delete
+    /// lands, resurrecting the "cleared" transcript on next launch. Takes
+    /// the writer, so it is idempotent (a second call is a no-op) and the
+    /// pane writes nothing further.
+    pub fn flush_chunk_writer(&mut self) {
+        if let Some(writer) = self.chunk_writer.take() {
+            writer.finish();
+        }
     }
 
     /// Stable per-pane id. Used to salt egui widget IDs that may
