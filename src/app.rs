@@ -1249,6 +1249,19 @@ impl eframe::App for TermicaApp {
                 live_panes.insert(*id);
             }
         }
+        // A pane leaves the tree only by being explicitly CLOSED (close
+        // tab / close pane). That is an explicit discard, so — like Cmd+K
+        // — delete its persisted transcript (keeping its `runs` history)
+        // before the slot is dropped. Quit does NOT pass through here (it
+        // tears down panes wholesale via app drop), so quit keeps
+        // everything for restore.
+        let closed: Vec<PaneId> =
+            self.panes.keys().copied().filter(|id| !live_panes.contains(id)).collect();
+        for id in closed {
+            if let Some(slot) = self.panes.get_mut(&id) {
+                slot.session.discard_persisted_transcript();
+            }
+        }
         self.panes.retain(|id, _| live_panes.contains(id));
     }
 }

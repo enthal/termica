@@ -939,6 +939,19 @@ impl PaneSession {
         }
     }
 
+    /// Explicit close: delete this pane's persisted **transcript** (chunk
+    /// files + index rows + chips) while keeping its command **history**
+    /// (`runs`) — the same discard model as Cmd+K. A closed pane is not
+    /// restored on the next launch, so leaving its chunks would only
+    /// orphan them until gc. Queues the discard on the writer, then drains
+    /// it so the delete lands before the pane is dropped.
+    pub fn discard_persisted_transcript(&mut self) {
+        if let Some(writer) = &self.chunk_writer {
+            writer.clear();
+        }
+        self.flush_chunk_writer();
+    }
+
     /// Drain this pane's background scrollback writer before teardown:
     /// block until every queued chunk write AND `Clear` delete (Cmd+K /
     /// close) has been applied, then drop the writer. Without this, a
