@@ -2434,6 +2434,7 @@ pub fn render_pane(
                 match crate::completion::resolve_driver(
                     pending.origin_byte,
                     &pending.token,
+                    pending.quote,
                     pending.locals,
                     resp.candidates,
                 ) {
@@ -3743,6 +3744,7 @@ pub fn render_pane(
                             origin_byte,
                             token,
                             locals,
+                            quote,
                             target,
                         } => {
                             slot.ui.completion_pending =
@@ -3750,6 +3752,7 @@ pub fn render_pane(
                                     origin_byte,
                                     token,
                                     locals,
+                                    quote,
                                     from_tab: true,
                                 });
                             slot.session.completion_driver_request(ctx, target);
@@ -3837,6 +3840,7 @@ pub fn render_pane(
                             origin_byte,
                             token,
                             locals,
+                            quote,
                             target,
                         } => {
                             // Keep any open popup VISIBLE (stale) while the
@@ -3850,6 +3854,7 @@ pub fn render_pane(
                                     origin_byte,
                                     token,
                                     locals,
+                                    quote,
                                     from_tab: false,
                                 });
                             slot.session.completion_driver_request(ctx, target);

@@ -220,6 +220,33 @@ fn needs_unquoted_escape(c: char) -> bool {
         )
 }
 
+/// Collapse backslash escapes in `value`, returning the literal text:
+/// `Application\ Scripts` → `Application Scripts`, `a\\b` → `a\b`. The
+/// inverse of [`escape_for_context`] for the unquoted (backslash) style.
+///
+/// Used to **canonicalize sidecar values**, which arrive in mixed forms —
+/// zsh's `compadd` capture emits the SAME match both raw (`Application
+/// Scripts`) and pre-escaped (`Application\ Scripts`). Unescaping both to
+/// the literal lets them collapse and then re-escape to one consistent
+/// value, instead of one being double-escaped (`Application\\\ Scripts`).
+///
+/// A trailing lone backslash is kept as-is (nothing follows to unescape).
+pub fn unescape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(next) => out.push(next),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// True if the byte position `cursor` is in "command position"
 /// in `text` — i.e. there is NO non-separator content before it
 /// on this command-line stretch (the stretch before the cursor
@@ -609,6 +636,38 @@ mod tests {
     #[test]
     fn escape_single_quote_passes_through() {
         assert_eq!(escape_for_context("my file.txt", Some('\'')), "my file.txt");
+    }
+
+    // ---- unescape (canonicalising sidecar values) ------------------
+
+    #[test]
+    fn unescape_collapses_backslash_space() {
+        assert_eq!(unescape("Application\\ Scripts"), "Application Scripts");
+    }
+
+    #[test]
+    fn unescape_is_noop_on_plain_value() {
+        assert_eq!(unescape("Application Scripts"), "Application Scripts");
+    }
+
+    #[test]
+    fn unescape_collapses_doubled_backslash_to_one() {
+        assert_eq!(unescape("a\\\\b"), "a\\b");
+    }
+
+    #[test]
+    fn unescape_then_escape_is_idempotent_on_escaped_input() {
+        // The mixed-form problem: raw and pre-escaped must both canonicalise
+        // to the same literal, so re-escaping yields ONE consistent value.
+        let raw = "Application Support";
+        let pre = "Application\\ Support";
+        assert_eq!(unescape(raw), unescape(pre));
+        assert_eq!(escape_for_context(&unescape(pre), None), "Application\\ Support");
+    }
+
+    #[test]
+    fn unescape_keeps_trailing_lone_backslash() {
+        assert_eq!(unescape("foo\\"), "foo\\");
     }
 
     // ---- token_under_cursor ----------------------------------------
