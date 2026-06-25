@@ -33,6 +33,11 @@ pub enum LifecycleEvent {
     /// `{"type":"integration_ready","value":{"shell":"zsh","version":1}}`
     /// — the bootstrap completed successfully. Termica transitions
     /// the pane from `Bootstrapping` → `RawTerminal` on receipt.
+    ///
+    /// bash additionally reports `"bash_major":N` and `"completion":bool`
+    /// (false ⇒ bash-completion couldn't load, so live Tab-completion is
+    /// degraded). Those fields are not consumed yet — a future UI notice
+    /// will read them — so they are parsed leniently (ignored here).
     IntegrationReady { shell: ShellKind, version: u32 },
     /// `{"type":"integration_error","value":"<reason>"}` — the
     /// bootstrap detected a problem and chose to fail loud rather

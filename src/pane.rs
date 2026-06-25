@@ -277,6 +277,30 @@ fn effective_var_names<'a>(shell: Option<&'a [String]>, snapshot: &'a [String]) 
     shell.unwrap_or(snapshot)
 }
 
+/// The text to actually write to the PTY for a submit, given the pane's
+/// `shell`, any prior `last_submitted` (set ⟺ a multi-line continuation is in
+/// progress), and the current full editor `text`.
+///
+/// **zsh / bash** buffer the already-sent prefix at the tty: after an
+/// incomplete submit their parser holds `<prev>\n` and waits at `PS2`, so the
+/// re-submit must send only the **new suffix** — sending the whole buffer
+/// would feed `<prev>` twice. **fish** holds no partial command (its read-eval
+/// loop `eval`s each line as a whole unit and loops back to a fresh `read`),
+/// so a continuation re-submit must resend the **whole buffer** — there is no
+/// buffered prefix to avoid duplicating, and the bootstrap re-checks
+/// completeness of the cumulative command each time. Pure + tested.
+fn continuation_to_send(shell: ShellSpec, last_submitted: Option<&str>, text: &str) -> String {
+    match last_submitted {
+        Some(prev) if shell != ShellSpec::Fish && text.starts_with(prev) => {
+            // Strip the already-sent prefix + the separator `\n` the
+            // restore-on-continuation logic inserted.
+            let after = &text[prev.len()..];
+            after.strip_prefix('\n').unwrap_or(after).to_string()
+        }
+        _ => text.to_string(),
+    }
+}
+
 impl PaneSession {
     /// Spawn a shell, attach a freshly sized [`TerminalState`], and
     /// start the background reader thread. Low-level constructor;
@@ -1135,15 +1159,18 @@ impl PaneSession {
         target: (DriverTool, String, usize),
     ) {
         let (tool, line) = (target.0, target.1.clone());
-        // Live-shell path: a fish or zsh pane sitting at a prompt with
+        // Live-shell path: a fish, zsh, or bash pane sitting at a prompt with
         // confirmed integration answers from its OWN shell (so it sees
         // aliases / functions defined at runtime), via a PTY request rather
         // than a one-shot subprocess. The reply lands as a `completion`
-        // marker. `ZshComplete` has no one-shot form at all, so it MUST take
-        // this path; `FishComplete` falls through to the subprocess engine
-        // when the fish pane isn't live-capable (degraded integration).
-        if matches!(tool, DriverTool::FishComplete | DriverTool::ZshComplete)
-            && self.live_completion_capable()
+        // marker. `ZshComplete` / `BashComplete` have no one-shot form at all,
+        // so they MUST take this path; `FishComplete` falls through to the
+        // subprocess engine when the fish pane isn't live-capable (degraded
+        // integration).
+        if matches!(
+            tool,
+            DriverTool::FishComplete | DriverTool::ZshComplete | DriverTool::BashComplete
+        ) && self.live_completion_capable()
         {
             self.live_completion_request(tool, line);
             return;
@@ -1180,12 +1207,13 @@ impl PaneSession {
     }
 
     /// True when this pane can answer completion from its **live** shell:
-    /// it's a fish OR zsh pane, sitting at a prompt (`ShellPromptEditor`),
-    /// with shell integration confirmed. Only then is the bootstrap ready to
-    /// service a completion request (fish's read-eval loop; zsh's
-    /// `__termica_complete` sentinel + warm completion child).
+    /// it's a fish, zsh, OR bash pane, sitting at a prompt
+    /// (`ShellPromptEditor`), with shell integration confirmed. Only then is
+    /// the bootstrap ready to service a completion request (fish's read-eval
+    /// loop; zsh's `__termica_complete` sentinel + warm completion child;
+    /// bash's `__termica_complete` sentinel + in-process `COMPREPLY` capture).
     fn live_completion_capable(&self) -> bool {
-        matches!(self.shell, ShellSpec::Fish | ShellSpec::Zsh)
+        matches!(self.shell, ShellSpec::Fish | ShellSpec::Zsh | ShellSpec::Bash)
             && self.controller.mode() == PaneMode::ShellPromptEditor
             && matches!(
                 self.controller.integration(),
@@ -1349,15 +1377,7 @@ impl PaneSession {
         //   submit and is waiting for more); we only need to send
         //   `<new_lines>\r` — sending the whole thing would feed
         //   `<prev_sent>` to the shell TWICE.
-        let to_send: String = match self.last_submitted.as_deref() {
-            Some(prev) if text.starts_with(prev) => {
-                // Strip the already-sent prefix + the separator \n
-                // the restore-on-continuation logic inserted.
-                let after = &text[prev.len()..];
-                after.strip_prefix('\n').unwrap_or(after).to_string()
-            }
-            _ => text.clone(),
-        };
+        let to_send = continuation_to_send(self.shell, self.last_submitted.as_deref(), &text);
         // Track the full editor text (not `to_send`) so the next
         // Continuation restore can put the right cumulative text
         // back into the editor.
@@ -1987,6 +2007,36 @@ mod tests {
     }
 
     #[test]
+    fn bash_live_reply_correlates_by_id_and_tags_bash() {
+        // The same live-completion plumbing serves a bash pane: a reply
+        // carrying bash's value-only `COMPREPLY` lines is correlated by id and
+        // the candidates are tagged `BashComplete` (popup `bash` source chip).
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c("sleep 0.1"), "t".into(), 0, None).expect("spawn");
+        session.live_completion =
+            Some(LiveCompletion { id: 4, sent_ms: 0, tool: DriverTool::BashComplete });
+
+        // Mismatched id dropped.
+        session.ingest_live_completion(1, &["nope".to_string()]);
+        assert!(session.live_completion.is_some(), "in-flight still pending after mismatch");
+
+        session.ingest_live_completion(
+            4,
+            &["beta".to_string(), "alpha".to_string(), "gamma".to_string()],
+        );
+        assert!(session.live_completion.is_none());
+        let resp = session.completion_driver_poll().expect("a response is available");
+        assert_eq!(resp.tool, DriverTool::BashComplete);
+        assert_eq!(resp.candidates.len(), 3);
+        assert_eq!(resp.candidates[0].value, "beta", "user `complete -F` candidate completes");
+        assert_eq!(resp.candidates[0].description, None, "values-only in v1");
+        assert_eq!(
+            resp.candidates[0].source,
+            crate::completion::CompletionSource::Driver(DriverTool::BashComplete)
+        );
+    }
+
+    #[test]
     fn live_completion_timeout_falls_back_to_empty_response_tagged_by_tool() {
         let mut session =
             PaneSession::spawn(5, 40, &sh_c("sleep 0.1"), "t".into(), 0, None).expect("spawn");
@@ -2293,6 +2343,40 @@ mod tests {
 
         // Bring the shell down quickly.
         let _ = session.write(b"\x03");
+    }
+
+    #[test]
+    fn continuation_to_send_first_submit_sends_full_text() {
+        // No prior continuation: every shell sends the whole editor text.
+        for shell in [ShellSpec::Zsh, ShellSpec::Bash, ShellSpec::Fish] {
+            assert_eq!(continuation_to_send(shell, None, "echo 1 &&"), "echo 1 &&");
+        }
+    }
+
+    #[test]
+    fn continuation_to_send_zsh_bash_send_only_the_suffix() {
+        // zsh/bash buffer `<prev>\n` at the tty (PS2), so a continuation
+        // re-submit sends only the new suffix beyond `last_submitted`.
+        for shell in [ShellSpec::Zsh, ShellSpec::Bash] {
+            assert_eq!(
+                continuation_to_send(shell, Some("echo 1 &&"), "echo 1 &&\necho 2"),
+                "echo 2",
+                "{shell:?} sends only the suffix"
+            );
+        }
+    }
+
+    #[test]
+    fn continuation_to_send_fish_sends_the_whole_buffer() {
+        // fish holds NO partial command across submits (it evals whole lines),
+        // so a continuation re-submit must resend the cumulative buffer — the
+        // suffix-diff that zsh/bash use would drop the prefix and run only
+        // `echo 2`, losing the `echo 1 &&` the user is continuing.
+        assert_eq!(
+            continuation_to_send(ShellSpec::Fish, Some("echo 1 &&"), "echo 1 &&\necho 2"),
+            "echo 1 &&\necho 2",
+            "fish resends the whole buffer, not the suffix"
+        );
     }
 
     #[test]

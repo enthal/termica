@@ -237,21 +237,25 @@ The eager demotion in step 1 is the safety invariant: if the user immediately ma
 
 ### Multi-line continuation (PS2 marker)
 
-When the user presses Enter on a command the shell considers incomplete (`echo 1 &&` → shell wants more; here-docs; unclosed quotes), the shell prints its **continuation prompt** (`PS2` in bash/zsh) and stays in line-reading mode. Termica's integration script overrides `PS2` to emit a DCS-JSON **continuation marker** instead of the conventional `>` glyph:
+When the user presses Enter on a command the shell considers incomplete (`echo 1 &&` → shell wants more; here-docs; unclosed quotes), Termica re-opens the editor on the next line instead of erroring. How the shell signals "incomplete" differs by shell, but all three converge on the same DCS-JSON **continuation marker**:
 
 ```jsonc
-// emitted by the shell whenever PS2 fires
+// emitted whenever the shell's parser wants more input
 { "type": "continuation", "session": "<id>" }
 ```
+
+- **bash / zsh** print a **continuation prompt** (`PS2`) and stay in line-reading mode; Termica's integration script overrides `PS2` to emit the marker instead of the conventional `>` glyph. The shell holds the partial command buffered at the tty.
+- **fish** has no `PS2` and runs non-interactively (its reader is off), so the bootstrap parse-checks each submitted command with `fish -n` (no-execute) BEFORE running it: an EOF-while-expecting-more error (trailing `&&`/`|`, open block, unbalanced quote, trailing `\`) means "incomplete" → emit the marker and loop without executing; a genuine syntax error executes (so fish surfaces it — the safe default, never trap the user). fish holds **no** partial buffer — nothing is sent until the command is complete.
 
 The parser surfaces this as `LifecycleEvent::Continuation` ([`src/markers.rs`](../src/markers.rs)). On reception the `PromptController` calls `try_promote_to_editor_for_continuation`, which re-promotes to `ShellPromptEditor` **only if** `last_transition.reason == EnterSubmitted` — i.e. the immediately-preceding demote came from a real submit, not from an `Esc` or any other path. (If the user explicitly `Esc`'d out of the editor, a continuation marker must not yank them back in.)
 
 When the editor reopens, the `PaneSession` restores the editor's text to `last_submitted + "\n"` and places the caret at the end so the user can resume typing on the next line. This effectively turns the "shell wanted more" path into "we hand the editor back, now multi-line."
 
-The submit path is **suffix-only on the second submit**:
+The next submit's framing depends on whether the shell **buffered the prefix** — this is the `continuation_to_send` decision ([`src/pane.rs`](../src/pane.rs)):
 
-- `submit_editor_command` remembers the full text in `last_submitted: Option<String>`.
-- On the next submit, if the new editor text begins with `last_submitted`, only the **suffix beyond it** is written to the PTY (with a leading `\n` stripped, since the restore added one). The shell already received the prefix on the first submit; resending it would duplicate every line, and the `EchoSuppressor` (which was primed for the first half) would mismatch and disengage.
+- **bash / zsh: suffix-only.** They hold `<prev>\n` buffered at the tty (waiting at `PS2`), so only the **suffix beyond `last_submitted`** is written (with the restore's leading `\n` stripped). Resending the prefix would duplicate every line, and the `EchoSuppressor` (primed for the first half) would mismatch and disengage.
+- **fish: whole buffer.** fish executed nothing on the incomplete submit and its read-eval loop is back at a fresh `read`, so the **entire cumulative buffer** is resent (base64-framed, one tty line); the bootstrap re-checks completeness of the whole command each time. Sending only the suffix would run `echo 2` alone and lose the `echo 1 &&` being continued.
+- `submit_editor_command` remembers the full text in `last_submitted: Option<String>` for both paths.
 - `last_submitted` is cleared on the next `Preexec` **or** `Precmd` lifecycle event, whichever arrives first. `Preexec` is the canonical clear — the shell has accepted a complete command and is about to execute it. `Precmd` is a backstop: if a `Preexec` is never observed (the shell aborted the line, an integration script swallowed the marker, the read boundary fell wrong and the parser dropped it), the next prompt redraw still resets the suffix-only-submit state so the user's next command can't "vanish" into an empty-suffix send. Without this backstop a single missing `Preexec` leaves the editor in suffix mode indefinitely; the next typed command appears to disappear because only the empty bytes beyond `last_submitted` are sent. The covering strict-layer test lives in [`src/pane.rs`](../src/pane.rs) (`precmd_clears_last_submitted_as_backstop_for_missed_preexec`).
 
 `EchoSuppressor::expect` treats both `\n` and `\r` in the expected stream as `\r\n` because the kernel's tty discipline applies ONLCR to **every** echoed newline, not only the trailing one. Without this rule the second multi-line submit would have a partially-matching prefix and disengage suppression mid-stream, leaking the second segment as duplicate echo into the running block.

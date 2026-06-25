@@ -25,7 +25,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use termica::integration::ZSH_BOOTSTRAP;
-use termica::submit_framing::completion_request_bytes_zsh;
+use termica::submit_framing::completion_request_bytes_sentinel;
 
 fn locate_zsh() -> Option<&'static str> {
     ["/bin/zsh", "/usr/bin/zsh", "/opt/homebrew/bin/zsh", "/usr/local/bin/zsh"]
@@ -33,12 +33,12 @@ fn locate_zsh() -> Option<&'static str> {
         .find(|c| std::path::Path::new(c).exists())
 }
 
-/// The zsh completion request over a PIPE: `completion_request_bytes_zsh`
+/// The zsh completion request over a PIPE: `completion_request_bytes_sentinel`
 /// ends in `\r` (a real tty maps it to `\n` via ICRNL); a pipe doesn't, and
 /// a trailing `\r` would glue onto the base64 arg and break decoding — so
 /// swap it for `\n`.
 fn pipe_request(id: u64, line: &str) -> Vec<u8> {
-    let mut req = completion_request_bytes_zsh(id, line);
+    let mut req = completion_request_bytes_sentinel(id, line, true);
     *req.last_mut().expect("non-empty request") = b'\n';
     req
 }
