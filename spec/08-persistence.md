@@ -70,7 +70,12 @@ CREATE TABLE pane (
     -- The restore path (10) populates tab_id when it writes layout.
     tab_id        INTEGER REFERENCES tab(id),
     title         TEXT,
-    cwd           TEXT,                     -- last known cwd (URL-decoded path)
+    -- Last known cwd (URL-decoded path). Seeded at session start, then
+    -- updated on EVERY cwd change (off the UI thread, via the pane's
+    -- writer thread) — durable on change, never deferred to quit, because
+    -- the process can vanish (crash, hard reset) with no teardown to flush
+    -- in. So a restored pane resumes in the dir it was last in.
+    cwd           TEXT,
     shell_kind    TEXT NOT NULL,
     created_at    INTEGER NOT NULL,
     last_open     INTEGER NOT NULL,
