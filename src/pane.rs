@@ -221,6 +221,11 @@ pub struct PaneSession {
     /// This pane's current `session` row id (its live PTY spawn), for
     /// stamping `ended_at` on close/quit.
     persist_session: Option<i64>,
+    /// Last cwd persisted to the durable `pane` row, so we only write on
+    /// an actual change. The pane forwards each change to the writer
+    /// thread (durable on change, never deferred to quit — the process can
+    /// vanish), so a restored pane resumes in the dir it was last in.
+    last_persisted_cwd: Option<std::path::PathBuf>,
     /// Which managed shell this pane runs. Drives shell-specific command
     /// submission framing ([`crate::submit_framing`]) — notably base64 for
     /// fish, whose non-interactive read-eval loop needs the whole command
@@ -348,6 +353,7 @@ impl PaneSession {
             session_lock: None,
             persist_pane_row: None,
             persist_session: None,
+            last_persisted_cwd: None,
             shell: ShellSpec::Zsh,
             live_completion: None,
             live_completion_response: None,
@@ -417,6 +423,7 @@ impl PaneSession {
             session_lock: None,
             persist_pane_row: Some(pane_row_id),
             persist_session: None,
+            last_persisted_cwd: None,
             // A restored pane is `Dead`: no live shell, so it never issues
             // completion requests. Defaults mirror the bare `spawn` path;
             // `Restart` rebuilds a real pane with the right shell.
@@ -773,6 +780,21 @@ impl PaneSession {
             self.controller.observe_alt_screen(alt, self.frame);
             self.last_alt_screen = alt;
             self.record_pending_transitions();
+        }
+
+        // Persist the pane's cwd to its durable `pane` row on every
+        // change, so a restored pane resumes in the dir it was LAST in.
+        // Durable ON CHANGE, never deferred to quit — the process can
+        // vanish (crash, hard reset), so there is no guaranteed teardown
+        // in which to flush. Routed through the writer thread (off the UI
+        // thread; it owns the store + durable pane row). cwd changes are
+        // user-paced and deduped here, so this is cheap.
+        let current_cwd = self.current_cwd();
+        if current_cwd != self.last_persisted_cwd {
+            self.last_persisted_cwd = current_cwd.clone();
+            if let Some(writer) = &self.chunk_writer {
+                writer.set_cwd(current_cwd.as_ref().map(|p| p.display().to_string()));
+            }
         }
 
         // 4G-async-context: drive the off-thread git probe. Request a

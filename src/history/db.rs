@@ -555,8 +555,21 @@ impl HistoryStore {
         Ok(())
     }
 
-    /// A pane row's last-known cwd (recorded at `begin_session`). Restore
-    /// seeds it onto the rebuilt pane so the tab title shows the path.
+    /// Update a pane row's last-known cwd. Called whenever the pane's cwd
+    /// changes (durable on change — never deferred to quit, since the
+    /// process can vanish), so a restored pane lands in the directory it
+    /// was last in, not the one it started in. No-op if `pane_id` is
+    /// unknown.
+    pub fn set_pane_cwd(&self, pane_id: i64, cwd: Option<&str>) -> rusqlite::Result<()> {
+        self.conn
+            .execute("UPDATE pane SET cwd = ?1 WHERE id = ?2", params![cwd, pane_id])
+            .map(|_| ())
+    }
+
+    /// A pane row's last-known cwd (recorded at `begin_session`, then kept
+    /// current by [`Self::set_pane_cwd`]). Restore seeds it onto the
+    /// rebuilt pane so the tab title shows the path and a restart starts
+    /// there.
     pub fn pane_cwd(&self, pane_id: i64) -> rusqlite::Result<Option<String>> {
         self.conn
             .query_row("SELECT cwd FROM pane WHERE id = ?1", params![pane_id], |r| r.get(0))
@@ -690,6 +703,28 @@ mod tests {
 
     fn store() -> HistoryStore {
         HistoryStore::in_memory().expect("in-memory store opens cleanly")
+    }
+
+    #[test]
+    fn set_pane_cwd_updates_the_pane_row() {
+        // A pane's cwd is recorded at session start, but must be updated
+        // as the user `cd`s so a restored pane lands in the dir it was
+        // LAST in — persisted on change, not at quit (the process can
+        // vanish). `set_pane_cwd` is that update; `pane_cwd` reads it back.
+        let s = store();
+        let (pane_id, _session_id) = s.begin_session_rows(Some("/start/dir"), "zsh", 1000).unwrap();
+        assert_eq!(s.pane_cwd(pane_id).unwrap().as_deref(), Some("/start/dir"));
+
+        s.set_pane_cwd(pane_id, Some("/new/dir")).unwrap();
+        assert_eq!(
+            s.pane_cwd(pane_id).unwrap().as_deref(),
+            Some("/new/dir"),
+            "restore now reads the last cwd, not the start cwd"
+        );
+
+        // Clearing is representable (cwd unknown) and round-trips.
+        s.set_pane_cwd(pane_id, None).unwrap();
+        assert_eq!(s.pane_cwd(pane_id).unwrap(), None);
     }
 
     #[test]
