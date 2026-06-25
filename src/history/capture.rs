@@ -37,6 +37,11 @@ impl std::fmt::Debug for HistoryContext {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CaptureState {
     pub current_run_id: Option<i64>,
+    /// The pane's durable `pane` row id, stamped onto each recorded run so
+    /// `↑` recall scoped to this pane survives restart. `None` when the
+    /// pane has no persistence (degraded mode) — recall then falls back to
+    /// the per-app-run scope. The pane sets this once it knows its row.
+    pub db_pane_id: Option<i64>,
 }
 
 /// Apply one lifecycle event to the history store. No-op if `ctx`
@@ -59,9 +64,14 @@ pub fn on_event(
     match event {
         LifecycleEvent::Preexec { command } => {
             let Ok(store) = ctx.store.lock() else { return };
-            if let Ok(id) =
-                store.record_submit(command, cwd, pane_id as i64, &ctx.app_run_id, now_ms)
-            {
+            if let Ok(id) = store.record_submit_with_pane(
+                command,
+                cwd,
+                pane_id as i64,
+                &ctx.app_run_id,
+                now_ms,
+                state.db_pane_id,
+            ) {
                 state.current_run_id = Some(id);
             }
         }
