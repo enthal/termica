@@ -74,12 +74,11 @@ CREATE TABLE pane (
     shell_kind    TEXT NOT NULL,
     created_at    INTEGER NOT NULL,
     last_open     INTEGER NOT NULL,
-    -- Cmd-K (clear scrollback) watermark, in the pane's cumulative
-    -- LOGICAL-line space. Restore and scrollback skip logical lines
-    -- below this; the chunks themselves stay on disk (gc-aged,
-    -- purge-deletable) so Cmd-K is a non-destructive "stop showing me
-    -- this", not an `rm`. NULL = nothing cleared. See
-    -- §"Clearing: Cmd-K vs close-pane vs purge".
+    -- Vestigial. An earlier design made Cmd-K a non-destructive
+    -- "stop showing me this" watermark; it is now an explicit transcript
+    -- delete (see §"Clearing: Cmd-K vs close-pane vs purge"), so this
+    -- column is unused and always NULL. Kept (dropping it is a migration)
+    -- in case a future "soft clear" wants it back.
     cleared_before_line INTEGER
 );
 
@@ -303,7 +302,7 @@ On launch:
 
 1. Read the most recent `workspace` row whose sessions are **not owned by a live process** (see §"Concurrent processes and session ownership" — a workspace still held by another running Termica is left alone, never adopted).
 2. For each window: deserialize `layout_blob`, restore tile tree.
-3. For each pane: create a `Pane` in `Dead` mode, attach its transcript view to its persisted chunks. Each restored block's command label / exit / cwd / git header is rebuilt from the chunk's `chunk_chip` rows (§"Schema v4"). Chunks are logical lines, so they re-wrap to the *current* (restore-time) pane width — a workspace saved on a wide monitor restores cleanly onto a narrow one. The pane's `cleared_before_line` watermark is honoured: logical lines below it are not shown.
+3. For each pane: create a `Pane` in `Dead` mode, attach its transcript view to its persisted chunks. Each restored block's command label / exit / cwd / git header is rebuilt from the chunk's `chunk_chip` rows (§"Schema v4"). Chunks are logical lines, so they re-wrap to the *current* (restore-time) pane width — a workspace saved on a wide monitor restores cleanly onto a narrow one. (There is no clear-watermark to honour: Cmd-K deletes the cleared chunks outright, so anything that survives to restore was never cleared.)
 4. Show a per-pane "Restart shell" affordance. Click → spawn a fresh PTY in the persisted cwd; the pane leaves `Dead` and bootstraps normally. **Restart reuses the pane's durable `pane` row** (a new `session` under the same pane, not a new pane), and the writer resumes its cumulative logical-line cursor at the pane's current `MAX(end_line)` — so a pane's chunks **accumulate across restarts** as one contiguous, non-overlapping range, and the restored transcript is preserved through restart→quit→relaunch rather than orphaned. The new shell's output appends *below* the restored scrollback (which is transplanted into the fresh session in memory).
 
 We do **not** restore live PTYs. Process-survival across app restart is a session-daemon problem ([10](10-roadmap.md)).
@@ -334,8 +333,8 @@ The load-bearing invariant: **a sealed block may be evicted from memory only by 
 
 Three distinct operations; conflating them is where data loss or leaks hide.
 
-- **Cmd-K (clear scrollback)** is a *non-destructive visual* clear. It drops the pane's resident sealed blocks and resets the live grid, and it advances the pane's `cleared_before_line` watermark — but it does **not** delete chunk files or rows. Cleared content stays searchable and gc-recoverable until it ages out; "no silent data loss" forbids Cmd-K from silently `rm`-ing durably-written history. (True deletion is `purge`.)
-- **Close-pane** ends the session: seal `current.chunk`, stamp `session.ended_at`, release the session's ownership lock, free all in-RAM resources. Chunks stay on disk (searchable, gc-aged). A closed pane is *not* restored on next launch — closing is intentional dismissal — but its commands remain in `runs` and its output remains searchable until retention. Close is **not** purge.
+- **Cmd-K (clear scrollback)** is an *explicit discard*. It drops the pane's resident sealed blocks, resets the live grid, AND deletes the pane's persisted **transcript** — every chunk file, index row, and chip for the pane, across all its sessions — so the cleared content does not reappear on the next launch. The disk delete runs on the writer thread, serialized behind any in-flight block writes, after which the writer's cursor resets and subsequent blocks start a fresh transcript at logical line 0. The writer is **flushed on quit** (§Teardown) so a Cmd-K issued immediately before quitting is durable — without that drain the queued delete would be lost to process exit and the cleared transcript would resurrect on the next launch. What Cmd-K does **not** touch is the pane's command **history** (`runs`): clearing the screen is not wiping `~/.zsh_history`, so ↑ / Ctrl+R still recall the commands — only the captured output is gone. "No silent data loss" governs *crashes and bugs* — work the user did not choose to discard — not an explicit Cmd-K. (`termica purge` is the harder delete that also removes the command history.)
+- **Close-pane** (closing a tab/pane while others remain) is the same explicit discard as Cmd-K: it deletes the pane's **transcript** (chunk files + index rows + chips) and keeps its command **history** (`runs`). Closing is intentional dismissal and a closed pane is *not* restored on next launch, so leaving its chunks would only orphan them until gc — and a user who closed a pane does not expect its output to resurface. The discard is queued on the writer and drained before the pane drops (flush-then-drop, §Teardown). Closing the **last** pane is not a close but a **quit** (there is nothing left to keep open), and quit keeps everything for restore. (`termica purge` additionally removes the command history.)
 - **`termica purge`** is the only destructive path: `--pane <id>` deletes that pane's chunks + rows; `--all` removes the entire `<data-dir>`.
 
 **Teardown — how we know we freed everything.** Not by a cleanup checklist at the call site (forget-one-step is the classic bug). By **ownership**: every resource a pane must release — the PTY child, the reader-thread `JoinHandle`, the git/gh probe request `Sender`s, the open chunk writer, the session lock — is a *field of `PaneSession`*, released in `Drop`. RAII *is* the checklist, enforced by the compiler; if a resource isn't owned by the struct, that's the bug. Because close must **seal-then-flush-then-drop**, the only way to remove a pane is an operation that flushes the writer first, so a pane cannot be dropped with an unflushed `current.chunk`. A leak test (spawn N panes, close them, assert thread + fd counts return to baseline) and the cross-OS "no zombie child on close" integration test prove it empirically.
