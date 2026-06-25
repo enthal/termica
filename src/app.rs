@@ -182,6 +182,10 @@ pub struct TermicaApp {
     /// `TermicaAppOptions.startup_cwd`. Consumed once by
     /// [`Self::bootstrap`] (via `take`) and never read again.
     startup_cwd: Option<PathBuf>,
+    /// Explicit CLI path (resolved dir), `Some` only when the user named
+    /// one. Consumed once by [`Self::bootstrap`] to open a tab there even
+    /// over a restored workspace. See `TermicaAppOptions`.
+    requested_workspace_path: Option<PathBuf>,
 }
 
 impl TermicaApp {
@@ -259,6 +263,7 @@ impl TermicaApp {
             watermark_picker_open: Arc::new(AtomicBool::new(opts.open_watermark_picker)),
             last_window_title: String::new(),
             startup_cwd: opts.startup_cwd,
+            requested_workspace_path: opts.requested_workspace_path,
         };
         app.bootstrap();
         app
@@ -337,9 +342,84 @@ impl TermicaApp {
         // to a fresh single pane if there's nothing to restore, the
         // layout is unreadable, or another process still owns it.
         if self.try_restore_workspace() {
+            // A restored workspace brings its own panes (each with its own
+            // cwd), so it ignores `startup_cwd`. But an EXPLICIT path arg
+            // still means "give me a pane here" — honor it as a new,
+            // focused tab alongside the restored panes (spec/06).
+            if let Some(path) = self.requested_workspace_path.take() {
+                self.open_tab_at_cwd(path);
+            }
             return;
         }
+        // Fresh start consumes `startup_cwd` (which already folded in any
+        // path arg) for the first pane, so no separate tab is needed.
         self.bootstrap_fresh();
+    }
+
+    /// Open a new, focused tab whose shell starts in `cwd`. Used when a
+    /// path is named on the command line over a restored workspace. The
+    /// tab is added to the root `Tabs` container; if the restored root is
+    /// not a `Tabs` (a split or a lone pane), it is wrapped in one so the
+    /// new pane becomes a sibling tab rather than being lost.
+    fn open_tab_at_cwd(&mut self, cwd: PathBuf) {
+        let pane_id = self.mint_pane_id();
+        let shell = resolve_shell_from_env();
+        let recorder = self.event_recorder.clone();
+        let history = self.history_ctx();
+        let persist = self.persist();
+        let session = match PaneSession::spawn_managed(
+            MIN_ROWS.max(24),
+            MIN_COLS.max(80),
+            shell,
+            Some(cwd),
+            pane_id.0,
+            recorder,
+            history,
+            persist,
+            None, // a fresh pane, not a resume
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("termica: failed to open the requested path as a tab: {e}");
+                return;
+            }
+        };
+        self.panes.insert(pane_id, PaneSlot { session, ui: PaneUiState::default() });
+        let pane_tile = self.tree.tiles.insert_pane(pane_id);
+
+        let root_is_tabs = self
+            .tree
+            .root
+            .and_then(|r| self.tree.tiles.get(r))
+            .is_some_and(|t| matches!(t, Tile::Container(egui_tiles::Container::Tabs(_))));
+        if root_is_tabs {
+            if let Some(root) = self.tree.root
+                && let Some(Tile::Container(egui_tiles::Container::Tabs(tabs))) =
+                    self.tree.tiles.get_mut(root)
+            {
+                tabs.add_child(pane_tile);
+                tabs.set_active(pane_tile);
+            }
+        } else if let Some(old_root) = self.tree.root {
+            // Wrap the existing root so the new pane is a sibling tab.
+            let new_root = self.tree.tiles.insert_tab_tile(vec![old_root, pane_tile]);
+            if let Some(Tile::Container(egui_tiles::Container::Tabs(tabs))) =
+                self.tree.tiles.get_mut(new_root)
+            {
+                tabs.set_active(pane_tile);
+            }
+            self.tree.root = Some(new_root);
+        } else {
+            // Empty tree (not expected post-restore) — make this the root.
+            let new_root = self.tree.tiles.insert_tab_tile(vec![pane_tile]);
+            self.tree.root = Some(new_root);
+        }
+
+        // Focus the new tab so the user lands in their requested dir.
+        self.focused_pane = Some(pane_id);
+        if let Some(slot) = self.panes.get_mut(&pane_id) {
+            slot.ui.needs_focus = true;
+        }
     }
 
     /// Rebuild the saved tile layout, recreating each pane in `Dead`
@@ -1394,6 +1474,14 @@ pub struct TermicaAppOptions {
     /// back to whatever `current_dir()` returns inside `bootstrap`
     /// — the pre-spec behaviour, kept for tests that don't care.
     pub startup_cwd: Option<PathBuf>,
+    /// An *explicit* directory requested on the command line (the resolved
+    /// positional path), or `None` if none was given. Unlike `startup_cwd`
+    /// — which is always populated (falling back to `current_dir`) and
+    /// seeds the first *fresh* pane — this is `Some` only when the user
+    /// actually named a path. Launching with a path opens a pane there
+    /// even when a saved workspace is restored: restore + a new tab at the
+    /// path (spec/06). Consumed once by `bootstrap`.
+    pub requested_workspace_path: Option<PathBuf>,
 }
 
 /// Resolve the first pane's starting cwd per
@@ -1411,19 +1499,8 @@ pub struct TermicaAppOptions {
 /// 4. Else `$HOME` if set.
 /// 5. Else `/`.
 pub fn resolve_startup_cwd(positional_path: Option<&std::path::Path>) -> PathBuf {
-    if let Some(p) = positional_path {
-        let meta = std::fs::metadata(p);
-        if let Ok(m) = meta {
-            if m.is_dir() {
-                return p.to_path_buf();
-            }
-            if let Some(parent) = p.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                return parent.to_path_buf();
-            }
-        }
-        // p doesn't exist or has no usable parent → fall through.
+    if let Some(dir) = positional_path.and_then(resolve_positional_dir) {
+        return dir;
     }
     if let Ok(cwd) = std::env::current_dir() {
         return cwd;
@@ -1432,6 +1509,26 @@ pub fn resolve_startup_cwd(positional_path: Option<&std::path::Path>) -> PathBuf
         return PathBuf::from(home);
     }
     PathBuf::from("/")
+}
+
+/// Resolve an *explicit* positional path to a starting directory: the
+/// path itself if it's a directory, or the parent directory of a file.
+/// `None` when the path doesn't exist or has no usable parent.
+///
+/// Returning `Option` (rather than a fallback) lets a caller distinguish
+/// "the user asked for this directory" from "no path was given" — the
+/// distinction that decides whether launching with a path opens a new
+/// tab on top of a restored workspace (spec/06).
+pub fn resolve_positional_dir(path: &std::path::Path) -> Option<PathBuf> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.is_dir() {
+        return Some(path.to_path_buf());
+    }
+    let parent = path.parent()?;
+    if parent.as_os_str().is_empty() {
+        return None;
+    }
+    Some(parent.to_path_buf())
 }
 
 /// Paint the focused-editor chrome picker into a deferred
@@ -1615,6 +1712,24 @@ mod tests {
     }
 
     // ---- resolve_startup_cwd: spec/06 fallback chain --------------
+
+    #[test]
+    fn resolve_positional_dir_directory_file_and_missing() {
+        // The explicit-path resolver returns the dir for a directory, the
+        // PARENT dir for a file, and `None` when there is no usable path —
+        // distinct from "no arg given", so the caller can tell an explicit
+        // request apart from the cwd fallback (it decides whether to open
+        // a new tab on restore).
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(resolve_positional_dir(dir.path()), Some(dir.path().to_path_buf()));
+
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, b"x").expect("write");
+        assert_eq!(resolve_positional_dir(&file), Some(dir.path().to_path_buf()));
+
+        let bogus = std::path::Path::new("/no/such/path/ever-termica-xyz");
+        assert_eq!(resolve_positional_dir(bogus), None, "non-existent path → None, not a fallback");
+    }
 
     #[test]
     fn resolve_startup_cwd_positional_directory_used_as_is() {
