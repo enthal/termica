@@ -1387,9 +1387,21 @@ impl PaneSession {
     /// runs normally. (Empirically verified against a real zsh + the
     /// bootstrap: `\x03` alone, `\r\x03`, and double-`\x03` all eat the
     /// next command; `\x03\r` does not.)
+    ///
+    /// The kernel echoes the interrupt char back as `^C\r\n` (ECHOCTL,
+    /// cooked mode). Unlike a real command-interrupt, the abort runs no
+    /// command, so no `Running` block ever seals to absorb that `^C` —
+    /// it would otherwise bleed into the *next* command's block (the
+    /// `^C` the user sees between `echo AAA` and its output). Since the
+    /// recovery is a Termica UI gesture, not a keystroke the user typed
+    /// at the shell, we prime the [`crate::echo_suppress::EchoSuppressor`]
+    /// to swallow the `^C\r\n` echo so the next prompt stays clean. The
+    /// match is prefix-and-disengage, so a terminal without ECHOCTL (no
+    /// `^C` echo) just passes through — no worse than before.
     fn abort_continuation_line(&mut self) -> Result<(), PtyError> {
         self.last_submitted = None;
         self.recall.abandon();
+        self.terminal.prime_echo_suppression(b"^C\r");
         self.write(b"\x03\r")
     }
 
@@ -2375,6 +2387,14 @@ mod tests {
         session.abort_continuation().expect("abort");
         assert!(!session.awaiting_continuation(), "continuation must be cleared");
         assert!(session.last_submitted.is_none(), "last_submitted must be cleared");
+        // The suppressor is primed to swallow the kernel's `^C\r\n` echo
+        // of the interrupt char (4 bytes after \r→\r\n expansion) so it
+        // doesn't bleed into the next command's block.
+        assert_eq!(
+            session.terminal.echo_suppressor().pending_len(),
+            4,
+            "abort must prime echo suppression for the `^C\\r\\n` interrupt echo"
+        );
         assert!(
             session.blocks.editor_on_tail().unwrap().is_empty(),
             "editor must be cleared back to a fresh prompt"
