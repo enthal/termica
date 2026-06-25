@@ -154,6 +154,9 @@ termica_precmd() {
     termica_emit_string "precmd" "$PWD"
     # Live `$VAR`-completion source (change-gated, names only).
     termica_emit_vars
+    # Release the warm completion child if it's gone idle (frees ~5 MB; the
+    # next Tab respawns it). Cheap: one arithmetic test per prompt.
+    __termica_zc_idle_check
 }
 
 # Keep the completion sentinel out of the user's shell history (in-memory
@@ -301,6 +304,31 @@ __termica_zc_ensure() {
     return 0
 }
 
+# Idle-drop bookkeeping for the warm completion child. `$SECONDS` (zsh's
+# built-in seconds-since-shell-start counter) of the last completion request;
+# the child holds ~5 MB, so we release it after a spell of no Tab use.
+typeset -gi __termica_zc_last_use=0
+typeset -gi __TERMICA_ZC_IDLE_SECS=300
+
+# Drop the warm completion child if it has been idle longer than
+# `__TERMICA_ZC_IDLE_SECS`, freeing its memory; the next Tab lazily respawns
+# it (`__termica_zc_ensure`). Called from `termica_precmd` — i.e. once per real
+# prompt — so a pane that keeps running commands but has stopped using Tab
+# completion releases the child. (precmd is the only in-shell clock we have, so
+# a pane left truly idle AT a prompt keeps the child until its next command;
+# the common "used completion a while ago, still working" case is covered.)
+# No-op when there's no live child. A live child always implies a prior
+# `__termica_zc_capture` ran (the only caller of `__termica_zc_ensure`), which
+# stamped `__termica_zc_last_use` — so the alive check alone gates the drop;
+# we don't second-guess `last_use` (guarding `> 0` would wrongly spare a child
+# first used at second 0 of the shell's life).
+__termica_zc_idle_check() {
+    zpty -t __termica_zc 2>/dev/null || return 0   # no live child → nothing to drop
+    if (( SECONDS - __termica_zc_last_use > __TERMICA_ZC_IDLE_SECS )); then
+        zpty -d __termica_zc 2>/dev/null
+    fi
+}
+
 # Capture completion candidates for `$1` (the command line up to the
 # cursor) into `__termica_zc_rows` (values only, deduped). Best-effort: on
 # any failure the rows are left empty and the popup falls back to locals.
@@ -308,6 +336,8 @@ __termica_zc_capture() {
     local line="$1"
     __termica_zc_rows=()
     __termica_zc_ensure || return 1
+    # Timestamp this use so `__termica_zc_idle_check` can release an idle child.
+    __termica_zc_last_use=$SECONDS
     # Per-request file (sourced, not typed): replay the live shell's aliases
     # — config AND runtime-defined — so they complete, and set the buffer.
     # A long / multi-line value here would jam the child's line editor; a
