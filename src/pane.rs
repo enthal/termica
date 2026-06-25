@@ -1135,15 +1135,18 @@ impl PaneSession {
         target: (DriverTool, String, usize),
     ) {
         let (tool, line) = (target.0, target.1.clone());
-        // Live-shell path: a fish or zsh pane sitting at a prompt with
+        // Live-shell path: a fish, zsh, or bash pane sitting at a prompt with
         // confirmed integration answers from its OWN shell (so it sees
         // aliases / functions defined at runtime), via a PTY request rather
         // than a one-shot subprocess. The reply lands as a `completion`
-        // marker. `ZshComplete` has no one-shot form at all, so it MUST take
-        // this path; `FishComplete` falls through to the subprocess engine
-        // when the fish pane isn't live-capable (degraded integration).
-        if matches!(tool, DriverTool::FishComplete | DriverTool::ZshComplete)
-            && self.live_completion_capable()
+        // marker. `ZshComplete` / `BashComplete` have no one-shot form at all,
+        // so they MUST take this path; `FishComplete` falls through to the
+        // subprocess engine when the fish pane isn't live-capable (degraded
+        // integration).
+        if matches!(
+            tool,
+            DriverTool::FishComplete | DriverTool::ZshComplete | DriverTool::BashComplete
+        ) && self.live_completion_capable()
         {
             self.live_completion_request(tool, line);
             return;
@@ -1180,12 +1183,13 @@ impl PaneSession {
     }
 
     /// True when this pane can answer completion from its **live** shell:
-    /// it's a fish OR zsh pane, sitting at a prompt (`ShellPromptEditor`),
-    /// with shell integration confirmed. Only then is the bootstrap ready to
-    /// service a completion request (fish's read-eval loop; zsh's
-    /// `__termica_complete` sentinel + warm completion child).
+    /// it's a fish, zsh, OR bash pane, sitting at a prompt
+    /// (`ShellPromptEditor`), with shell integration confirmed. Only then is
+    /// the bootstrap ready to service a completion request (fish's read-eval
+    /// loop; zsh's `__termica_complete` sentinel + warm completion child;
+    /// bash's `__termica_complete` sentinel + in-process `COMPREPLY` capture).
     fn live_completion_capable(&self) -> bool {
-        matches!(self.shell, ShellSpec::Fish | ShellSpec::Zsh)
+        matches!(self.shell, ShellSpec::Fish | ShellSpec::Zsh | ShellSpec::Bash)
             && self.controller.mode() == PaneMode::ShellPromptEditor
             && matches!(
                 self.controller.integration(),
@@ -1983,6 +1987,36 @@ mod tests {
         assert_eq!(
             resp.candidates[0].source,
             crate::completion::CompletionSource::Driver(DriverTool::ZshComplete)
+        );
+    }
+
+    #[test]
+    fn bash_live_reply_correlates_by_id_and_tags_bash() {
+        // The same live-completion plumbing serves a bash pane: a reply
+        // carrying bash's value-only `COMPREPLY` lines is correlated by id and
+        // the candidates are tagged `BashComplete` (popup `bash` source chip).
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c("sleep 0.1"), "t".into(), 0, None).expect("spawn");
+        session.live_completion =
+            Some(LiveCompletion { id: 4, sent_ms: 0, tool: DriverTool::BashComplete });
+
+        // Mismatched id dropped.
+        session.ingest_live_completion(1, &["nope".to_string()]);
+        assert!(session.live_completion.is_some(), "in-flight still pending after mismatch");
+
+        session.ingest_live_completion(
+            4,
+            &["beta".to_string(), "alpha".to_string(), "gamma".to_string()],
+        );
+        assert!(session.live_completion.is_none());
+        let resp = session.completion_driver_poll().expect("a response is available");
+        assert_eq!(resp.tool, DriverTool::BashComplete);
+        assert_eq!(resp.candidates.len(), 3);
+        assert_eq!(resp.candidates[0].value, "beta", "user `complete -F` candidate completes");
+        assert_eq!(resp.candidates[0].description, None, "values-only in v1");
+        assert_eq!(
+            resp.candidates[0].source,
+            crate::completion::CompletionSource::Driver(DriverTool::BashComplete)
         );
     }
 

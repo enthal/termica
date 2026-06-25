@@ -105,9 +105,10 @@ pub fn parse_for(tool: DriverTool, stdout: &str, line: &str) -> Vec<CompletionCa
         DriverTool::Aws => parse_aws_completer(stdout),
         DriverTool::Git => parse_git_list_cmds(stdout, last_word(line)),
         DriverTool::FishComplete => parse_fish_complete(stdout),
-        // Defensive: zsh completion is live-only (no one-shot worker path),
-        // but keep the parser total. Same shape as fish, tagged `zsh`.
+        // Defensive: zsh/bash completion is live-only (no one-shot worker
+        // path), but keep the parser total. Same shape as fish, tagged by tool.
         DriverTool::ZshComplete => parse_shell_complete(stdout, DriverTool::ZshComplete),
+        DriverTool::BashComplete => parse_shell_complete(stdout, DriverTool::BashComplete),
     }
 }
 
