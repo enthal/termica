@@ -1,4 +1,8 @@
-//! SQLite-backed `runs` table — Phase 4J's storage layer.
+//! SQLite-backed persistence store — the single `termica.sqlite`
+//! database. Started life (Phase 4J) holding only the `runs` table;
+//! the Phase 9 v3 migration adds the layout / session / scrollback-
+//! index tables ([spec/08-persistence.md]). The forward-only
+//! migration ladder lives here.
 //!
 //! Open / migrate / capture / query. No UI dependencies — pure
 //! engine code with strict-layer tests against an in-memory
@@ -13,7 +17,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// Read on open via `PRAGMA user_version` and compared against
 /// the embedded constant; mismatching versions trigger the
 /// migration ladder.
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 4;
 
 /// One row in `runs`. `pane_id` / `app_run_id` / `cwd` are `None`
 /// for entries replayed from a shell-history file (those formats
@@ -68,6 +72,16 @@ impl HistoryStore {
             })?;
         }
         let conn = Connection::open(path)?;
+        // WAL mode: concurrent readers (the UI, a second Termica
+        // process) coexist with the single background scrollback
+        // writer without `SQLITE_BUSY` churn. `busy_timeout` bounds
+        // how long a writer waits on a transient lock before erroring
+        // (5s is generous; history/scrollback writes are short). Both
+        // are no-ops on an in-memory DB, so they're set only here.
+        // `journal_mode = WAL` returns a row, so use `query_row`, not
+        // `execute_batch` (which rejects statements that yield rows).
+        conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -94,11 +108,111 @@ impl HistoryStore {
             match v {
                 1 => self.apply_v1()?,
                 2 => self.apply_v2()?,
+                3 => self.apply_v3()?,
+                4 => self.apply_v4()?,
                 _ => unreachable!("no migration for v{v}"),
             }
         }
         self.conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
+    }
+
+    fn apply_v4(&self) -> rusqlite::Result<()> {
+        // Phase 9F: per-chunk block metadata as an open key/value side
+        // table — the command, exit code, cwd, git context, and any future
+        // chip (kube/aws/ssh/pr…) a restored block displays. Flexible by
+        // design: a new chip is a new `key`, never a migration. The chunk
+        // *output bytes* stay in the TMCK file; only this small,
+        // queryable metadata lives in SQLite. gc deletes a chunk's chips
+        // alongside its row (FKs are OFF, so the delete is explicit).
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS chunk_chip (
+                chunk_id INTEGER NOT NULL REFERENCES scrollback_chunk(id),
+                key      TEXT NOT NULL,
+                value    TEXT,
+                PRIMARY KEY (chunk_id, key)
+            );
+            ",
+        )
+    }
+
+    fn apply_v3(&self) -> rusqlite::Result<()> {
+        // Phase 9 persistence: the layout / session / scrollback-index
+        // tables. v3 only ADDS tables — it never rewrites the v1 `runs`
+        // table or its v2 replay index, so existing history is
+        // untouched. The schema mirrors [spec/08-persistence.md §Schema
+        // v1]; that document calls this the "v1" target schema, but in
+        // the live ladder it lands as the third migration step (the
+        // `runs` table predates it). `start_line` / `end_line` in
+        // `scrollback_chunk` are LOGICAL-line indices (width-independent,
+        // stable across resize); the chunk's visual height is re-derived
+        // by re-wrapping on load and is deliberately not stored.
+        // FK clauses are declarative — `foreign_keys` is left OFF so a
+        // chunk row can outlive a rolled-back session row (chunk-on-disk
+        // wins; see §"Why no foreign-key cascades").
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS workspace (
+                id          INTEGER PRIMARY KEY,
+                name        TEXT NOT NULL,
+                created_at  INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS window (
+                id           INTEGER PRIMARY KEY,
+                workspace_id INTEGER NOT NULL REFERENCES workspace(id),
+                title        TEXT,
+                layout_blob  BLOB NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS tab (
+                id         INTEGER PRIMARY KEY,
+                window_id  INTEGER NOT NULL REFERENCES window(id),
+                name       TEXT,
+                ord        INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS pane (
+                id            INTEGER PRIMARY KEY,
+                -- NULL until the pane is placed in a saved layout (9F).
+                -- A pane's identity + its scrollback are independent of
+                -- where it currently sits in the tile tree, so a pane row
+                -- exists and accumulates chunks before any tab row does.
+                tab_id        INTEGER REFERENCES tab(id),
+                title         TEXT,
+                cwd           TEXT,
+                shell_kind    TEXT NOT NULL,
+                created_at    INTEGER NOT NULL,
+                last_open     INTEGER NOT NULL,
+                cleared_before_line INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS session (
+                id          INTEGER PRIMARY KEY,
+                pane_id     INTEGER NOT NULL REFERENCES pane(id),
+                started_at  INTEGER NOT NULL,
+                ended_at    INTEGER,
+                exit_code   INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS scrollback_chunk (
+                id           INTEGER PRIMARY KEY,
+                session_id   INTEGER NOT NULL REFERENCES session(id),
+                pane_id      INTEGER NOT NULL REFERENCES pane(id),
+                path         TEXT NOT NULL,
+                start_line   INTEGER NOT NULL,
+                end_line     INTEGER NOT NULL,
+                emit_cols    INTEGER NOT NULL,
+                start_time   INTEGER NOT NULL,
+                end_time     INTEGER NOT NULL,
+                compressed   INTEGER NOT NULL,
+                byte_size    INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_scrollback_chunk_pane ON scrollback_chunk(pane_id, start_line);
+            ",
+        )
     }
 
     fn apply_v2(&self) -> rusqlite::Result<()> {
@@ -246,6 +360,292 @@ impl HistoryStore {
             )
             .optional()
     }
+
+    /// Allocate the `pane` + `session` rows that anchor a new shell
+    /// session's scrollback, in one transaction, and return their
+    /// SQLite-assigned ids as `(pane_id, session_id)`.
+    ///
+    /// The pane row is created with `tab_id = NULL` — placement in the
+    /// tile layout is a restore-time concern ([spec/08] §pane). The
+    /// session id is allocated under the WAL writer lock, so it is
+    /// unique across every process sharing the database; the on-disk
+    /// `session-<id>/` directory is named from it, which is how two
+    /// concurrent Termica processes never collide on chunk files
+    /// ([spec/08] §"Concurrent processes and session ownership"). The
+    /// filesystem side (creating that directory) is done by
+    /// [`crate::persist::store::Persistence::begin_session`], which
+    /// calls this.
+    pub fn begin_session_rows(
+        &self,
+        cwd: Option<&str>,
+        shell_kind: &str,
+        now_ms: i64,
+    ) -> rusqlite::Result<(i64, i64)> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO pane (cwd, shell_kind, created_at, last_open)
+             VALUES (?1, ?2, ?3, ?3)",
+            params![cwd, shell_kind, now_ms],
+        )?;
+        let pane_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO session (pane_id, started_at) VALUES (?1, ?2)",
+            params![pane_id, now_ms],
+        )?;
+        let session_id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok((pane_id, session_id))
+    }
+
+    /// Insert one `scrollback_chunk` index row, returning its id. The
+    /// chunk *bytes* live in the file at `path` (relative to the data
+    /// dir); this row is the small, queryable index pointing at it.
+    /// `start_line` / `end_line` are cumulative LOGICAL-line offsets
+    /// (width-independent); `compressed` records whether the file is
+    /// zstd-compressed. See [spec/08 §scrollback_chunk].
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_scrollback_chunk(
+        &self,
+        session_id: i64,
+        pane_id: i64,
+        path: &str,
+        start_line: i64,
+        end_line: i64,
+        emit_cols: i64,
+        start_time: i64,
+        end_time: i64,
+        compressed: bool,
+        byte_size: i64,
+    ) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO scrollback_chunk
+                 (session_id, pane_id, path, start_line, end_line,
+                  emit_cols, start_time, end_time, compressed, byte_size)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                session_id,
+                pane_id,
+                path,
+                start_line,
+                end_line,
+                emit_cols,
+                start_time,
+                end_time,
+                compressed as i64,
+                byte_size
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Every `scrollback_chunk` row, newest-ended first. Backs both
+    /// `gc()` (which decides what to delete) and restore (which lists a
+    /// pane's chunks). Returned wholesale because the index is small (one
+    /// row per sealed block) — the bulky payload lives in the files.
+    pub fn all_scrollback_chunks(&self) -> rusqlite::Result<Vec<ChunkRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, pane_id, path, start_line, end_line,
+                    emit_cols, start_time, end_time, compressed, byte_size
+             FROM scrollback_chunk
+             ORDER BY end_time DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([], row_to_chunk)?;
+        rows.collect()
+    }
+
+    /// All chunk rows for one pane, oldest logical line first — the
+    /// order restore re-pages them in. (Restore attaches a pane's
+    /// transcript to its persisted chunks.)
+    pub fn pane_scrollback_chunks(&self, pane_id: i64) -> rusqlite::Result<Vec<ChunkRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, pane_id, path, start_line, end_line,
+                    emit_cols, start_time, end_time, compressed, byte_size
+             FROM scrollback_chunk
+             WHERE pane_id = ?1
+             ORDER BY start_line ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![pane_id], row_to_chunk)?;
+        rows.collect()
+    }
+
+    /// Delete one `scrollback_chunk` index row by id, plus its chips. The
+    /// file on disk is the caller's responsibility (gc deletes the file
+    /// first, then the row — chunk-on-disk is the source of truth, so an
+    /// orphan file is recoverable but an orphan row is not). FKs are OFF,
+    /// so the chip cascade is explicit.
+    pub fn delete_scrollback_chunk(&self, id: i64) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM chunk_chip WHERE chunk_id = ?1", params![id])?;
+        tx.execute("DELETE FROM scrollback_chunk WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Attach block metadata to a chunk as key/value chips (command,
+    /// exit, cwd, git, …). Open-ended: callers add new keys without a
+    /// migration. `INSERT OR REPLACE` so a re-write is idempotent.
+    pub fn insert_chunk_chips(
+        &self,
+        chunk_id: i64,
+        chips: &[(&str, String)],
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO chunk_chip (chunk_id, key, value) VALUES (?1, ?2, ?3)",
+            )?;
+            for (key, value) in chips {
+                stmt.execute(params![chunk_id, key, value])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Read a chunk's chips as `(key, value)` pairs. Restore turns these
+    /// back into a block's command / exit / cwd / git header.
+    pub fn chunk_chips(&self, chunk_id: i64) -> rusqlite::Result<Vec<(String, String)>> {
+        let mut stmt =
+            self.conn.prepare("SELECT key, value FROM chunk_chip WHERE chunk_id = ?1")?;
+        let rows = stmt.query_map(params![chunk_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Number of rows in `runs` (the global history cap is enforced
+    /// against this).
+    pub fn count_runs(&self) -> rusqlite::Result<i64> {
+        self.conn.query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))
+    }
+
+    /// Trim `runs` to its newest `keep` rows by `started_at`, deleting
+    /// the oldest overflow. Returns how many rows were deleted. A no-op
+    /// when already at or under `keep`.
+    pub fn trim_runs_to_newest(&self, keep: i64) -> rusqlite::Result<usize> {
+        // Keep the `keep` highest started_at ids; delete the rest. The
+        // subquery picks the survivors so ties on started_at are broken
+        // deterministically by id.
+        let n = self.conn.execute(
+            "DELETE FROM runs WHERE id NOT IN (
+                 SELECT id FROM runs ORDER BY started_at DESC, id DESC LIMIT ?1
+             )",
+            params![keep],
+        )?;
+        Ok(n)
+    }
+
+    /// Persist the current window layout (Phase 9F): replace the single
+    /// workspace + window with one carrying `layout_blob`. Termica is a
+    /// single-window app today, so this is a clear-and-insert rather than
+    /// a per-window upsert. Done in one transaction.
+    pub fn save_layout(&self, layout_blob: &[u8], now_ms: i64) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        // window references workspace, so clear window first.
+        tx.execute("DELETE FROM window", [])?;
+        tx.execute("DELETE FROM workspace", [])?;
+        tx.execute(
+            "INSERT INTO workspace (name, created_at) VALUES ('default', ?1)",
+            params![now_ms],
+        )?;
+        let workspace_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO window (workspace_id, title, layout_blob) VALUES (?1, NULL, ?2)",
+            params![workspace_id, layout_blob],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Update a pane row's last-known cwd. Called whenever the pane's cwd
+    /// changes (durable on change — never deferred to quit, since the
+    /// process can vanish), so a restored pane lands in the directory it
+    /// was last in, not the one it started in. No-op if `pane_id` is
+    /// unknown.
+    pub fn set_pane_cwd(&self, pane_id: i64, cwd: Option<&str>) -> rusqlite::Result<()> {
+        self.conn
+            .execute("UPDATE pane SET cwd = ?1 WHERE id = ?2", params![cwd, pane_id])
+            .map(|_| ())
+    }
+
+    /// A pane row's last-known cwd (recorded at `begin_session`, then kept
+    /// current by [`Self::set_pane_cwd`]). Restore seeds it onto the
+    /// rebuilt pane so the tab title shows the path and a restart starts
+    /// there.
+    pub fn pane_cwd(&self, pane_id: i64) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row("SELECT cwd FROM pane WHERE id = ?1", params![pane_id], |r| r.get(0))
+            .optional()
+            .map(|opt| opt.flatten())
+    }
+
+    /// The most recently saved window's `layout_blob`, or `None` if no
+    /// layout has been saved yet. Restore reads this on launch.
+    pub fn latest_layout(&self) -> rusqlite::Result<Option<Vec<u8>>> {
+        self.conn
+            .query_row("SELECT layout_blob FROM window ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .optional()
+    }
+
+    /// The most recent session id for a pane (its latest PTY spawn), or
+    /// `None` if the pane has no sessions. Restore uses this to find the
+    /// session directory whose ownership lock decides liveness.
+    pub fn latest_session_for_pane(&self, pane_id: i64) -> rusqlite::Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM session WHERE pane_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![pane_id],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// Stamp a session's end (`ended_at`, optional `exit_code`). Called
+    /// when a pane closes or the app quits. No-op if the id is unknown.
+    pub fn end_session(
+        &self,
+        session_id: i64,
+        ended_at_ms: i64,
+        exit_code: Option<i32>,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE session SET ended_at = ?1, exit_code = ?2 WHERE id = ?3",
+            params![ended_at_ms, exit_code, session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Open a new `session` row under an **existing** `pane` (restart,
+    /// 9F): the pane's durable identity is reused so its chunks
+    /// accumulate across shell restarts. Bumps `pane.last_open`. Returns
+    /// the new session id.
+    pub fn resume_session_rows(&self, pane_id: i64, now_ms: i64) -> rusqlite::Result<i64> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("UPDATE pane SET last_open = ?1 WHERE id = ?2", params![now_ms, pane_id])?;
+        tx.execute(
+            "INSERT INTO session (pane_id, started_at) VALUES (?1, ?2)",
+            params![pane_id, now_ms],
+        )?;
+        let session_id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(session_id)
+    }
+
+    /// The highest `end_line` across all of a pane's chunks (0 if it has
+    /// none) — the cumulative logical-line offset a resumed session's
+    /// writer continues from, so new chunks never overlap the old ones.
+    pub fn pane_max_end_line(&self, pane_id: i64) -> rusqlite::Result<i64> {
+        self.conn.query_row(
+            "SELECT COALESCE(MAX(end_line), 0) FROM scrollback_chunk WHERE pane_id = ?1",
+            params![pane_id],
+            |r| r.get(0),
+        )
+    }
+
+    /// Read-only access to the underlying connection, for tests that
+    /// need to assert raw row state the typed API doesn't expose.
+    #[cfg(test)]
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
 }
 
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
@@ -262,12 +662,69 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
     })
 }
 
+/// One `scrollback_chunk` index row. The chunk *bytes* live in the file
+/// at `path` (relative to the data dir); this is the small queryable
+/// pointer to it. `start_line` / `end_line` are cumulative LOGICAL-line
+/// offsets (width-independent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkRow {
+    pub id: i64,
+    pub session_id: i64,
+    pub pane_id: i64,
+    pub path: String,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub emit_cols: i64,
+    pub start_time: i64,
+    pub end_time: i64,
+    pub compressed: bool,
+    pub byte_size: i64,
+}
+
+fn row_to_chunk(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkRow> {
+    Ok(ChunkRow {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        pane_id: row.get(2)?,
+        path: row.get(3)?,
+        start_line: row.get(4)?,
+        end_line: row.get(5)?,
+        emit_cols: row.get(6)?,
+        start_time: row.get(7)?,
+        end_time: row.get(8)?,
+        compressed: row.get::<_, i64>(9)? != 0,
+        byte_size: row.get(10)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn store() -> HistoryStore {
         HistoryStore::in_memory().expect("in-memory store opens cleanly")
+    }
+
+    #[test]
+    fn set_pane_cwd_updates_the_pane_row() {
+        // A pane's cwd is recorded at session start, but must be updated
+        // as the user `cd`s so a restored pane lands in the dir it was
+        // LAST in — persisted on change, not at quit (the process can
+        // vanish). `set_pane_cwd` is that update; `pane_cwd` reads it back.
+        let s = store();
+        let (pane_id, _session_id) = s.begin_session_rows(Some("/start/dir"), "zsh", 1000).unwrap();
+        assert_eq!(s.pane_cwd(pane_id).unwrap().as_deref(), Some("/start/dir"));
+
+        s.set_pane_cwd(pane_id, Some("/new/dir")).unwrap();
+        assert_eq!(
+            s.pane_cwd(pane_id).unwrap().as_deref(),
+            Some("/new/dir"),
+            "restore now reads the last cwd, not the start cwd"
+        );
+
+        // Clearing is representable (cwd unknown) and round-trips.
+        s.set_pane_cwd(pane_id, None).unwrap();
+        assert_eq!(s.pane_cwd(pane_id).unwrap(), None);
     }
 
     #[test]
@@ -300,6 +757,131 @@ mod tests {
         s.migrate().expect("re-migrate is a no-op");
         let v: u32 = s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    /// The schema-version pin. Bumping the ladder is a deliberate
+    /// act; this literal catches an accidental change to the constant
+    /// without a matching migration arm + fixture test.
+    #[test]
+    fn schema_version_is_four() {
+        assert_eq!(SCHEMA_VERSION, 4);
+    }
+
+    /// Every v3 table the Phase 9 persistence layer adds is present
+    /// and empty on a fresh store. A `COUNT(*)` against each is the
+    /// "did the migration create it" probe (same shape as the runs
+    /// probe above).
+    #[test]
+    fn fresh_store_has_layout_session_and_chunk_tables() {
+        let s = store();
+        for t in ["workspace", "window", "tab", "pane", "session", "scrollback_chunk", "chunk_chip"]
+        {
+            let n: i64 = s
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap_or_else(|e| panic!("table `{t}` should exist after migrate: {e}"));
+            assert_eq!(n, 0, "table `{t}` starts empty");
+        }
+    }
+
+    /// Frozen-fixture migration test (strict layer, per
+    /// [spec/08 §Testing]): hand-build a v2 database with a real
+    /// `runs` row, run the ladder, and assert it advances to v3,
+    /// creates the new tables, and leaves the pre-existing row
+    /// untouched. Forward-only migrations never rewrite earlier data.
+    #[test]
+    fn migrate_v2_fixture_to_v3_adds_tables_and_preserves_runs() {
+        let conn = Connection::open_in_memory().unwrap();
+        // The exact v1 + v2 schema as it shipped, stamped at v2, with
+        // one row of data. No HistoryStore methods are used to build
+        // it — this is a frozen snapshot of the old on-disk shape.
+        conn.execute_batch(
+            "
+            CREATE TABLE runs (
+                id INTEGER PRIMARY KEY, text TEXT NOT NULL, started_at INTEGER NOT NULL,
+                finished_at INTEGER, exit_code INTEGER, cwd TEXT, app_run_id TEXT,
+                pane_id INTEGER, source TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX idx_runs_replay_unique
+                ON runs(source, text, started_at) WHERE source != 'termica';
+            INSERT INTO runs (text, started_at, source) VALUES ('echo hi', 123, 'zsh');
+            PRAGMA user_version = 2;
+            ",
+        )
+        .unwrap();
+        let store = HistoryStore { conn };
+
+        store.migrate().expect("v2 -> v4 migration applies cleanly");
+
+        let v: u32 = store.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 4, "ladder advances the fixture to v4");
+        for t in ["workspace", "window", "tab", "pane", "session", "scrollback_chunk", "chunk_chip"]
+        {
+            let n: i64 = store
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap_or_else(|e| panic!("v3/v4 adds table `{t}`: {e}"));
+            assert_eq!(n, 0);
+        }
+        let text: String = store
+            .conn
+            .query_row("SELECT text FROM runs WHERE started_at = 123", [], |r| r.get(0))
+            .expect("the pre-existing v2 runs row survives the migration");
+        assert_eq!(text, "echo hi");
+    }
+
+    #[test]
+    fn chunk_chips_write_read_and_cascade_on_chunk_delete() {
+        let s = store();
+        let (pane, session) = s.begin_session_rows(None, "zsh", 1).unwrap();
+        let chunk_id = s
+            .insert_scrollback_chunk(session, pane, "p/0.tmck", 0, 3, 80, 100, 200, true, 42)
+            .unwrap();
+        s.insert_chunk_chips(chunk_id, &[("command", "ls -la".into()), ("exit", "0".into())])
+            .unwrap();
+        let mut chips = s.chunk_chips(chunk_id).unwrap();
+        chips.sort();
+        assert_eq!(
+            chips,
+            vec![
+                ("command".to_string(), "ls -la".to_string()),
+                ("exit".to_string(), "0".to_string())
+            ]
+        );
+        // Deleting the chunk row cascades to its chips (FKs are OFF, so
+        // delete_scrollback_chunk does it explicitly).
+        s.delete_scrollback_chunk(chunk_id).unwrap();
+        assert!(s.chunk_chips(chunk_id).unwrap().is_empty(), "chips deleted with the chunk");
+    }
+
+    #[test]
+    fn save_layout_replaces_and_latest_reads_back() {
+        let s = store();
+        assert!(s.latest_layout().unwrap().is_none(), "no layout before first save");
+        s.save_layout(b"first-blob", 1000).unwrap();
+        assert_eq!(s.latest_layout().unwrap().as_deref(), Some(&b"first-blob"[..]));
+        // A second save replaces (single-window app) — exactly one window
+        // row remains, carrying the newest blob.
+        s.save_layout(b"second-blob", 2000).unwrap();
+        assert_eq!(s.latest_layout().unwrap().as_deref(), Some(&b"second-blob"[..]));
+        let windows: i64 =
+            s.conn.query_row("SELECT COUNT(*) FROM window", [], |r| r.get(0)).unwrap();
+        let workspaces: i64 =
+            s.conn.query_row("SELECT COUNT(*) FROM workspace", [], |r| r.get(0)).unwrap();
+        assert_eq!((windows, workspaces), (1, 1), "save replaces, never accumulates");
+    }
+
+    #[test]
+    fn end_session_stamps_ended_at_and_latest_session_lookup() {
+        let s = store();
+        let (pane, session) = s.begin_session_rows(Some("/w"), "zsh", 100).unwrap();
+        assert_eq!(s.latest_session_for_pane(pane).unwrap(), Some(session));
+        s.end_session(session, 500, Some(0)).unwrap();
+        let ended: i64 = s
+            .conn
+            .query_row("SELECT ended_at FROM session WHERE id = ?1", [session], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ended, 500);
     }
 
     #[test]
@@ -434,6 +1016,20 @@ mod tests {
         let entries = s.recent(&Scope::Global, 10).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].text, "first run");
+    }
+
+    #[test]
+    fn file_backed_open_enables_wal() {
+        // A file-backed DB runs in WAL mode so a reader (e.g. the UI)
+        // and the background scrollback writer never block each other,
+        // and a second Termica process can read concurrently. In-memory
+        // DBs can't be WAL, so this is asserted only on disk.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("termica.sqlite");
+        let s = HistoryStore::open(&path).expect("open");
+        let mode: String =
+            s.conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).expect("journal_mode");
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
     }
 
     #[test]

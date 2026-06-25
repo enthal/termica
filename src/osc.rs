@@ -101,6 +101,13 @@ impl OscSniffer {
         &self.state
     }
 
+    /// Seed the cwd directly (no OSC 7 byte stream), used by restore to
+    /// recover a Dead pane's last-known directory from its persisted
+    /// `pane` row so its tab title reads the path instead of `pane N`.
+    pub fn seed_cwd(&mut self, cwd: std::path::PathBuf) {
+        self.state.cwd = Some(cwd);
+    }
+
     /// Drain all queued lifecycle events. Order is preserved.
     pub fn drain_events(&mut self) -> Vec<LifecycleEvent> {
         self.events.drain(..).collect()

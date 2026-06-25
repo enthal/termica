@@ -39,11 +39,14 @@ fn drawn_glyph_snapshot_options() -> SnapshotOptions {
     SnapshotOptions::new().failed_pixel_count_threshold(16)
 }
 
-/// Build a sealed-block snapshot from synthetic bytes: feed bytes
-/// into a fresh `TerminalState`, then take a `snapshot_lines_all()`.
-/// This is the exact path `BlockStack::seal_running` walks at
-/// `CommandFinished` time, so the snapshot test paints what a real
-/// sealed block would.
+/// Build a sealed-block snapshot from synthetic bytes: feed bytes into
+/// a fresh `TerminalState`, then take a `snapshot_lines_all()` — grid
+/// rows at `cols` width. Production (Phase 9B) un-wraps these to logical
+/// lines at seal and re-wraps them to the current width on render; these
+/// renderer tests paint the grid rows directly as representative visual
+/// rows (at a width where nothing wraps the result is identical). The
+/// reflow path itself is covered by `reflow`'s unit tests and the
+/// `*_reflow_narrow` snapshot below.
 fn sealed_snapshot(rows: u16, cols: u16, bytes: &[u8]) -> Vec<termica::terminal::StyledLine> {
     let mut t = TerminalState::new(rows, cols);
     t.feed(bytes);
@@ -505,6 +508,31 @@ fn snapshot_paint_sealed_block_echo() {
             );
         });
     harness.snapshot("paint_sealed_block_echo");
+}
+
+#[test]
+fn snapshot_paint_sealed_block_reflows_long_line_at_narrow_width() {
+    // Phase 9B: a logical line longer than the pane wraps into several
+    // visual rows at render time. Build logical lines the way production
+    // stores them (un-wrapped), then reflow to a narrow width before
+    // painting — the result must show the line broken across rows.
+    let logical = termica::persist::chunk::unwrap_rows(&sealed_snapshot(
+        3,
+        80,
+        b"the quick brown fox jumps over the lazy dog\r\n",
+    ));
+    let visual = termica::reflow::ReflowMap::build(&logical, 20).visual_rows().to_vec();
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(320.0, 160.0)).build_ui(move |ui| {
+            let _ = render::paint_sealed_block(
+                ui,
+                "echo fox",
+                &visual,
+                None,
+                render::BlockHeader { exit: Some(0), ..Default::default() },
+            );
+        });
+    harness.snapshot("paint_sealed_block_reflow_narrow");
 }
 
 #[test]

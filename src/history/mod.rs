@@ -45,7 +45,7 @@ pub mod search;
 pub mod shell_files;
 
 pub use capture::{CaptureState, HistoryContext, on_event as capture_on_event};
-pub use db::{Entry, HistoryStore, Scope};
+pub use db::{ChunkRow, Entry, HistoryStore, Scope};
 pub use recall::{RecallOutcome, RecallState};
 pub use replay::{ReplayPaths, ReplayStats, replay_into};
 pub use search::rank as rank_entries;
