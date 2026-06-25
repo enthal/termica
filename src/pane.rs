@@ -1366,19 +1366,31 @@ impl PaneSession {
         self.abort_continuation_line()
     }
 
-    /// Send SIGINT (`\x03`) to abort the shell's dangling continuation
-    /// line and reset the continuation state. The shell prints `^C` and a
-    /// fresh prompt — exactly like Ctrl+C at a PS2 prompt in any
-    /// terminal. Resets `last_submitted` BEFORE the write so the pane
-    /// can't be observed mid-abort with a stale value (which would
-    /// corrupt the next submit's diff) — the same
-    /// make-wrong-states-unrepresentable ordering as `submit`. Leaves the
-    /// editor buffer untouched; callers decide whether to clear it
-    /// (Ctrl+C does; the 2-Enter heal keeps the retyped text).
+    /// Abort the shell's dangling continuation line and reset the
+    /// continuation state. The shell prints `^C` and a fresh prompt —
+    /// exactly like Ctrl+C at a PS2 prompt in any terminal. Resets
+    /// `last_submitted` BEFORE the write so the pane can't be observed
+    /// mid-abort with a stale value (which would corrupt the next
+    /// submit's diff) — the same make-wrong-states-unrepresentable
+    /// ordering as `submit`. Leaves the editor buffer untouched; callers
+    /// decide whether to clear it (Ctrl+C does; the 2-Enter heal keeps
+    /// the retyped text).
+    ///
+    /// The bytes are `\x03\r`, not a bare `\x03`. Our zsh integration
+    /// runs with `unsetopt zle` (cooked-mode tty — see
+    /// `integration/zsh-bootstrap.zsh`), and there a lone `\x03` aborts
+    /// the line but leaves the reader in a state that **swallows the very
+    /// next command**: it arrives with no `preexec`, the shell reports
+    /// the aborted line's exit (130) on the following prompt, and the
+    /// user's command silently vanishes. The trailing `\r` completes the
+    /// prompt cycle so the shell emits its `precmd` and the next command
+    /// runs normally. (Empirically verified against a real zsh + the
+    /// bootstrap: `\x03` alone, `\r\x03`, and double-`\x03` all eat the
+    /// next command; `\x03\r` does not.)
     fn abort_continuation_line(&mut self) -> Result<(), PtyError> {
         self.last_submitted = None;
         self.recall.abandon();
-        self.write(b"\x03")
+        self.write(b"\x03\r")
     }
 
     /// Demote the pane out of `ShellPromptEditor` back to
