@@ -467,6 +467,7 @@ impl PaneSession {
         // Capture the starting cwd as a string before `cwd` moves into
         // the PtyConfig — the persisted `pane` row records it.
         let cwd_str = cwd.as_ref().map(|p| p.display().to_string());
+        let env = env_with_pwd(env, cwd.as_deref());
         let config = PtyConfig { program, args, env, cwd, rows, cols };
         let mut session = Self::spawn(rows, cols, &config, session_id, pane_id, recorder)?;
         session.shell = shell;
@@ -1742,6 +1743,25 @@ fn wall_clock_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+/// Set `$PWD` in the spawned shell's environment to the directory we
+/// spawn into, so the shell reports the *logical* path the caller asked
+/// for (e.g. `/tmp/x`) rather than the kernel's symlink-resolved physical
+/// path (`/private/tmp/x` on macOS, where `/tmp` is a symlink). A shell
+/// born in a directory has no logical path to remember, so it reads
+/// `getcwd()`; an inherited `$PWD` overrides that — and shells validate it
+/// against the actual directory and fall back to `getcwd()` if it does not
+/// match, so this is safe. Replaces any inherited `PWD`. No cwd → no-op.
+fn env_with_pwd(
+    mut env: Vec<(String, String)>,
+    cwd: Option<&std::path::Path>,
+) -> Vec<(String, String)> {
+    if let Some(cwd) = cwd {
+        env.retain(|(k, _)| k != "PWD");
+        env.push(("PWD".to_string(), cwd.display().to_string()));
+    }
+    env
+}
+
 /// Word range for `col` (a char index) in `chars`, using the
 /// shared `is_word_char` predicate. Used by command-label
 /// selection where we have a `&str` rather than `&[StyledCell]`.
@@ -1775,6 +1795,26 @@ mod tests {
 
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn env_with_pwd_sets_logical_path_and_overrides_existing() {
+        // We spawn a shell with `$PWD` set to the path we asked for, so it
+        // reports the logical path (e.g. /tmp/x) instead of the kernel's
+        // symlink-resolved physical one (/private/tmp/x on macOS).
+        let base = vec![
+            ("PATH".to_string(), "/bin".to_string()),
+            ("PWD".to_string(), "/stale".to_string()),
+        ];
+        let out = env_with_pwd(base.clone(), Some(std::path::Path::new("/tmp/opened-by-arg")));
+        // Unrelated vars preserved.
+        assert!(out.contains(&("PATH".to_string(), "/bin".to_string())));
+        // Exactly one PWD, set to the spawn dir (stale one replaced).
+        let pwds: Vec<&str> =
+            out.iter().filter(|(k, _)| k == "PWD").map(|(_, v)| v.as_str()).collect();
+        assert_eq!(pwds, vec!["/tmp/opened-by-arg"], "one PWD, the requested path");
+        // No cwd → env untouched.
+        assert_eq!(env_with_pwd(base.clone(), None), base);
+    }
 
     #[test]
     fn effective_var_names_prefers_shell_report_then_falls_back_to_snapshot() {
