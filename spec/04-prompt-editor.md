@@ -526,14 +526,16 @@ The extend **preserves the selection mode** the gesture established, because Shi
 
 This holds in all three selection domains and, in the sealed domain, **across block boundaries and into / out of a block's command vs. output** — Shift+click reuses `find_head_block_for_pos` + `extend_multiclick_selection_endpoints`, so the head can land in a different block (or the pinned sticky header) than the anchor. Shift+click never opens a Cmd-clickable link (link-open lives only on the fresh-start path).
 
-## Resize: sealed blocks don't reflow
+## Resize: everything reflows
 
-Per-pane resize is asymmetric:
+Per-pane resize is **uniform** — every block re-wraps to the pane's current cell width, the way every modern terminal (WezTerm, kitty, iTerm) behaves. An earlier draft of this spec froze sealed blocks at their emit-time width; that was an *incidental* consequence of snapshotting grid rows rather than logical lines (the live `Running` block reflowed only because alacritty's `Term` reflows its own grid for free, while nobody had written the sealed-block un-wrap/re-wrap path). It looked wrong on resize and diverged from every competitor, so it is reversed.
 
-- **`Running` and `Prompt` blocks** track the pane's current cell width, exactly like a normal terminal would. The live alacritty grid (in `Running`) re-flows; the editor (in `Prompt`) re-wraps.
-- **`Sealed` blocks keep their original cell width.** Their `Vec<StyledLine>` snapshot is frozen at the width the command saw. Resize is cheap (no re-rendering thousands of stored lines) and matches iTerm / Warp behaviour.
+- **`Running` and `Prompt` blocks** track the pane's current cell width directly: the live alacritty grid (in `Running`) re-flows; the editor (in `Prompt`) re-wraps.
+- **`Sealed` blocks reflow too.** They are stored as **logical lines** (width-independent — see [spec/08 §"Logical lines"](08-persistence.md#logical-lines-not-grid-rows)), not grid rows. On render, each logical line is re-wrapped into rows for the *current* pane width by a pure `wrap_logical_line(width)` function (wide-char aware: a `WIDE_CHAR` may not be split across a row boundary). Nothing is frozen at the old width.
 
-A sealed block narrower than the current pane is left-aligned within its strip. A sealed block wider than the current pane horizontally scrolls (or hard-truncates — TBD by Phase 8's polish pass).
+Because storage is logical, **selection coordinates are logical too**: a `PaneCursor`'s line/column index into logical-line space, not visual rows. A selection therefore survives a resize unchanged instead of pointing at the wrong cell — reflow *simplifies* selection rather than complicating it.
+
+The one cost is that re-wrapping is recomputed per width; results are cached per-width in memory so a steady-state resize-then-render doesn't re-wrap every frame.
 
 The editor model and submit semantics described earlier in this document apply to the editor that lives **inside** the `Prompt` block. Everything else (the live cell grid, the sealed snapshots) belongs to the surrounding block infrastructure.
 

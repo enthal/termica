@@ -37,6 +37,7 @@ It embeds your existing `zsh`, `bash`, or `fish` — Termica is not a new shell,
 - **A real terminal.** Full VT/ANSI emulation, alternate-screen apps, mouse reporting, bracketed paste, true color. vim/htop/less/fzf/ssh/tmux just work.
 - **Editor-driven prompt.** At a known shell prompt, the line editor becomes a native editor: click to place the cursor, drag to select, multiline editing, undo/redo, and shell syntax highlighting. Press Enter to send the command.
 - **Structured command blocks.** Each command and its output are sealed into a block you can select across, copy, and read back with its exit status.
+- **Scrollback that survives restarts.** Sealed blocks — their output, command, and exit status — are written to disk as you work. Relaunch (or recover from a crash) and your panes come back with their transcripts intact; a per-pane *Restart shell* brings the live shell back and new output appends below the restored history. Old scrollback is bounded and aged out automatically, never silently dropped.
 - **Command history that remembers.** Backed by SQLite and seeded from your existing shell history. Walk it with ↑/↓ in the prompt, or open a fuzzy-search overlay with Ctrl+R, scoped to the current pane or everywhere.
 - **Find in the transcript.** Cmd+F opens an in-pane find bar that searches your command blocks — match case, regex, and an All / Commands / Outputs filter — highlighting hits over the grid. Enter / Shift+Enter step through matches; ↑/↓ recall previous searches.
 - **Tab completion.** A completion popup sourced from filesystem paths, executables on your `PATH`, and environment variables — augmented by CLI-native completion for modern tools (`kubectl`, `gh`, `git`, `docker`, `aws`) and, in a **fish or zsh** pane, by your live shell's own completions (built-ins, installed completions, and aliases / functions — including ones you defined right at the prompt). In a zsh pane the modern tools keep their dedicated completion and the shell fills in the long tail.
@@ -47,7 +48,7 @@ It embeds your existing `zsh`, `bash`, or `fish` — Termica is not a new shell,
 
 ## Status
 
-Termica is in **active development and pre-1.0**. The core terminal, the tab/split workspace, the prompt-editor mode machine, command history, and tab completion are all working day-to-day, but the format and behavior may still change and there are rough edges. There are **no prebuilt binaries yet** — for now you build from source (it's one `cargo` command). Follow the [issue tracker](https://github.com/enthal/termica/issues) for the roadmap.
+Termica is in **active development and pre-1.0**. The core terminal, the tab/split workspace, the prompt-editor mode machine, command history, tab completion, and scrollback persistence are all working day-to-day, but the format and behavior may still change and there are rough edges. There are **no prebuilt binaries yet** — for now you build from source (it's one `cargo` command). Follow the [issue tracker](https://github.com/enthal/termica/issues) for the roadmap.
 
 ## Platform support
 

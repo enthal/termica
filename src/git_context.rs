@@ -16,7 +16,7 @@
 /// `lines_added` / `lines_removed` are summed from `git diff` numstat over
 /// the tracked changes (untracked files have no diff and contribute only
 /// to `files_changed`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DirtySummary {
     pub files_changed: u32,
     pub lines_added: u32,
@@ -36,7 +36,7 @@ impl DirtySummary {
 /// summary. `None` for the whole `GitContext` (at the probe layer) means
 /// "not a git repo"; an all-default `GitContext` here means "clean repo,
 /// no upstream."
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GitContext {
     /// Current branch name, or `None` when HEAD is detached.
     pub branch: Option<String>,

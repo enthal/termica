@@ -52,9 +52,11 @@ pub mod osc;
 pub mod pane;
 pub mod pane_selection;
 pub mod paths;
+pub mod persist;
 pub mod pr_context;
 pub mod prompt_editor;
 pub mod pty;
+pub mod reflow;
 pub mod render;
 pub mod selection;
 pub mod shell;
@@ -88,6 +90,7 @@ pub use shortcuts::match_pane_shortcut;
 pub use tab_title::{active_pane_in_tabs, home_relative_cwd, tab_title_for};
 
 use eframe::egui;
+use std::path::{Path, PathBuf};
 
 /// Minimum cell grid Termica will ever ask a PTY for. Below this,
 /// shells and full-screen TTY programs behave erratically. The
@@ -96,12 +99,29 @@ use eframe::egui;
 pub(crate) const MIN_ROWS: u16 = 5;
 pub(crate) const MIN_COLS: u16 = 20;
 
-/// Stable application identifier. Used as the eframe app name, the
-/// Wayland/X11 `app_id` (which becomes the window's `StartupWMClass`
-/// for icon matching), and the basename of the Linux `.desktop` +
-/// icon files we install. Must stay in sync with `StartupWMClass`
-/// in [`desktop_entry_contents`].
-const APP_ID: &str = "termica";
+/// Reverse-DNS application identifier — the single identity the desktop
+/// environment keys on. It is the Wayland/X11 `app_id` (→ the window's
+/// `StartupWMClass`) AND the basename of the Linux `.desktop` + icon
+/// files we install, so the *running window* and the *installed
+/// launcher* resolve to the same app (icon on the window, launcher
+/// merges with its window, single app-grid entry). Capitalized app
+/// component per the prevailing convention (`dev.warp.Warp`,
+/// `dev.zed.Zed`).
+///
+/// MUST equal the `[package.metadata.packager] identifier` in
+/// `Cargo.toml` (the basename of the packaged `.deb`/AppImage entry +
+/// icon) — see `app_id_matches_packaged_identifier`. This is NOT the
+/// storage namespace; that is [`APP_STORAGE_NAME`], deliberately kept
+/// short and stable so user data does not move.
+const APP_ID: &str = "io.termica.Termica";
+
+/// Where on-disk state lives: `$XDG_DATA_HOME/<APP_STORAGE_NAME>/`
+/// (eframe window state) and the history SQLite. Kept as the short,
+/// stable `termica` — distinct from the reverse-DNS [`APP_ID`] — because
+/// it names a directory holding real user data (command history); moving
+/// it would orphan that data. The desktop *identity* and the storage
+/// *namespace* are different concerns.
+pub(crate) const APP_STORAGE_NAME: &str = "termica";
 
 /// The window/dock/taskbar icon, embedded in the binary so there is
 /// no runtime file dependency. Decoded by [`load_app_icon`]; written
@@ -119,9 +139,49 @@ fn load_app_icon() -> Option<egui::IconData> {
     Some(egui::IconData { rgba: image.into_raw(), width, height })
 }
 
+/// Quote a path for the `Exec=` key of a freedesktop `.desktop` entry.
+///
+/// Two independent escaping layers apply, and we must satisfy both:
+/// 1. **Quoting** — the argument is wrapped in double quotes and the
+///    reserved characters `"`, `` ` ``, `$` and `\` are escaped with a
+///    preceding backslash. We always quote: it is valid for any path
+///    and spares us from classifying which characters are "reserved".
+/// 2. **Field codes** — the launcher expands `%f`, `%u`, `%i`, … in
+///    `Exec`, so a *literal* percent must be written `%%` or a path
+///    containing `%` is misread as a (possibly garbage) field code.
+///    This layer is outside the quotes; double-quoting does not exempt
+///    it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn desktop_exec_field(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 2);
+    out.push('"');
+    for c in path.chars() {
+        match c {
+            '"' | '`' | '$' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '%' => out.push_str("%%"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Contents of the freedesktop `.desktop` entry installed on Linux so
 /// desktop environments (GNOME, KDE, Sway, …) can match the running
 /// window to a name and icon in task switchers and docks.
+///
+/// `exec_path` MUST be the **absolute path to a program that resolves**
+/// (normally this binary, via `std::env::current_exe`). This is not
+/// cosmetic: GIO's `GDesktopAppInfo` loader — which gnome-shell's
+/// `shell-window-tracker` calls to turn a window's `app_id` into an app
+/// (and thus an icon) — runs `g_find_program_in_path` on `Exec` and
+/// returns NULL for the *entire entry* if it does not resolve. A bare
+/// `Exec=termica` is not on `PATH` for a dev/cargo build, so the entry
+/// silently fails to load and the window falls back to a generic icon,
+/// even though every other field is correct.
 ///
 /// Kept pure — no `cfg`, no filesystem — so it is unit-testable on
 /// every platform. `StartupWMClass` MUST equal the `app_id` we set on
@@ -130,13 +190,14 @@ fn load_app_icon() -> Option<egui::IconData> {
 // Non-Linux production builds have no caller (the installer is
 // Linux-gated); the tests below still exercise it on every platform.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn desktop_entry_contents() -> String {
+fn desktop_entry_contents(exec_path: &str) -> String {
+    let exec = desktop_exec_field(exec_path);
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
          Name=Termica\n\
          Comment=Native terminal workspace\n\
-         Exec={APP_ID}\n\
+         Exec={exec}\n\
          Icon={APP_ID}\n\
          Terminal=false\n\
          StartupWMClass={APP_ID}\n\
@@ -144,12 +205,42 @@ fn desktop_entry_contents() -> String {
     )
 }
 
+/// Resolve the path to record as the desktop entry's `Exec`.
+///
+/// Normally this is `current_exe`. Inside an AppImage, though,
+/// `current_exe` is an ephemeral `/tmp/.mount_*` path that vanishes when
+/// the app exits — recording it would make `Exec` unresolvable on the
+/// next launch (the generic-icon bug `desktop_entry_contents` warns
+/// about). The AppImage runtime exports `$APPIMAGE`, the stable path of
+/// the `.AppImage` file itself, for exactly this case.
+///
+/// `$APPIMAGE` is an *inherited* env var, so it is trusted only when we
+/// are genuinely the AppImage: `current_exe` must live inside `$APPDIR`
+/// (the AppImage mount). That rejects a stray `$APPIMAGE` leaked from a
+/// parent AppImage process (e.g. a dev build launched from a terminal
+/// that was itself spawned by some other AppImage). Any mismatch — env
+/// unset, empty, or `current_exe` outside the mount — falls back to
+/// `current_exe`, i.e. today's behavior.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn resolve_exec_path(
+    appimage: Option<&Path>,
+    appdir: Option<&Path>,
+    current_exe: Option<&Path>,
+) -> Option<PathBuf> {
+    let is_appimage = match (appimage, appdir, current_exe) {
+        (Some(img), Some(dir), Some(exe)) => {
+            !img.as_os_str().is_empty() && !dir.as_os_str().is_empty() && exe.starts_with(dir)
+        }
+        _ => false,
+    };
+    if is_appimage { appimage.map(Path::to_path_buf) } else { current_exe.map(Path::to_path_buf) }
+}
+
 /// On Linux, install the icon and a `.desktop` entry into the user's
 /// XDG data dir (`$XDG_DATA_HOME` or `~/.local/share`) so the app is
-/// identifiable in the launcher and its window carries our icon. Both
-/// writes are skipped if the target already exists, and every step is
-/// best-effort: a failure here never blocks startup, it just means
-/// the desktop environment falls back to a generic icon.
+/// identifiable in the launcher and its window carries our icon. Every
+/// step is best-effort: a failure here never blocks startup, it just
+/// means the desktop environment falls back to a generic icon.
 #[cfg(target_os = "linux")]
 fn install_desktop_entry() {
     let Some(base) = directories::BaseDirs::new() else {
@@ -157,16 +248,53 @@ fn install_desktop_entry() {
     };
     let data_home = base.data_dir();
 
+    // One-time migration: earlier builds installed under the bare
+    // `termica` basename, before we unified on the reverse-DNS
+    // [`APP_ID`]. Leaving those behind would shadow/duplicate the new
+    // entry, so drop the files we used to write. Best-effort; absent is
+    // fine.
+    let _ = std::fs::remove_file(data_home.join("applications/termica.desktop"));
+    let _ = std::fs::remove_file(data_home.join("icons/hicolor/256x256/apps/termica.png"));
+
+    // The icon bytes are constant, so write-if-missing is enough.
     let icon_dir = data_home.join("icons/hicolor/256x256/apps");
     let icon_path = icon_dir.join(format!("{APP_ID}.png"));
     if !icon_path.exists() && std::fs::create_dir_all(&icon_dir).is_ok() {
         let _ = std::fs::write(&icon_path, APP_ICON_PNG);
     }
 
+    // The entry's `Exec` must resolve to a real program or GIO refuses
+    // to load the whole entry (see `desktop_entry_contents`), so point
+    // it at this binary's absolute path — or, under an AppImage, at the
+    // stable `.AppImage` file rather than its ephemeral mount (see
+    // `resolve_exec_path`). "Steal on start": rewrite whenever the
+    // content differs, so the most recently launched build claims the
+    // entry. Self-healing (a stale path from a since-deleted build is
+    // replaced) and idempotent (no write when already correct).
+    let current_exe = std::env::current_exe().ok();
+    let appimage = std::env::var_os("APPIMAGE").map(PathBuf::from);
+    let appdir = std::env::var_os("APPDIR").map(PathBuf::from);
+    let Some(exe) =
+        resolve_exec_path(appimage.as_deref(), appdir.as_deref(), current_exe.as_deref())
+    else {
+        return;
+    };
+    let desired = desktop_entry_contents(&exe.to_string_lossy());
     let app_dir = data_home.join("applications");
     let desktop_path = app_dir.join(format!("{APP_ID}.desktop"));
-    if !desktop_path.exists() && std::fs::create_dir_all(&app_dir).is_ok() {
-        let _ = std::fs::write(&desktop_path, desktop_entry_contents());
+    let up_to_date = std::fs::read_to_string(&desktop_path).is_ok_and(|cur| cur == desired);
+    if !up_to_date
+        && std::fs::create_dir_all(&app_dir).is_ok()
+        && std::fs::write(&desktop_path, &desired).is_ok()
+    {
+        // Best-effort nudge so an already-running shell re-reads the
+        // entry without a re-login. Failure (tool absent) is fine: the
+        // shell's own file monitor still catches the write.
+        let _ = std::process::Command::new("update-desktop-database")
+            .arg(&app_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
     }
 }
 
@@ -249,7 +377,10 @@ pub fn run() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        APP_ID,
+        // eframe's app name is its storage key, NOT the desktop app_id
+        // (that is set via `with_app_id` above). Keep it on the stable
+        // storage namespace so window state stays put.
+        APP_STORAGE_NAME,
         options,
         Box::new(|cc| {
             // Force dark theme always, regardless of the system
@@ -286,15 +417,109 @@ mod app_icon_tests {
     }
 
     #[test]
+    fn app_id_matches_packaged_identifier() {
+        // The runtime `app_id` is the desktop-file basename gnome-shell
+        // matches a window to; the packager `identifier` is the basename
+        // of the installed `.deb`/AppImage entry + icon. If they drift,
+        // the running window and the installed launcher are two different
+        // apps to the desktop environment (generic icon / duplicate
+        // launcher). Pin them together.
+        let cargo_toml = include_str!("../Cargo.toml");
+        assert!(
+            cargo_toml.contains(&format!("identifier = \"{APP_ID}\"")),
+            "packager identifier in Cargo.toml must equal APP_ID = {APP_ID:?}"
+        );
+    }
+
+    #[test]
+    fn app_id_is_reverse_dns_distinct_from_storage_namespace() {
+        // Desktop identity is reverse-DNS; storage stays short so user
+        // data does not move when the identity changes.
+        assert!(APP_ID.contains('.'), "APP_ID should be reverse-DNS");
+        assert_ne!(APP_ID, APP_STORAGE_NAME);
+    }
+
+    #[test]
+    fn exec_path_prefers_appimage_only_when_inside_appdir() {
+        let img = Path::new("/home/u/Downloads/Termica.AppImage");
+        let appdir = Path::new("/tmp/.mount_TermicaABC");
+        let mount_exe = Path::new("/tmp/.mount_TermicaABC/usr/bin/termica");
+
+        // Genuine AppImage run: current_exe is inside APPDIR → record the
+        // stable .AppImage path, not the ephemeral mount.
+        assert_eq!(
+            resolve_exec_path(Some(img), Some(appdir), Some(mount_exe)),
+            Some(PathBuf::from("/home/u/Downloads/Termica.AppImage"))
+        );
+
+        // $APPIMAGE leaked from a parent AppImage while we run a normal
+        // build: current_exe is NOT under APPDIR → ignore it, use
+        // current_exe (the spoof guard).
+        let dev_exe = Path::new("/home/u/proj/target/release/termica");
+        assert_eq!(
+            resolve_exec_path(Some(img), Some(appdir), Some(dev_exe)),
+            Some(PathBuf::from("/home/u/proj/target/release/termica"))
+        );
+
+        // Plain .deb / dev: no AppImage env → current_exe.
+        assert_eq!(
+            resolve_exec_path(None, None, Some(Path::new("/usr/bin/termica"))),
+            Some(PathBuf::from("/usr/bin/termica"))
+        );
+
+        // Defensive: empty env values are ignored, not treated as a match.
+        assert_eq!(
+            resolve_exec_path(
+                Some(Path::new("")),
+                Some(Path::new("")),
+                Some(Path::new("/usr/bin/termica"))
+            ),
+            Some(PathBuf::from("/usr/bin/termica"))
+        );
+    }
+
+    #[test]
     fn desktop_entry_wm_class_matches_app_id() {
-        let entry = desktop_entry_contents();
+        let entry = desktop_entry_contents("/opt/termica/bin/termica");
         // The compositor keys icon lookup on StartupWMClass; it must
         // equal the app_id we set on the viewport, or Linux desktops
         // fall back to a generic icon.
         assert!(entry.contains(&format!("StartupWMClass={APP_ID}\n")));
-        assert!(entry.contains(&format!("Exec={APP_ID}\n")));
         assert!(entry.contains(&format!("Icon={APP_ID}\n")));
         assert!(entry.starts_with("[Desktop Entry]\n"));
         assert!(entry.contains("Type=Application\n"));
+    }
+
+    #[test]
+    fn desktop_entry_exec_is_the_absolute_binary_path_not_bare_name() {
+        // Regression guard for the generic-icon bug: a bare
+        // `Exec=termica` is not on PATH for a dev/cargo build, so GIO's
+        // GDesktopAppInfo loader rejects the whole entry
+        // (g_find_program_in_path fails) and gnome-shell cannot map the
+        // window's app_id to an app — generic icon. `Exec` must be the
+        // resolvable absolute path to this binary.
+        let entry = desktop_entry_contents("/home/u/wt/target/release/termica");
+        assert!(entry.contains("Exec=\"/home/u/wt/target/release/termica\"\n"), "got: {entry}");
+        assert!(
+            !entry.contains(&format!("Exec={APP_ID}\n")),
+            "must never emit the bare, unresolvable Exec={APP_ID}"
+        );
+    }
+
+    #[test]
+    fn desktop_entry_exec_quotes_spaces_and_escapes_reserved_chars() {
+        // Worktrees / homes can contain spaces and shell metacharacters;
+        // the Exec field must stay a single, spec-valid quoted argument.
+        let entry = desktop_entry_contents("/home/a b/$x/termica");
+        assert!(entry.contains("Exec=\"/home/a b/\\$x/termica\"\n"), "got: {entry}");
+    }
+
+    #[test]
+    fn desktop_entry_exec_doubles_literal_percent_for_field_codes() {
+        // `%` is the desktop-entry field-code marker (%f, %u, …), a layer
+        // separate from quoting: a literal percent in the path must be
+        // written `%%` or the launcher reads it as a (garbage) field code.
+        let entry = desktop_entry_contents("/home/u/50%off/termica");
+        assert!(entry.contains("Exec=\"/home/u/50%%off/termica\"\n"), "got: {entry}");
     }
 }
