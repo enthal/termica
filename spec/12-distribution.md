@@ -65,6 +65,16 @@ Flatpak, AUR, Homebrew cask, and Windows packaging are explicitly **post-MVP** (
 
 > **Cursor-read follow-up tied to sandboxed packaging:** when a Flatpak or Snap package ships, switch the cursor size/theme read in `src/cursor_env.rs` from the `gsettings` subprocess to the XDG `org.freedesktop.portal.Settings` portal. Inside a sandbox `gsettings` is blocked, so today's read simply no-ops there; the portal is the supported path and is a **cheap swap** — `zbus` (blocking API, pure Rust) is already in our dependency tree via `accesskit`, so no new heavyweight dependency. Non-sandboxed GNOME already works via `gsettings`, and KDE almost certainly needs nothing (Plasma exports `XCURSOR_SIZE`, which our existing no-op respects), so this is only worth doing alongside sandboxed packaging — not before.
 
+### Desktop integration (Linux)
+
+Linux desktops put an app's icon on its window — and merge a running window with its launcher — by matching the window's **`app_id`** to an installed `.desktop` entry of the same basename. Termica uses **one reverse-DNS identity** for all of it (`io.termica.Termica`, capitalized app component per `dev.warp.Warp` / `dev.zed.Zed`): the Wayland/X11 `app_id`, the `.desktop` and icon basenames, `Icon=`, and `StartupWMClass`. That identity **MUST equal the cargo-packager `identifier`**, or the installed launcher and the running window become two different apps (generic icon; launcher won't merge with its window). A unit test (`app_id_matches_packaged_identifier`) pins the two together.
+
+Beyond any package-installed entry, Termica **self-installs** the `.desktop` + icon under `$XDG_DATA_HOME` on every launch — idempotent, "steal on start". This is what gives a dock icon to the **AppImage** and to dev / `cargo run` builds, where no package manager dropped an entry.
+
+The entry's **`Exec` must be an absolute path that resolves**: GIO's `GDesktopAppInfo` loader — which gnome-shell calls to map a window's `app_id` to an app — runs `g_find_program_in_path` on `Exec` and returns NULL for the *whole entry* (icon and all) if it does not resolve. So Termica writes `std::env::current_exe()` (never a bare `termica`, which is not on `PATH` for a dev build), or, inside an AppImage, the stable `$APPIMAGE` file path rather than the per-launch `/tmp/.mount_*` (guarded by `$APPDIR` membership so an inherited `$APPIMAGE` from a parent process is not trusted). The storage namespace stays the short `termica` (history DB, eframe state), distinct from the desktop identity, so user data does not move when the identity changes.
+
+Listing in software centers (an AppStream `io.termica.Termica.metainfo.xml`) is a post-MVP follow-up.
+
 ## Code signing & notarization
 
 ### macOS

@@ -255,6 +255,13 @@ impl TerminalState {
         self.osc.state().cwd.as_deref()
     }
 
+    /// Seed the cwd without an OSC 7 byte stream — restore (9F) uses this
+    /// to recover a Dead pane's last-known directory from its persisted
+    /// `pane` row, so the tab title shows the path, not `pane N`.
+    pub fn seed_cwd(&mut self, cwd: std::path::PathBuf) {
+        self.osc.seed_cwd(cwd);
+    }
+
     /// Drain all DCS-JSON lifecycle events that have been extracted
     /// from the byte stream since the last drain. Empty if no events
     /// are queued. Caller is the per-pane `PromptController`.

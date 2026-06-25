@@ -109,11 +109,119 @@ pub enum Block {
 }
 
 impl Block {
+    /// Build a `Sealed` block from restored scrollback (9F). The output
+    /// logical lines come from the chunk file; the command label, exit
+    /// code, cwd, and git header come from the chunk's [`BlockMeta`]
+    /// chips. `duration` is recovered from the chunk's recorded span.
+    pub fn restored_sealed(
+        id: BlockId,
+        snapshot: Vec<StyledLine>,
+        start_time_ms: i64,
+        end_time_ms: i64,
+        meta: BlockMeta,
+    ) -> Self {
+        Block::Sealed {
+            id,
+            header: meta.to_header(),
+            command: meta.command,
+            snapshot,
+            duration: Duration::from_millis(end_time_ms.saturating_sub(start_time_ms).max(0) as u64),
+            exit: meta.exit,
+        }
+    }
+
     /// Stable id, regardless of variant.
     pub fn id(&self) -> BlockId {
         match self {
             Block::Prompt { id, .. } | Block::Running { id, .. } | Block::Sealed { id, .. } => *id,
         }
+    }
+}
+
+/// What a seal produced, handed up to the caller so it can be
+/// persisted. The block stack stays free of I/O and threads: it
+/// *returns* this value from [`BlockStack::observe_lifecycle_event`]
+/// and the pane forwards it to the background chunk writer (9D). The
+/// `lines` are the same width-independent logical lines stored in the
+/// resulting `Block::Sealed` (a clone — a future optimization may
+/// share them via `Arc`); the writer encodes them straight into a
+/// chunk file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SealedSnapshot {
+    pub block_id: BlockId,
+    pub lines: Vec<StyledLine>,
+    /// Pane width when the block sealed. Diagnostic only — logical
+    /// lines re-wrap to any width — but recorded in `scrollback_chunk`.
+    pub emit_cols: u32,
+    pub start_time_ms: i64,
+    pub end_time_ms: i64,
+    /// Block identity + chips (command, exit, cwd, git) — persisted as
+    /// the chunk's key/value `chunk_chip` rows so a restored block shows
+    /// its label and chips, not just its output (9F).
+    pub meta: BlockMeta,
+}
+
+/// A block's metadata — its command label, exit code, cwd, and git
+/// context — kept TYPED in code while it's stored as an open key/value
+/// set (`chunk_chip`) on disk: the typed↔chips conversion is the only
+/// place chip keys live, so a new chip (kube/aws/ssh/pr…) is a new field
+/// here + a new key, never a schema migration.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BlockMeta {
+    pub command: String,
+    pub exit: Option<i32>,
+    pub cwd: Option<String>,
+    pub git: Option<crate::git_context::GitContext>,
+}
+
+impl BlockMeta {
+    /// Capture a sealed block's metadata from its parts.
+    pub fn from_block(command: &str, exit: Option<i32>, header: &BlockHeader) -> Self {
+        BlockMeta {
+            command: command.to_string(),
+            exit,
+            cwd: header.cwd.as_ref().map(|p| p.display().to_string()),
+            git: header.git.clone(),
+        }
+    }
+
+    /// Fan out to the `(key, value)` chips stored on the chunk. Absent
+    /// fields produce no row. `git` is JSON (a structured value under one
+    /// key); the rest are plain strings.
+    pub fn to_chips(&self) -> Vec<(&'static str, String)> {
+        let mut chips = Vec::new();
+        if !self.command.is_empty() {
+            chips.push(("command", self.command.clone()));
+        }
+        if let Some(exit) = self.exit {
+            chips.push(("exit", exit.to_string()));
+        }
+        if let Some(cwd) = &self.cwd {
+            chips.push(("cwd", cwd.clone()));
+        }
+        if let Some(git) = &self.git
+            && let Ok(json) = serde_json::to_string(git)
+        {
+            chips.push(("git", json));
+        }
+        chips
+    }
+
+    /// Rebuild from a chunk's stored chips (restore). Unknown keys are
+    /// ignored; malformed values fall back to absent.
+    pub fn from_chips(chips: &[(String, String)]) -> Self {
+        let get = |k: &str| chips.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+        BlockMeta {
+            command: get("command").unwrap_or("").to_string(),
+            exit: get("exit").and_then(|s| s.parse().ok()),
+            cwd: get("cwd").map(|s| s.to_string()),
+            git: get("git").and_then(|s| serde_json::from_str(s).ok()),
+        }
+    }
+
+    /// The `BlockHeader` this metadata reconstructs for a restored block.
+    pub fn to_header(&self) -> BlockHeader {
+        BlockHeader { cwd: self.cwd.as_ref().map(PathBuf::from), git: self.git.clone() }
     }
 }
 
@@ -167,6 +275,38 @@ impl BlockStack {
             editor: PromptEditor::new(),
         });
         stack
+    }
+
+    /// Build a stack pre-populated with restored `Sealed` blocks (9F),
+    /// then a fresh live `Prompt` tail so the invariants hold (last is
+    /// always live; ids are monotonic). The blocks must all be
+    /// `Block::Sealed` and ordered oldest→newest; their ids are
+    /// reassigned `0..n` so the tail `Prompt` gets `n`.
+    pub fn with_restored_sealed(sealed: Vec<Block>) -> Self {
+        debug_assert!(
+            sealed.iter().all(|b| matches!(b, Block::Sealed { .. })),
+            "with_restored_sealed takes only Sealed blocks"
+        );
+        let next_id = sealed.len() as u64;
+        let mut stack = Self { blocks: sealed, next_id, event_clock_ms: 0, current_git: None };
+        let id = stack.alloc_id();
+        stack.blocks.push(Block::Prompt {
+            id,
+            header: BlockHeader::default(),
+            started_at_frame: 0,
+            editor: PromptEditor::new(),
+        });
+        stack
+    }
+
+    /// Consume the stack and return just its `Sealed` blocks (the live
+    /// `Prompt`/`Running` tail is dropped). Used by restart (9F) to carry
+    /// a restored pane's scrollback into the freshly-spawned shell —
+    /// `BlockStack::with_restored_sealed(stack.into_sealed())` rebuilds a
+    /// valid stack with those blocks under a new live tail. No clone: the
+    /// (potentially large) snapshots move.
+    pub fn into_sealed(self) -> Vec<Block> {
+        self.blocks.into_iter().filter(|b| matches!(b, Block::Sealed { .. })).collect()
     }
 
     fn alloc_id(&mut self) -> BlockId {
@@ -232,19 +372,26 @@ impl BlockStack {
     /// Other lifecycle events (`IntegrationReady`, `PromptVars`,
     /// `IntegrationError`, `CommandAborted`) are the controller's
     /// concern, not the stack's; they leave the stack alone.
+    /// Returns the [`SealedSnapshot`] of a block that just sealed (only
+    /// the `CommandFinished` path produces one), for the pane to forward
+    /// to the chunk writer; `None` for every other event.
     pub fn observe_lifecycle_event(
         &mut self,
         event: &LifecycleEvent,
         terminal: &mut TerminalState,
         frame: u64,
-    ) {
+    ) -> Option<SealedSnapshot> {
         match event {
-            LifecycleEvent::Preexec { command } => self.start_running(command.clone()),
+            LifecycleEvent::Preexec { command } => {
+                self.start_running(command.clone());
+                None
+            }
             LifecycleEvent::CommandFinished { exit } => self.seal_running(*exit, terminal, frame),
             LifecycleEvent::Precmd { cwd } | LifecycleEvent::Cwd { cwd } => {
                 self.update_tail_cwd(cwd.clone());
+                None
             }
-            _ => {}
+            _ => None,
         }
     }
 
@@ -340,21 +487,47 @@ impl BlockStack {
     ///
     /// Order matters: snapshot first, then reset. Otherwise the
     /// sealed snapshot is empty.
-    fn seal_running(&mut self, exit: i32, terminal: &mut TerminalState, frame: u64) {
+    fn seal_running(
+        &mut self,
+        exit: i32,
+        terminal: &mut TerminalState,
+        frame: u64,
+    ) -> Option<SealedSnapshot> {
+        use alacritty_terminal::grid::Dimensions;
+
         let now_ms = self.event_clock_ms;
-        let Some(tail) = self.blocks.last() else { return };
+        let tail = self.blocks.last()?;
         let Block::Running { id, header, command, started_at_ms } = tail else {
-            return;
+            return None;
         };
         let id = *id;
         let header = header.clone();
         let command = command.clone();
         let started_ms = *started_at_ms;
 
-        let snapshot = terminal.snapshot_lines_all();
+        // Pane width at seal, before the reset clears the grid. Logical
+        // lines are width-independent; this is recorded for diagnostics.
+        let emit_cols = terminal.grid().columns() as u32;
+        // Store the sealed output as width-independent LOGICAL lines
+        // (un-wrapped from the grid rows), not fixed-width grid rows, so
+        // the block can reflow to the current pane width on render
+        // (Phase 9B; see [`crate::reflow`] and spec/08 §"Logical lines").
+        let snapshot = crate::persist::chunk::unwrap_rows(&terminal.snapshot_lines_all());
         terminal.reset_for_new_block();
         // Real wall-clock duration; clamp negative clock skew to zero.
         let duration = Duration::from_millis(now_ms.saturating_sub(started_ms).max(0) as u64);
+
+        // What the writer persists. Cloning the lines keeps the block
+        // stack and the writer decoupled (the Sealed block keeps its own
+        // copy for rendering); a future optimization may share via `Arc`.
+        let produced = SealedSnapshot {
+            block_id: id,
+            lines: snapshot.clone(),
+            emit_cols,
+            start_time_ms: started_ms,
+            end_time_ms: now_ms,
+            meta: BlockMeta::from_block(&command, Some(exit), &header),
+        };
 
         let sealed = Block::Sealed {
             id,
@@ -377,6 +550,7 @@ impl BlockStack {
             started_at_frame: frame,
             editor: PromptEditor::new(),
         });
+        Some(produced)
     }
 
     /// Mutable access to the editor on the live tail block, if any.
@@ -881,6 +1055,140 @@ mod tests {
             }
             other => panic!("expected Sealed, got {other:?}"),
         }
+    }
+
+    /// Phase 9B: the sealed snapshot stores width-independent LOGICAL
+    /// lines (un-wrapped), not fixed-width grid rows. A line longer than
+    /// the terminal width soft-wraps into two grid rows but must seal as
+    /// one logical line. Fails on the pre-9B tree, which stored the raw
+    /// grid rows.
+    #[test]
+    fn sealed_snapshot_stores_unwrapped_logical_lines() {
+        let mut term = TerminalState::new(5, 10);
+        let mut stack = fresh_stack();
+        stack.observe_lifecycle_event(
+            &LifecycleEvent::Preexec { command: "x".into() },
+            &mut term,
+            1,
+        );
+        // 15 chars at width 10 -> alacritty soft-wraps into two rows.
+        term.feed(b"0123456789abcde");
+        stack.observe_lifecycle_event(&LifecycleEvent::CommandFinished { exit: 0 }, &mut term, 2);
+
+        match stack.iter().next().unwrap() {
+            Block::Sealed { snapshot, .. } => {
+                assert_eq!(snapshot.len(), 1, "soft-wrapped output is one logical line");
+                let text: String = snapshot[0].text_chars().collect();
+                assert_eq!(text, "0123456789abcde");
+            }
+            other => panic!("expected Sealed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_restored_sealed_preserves_blocks_and_keeps_invariants() {
+        let sealed: Vec<Block> = (0..3)
+            .map(|i| {
+                Block::restored_sealed(
+                    BlockId(i),
+                    vec![StyledLine::default()],
+                    0,
+                    100,
+                    BlockMeta::default(),
+                )
+            })
+            .collect();
+        let stack = BlockStack::with_restored_sealed(sealed);
+        // 3 sealed + 1 fresh Prompt tail.
+        assert_eq!(stack.len(), 4);
+        let mut it = stack.iter();
+        for _ in 0..3 {
+            assert!(matches!(it.next().unwrap(), Block::Sealed { .. }));
+        }
+        // Invariant: last is always live (a Prompt here), with the next id.
+        match stack.last().unwrap() {
+            Block::Prompt { id, .. } => assert_eq!(*id, BlockId(3)),
+            other => panic!("tail must be a live Prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn into_sealed_drops_the_live_tail_and_round_trips() {
+        // Restart's transplant: with_restored_sealed then into_sealed is
+        // the identity on the sealed blocks (the live Prompt tail added by
+        // the constructor is dropped again).
+        let sealed: Vec<Block> = (0..3)
+            .map(|i| {
+                Block::restored_sealed(
+                    BlockId(i),
+                    vec![StyledLine::default()],
+                    0,
+                    50,
+                    BlockMeta::default(),
+                )
+            })
+            .collect();
+        let stack = BlockStack::with_restored_sealed(sealed);
+        assert_eq!(stack.len(), 4, "3 sealed + 1 Prompt tail");
+        let back = stack.into_sealed();
+        assert_eq!(back.len(), 3, "into_sealed returns just the sealed blocks");
+        assert!(back.iter().all(|b| matches!(b, Block::Sealed { .. })));
+    }
+
+    #[test]
+    fn seal_returns_snapshot_for_the_writer() {
+        // The pane forwards this returned snapshot to the background
+        // chunk writer (9D). It must carry the same logical lines stored
+        // in the Sealed block, the emit width, and the wall-clock span.
+        let mut term = TerminalState::new(5, 10);
+        let mut stack = fresh_stack();
+        stack.set_event_clock_ms(1000);
+        stack.observe_lifecycle_event(
+            &LifecycleEvent::Preexec { command: "x".into() },
+            &mut term,
+            1,
+        );
+        term.feed(b"0123456789abcde"); // 15 chars @ width 10 -> 1 logical line
+        stack.set_event_clock_ms(2500);
+        let produced = stack
+            .observe_lifecycle_event(&LifecycleEvent::CommandFinished { exit: 0 }, &mut term, 2)
+            .expect("CommandFinished returns a SealedSnapshot");
+
+        assert_eq!(produced.lines.len(), 1, "soft-wrapped output is one logical line");
+        let text: String = produced.lines[0].text_chars().collect();
+        assert_eq!(text, "0123456789abcde");
+        assert_eq!(produced.emit_cols, 10, "emit width = the grid width at seal");
+        assert_eq!((produced.start_time_ms, produced.end_time_ms), (1000, 2500));
+
+        // And it matches what the Sealed block kept for rendering.
+        match stack.iter().next().unwrap() {
+            Block::Sealed { snapshot, .. } => assert_eq!(&produced.lines, snapshot),
+            other => panic!("expected Sealed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_finish_events_return_no_snapshot() {
+        // Only CommandFinished produces a snapshot; Preexec / Cwd / etc.
+        // return None so the pane has nothing to forward.
+        let mut term = TerminalState::new(5, 10);
+        let mut stack = fresh_stack();
+        assert!(
+            stack
+                .observe_lifecycle_event(
+                    &LifecycleEvent::Preexec { command: "x".into() },
+                    &mut term,
+                    1
+                )
+                .is_none(),
+            "Preexec produces no snapshot"
+        );
+        assert!(
+            stack
+                .observe_lifecycle_event(&LifecycleEvent::Cwd { cwd: "/tmp".into() }, &mut term, 2)
+                .is_none(),
+            "Cwd produces no snapshot"
+        );
     }
 
     /// The whole-Term-snapshot-then-reset model: after `CommandFinished`,

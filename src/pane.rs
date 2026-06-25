@@ -77,7 +77,11 @@ pub struct PaneView {
 /// the kernel takes to deliver EOF, which we don't want on window
 /// close. The thread will exit once its read returns 0.
 pub struct PaneSession {
-    pty: PtySession,
+    /// The live PTY. `None` for a **restored** pane (9F): a pane rebuilt
+    /// from persisted scrollback has no shell until "Restart" spawns one.
+    /// All PTY-touching paths (`write`, `resize`, `drain`) guard on this;
+    /// `drain` early-returns when it's `None`.
+    pty: Option<PtySession>,
     terminal: TerminalState,
     bytes_rx: mpsc::Receiver<Vec<u8>>,
     bytes_received: u64,
@@ -195,6 +199,33 @@ pub struct PaneSession {
     /// included. `None` before the first report (and when integration is
     /// absent), so completion falls back to the spawn snapshot.
     shell_var_names: Option<Vec<String>>,
+    /// Background scrollback writer (9D). `Some` when persistence is
+    /// available (managed spawn with an open `termica.sqlite`); each
+    /// sealed block's snapshot is forwarded to it for durable chunk
+    /// writing. `None` on the low-level `spawn` path and in degraded
+    /// mode. Dropped with the pane → its thread exits (RAII teardown).
+    chunk_writer: Option<crate::persist::writer::ChunkWriter>,
+    /// This session's ownership lock (9F). Held for the pane's lifetime
+    /// so no other Termica process adopts the session while it's live;
+    /// released on pane drop / process death. `Some` exactly when
+    /// `chunk_writer` is. See [spec/08 §"Concurrent processes"].
+    /// Held purely for its `Drop` (lock release); never read.
+    #[allow(dead_code)]
+    session_lock: Option<crate::persist::lock::SessionLock>,
+    /// This pane's durable `pane` row id (9D/9F), `Some` when
+    /// persistence is active. Saved into the layout blob so a relaunch
+    /// can reconnect the restored pane to its scrollback chunks (which
+    /// are keyed by this db id, not the ephemeral app `PaneId`). Also
+    /// the `session.id` we stamp `ended_at` on at teardown.
+    persist_pane_row: Option<i64>,
+    /// This pane's current `session` row id (its live PTY spawn), for
+    /// stamping `ended_at` on close/quit.
+    persist_session: Option<i64>,
+    /// Last cwd persisted to the durable `pane` row, so we only write on
+    /// an actual change. The pane forwards each change to the writer
+    /// thread (durable on change, never deferred to quit — the process can
+    /// vanish), so a restored pane resumes in the dir it was last in.
+    last_persisted_cwd: Option<std::path::PathBuf>,
     /// Which managed shell this pane runs. Drives shell-specific command
     /// submission framing ([`crate::submit_framing`]) — notably base64 for
     /// fish, whose non-interactive read-eval loop needs the whole command
@@ -286,7 +317,7 @@ impl PaneSession {
         });
 
         Ok(Self {
-            pty,
+            pty: Some(pty),
             terminal,
             bytes_rx: rx,
             bytes_received: 0,
@@ -318,11 +349,89 @@ impl PaneSession {
             completion_driver: None,
             last_git_branch: None,
             shell_var_names: None,
+            chunk_writer: None,
+            session_lock: None,
+            persist_pane_row: None,
+            persist_session: None,
+            last_persisted_cwd: None,
             shell: ShellSpec::Zsh,
             live_completion: None,
             live_completion_response: None,
             next_live_completion_id: 0,
         })
+    }
+
+    /// Construct a **restored** pane (9F): no live PTY, a `BlockStack`
+    /// pre-populated with the persisted scrollback, and the controller
+    /// already in `Dead`. The renderer draws the sealed blocks above an
+    /// empty live grid; "Restart" later spawns a real shell into it
+    /// (9F-restart). `pane_row_id` is the durable `pane` row this was
+    /// restored from, kept so a re-quit re-saves the layout.
+    pub fn restored(
+        rows: u16,
+        cols: u16,
+        blocks: BlockStack,
+        pane_id: u64,
+        pane_row_id: i64,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Self {
+        // No PTY: a disconnected byte channel + an immediately-returning
+        // reader thread stand in for the live reader so the struct's
+        // ownership shape is unchanged. `drain()` early-returns on a
+        // `None` pty, so this channel is never actually read.
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        drop(tx); // rx is now disconnected
+        let handle = thread::spawn(|| {});
+        // Start past bootstrap, then drive straight to `Dead`.
+        let mut controller = PromptController::new_no_bootstrap(0);
+        controller.observe_pty_exit(0);
+        let mut terminal = TerminalState::new(rows, cols);
+        // Recover the last-known cwd so the tab title reads the path.
+        if let Some(cwd) = cwd {
+            terminal.seed_cwd(cwd);
+        }
+        Self {
+            pty: None,
+            terminal,
+            bytes_rx: rx,
+            bytes_received: 0,
+            selection: None,
+            exited: false,
+            _reader: handle,
+            controller,
+            blocks,
+            session_id: String::new(),
+            frame: 0,
+            last_alt_screen: false,
+            last_transition_at: 0,
+            wrapper_dir: None,
+            pane_id,
+            recorder: None,
+            last_submitted: None,
+            pane_selection: None,
+            history: None,
+            capture_state: CaptureState::default(),
+            recall: RecallState::default(),
+            git_probe: GitProbe::spawn(),
+            git_context: None,
+            gh_probe: GhProbe::spawn(),
+            pr_context: None,
+            completion_driver: None,
+            last_git_branch: None,
+            shell_var_names: None,
+            chunk_writer: None,
+            session_lock: None,
+            persist_pane_row: Some(pane_row_id),
+            persist_session: None,
+            last_persisted_cwd: None,
+            // A restored pane is `Dead`: no live shell, so it never issues
+            // completion requests. Defaults mirror the bare `spawn` path;
+            // `Restart` rebuilds a real pane with the right shell.
+            shell: ShellSpec::Zsh,
+            live_completion: None,
+            live_completion_response: None,
+            next_live_completion_id: 0,
+        }
     }
 
     /// Spawn a managed shell session per spec/03: build a
@@ -338,6 +447,7 @@ impl PaneSession {
     /// reads `false` (i.e. the bootstrap has emitted
     /// `integration_ready` or `Bootstrapping` has timed out into
     /// `Degraded`).
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_managed(
         rows: u16,
         cols: u16,
@@ -346,6 +456,11 @@ impl PaneSession {
         pane_id: u64,
         recorder: Option<Arc<EventRecorder>>,
         history: Option<HistoryContext>,
+        persist: Option<crate::persist::store::Persistence>,
+        // `Some(db_pane_id)` to RESUME an existing pane (restart, 9F):
+        // the pane's durable identity is reused so its chunks accumulate
+        // across restarts. `None` begins a fresh pane.
+        resume_pane_row: Option<i64>,
     ) -> Result<Self, PtyError> {
         let session_id = new_session_id();
         let ManagedSpawn { argv, pty_bootstrap, env, wrapper_dir } =
@@ -356,10 +471,44 @@ impl PaneSession {
         }
         let program = argv[0].clone();
         let args: Vec<String> = argv[1..].to_vec();
+        // Capture the starting cwd as a string before `cwd` moves into
+        // the PtyConfig — the persisted `pane` row records it.
+        let cwd_str = cwd.as_ref().map(|p| p.display().to_string());
         let config = PtyConfig { program, args, env, cwd, rows, cols };
         let mut session = Self::spawn(rows, cols, &config, session_id, pane_id, recorder)?;
         session.shell = shell;
         session.history = history;
+        // Persistence (9D): allocate this session's pane + session rows
+        // and its on-disk scrollback directory, then spawn the background
+        // chunk writer. Best-effort — a failure here leaves the pane fully
+        // usable, just without durable scrollback (same posture as
+        // history). `None` persist (degraded mode / low-level spawn) skips
+        // it entirely.
+        if let Some(persist) = persist {
+            // Restart reuses the pane row (chunks accumulate); a fresh
+            // pane begins a new one.
+            let begun = match resume_pane_row {
+                Some(pane_row) => persist.resume_session(pane_row, wall_clock_ms()),
+                None => persist.begin_session(cwd_str.as_deref(), shell.name(), wall_clock_ms()),
+            };
+            match begun {
+                Ok(record) => {
+                    session.chunk_writer = Some(crate::persist::writer::ChunkWriter::spawn(
+                        persist.root().to_path_buf(),
+                        record.dir,
+                        persist.store_handle(),
+                        record.session,
+                        record.pane_row,
+                        record.start_line,
+                    ));
+                    // Hold the session-ownership lock for the pane's life.
+                    session.session_lock = Some(record.lock);
+                    session.persist_pane_row = Some(record.pane_row.0);
+                    session.persist_session = Some(record.session.0);
+                }
+                Err(e) => eprintln!("termica: persistence session start failed: {e}"),
+            }
+        }
         // Tie the wrapper TempDir's lifetime to the pane session.
         // When the pane closes, the directory under $TMPDIR is
         // recursively removed.
@@ -383,7 +532,9 @@ impl PaneSession {
             // hooks → emits integration_ready), then waits for normal
             // user input. The `PromptController` observes
             // `IntegrationReady` and transitions out of Bootstrapping.
-            session.pty.write(bootstrap.as_bytes())?;
+            if let Some(pty) = session.pty.as_mut() {
+                pty.write(bootstrap.as_bytes())?;
+            }
         }
 
         Ok(session)
@@ -400,6 +551,12 @@ impl PaneSession {
     /// exited panes to close on the next frame via
     /// [`Self::is_exited`].
     pub fn drain(&mut self) -> usize {
+        // A restored pane (9F) has no live PTY: nothing to drain, and we
+        // must NOT let the disconnected byte channel latch `exited` (which
+        // would auto-close the pane). It stays `Dead` until "Restart".
+        if self.pty.is_none() {
+            return 0;
+        }
         let mut consumed = 0usize;
         loop {
             match self.bytes_rx.try_recv() {
@@ -431,8 +588,10 @@ impl PaneSession {
         // reply is moot — drop it silently rather than surfacing an
         // error from this per-frame drain.
         let responses = self.terminal.drain_pty_responses();
-        if !responses.is_empty() {
-            let _ = self.pty.write(&responses);
+        if !responses.is_empty()
+            && let Some(pty) = self.pty.as_mut()
+        {
+            let _ = pty.write(&responses);
         }
 
         // Advance the per-pane frame counter. Used by the controller
@@ -600,7 +759,15 @@ impl PaneSession {
             // here is last frame's probe result — the state just before
             // the command ran, which is exactly what we want.
             self.blocks.set_current_git(self.git_context.clone());
-            self.blocks.observe_lifecycle_event(&event, &mut self.terminal, self.frame);
+            // A `CommandFinished` seals the running block; forward its
+            // snapshot (logical lines) to the background writer for
+            // durable chunk persistence (9D). Other events return `None`.
+            if let Some(sealed) =
+                self.blocks.observe_lifecycle_event(&event, &mut self.terminal, self.frame)
+                && let Some(writer) = &self.chunk_writer
+            {
+                writer.submit(sealed);
+            }
             self.controller.observe_event(event, self.frame);
             self.record_pending_transitions();
         }
@@ -613,6 +780,21 @@ impl PaneSession {
             self.controller.observe_alt_screen(alt, self.frame);
             self.last_alt_screen = alt;
             self.record_pending_transitions();
+        }
+
+        // Persist the pane's cwd to its durable `pane` row on every
+        // change, so a restored pane resumes in the dir it was LAST in.
+        // Durable ON CHANGE, never deferred to quit — the process can
+        // vanish (crash, hard reset), so there is no guaranteed teardown
+        // in which to flush. Routed through the writer thread (off the UI
+        // thread; it owns the store + durable pane row). cwd changes are
+        // user-paced and deduped here, so this is cheap.
+        let current_cwd = self.current_cwd();
+        if current_cwd != self.last_persisted_cwd {
+            self.last_persisted_cwd = current_cwd.clone();
+            if let Some(writer) = &self.chunk_writer {
+                writer.set_cwd(current_cwd.as_ref().map(|p| p.display().to_string()));
+            }
         }
 
         // 4G-async-context: drive the off-thread git probe. Request a
@@ -764,9 +946,45 @@ impl PaneSession {
     /// blank the live terminal grid. The shell process is
     /// untouched — it'll redraw its prompt on the next prompt
     /// cycle, or when the user presses Enter.
+    ///
+    /// This is an **explicit discard**: it also deletes the pane's
+    /// persisted transcript from disk (chunk files + index rows + chips)
+    /// so the cleared content does not reappear on the next launch. The
+    /// pane's command history (`runs`) is deliberately kept — clearing
+    /// the screen never wipes `~/.zsh_history`. The disk delete runs on
+    /// the writer thread, serialized behind any in-flight block writes.
     pub fn clear_scrollback(&mut self) {
         self.blocks.clear_sealed();
         self.terminal.clear_all();
+        if let Some(writer) = &self.chunk_writer {
+            writer.clear();
+        }
+    }
+
+    /// Explicit close: delete this pane's persisted **transcript** (chunk
+    /// files + index rows + chips) while keeping its command **history**
+    /// (`runs`) — the same discard model as Cmd+K. A closed pane is not
+    /// restored on the next launch, so leaving its chunks would only
+    /// orphan them until gc. Queues the discard on the writer, then drains
+    /// it so the delete lands before the pane is dropped.
+    pub fn discard_persisted_transcript(&mut self) {
+        if let Some(writer) = &self.chunk_writer {
+            writer.clear();
+        }
+        self.flush_chunk_writer();
+    }
+
+    /// Drain this pane's background scrollback writer before teardown:
+    /// block until every queued chunk write AND `Clear` delete (Cmd+K /
+    /// close) has been applied, then drop the writer. Without this, a
+    /// quit immediately after a Cmd+K can exit before the async delete
+    /// lands, resurrecting the "cleared" transcript on next launch. Takes
+    /// the writer, so it is idempotent (a second call is a no-op) and the
+    /// pane writes nothing further.
+    pub fn flush_chunk_writer(&mut self) {
+        if let Some(writer) = self.chunk_writer.take() {
+            writer.finish();
+        }
     }
 
     /// Stable per-pane id. Used to salt egui widget IDs that may
@@ -776,6 +994,40 @@ impl PaneSession {
     /// CLAUDE.md).
     pub fn pane_id(&self) -> u64 {
         self.pane_id
+    }
+
+    /// This pane's durable `pane` row id, if persistence is active.
+    /// Saved into the layout blob so a restored pane reconnects to its
+    /// scrollback chunks.
+    pub fn persist_pane_row(&self) -> Option<i64> {
+        self.persist_pane_row
+    }
+
+    /// This pane's live `session` row id, if persistence is active.
+    /// Stamped with `ended_at` when the pane closes or the app quits.
+    pub fn persist_session(&self) -> Option<i64> {
+        self.persist_session
+    }
+
+    /// Whether the pane is in `Dead` mode — its shell has exited or it
+    /// was restored without one. Drives the "Restart shell" affordance.
+    pub fn is_dead(&self) -> bool {
+        self.controller.mode() == crate::shell::PaneMode::Dead
+    }
+
+    /// Consume the pane and return just its `Sealed` scrollback blocks.
+    /// Restart (9F) uses this to carry a restored pane's transcript into
+    /// the freshly-spawned shell via [`Self::adopt_restored_scrollback`].
+    pub fn into_sealed_blocks(self) -> Vec<crate::block::Block> {
+        self.blocks.into_sealed()
+    }
+
+    /// Replace this (freshly-spawned) pane's empty block stack with one
+    /// carrying `sealed` scrollback under a fresh live `Prompt` tail, so
+    /// a restarted shell's output appends *below* the restored
+    /// transcript. Called right after `spawn_managed` during restart.
+    pub fn adopt_restored_scrollback(&mut self, sealed: Vec<crate::block::Block>) {
+        self.blocks = BlockStack::with_restored_sealed(sealed);
     }
 
     /// Mutable handle to the editor on the live `Prompt` block, if
@@ -958,7 +1210,13 @@ impl PaneSession {
         self.next_live_completion_id = self.next_live_completion_id.wrapping_add(1);
         let bytes = crate::submit_framing::completion_request_bytes_for(self.shell, id, &line);
         self.terminal.prime_echo_suppression(&bytes);
-        if self.pty.write(&bytes).is_err() {
+        // A restored / `Dead` pane has no live PTY; it is never in
+        // `ShellPromptEditor` mode either, so `live_completion_capable`
+        // already excludes it — guard anyway and fall back to locals.
+        let Some(pty) = self.pty.as_mut() else {
+            return;
+        };
+        if pty.write(&bytes).is_err() {
             return;
         }
         self.live_completion = Some(LiveCompletion { id, sent_ms: wall_clock_ms(), tool });
@@ -1113,7 +1371,9 @@ impl PaneSession {
         // loop receives a multi-line command intact ([`crate::submit_framing`]).
         let bytes = crate::submit_framing::submission_bytes(&to_send, self.shell);
         self.terminal.prime_echo_suppression(&bytes);
-        self.pty.write(&bytes)?;
+        if let Some(pty) = self.pty.as_mut() {
+            pty.write(&bytes)?;
+        }
         Ok(())
     }
 
@@ -1146,7 +1406,10 @@ impl PaneSession {
         if self.controller.is_bootstrapping() {
             return Ok(());
         }
-        self.pty.write(bytes)
+        match self.pty.as_mut() {
+            Some(pty) => pty.write(bytes),
+            None => Ok(()), // restored pane, no shell to write to
+        }
     }
 
     /// Resize the PTY and adjust the terminal's grid. Both must
@@ -1155,7 +1418,11 @@ impl PaneSession {
     /// kernel-side PTY size is updated so terminal-mode programs
     /// (vim, less, ...) see the new size on their next `read`.
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), PtyError> {
-        self.pty.resize(rows, cols)?;
+        // Resize the grid regardless (sealed blocks reflow to the current
+        // width); only push SIGWINCH when there's a live PTY.
+        if let Some(pty) = self.pty.as_mut() {
+            pty.resize(rows, cols)?;
+        }
         self.terminal.resize(rows, cols);
         Ok(())
     }
@@ -1174,7 +1441,8 @@ impl PaneSession {
     /// ([`crate::pty::PtySession::env_var_names`], inherited + built-ins +
     /// `TERMICA_*`).
     pub fn env_var_names(&self) -> &[String] {
-        effective_var_names(self.shell_var_names.as_deref(), self.pty.env_var_names())
+        let spawn_names = self.pty.as_ref().map(|p| p.env_var_names()).unwrap_or(&[]);
+        effective_var_names(self.shell_var_names.as_deref(), spawn_names)
     }
 
     /// The shell this pane is running. Drives shell-specific completion
@@ -1780,6 +2048,30 @@ mod tests {
     // every drained lifecycle event must reach it. Unit-level state
     // machine coverage lives in `src/block.rs`; these tests prove
     // the wiring at the `PaneSession::drain` boundary.
+
+    #[test]
+    fn restored_pane_is_dead_with_no_pty_and_seeded_cwd() {
+        use crate::block::BlockStack;
+        let session = PaneSession::restored(
+            24,
+            80,
+            BlockStack::new(0),
+            7,
+            42,
+            Some(std::path::PathBuf::from("/work/proj")),
+        );
+        // Dead, not exited (so the app won't auto-close it), no PTY.
+        assert_eq!(session.controller.mode(), crate::shell::PaneMode::Dead);
+        assert!(!session.is_exited(), "a restored pane must not auto-close");
+        assert!(session.pty.is_none());
+        // cwd seeded -> tab title will show the path, not `pane N`.
+        assert_eq!(session.terminal().cwd(), Some(std::path::Path::new("/work/proj")));
+        assert_eq!(session.persist_pane_row(), Some(42));
+        // drain is inert (no panic, returns 0, stays not-exited).
+        let mut session = session;
+        assert_eq!(session.drain(), 0);
+        assert!(!session.is_exited());
+    }
 
     #[test]
     fn fresh_pane_has_one_prompt_block() {
