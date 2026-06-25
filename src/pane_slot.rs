@@ -269,6 +269,10 @@ pub struct PaneUiState {
     /// because the chrome lives outside the painter's view of any
     /// individual widget.
     pub(crate) chrome_opacity: f32,
+    /// The user dismissed the "Tab completion is limited" notice (old bash
+    /// with no bash-completion) for this pane. Once dismissed it stays
+    /// dismissed for the pane's life; a fresh pane shows it again.
+    pub(crate) completion_notice_dismissed: bool,
 }
 
 /// One pane's full state: the OS-resource [`PaneSession`] (PTY +
