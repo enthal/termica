@@ -66,6 +66,10 @@ pub struct PaneView {
     /// renderer should suppress the cell grid and show a placeholder
     /// instead.
     pub is_bootstrapping: bool,
+    /// `true` when integration is confirmed but the shell reported that live
+    /// Tab-completion is degraded (old bash with no bash-completion). Drives
+    /// the one-time dismissible UI notice; the terminal is fully functional.
+    pub completion_degraded: bool,
 }
 
 /// Live session: one PTY + one [`TerminalState`] + the reader thread
@@ -905,6 +909,7 @@ impl PaneSession {
             screen_text: self.terminal.screen_text(),
             mode: Some(mode),
             is_bootstrapping: mode == PaneMode::Bootstrapping,
+            completion_degraded: self.controller.completion_degraded(),
         }
     }
 

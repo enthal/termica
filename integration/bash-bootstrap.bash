@@ -103,6 +103,45 @@ termica_emit_vars() {
 # into `__termica_bc_rows` (values only, deduped, stable order). Best-effort:
 # any failure leaves the rows empty and the popup falls back to locals.
 __termica_bc_rows=()
+# Split $1 into readline-style completion words, into the global array
+# `__termica_bc_words`: breaks on whitespace AND on each non-whitespace
+# `$COMP_WORDBREAKS` char (`=`, `:`, `@`, …), with the break char emitted as
+# its own token — exactly how readline tokenises a line for completion. This
+# is what lets `export FOO=ba`<Tab> complete `ba` (not `FOO=ba`), and what
+# bash-completion's own `_get_comp_words_by_ref -n :` re-merges from for
+# `scp host:pa`. Quote / backslash handling is a later refinement; the
+# unquoted common case is what 99% of completions need. A fixed global array
+# (not a `local -n` nameref) keeps this working on bash 4.0–4.2, which have
+# bash-completion but not namerefs (4.3+).
+__termica_bc_words=()
+__termica_bc_split_words() {
+    __termica_bc_words=()
+    # `s` is assigned in its OWN `local` first: referencing `${#s}` in the same
+    # `local` that assigns `s` reads the OUTER scope's `s` (a bash gotcha), so
+    # `n` would be 0 and the loop never runs.
+    local s="$1"
+    local i=0 n=${#s} ch cur="" breaks="$COMP_WORDBREAKS"
+    while ((i < n)); do
+        ch="${s:i:1}"
+        if [[ "$ch" == [[:space:]] ]]; then
+            [[ -n "$cur" ]] && {
+                __termica_bc_words+=("$cur")
+                cur=""
+            }
+        elif [[ "$breaks" == *"$ch"* ]]; then
+            [[ -n "$cur" ]] && {
+                __termica_bc_words+=("$cur")
+                cur=""
+            }
+            __termica_bc_words+=("$ch")
+        else
+            cur+="$ch"
+        fi
+        ((i++))
+    done
+    [[ -n "$cur" ]] && __termica_bc_words+=("$cur")
+}
+
 __termica_bc_capture() {
     __termica_bc_rows=()
     local line="$1"
@@ -114,11 +153,14 @@ __termica_bc_capture() {
     local -a COMP_WORDS COMPREPLY
     COMP_LINE="$line"
     COMP_POINT=${#line}
-    read -ra COMP_WORDS <<< "$line"
+    __termica_bc_split_words "$line"
+    COMP_WORDS=("${__termica_bc_words[@]}")
     # A trailing space (or empty line) means a fresh, empty word at the cursor.
     [[ -z "$line" || "$line" == *[[:space:]] ]] && COMP_WORDS+=("")
     COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 ))
     (( COMP_CWORD < 0 )) && COMP_CWORD=0
+    # The command is the first whitespace-delimited word; with the readline
+    # split that's still `COMP_WORDS[0]` for an ordinary command line.
     cmd="${COMP_WORDS[0]}"
     [[ -z "$cmd" ]] && return 0
     # Trigger bash-completion's lazy loader for this command, if loaded.
