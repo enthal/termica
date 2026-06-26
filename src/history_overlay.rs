@@ -104,12 +104,7 @@ impl HistoryOverlay {
         let entries = match self.scope {
             OverlayScope::Global => store.recent(&Scope::Global, 2000).ok()?,
             OverlayScope::Pane => {
-                let scope = match db_pane_id {
-                    Some(id) => Scope::DurablePane { db_pane_id: id },
-                    None => {
-                        Scope::Pane { pane_id: pane_id as i64, app_run_id: &history.app_run_id }
-                    }
-                };
+                let scope = Scope::pane_recall(db_pane_id, pane_id as i64, &history.app_run_id);
                 store.recent(&scope, 2000).ok()?
             }
         };
