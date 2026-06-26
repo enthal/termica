@@ -191,7 +191,7 @@ Per-block affordances:
 
   When the right-click lands on one of the block's header chips, a **Copy `<chip>`** item plus a divider are *prepended* before those three, where `<chip>` names the chip under the pointer (`path`, `git branch`, `git sync`, `git changes`, `exit code`, `duration`) and the item copies that chip's displayed text. This is the per-block counterpart to the Phase 5 status-header "copy branch / copy path" click actions ([spec/10](10-roadmap.md)).
 
-  A `Running` block — a command still executing, whose output is streaming in the live grid and is not yet frozen into a snapshot — gets a reduced menu: **Copy command** only, plus the same prepended **Copy `<chip>`** when a header chip is right-clicked. Copy block / output are `Sealed`-only, because there is no frozen output to copy until the command finishes.
+  A `Running` block — a command still executing, whose output is streaming in the live grid and is not yet frozen into a snapshot — copies a **best-effort snapshot of the live grid taken at click time** (it may be mid-stream). When the grid shows normal scrolling output, the menu is the same **Copy block / Copy command / Copy output** as a sealed block, reflecting the bytes printed so far. When the running command is in **alternate screen** (vim / htop / less / fzf — a full-screen TUI rather than a transcript), the menu instead offers **Copy command** and **Copy screen** (the visible grid) and omits **Copy block**, since there is no meaningful command-plus-output block. The prepended **Copy `<chip>`** behaves the same in both cases.
 - Failed (non-zero exit) blocks get a subtle red gutter mark.
 - Blocks are non-modal — scrolling moves them as a stack, but each is independently selectable / collapsible.
 

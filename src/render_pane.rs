@@ -1927,14 +1927,17 @@ pub fn render_pane(
                                 });
 
                                 // Right-click context menu (spec/07
-                                // §"Per-block affordances"): a running command
-                                // has no frozen output, so the menu offers only
-                                // Copy command — plus a "Copy <chip>" item when
-                                // the click landed on a header chip. The chip
-                                // strip is painted hover-only, so re-interact
-                                // its rect for the secondary click; the command
-                                // label already senses clicks. Same latch-at-
-                                // open-time approach as sealed blocks.
+                                // §"Per-block affordances"): a running command's
+                                // output isn't sealed yet, so we snapshot the
+                                // live grid at click time (best-effort — it may
+                                // be mid-stream). In alt-screen (vim / htop) the
+                                // grid is a TUI, so the menu shows Copy screen
+                                // and omits Copy block. Plus a "Copy <chip>"
+                                // item when the click landed on a header chip.
+                                // The chip strip is painted hover-only, so
+                                // re-interact its rect for the secondary click;
+                                // the command label already senses clicks. Same
+                                // latch-at-open-time approach as sealed blocks.
                                 let menu_chip_id = ui.id().with(("running_ctx_chip", *id));
                                 let header_click = hdr.response.as_ref().map(|r| {
                                     ui.interact(
@@ -1961,8 +1964,14 @@ pub fn render_pane(
                                             d.get_temp::<Option<(String, String)>>(menu_chip_id)
                                         })
                                         .flatten();
+                                    // Snapshot the live output lazily — only
+                                    // while the menu is actually open.
+                                    let terminal = slot.session.terminal();
+                                    let output = terminal.snapshot_lines_all();
                                     let entries = crate::block_menu::running_context_menu_entries(
                                         command,
+                                        &output,
+                                        terminal.is_alternate_screen(),
                                         chip.as_ref().map(|(n, v)| (n.as_str(), v.as_str())),
                                     );
                                     crate::block_menu::show_block_context_menu(menu_ui, &entries);

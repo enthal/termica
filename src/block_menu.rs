@@ -94,21 +94,49 @@ pub fn block_context_menu_entries(
     entries
 }
 
-/// Build the context-menu entries for a *running* block. A running command's
-/// output is still streaming in the live grid (not frozen into a snapshot), so
-/// the menu offers only **Copy command** — plus a prepended `Copy <chip>` +
-/// separator when the right-click landed on a header chip. Copy block / output
-/// are sealed-only (see [`block_context_menu_entries`]).
+/// Build the context-menu entries for a *running* block. The command is still
+/// executing, so `output` is a best-effort snapshot of the live grid taken at
+/// click time (not a frozen sealed snapshot). A prepended `Copy <chip>` +
+/// separator is added when the right-click landed on a header chip.
+///
+/// - **Normal output** (`alt_screen == false`): the usual **Copy block** /
+///   **Copy command** / **Copy output**, where block / output reflect the
+///   bytes printed so far.
+/// - **Alternate screen** (`alt_screen == true`, e.g. vim / htop / less): the
+///   grid is a full-screen TUI, not a command transcript, so there is no
+///   meaningful "block". The menu offers **Copy command** and **Copy screen**
+///   (the visible grid) — no Copy block.
 pub fn running_context_menu_entries(
     command: &str,
+    output: &[StyledLine],
+    alt_screen: bool,
     chip: Option<(&str, &str)>,
 ) -> Vec<BlockMenuEntry> {
     let mut entries = Vec::new();
     prepend_chip(&mut entries, chip);
-    entries.push(BlockMenuEntry::Action {
-        label: "Copy command".to_string(),
-        clipboard: command.to_string(),
-    });
+    if alt_screen {
+        entries.push(BlockMenuEntry::Action {
+            label: "Copy command".to_string(),
+            clipboard: command.to_string(),
+        });
+        entries.push(BlockMenuEntry::Action {
+            label: "Copy screen".to_string(),
+            clipboard: block_output_text(output),
+        });
+    } else {
+        entries.push(BlockMenuEntry::Action {
+            label: "Copy block".to_string(),
+            clipboard: block_full_text(command, output),
+        });
+        entries.push(BlockMenuEntry::Action {
+            label: "Copy command".to_string(),
+            clipboard: command.to_string(),
+        });
+        entries.push(BlockMenuEntry::Action {
+            label: "Copy output".to_string(),
+            clipboard: block_output_text(output),
+        });
+    }
     entries
 }
 
@@ -241,33 +269,49 @@ mod tests {
         assert_eq!(clip(&entries, "Copy git branch"), "feat/x");
     }
 
-    #[test]
-    fn running_entries_offer_only_copy_command() {
-        // A running command has no frozen output, so the menu is just
-        // Copy command (no block / output items).
-        let entries = running_context_menu_entries("make build", None);
-        let labels: Vec<&str> = entries
+    /// Collect entry labels (with `<sep>` for dividers) for order assertions.
+    fn labels(entries: &[BlockMenuEntry]) -> Vec<&str> {
+        entries
             .iter()
             .map(|e| match e {
                 BlockMenuEntry::Action { label, .. } => label.as_str(),
                 BlockMenuEntry::Separator => "<sep>",
             })
-            .collect();
-        assert_eq!(labels, ["Copy command"]);
-        assert_eq!(clip(&entries, "Copy command"), "make build");
+            .collect()
     }
 
     #[test]
-    fn running_entries_prepend_copy_chip_then_a_separator() {
-        let entries = running_context_menu_entries("make build", Some(("git branch", "feat/y")));
-        let labels: Vec<&str> = entries
-            .iter()
-            .map(|e| match e {
-                BlockMenuEntry::Action { label, .. } => label.as_str(),
-                BlockMenuEntry::Separator => "<sep>",
-            })
-            .collect();
-        assert_eq!(labels, ["Copy git branch", "<sep>", "Copy command"]);
-        assert_eq!(clip(&entries, "Copy git branch"), "feat/y");
+    fn running_normal_output_offers_block_command_output_from_the_live_snapshot() {
+        let out = snap(&["building...", "linking"]);
+        let entries = running_context_menu_entries("make build", &out, false, None);
+        assert_eq!(labels(&entries), ["Copy block", "Copy command", "Copy output"]);
+        assert_eq!(clip(&entries, "Copy block"), "make build\nbuilding...\nlinking");
+        assert_eq!(clip(&entries, "Copy command"), "make build");
+        assert_eq!(clip(&entries, "Copy output"), "building...\nlinking");
+    }
+
+    #[test]
+    fn running_alt_screen_offers_copy_command_and_copy_screen_no_block() {
+        // vim / htop: the grid is a TUI, not a transcript — "Copy screen",
+        // and no "Copy block".
+        let screen = snap(&["~  vim buffer", "~"]);
+        let entries = running_context_menu_entries("vim notes.md", &screen, true, None);
+        assert_eq!(labels(&entries), ["Copy command", "Copy screen"]);
+        assert!(!labels(&entries).contains(&"Copy block"), "alt-screen has no Copy block");
+        assert_eq!(clip(&entries, "Copy command"), "vim notes.md");
+        assert_eq!(clip(&entries, "Copy screen"), "~  vim buffer\n~");
+    }
+
+    #[test]
+    fn running_prepends_copy_chip_then_a_separator_in_both_modes() {
+        let out = snap(&["x"]);
+        let normal = running_context_menu_entries("c", &out, false, Some(("git branch", "feat/y")));
+        assert_eq!(
+            labels(&normal),
+            ["Copy git branch", "<sep>", "Copy block", "Copy command", "Copy output"]
+        );
+        let alt = running_context_menu_entries("c", &out, true, Some(("git branch", "feat/y")));
+        assert_eq!(labels(&alt), ["Copy git branch", "<sep>", "Copy command", "Copy screen"]);
+        assert_eq!(clip(&alt, "Copy git branch"), "feat/y");
     }
 }
