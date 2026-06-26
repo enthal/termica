@@ -1105,10 +1105,7 @@ impl PaneSession {
                     Ok(s) => s,
                     Err(_) => return Vec::new(),
                 };
-                let scope = match db_pane_id {
-                    Some(id) => Scope::DurablePane { db_pane_id: id },
-                    None => Scope::Pane { pane_id: pane_id as i64, app_run_id: &app_run_id },
-                };
+                let scope = Scope::pane_recall(db_pane_id, pane_id as i64, &app_run_id);
                 store
                     .recent(&scope, 500)
                     .map(|rows| rows.into_iter().map(|r| r.text).collect())

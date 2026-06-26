@@ -60,6 +60,23 @@ pub enum Scope<'a> {
     },
 }
 
+impl<'a> Scope<'a> {
+    /// Build the "this pane" recall scope from a pane's identity. The
+    /// durable `pane` row wins whenever the pane has one, so recall
+    /// survives restart; a pane without persistence falls back to the
+    /// ephemeral `(pane_id, app_run_id)` slice.
+    ///
+    /// This is the single place that fallback rule lives — both `↑`/`↓`
+    /// recall and the `^R` "this pane" scope construct through it, so the
+    /// two can't drift.
+    pub fn pane_recall(db_pane_id: Option<i64>, pane_id: i64, app_run_id: &'a str) -> Self {
+        match db_pane_id {
+            Some(db_pane_id) => Scope::DurablePane { db_pane_id },
+            None => Scope::Pane { pane_id, app_run_id },
+        }
+    }
+}
+
 /// History store handle. Wraps a `rusqlite::Connection` so the
 /// rest of the codebase doesn't need to know we're using SQLite
 /// specifically. Cheaply created via [`Self::open`] (file-backed)
@@ -1080,6 +1097,25 @@ mod tests {
             vec!["after restart", "before restart"],
             "durable-pane recall spans restarts, newest first, isolated per pane"
         );
+    }
+
+    #[test]
+    fn pane_recall_prefers_the_durable_row_and_falls_back_to_the_ephemeral_slice() {
+        // The single source of truth for the "durable wins, ephemeral is
+        // fallback" rule that both `↑`/`↓` recall and the Cmd+R "this pane"
+        // scope go through. A persisted pane (Some db_pane_id) recalls by
+        // its durable row; a degraded pane (None) by (pane_id, app_run_id).
+        match Scope::pane_recall(Some(7), 11, "run-A") {
+            Scope::DurablePane { db_pane_id } => assert_eq!(db_pane_id, 7),
+            other => panic!("Some(db_pane_id) must be durable, got {other:?}"),
+        }
+        match Scope::pane_recall(None, 11, "run-A") {
+            Scope::Pane { pane_id, app_run_id } => {
+                assert_eq!(pane_id, 11);
+                assert_eq!(app_run_id, "run-A");
+            }
+            other => panic!("None must fall back to the ephemeral pane, got {other:?}"),
+        }
     }
 
     #[test]
