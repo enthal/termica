@@ -593,9 +593,11 @@ fn close_all_popups(slot: &mut PaneSlot) {
 fn open_history_overlay(slot: &mut PaneSlot) {
     let prefill = slot.session.editor_mut().map(|e| e.text().to_string()).unwrap_or_default();
     let Some(history) = slot.session.history_ctx().cloned() else { return };
-    let Some(mut overlay) =
-        crate::history_overlay::HistoryOverlay::open(&history, slot.session.pane_id())
-    else {
+    let Some(mut overlay) = crate::history_overlay::HistoryOverlay::open(
+        &history,
+        slot.session.pane_id(),
+        slot.session.persist_pane_row(),
+    ) else {
         return;
     };
     if !prefill.is_empty() {
@@ -3958,11 +3960,12 @@ pub fn render_pane(
                 slot.ui.needs_focus = true;
             }
             OverlayAction::ToggleScope => {
+                let db_pane_id = slot.session.persist_pane_row();
                 if let Some(history) = slot.session.history_ctx().cloned()
                     && let Some(overlay) = slot.ui.history_overlay.as_mut()
                 {
                     overlay.toggle_scope();
-                    overlay.refresh_entries(&history, slot.session.pane_id());
+                    overlay.refresh_entries(&history, slot.session.pane_id(), db_pane_id);
                     let cwd = slot.session.terminal().cwd().map(|p| p.display().to_string());
                     overlay.rerank(cwd.as_deref());
                 }

@@ -106,9 +106,11 @@ CREATE TABLE session (
 -- `history_entry` (UI quick-walk tail). The split added churn — the
 -- same row needed two writes and the UI had to UNION across them —
 -- without buying anything: a single `runs` table with the right
--- indexes serves both surfaces. `(pane_id, app_run_id)` is the
--- pane-scope key; the `app_run_id` UUID distinguishes a fresh pane
--- from a closed pane that happens to reuse the same numeric id.
+-- indexes serves both surfaces. For a persisted pane, `db_pane_id` is
+-- the pane-scope key (it survives restart, §schema v5); the legacy
+-- `(pane_id, app_run_id)` pair is the degraded-mode fallback, where the
+-- `app_run_id` UUID distinguishes a fresh pane from a closed pane that
+-- happens to reuse the same ephemeral numeric id.
 CREATE TABLE runs (
     id            INTEGER PRIMARY KEY,
     text          TEXT NOT NULL,
@@ -117,7 +119,8 @@ CREATE TABLE runs (
     exit_code     INTEGER,
     cwd           TEXT,
     app_run_id    TEXT,                      -- UUIDv4, one per Termica process lifetime
-    pane_id       INTEGER,                   -- not yet a FK; becomes one when `pane` lands
+    pane_id       INTEGER,                   -- EPHEMERAL app PaneId (in-memory counter, reused)
+    db_pane_id    INTEGER,                   -- DURABLE pane row (v5); pane-scope recall key, survives restart. NULL pre-v5 / no persistence
     source        TEXT NOT NULL              -- 'termica' | 'zsh' | 'bash' | 'fish'
 );
 

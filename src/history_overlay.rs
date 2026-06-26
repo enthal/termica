@@ -20,7 +20,9 @@ use crate::pane_slot::PaneSlot;
 pub enum OverlayScope {
     /// Every row. Default.
     Global,
-    /// `(pane_id, app_run_id)` slice — same shape as `↑` / `↓` recall.
+    /// This pane's slice — same shape as `↑` / `↓` recall. A persisted
+    /// pane uses its durable `pane` row (survives restart); a degraded
+    /// pane falls back to the ephemeral `(pane_id, app_run_id)` slice.
     Pane,
 }
 
@@ -70,7 +72,7 @@ impl HistoryOverlay {
     /// fetched candidate set. Returns `None` if the history store
     /// can't be locked or the query fails — the overlay will not
     /// open in that case and the caller should keep the editor as-is.
-    pub fn open(history: &HistoryContext, pane_id: u64) -> Option<Self> {
+    pub fn open(history: &HistoryContext, pane_id: u64, db_pane_id: Option<i64>) -> Option<Self> {
         let mut overlay = Self {
             query: String::new(),
             scope: OverlayScope::Global,
@@ -78,7 +80,7 @@ impl HistoryOverlay {
             cached_entries: Vec::new(),
             ranked: Vec::new(),
         };
-        overlay.refresh_entries(history, pane_id)?;
+        overlay.refresh_entries(history, pane_id, db_pane_id)?;
         overlay.rerank(None);
         Some(overlay)
     }
@@ -86,16 +88,30 @@ impl HistoryOverlay {
     /// Refresh `cached_entries` from the store under the current
     /// scope. Called on open and after a scope toggle. Returns
     /// `Some(())` on success; `None` if the lock or query failed.
-    pub fn refresh_entries(&mut self, history: &HistoryContext, pane_id: u64) -> Option<()> {
+    ///
+    /// `db_pane_id` is the pane's durable `pane` row when it has one.
+    /// In `Pane` scope it selects the durable slice (`DurablePane`) so
+    /// "this pane" survives a restart — same as `↑` recall. A pane
+    /// without persistence (`None`) falls back to the ephemeral
+    /// `(pane_id, app_run_id)` slice.
+    pub fn refresh_entries(
+        &mut self,
+        history: &HistoryContext,
+        pane_id: u64,
+        db_pane_id: Option<i64>,
+    ) -> Option<()> {
         let store = history.store.lock().ok()?;
         let entries = match self.scope {
             OverlayScope::Global => store.recent(&Scope::Global, 2000).ok()?,
-            OverlayScope::Pane => store
-                .recent(
-                    &Scope::Pane { pane_id: pane_id as i64, app_run_id: &history.app_run_id },
-                    2000,
-                )
-                .ok()?,
+            OverlayScope::Pane => {
+                let scope = match db_pane_id {
+                    Some(id) => Scope::DurablePane { db_pane_id: id },
+                    None => {
+                        Scope::Pane { pane_id: pane_id as i64, app_run_id: &history.app_run_id }
+                    }
+                };
+                store.recent(&scope, 2000).ok()?
+            }
         };
         self.cached_entries = dedupe_by_text(entries);
         Some(())
@@ -707,6 +723,49 @@ mod tests {
         assert_eq!(o.scope, OverlayScope::Pane);
         o.toggle_scope();
         assert_eq!(o.scope, OverlayScope::Global);
+    }
+
+    fn ctx_with(store: crate::history::HistoryStore, app_run_id: &str) -> HistoryContext {
+        use std::sync::{Arc, Mutex};
+        HistoryContext { store: Arc::new(Mutex::new(store)), app_run_id: app_run_id.to_string() }
+    }
+
+    #[test]
+    fn pane_scope_uses_durable_pane_id_so_recall_survives_restart() {
+        // Prior session recorded two commands tagged with this pane's
+        // durable row (7), under an OLD app_run_id. After a restart the
+        // process carries a NEW app_run_id, so the ephemeral
+        // `(pane_id, app_run_id)` scope would find nothing — only the
+        // durable scope spans the restart, exactly like `↑` recall.
+        let store = crate::history::HistoryStore::in_memory().unwrap();
+        store.record_submit_with_pane("echo one", None, 99, "OLD-RUN", 100, Some(7)).unwrap();
+        store.record_submit_with_pane("echo two", None, 99, "OLD-RUN", 200, Some(7)).unwrap();
+        let history = ctx_with(store, "NEW-RUN");
+
+        let mut o = overlay_with(vec![]);
+        o.toggle_scope(); // -> Pane
+        o.refresh_entries(&history, 99, Some(7)).unwrap();
+
+        let texts: Vec<&str> = o.cached_entries.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, vec!["echo two", "echo one"]);
+    }
+
+    #[test]
+    fn pane_scope_without_durable_id_falls_back_to_ephemeral_app_run() {
+        // Degraded pane (no persistence): "this pane" is the
+        // `(pane_id, app_run_id)` slice. A row from a different
+        // app_run_id must NOT leak in.
+        let store = crate::history::HistoryStore::in_memory().unwrap();
+        store.record_submit_with_pane("echo cur", None, 5, "RUN-A", 100, None).unwrap();
+        store.record_submit_with_pane("echo other", None, 5, "RUN-B", 200, None).unwrap();
+        let history = ctx_with(store, "RUN-A");
+
+        let mut o = overlay_with(vec![]);
+        o.toggle_scope(); // -> Pane
+        o.refresh_entries(&history, 5, None).unwrap();
+
+        let texts: Vec<&str> = o.cached_entries.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, vec!["echo cur"]);
     }
 
     // ---- format_age ---------------------------------------------------
