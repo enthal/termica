@@ -1806,6 +1806,66 @@ pub fn render_pane(
                                             STICKY_MAX_CMD_LINES,
                                         ),
                                 });
+                                // Right-click context menu (spec/07
+                                // §"Per-block affordances"): Copy block /
+                                // command / output, plus a "Copy <chip>"
+                                // item when the click landed on one of this
+                                // block's header chips. The chip strip is
+                                // painted hover-only, so re-interact its rect
+                                // for the secondary click; the command and
+                                // snapshot responses already sense clicks.
+                                let menu_chip_id = ui.id().with(("block_ctx_chip", *id));
+                                let header_click =
+                                    sealed_render.header_response.as_ref().map(|r| {
+                                        ui.interact(
+                                            r.rect,
+                                            ui.id().with(("block_ctx_header", *id)),
+                                            egui::Sense::click(),
+                                        )
+                                    });
+                                // Latch which chip (if any) sat under the
+                                // secondary click. egui keeps the menu open
+                                // across frames, so freeze the choice at open
+                                // time rather than re-reading the moving
+                                // pointer — which would drop the chip item the
+                                // instant the cursor entered the menu.
+                                for resp in [
+                                    header_click.as_ref(),
+                                    sealed_render.command.as_ref(),
+                                    Some(&sealed_render.snapshot),
+                                ]
+                                .into_iter()
+                                .flatten()
+                                {
+                                    if resp.secondary_clicked() {
+                                        let chip = resp
+                                            .interact_pointer_pos()
+                                            .or_else(|| resp.hover_pos())
+                                            .and_then(|p| render::chip_at(p, &sealed_render.chips))
+                                            .map(|c| (c.name.to_string(), c.value.clone()));
+                                        ui.data_mut(|d| d.insert_temp(menu_chip_id, chip));
+                                    }
+                                }
+                                let render_menu = |menu_ui: &mut egui::Ui| {
+                                    let chip: Option<(String, String)> = menu_ui
+                                        .data(|d| {
+                                            d.get_temp::<Option<(String, String)>>(menu_chip_id)
+                                        })
+                                        .flatten();
+                                    let entries = crate::block_menu::block_context_menu_entries(
+                                        command,
+                                        snapshot,
+                                        chip.as_ref().map(|(n, v)| (n.as_str(), v.as_str())),
+                                    );
+                                    crate::block_menu::show_block_context_menu(menu_ui, &entries);
+                                };
+                                if let Some(h) = &header_click {
+                                    h.context_menu(|menu_ui| render_menu(menu_ui));
+                                }
+                                if let Some(c) = &sealed_render.command {
+                                    c.context_menu(|menu_ui| render_menu(menu_ui));
+                                }
+                                sealed_render.snapshot.context_menu(|menu_ui| render_menu(menu_ui));
                                 sealed_block_renders.push((*id, sealed_render));
                                 // Block separator — picked via
                                 // `cargo run --example pick_block_separator`
@@ -1843,7 +1903,8 @@ pub fn render_pane(
                                         ..Default::default()
                                     },
                                 );
-                                let chip_h = hdr.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
+                                let chip_h =
+                                    hdr.response.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
                                 let cmd_resp = (!command.is_empty())
                                     .then(|| render::paint_command_label(ui, command));
                                 let cmd_lines = if command.is_empty() {
@@ -1864,6 +1925,54 @@ pub fn render_pane(
                                             STICKY_MAX_CMD_LINES,
                                         ),
                                 });
+
+                                // Right-click context menu (spec/07
+                                // §"Per-block affordances"): a running command
+                                // has no frozen output, so the menu offers only
+                                // Copy command — plus a "Copy <chip>" item when
+                                // the click landed on a header chip. The chip
+                                // strip is painted hover-only, so re-interact
+                                // its rect for the secondary click; the command
+                                // label already senses clicks. Same latch-at-
+                                // open-time approach as sealed blocks.
+                                let menu_chip_id = ui.id().with(("running_ctx_chip", *id));
+                                let header_click = hdr.response.as_ref().map(|r| {
+                                    ui.interact(
+                                        r.rect,
+                                        ui.id().with(("running_ctx_header", *id)),
+                                        egui::Sense::click(),
+                                    )
+                                });
+                                for resp in
+                                    [header_click.as_ref(), cmd_resp.as_ref()].into_iter().flatten()
+                                {
+                                    if resp.secondary_clicked() {
+                                        let chip = resp
+                                            .interact_pointer_pos()
+                                            .or_else(|| resp.hover_pos())
+                                            .and_then(|p| render::chip_at(p, &hdr.chips))
+                                            .map(|c| (c.name.to_string(), c.value.clone()));
+                                        ui.data_mut(|d| d.insert_temp(menu_chip_id, chip));
+                                    }
+                                }
+                                let render_menu = |menu_ui: &mut egui::Ui| {
+                                    let chip: Option<(String, String)> = menu_ui
+                                        .data(|d| {
+                                            d.get_temp::<Option<(String, String)>>(menu_chip_id)
+                                        })
+                                        .flatten();
+                                    let entries = crate::block_menu::running_context_menu_entries(
+                                        command,
+                                        chip.as_ref().map(|(n, v)| (n.as_str(), v.as_str())),
+                                    );
+                                    crate::block_menu::show_block_context_menu(menu_ui, &entries);
+                                };
+                                if let Some(h) = &header_click {
+                                    h.context_menu(|menu_ui| render_menu(menu_ui));
+                                }
+                                if let Some(c) = &cmd_resp {
+                                    c.context_menu(|menu_ui| render_menu(menu_ui));
+                                }
                             }
                             crate::block::Block::Prompt { .. } => {
                                 // The `Prompt` block's chrome lives in

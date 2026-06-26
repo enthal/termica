@@ -190,7 +190,8 @@ Shipped under the Phase 4J slices ([#91](https://github.com/enthal/termica/pull/
 - ✅ `CommandRun` lifecycle wiring: open on submit / `Preexec`; seal on `CommandFinished`.
 - ✅ Transcript renders command blocks with header chrome (cwd, exit, duration; sticky-top header).
 - ✅ Failed exits are visually distinct (red `exit N`); within- and cross-block selection + copy.
-- ⏳ Collapse / expand, copy-output / rerun, context menu — tracked in [#120](https://github.com/enthal/termica/issues/120).
+- ✅ Block right-click context menu — copy block / command / output, plus copy-`<chip>` when a header chip is right-clicked ([spec/07](07-history-and-search.md#command-blocks-transcript-view)).
+- ⏳ Collapse / expand, rerun / pin / jump-to-output — tracked in [#120](https://github.com/enthal/termica/issues/120).
 
 The foundational block model was pulled forward into Phase 4 (the block-model pivot, [#51](https://github.com/enthal/termica/pull/51)–[#116](https://github.com/enthal/termica/pull/116)); as noted above, Phase 7 is "largely subsumed by Phase 4G."
 
