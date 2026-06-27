@@ -5,10 +5,19 @@ name: Release
 # - On a `v*` tag (pushed by release-plz with a PAT — see release-plz.yml):
 #   build, package, and create/update the GitHub Release with the artifacts.
 # - On manual dispatch: build + package and upload as workflow artifacts only
-#   (no release). Use this to test the pipeline without cutting a version.
+#   (no release). Use this to test the pipeline (incl. signing) without cutting
+#   a version.
 #
-# macOS builds are UNSIGNED for now (see spec/12-distribution.md); the signing
-# steps will slot in later, gated behind secrets.
+# macOS code signing + notarization (see spec/12-distribution.md):
+#   - cargo-packager imports the Developer ID cert from APPLE_CERTIFICATE (a
+#     base64 full-chain .p12 — leaf + Developer ID G2 intermediate + key) into a
+#     temporary keychain and signs Termica.app with hardened runtime + a secure
+#     timestamp, then builds the .dmg around it.
+#   - A dedicated step then submits the .dmg to Apple's notary service with an
+#     App Store Connect API key and staples the ticket, so the downloaded image
+#     opens with no Gatekeeper prompt (even offline).
+# Both are gated on HAS_APPLE_SIGNING (the secrets being present); without them
+# the build still succeeds, producing unsigned artifacts.
 
 on:
   push:
@@ -22,6 +31,10 @@ jobs:
   package:
     name: Package (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
+    env:
+      # True only when the Apple secrets are configured (i.e. on this repo, not
+      # forks). The signing/notarization steps below no-op when false.
+      HAS_APPLE_SIGNING: ${{ secrets.APPLE_CERTIFICATE != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -64,7 +77,43 @@ jobs:
         run: cargo binstall -y --force --version 0.11.8 cargo-packager
 
       - name: Build & package
+        env:
+          # macOS only: cargo-packager imports this .p12 into a temp keychain and
+          # signs Termica.app with the cert's CommonName, hardened runtime, and a
+          # secure timestamp. Empty on forks → it builds unsigned and continues.
+          # (Notarization is handled by the next step, not by cargo-packager.)
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: cargo packager --release --formats ${{ matrix.formats }} --verbose
+
+      - name: Notarize & staple the DMG
+        # macOS only, and only when the Apple secrets exist. Submits the signed
+        # .dmg to Apple's notary service and staples the ticket. `stapler` is the
+        # safety gate: it can only succeed if notarization was Accepted, so a
+        # rejected build fails the job here rather than shipping a bad artifact.
+        if: runner.os == 'macOS' && env.HAS_APPLE_SIGNING == 'true'
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s\n' "$APPLE_API_KEY_P8" > "$key"
+          trap 'rm -f "$key"' EXIT
+          shopt -s nullglob
+          dmgs=(dist/*.dmg)
+          if [ ${#dmgs[@]} -eq 0 ]; then
+            echo "::error::No .dmg found to notarize"; exit 1
+          fi
+          for dmg in "${dmgs[@]}"; do
+            echo "Notarizing $dmg"
+            xcrun notarytool submit "$dmg" \
+              --key "$key" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" \
+              --wait
+            xcrun stapler staple "$dmg"
+            xcrun stapler validate "$dmg"
+          done
 
       - name: List artifacts
         shell: bash
