@@ -389,12 +389,14 @@ fn lifecycle_to_json(event: &LifecycleEvent, obj: &mut serde_json::Map<String, s
         LifecycleEvent::Continuation => {
             obj.insert("event".into(), json!("Continuation"));
         }
-        LifecycleEvent::Completion { id, lines } => {
+        LifecycleEvent::Completion { id, lines, filenames, cur } => {
             obj.insert("event".into(), json!("Completion"));
             obj.insert("id".into(), json!(id));
             // Count only — the candidate list can be long and the dump is
             // for tracing event flow, mirroring ShellVars above.
             obj.insert("count".into(), json!(lines.len()));
+            obj.insert("filenames".into(), json!(filenames));
+            obj.insert("cur".into(), json!(cur));
         }
     }
 }

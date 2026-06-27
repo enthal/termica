@@ -305,6 +305,26 @@ fn continuation_to_send(shell: ShellSpec, last_submitted: Option<&str>, text: &s
     }
 }
 
+/// Whether a submit made *during* a pending continuation **abandons** the
+/// half-sent command (vs. extending it), so it must abort the dangling line
+/// rather than feed it.
+///
+/// Only **zsh / bash** buffer a dangling line at the tty (`PS2`): once their
+/// parser has swallowed an incomplete `<prev>\n` (an unmatched quote, a
+/// trailing `&&`, …) it keeps reading, and anything sent that doesn't *extend*
+/// `<prev>` just lengthens the stuck line — the lock this fix recovers from.
+/// **fish** holds no partial command (it re-`eval`s the whole cumulative
+/// buffer each submit — see [`continuation_to_send`]), so a retype simply
+/// re-evaluates fresh and can never lock; it must NOT be aborted. Hence the
+/// abandonment (and its SIGINT recovery) is gated to non-fish. Pure + tested.
+fn submit_abandons_continuation(
+    shell: ShellSpec,
+    last_submitted: Option<&str>,
+    text: &str,
+) -> bool {
+    shell != ShellSpec::Fish && last_submitted.is_some_and(|prev| !text.starts_with(prev))
+}
+
 impl PaneSession {
     /// Spawn a shell, attach a freshly sized [`TerminalState`], and
     /// start the background reader thread. Low-level constructor;
@@ -680,12 +700,13 @@ impl PaneSession {
             if let crate::markers::LifecycleEvent::ShellVars { names } = &event {
                 self.shell_var_names = Some(names.clone());
             }
-            // Live-shell completion reply (fish or zsh): correlate to the
-            // in-flight request and stash the candidates for
+            // Live-shell completion reply (fish, zsh, or bash): correlate to
+            // the in-flight request and stash the candidates for
             // `completion_driver_poll`. Cloned out before `observe_event`
             // consumes the event below; it's inert to the mode machine (spec/05).
-            if let crate::markers::LifecycleEvent::Completion { id, lines } = &event {
-                self.ingest_live_completion(*id, lines);
+            if let crate::markers::LifecycleEvent::Completion { id, lines, filenames, cur } = &event
+            {
+                self.ingest_live_completion(*id, lines, *filenames, cur.clone());
             }
             // Multi-line continuation: if the shell's parser saw an
             // incomplete command after submit and emitted `PS2` (as
@@ -1266,7 +1287,13 @@ impl PaneSession {
     /// late answer) is dropped. The reply carries the **raw** shell lines;
     /// parsing uses the one shared parser tagged with the originating tool,
     /// so the fish and zsh paths handle tabs / padded columns identically.
-    fn ingest_live_completion(&mut self, id: u64, lines: &[String]) {
+    fn ingest_live_completion(
+        &mut self,
+        id: u64,
+        lines: &[String],
+        filenames: bool,
+        cur: Option<String>,
+    ) {
         let Some(req) = self.live_completion.as_ref().filter(|f| f.id == id) else {
             return;
         };
@@ -1274,12 +1301,27 @@ impl PaneSession {
         self.live_completion = None;
         let candidates =
             crate::completion::drivers::parse::parse_shell_complete(&lines.join("\n"), tool);
+        // bash's `-o filenames` controls whether the accept path shell-escapes
+        // glob/space chars (#178). fish/zsh capture filename-style values whose
+        // space-handling depends on the escape, so they always escape; only
+        // bash carries (and honours) the per-reply flag.
+        let escape_as_filename = match tool {
+            DriverTool::BashComplete => filenames,
+            _ => true,
+        };
+        // bash's COMP_WORDBREAKS current word, for re-basing the replace range
+        // (#183). Only meaningful for bash; fish/zsh use the whole-token realign.
+        let cur = match tool {
+            DriverTool::BashComplete => cur,
+            _ => None,
+        };
         self.record_completion(&CompletionEvent::DriverResult {
             tool,
             candidates: candidates.len(),
             cache_hit: false,
         });
-        self.live_completion_response = Some(DriverResponse::live(tool, candidates));
+        self.live_completion_response =
+            Some(DriverResponse::live(tool, candidates, escape_as_filename, cur));
     }
 
     /// Drop an in-flight live-shell request the shell never answered within
@@ -1293,7 +1335,9 @@ impl PaneSession {
         {
             let tool = f.tool;
             self.live_completion = None;
-            self.live_completion_response = Some(DriverResponse::live(tool, Vec::new()));
+            // Empty fallback — escape flag / cur are moot with no candidates.
+            self.live_completion_response =
+                Some(DriverResponse::live(tool, Vec::new(), true, None));
         }
     }
 
@@ -1335,26 +1379,48 @@ impl PaneSession {
     /// "no editor" / "editor empty" no-ops. A `Err(PtyError)` is
     /// only returned when the PTY write itself fails.
     pub fn submit_editor_command(&mut self) -> Result<(), PtyError> {
-        // 1. Take the editor text. If there's no editor (the tail
-        //    isn't a `Prompt`), submit is a no-op. If the editor is
-        //    empty, we still send a bare `\r` so the shell sees a
-        //    blank line and emits the next prompt — that's what
+        // 1. Peek the editor text (without consuming yet). If there's no
+        //    editor (the tail isn't a `Prompt`), submit is a no-op. If
+        //    the editor is empty, we still send a bare `\r` so the shell
+        //    sees a blank line and emits the next prompt — that's what
         //    pressing Enter on an empty shell prompt does in every
         //    terminal.
-        let text = match self.blocks.editor_on_tail_mut() {
-            Some(editor) => {
-                let t = editor.text().to_string();
-                editor.clear();
-                // Per spec/04 §"Undo / redo" reset-on-submit: the
-                // previous command's undo history doesn't follow into
-                // the next prompt. Done AFTER `clear` because `clear`
-                // pushes one undo entry (the pre-clear state), which
-                // we promptly throw away.
-                editor.reset_undo();
-                t
-            }
+        let text = match self.blocks.editor_on_tail() {
+            Some(editor) => editor.text().to_string(),
             None => return Ok(()),
         };
+
+        // 2-Enter continuation heal. We're mid-continuation — the shell
+        // is still waiting to finish a previously-submitted, incomplete
+        // line (e.g. the unmatched quote `echo "!"` leaves behind) — and
+        // the editor text no longer EXTENDS that line: the user cleared
+        // it and/or retyped something different. Submitting it as-is
+        // would feed the dangling line and re-lock the pane (every later
+        // submit just continues the same broken line). So abort the
+        // stuck line with SIGINT and reset the continuation state, but
+        // KEEP the editor text: the next Enter, now at a fresh prompt,
+        // submits it as a clean first command. (An empty editor counts
+        // as abandonment too — clearing the line and pressing Enter once
+        // is the "just get me out" gesture.) The legitimate multi-line
+        // case (the user APPENDED, so `text` still starts with
+        // `last_submitted`) falls through to the normal diff-submit, as
+        // does fish, which buffers no dangling line and recovers by
+        // re-eval — see [`submit_abandons_continuation`].
+        if self.awaiting_continuation()
+            && submit_abandons_continuation(self.shell, self.last_submitted.as_deref(), &text)
+        {
+            return self.abort_continuation_line();
+        }
+
+        // Consume the editor now that we're committing to a real submit.
+        if let Some(editor) = self.blocks.editor_on_tail_mut() {
+            editor.clear();
+            // Per spec/04 §"Undo / redo" reset-on-submit: the previous
+            // command's undo history doesn't follow into the next prompt.
+            // Done AFTER `clear` because `clear` pushes one undo entry
+            // (the pre-clear state), which we promptly throw away.
+            editor.reset_undo();
+        }
 
         // Reset history-recall state: the next `↑` should start a
         // fresh walk from the most-recent entry, not from wherever
@@ -1404,6 +1470,83 @@ impl PaneSession {
             pty.write(&bytes)?;
         }
         Ok(())
+    }
+
+    /// True when a multi-line continuation is pending: we're back in the
+    /// editor after a submit the shell considered incomplete (PS2 fired,
+    /// `last_submitted` still set — it's cleared on `Preexec`/`Precmd`).
+    /// In this sub-state the shell is mid-line-read, NOT idle at a
+    /// confirmed prompt, so Ctrl+C must reach it as SIGINT to abort the
+    /// dangling line rather than being swallowed as inert.
+    pub fn awaiting_continuation(&self) -> bool {
+        self.editor_is_active() && self.last_submitted.is_some()
+    }
+
+    /// Abort a pending PS2 continuation and clear the editor — the
+    /// explicit "give up entirely" gesture, bound to Ctrl+C. The shell is
+    /// mid-line-read after a submit it deemed incomplete (e.g. the
+    /// unmatched quote zsh derives from `echo "!"`), so a plain submit
+    /// can't recover — it only feeds more text into the dangling line,
+    /// and Termica's continuation-restore masks that the pane is stuck.
+    /// This clears the restored editor text, then aborts the stuck line
+    /// (see [`Self::abort_continuation_line`]). No-op when no continuation
+    /// is pending, so Ctrl+C stays inert at an idle prompt (spec/04). The
+    /// "abort but keep my retyped text" variant is the 2-Enter heal in
+    /// [`Self::submit_editor_command`], which reuses the same primitive.
+    ///
+    /// No-op for **fish**: it buffers no dangling tty line (it re-`eval`s
+    /// the whole cumulative buffer each submit), so it never gets stuck
+    /// and needs no SIGINT recovery — same reasoning as
+    /// [`submit_abandons_continuation`]. Ctrl+C there stays inert, as
+    /// before fish continuation shipped.
+    pub fn abort_continuation(&mut self) -> Result<(), PtyError> {
+        if self.shell == ShellSpec::Fish || !self.awaiting_continuation() {
+            return Ok(());
+        }
+        if let Some(editor) = self.blocks.editor_on_tail_mut() {
+            editor.clear();
+            editor.reset_undo();
+        }
+        self.abort_continuation_line()
+    }
+
+    /// Abort the shell's dangling continuation line and reset the
+    /// continuation state. The shell prints `^C` and a fresh prompt —
+    /// exactly like Ctrl+C at a PS2 prompt in any terminal. Resets
+    /// `last_submitted` BEFORE the write so the pane can't be observed
+    /// mid-abort with a stale value (which would corrupt the next
+    /// submit's diff) — the same make-wrong-states-unrepresentable
+    /// ordering as `submit`. Leaves the editor buffer untouched; callers
+    /// decide whether to clear it (Ctrl+C does; the 2-Enter heal keeps
+    /// the retyped text).
+    ///
+    /// The bytes are `\x03\r`, not a bare `\x03`. Our zsh integration
+    /// runs with `unsetopt zle` (cooked-mode tty — see
+    /// `integration/zsh-bootstrap.zsh`), and there a lone `\x03` aborts
+    /// the line but leaves the reader in a state that **swallows the very
+    /// next command**: it arrives with no `preexec`, the shell reports
+    /// the aborted line's exit (130) on the following prompt, and the
+    /// user's command silently vanishes. The trailing `\r` completes the
+    /// prompt cycle so the shell emits its `precmd` and the next command
+    /// runs normally. (Empirically verified against a real zsh + the
+    /// bootstrap: `\x03` alone, `\r\x03`, and double-`\x03` all eat the
+    /// next command; `\x03\r` does not.)
+    ///
+    /// The kernel echoes the interrupt char back as `^C\r\n` (ECHOCTL,
+    /// cooked mode). Unlike a real command-interrupt, the abort runs no
+    /// command, so no `Running` block ever seals to absorb that `^C` —
+    /// it would otherwise bleed into the *next* command's block (the
+    /// `^C` the user sees between `echo AAA` and its output). Since the
+    /// recovery is a Termica UI gesture, not a keystroke the user typed
+    /// at the shell, we prime the [`crate::echo_suppress::EchoSuppressor`]
+    /// to swallow the `^C\r\n` echo so the next prompt stays clean. The
+    /// match is prefix-and-disengage, so a terminal without ECHOCTL (no
+    /// `^C` echo) just passes through — no worse than before.
+    fn abort_continuation_line(&mut self) -> Result<(), PtyError> {
+        self.last_submitted = None;
+        self.recall.abandon();
+        self.terminal.prime_echo_suppression(b"^C\r");
+        self.write(b"\x03\r")
     }
 
     /// Demote the pane out of `ShellPromptEditor` back to
@@ -1959,7 +2102,7 @@ mod tests {
             Some(LiveCompletion { id: 5, sent_ms: 0, tool: DriverTool::FishComplete });
 
         // A reply for a DIFFERENT id (a superseded request) is dropped.
-        session.ingest_live_completion(9, &["stale".to_string()]);
+        session.ingest_live_completion(9, &["stale".to_string()], false, None);
         assert!(session.live_completion_response.is_none(), "mismatched id is ignored");
         assert!(session.live_completion.is_some(), "in-flight request still pending");
 
@@ -1970,10 +2113,14 @@ mod tests {
         session.ingest_live_completion(
             5,
             &["hello\talias hello=echo HI".to_string(), "help\tDisplay help".to_string()],
+            false,
+            None,
         );
         assert!(session.live_completion.is_none(), "in-flight cleared on a correlated reply");
         let resp = session.completion_driver_poll().expect("a response is available");
         assert_eq!(resp.tool, DriverTool::FishComplete);
+        assert!(resp.escape_as_filename, "fish always escapes filename-style, ignoring the flag");
+        assert_eq!(resp.cur, None, "fish carries no COMP_WORDBREAKS cur");
         assert_eq!(resp.candidates.len(), 2);
         assert_eq!(resp.candidates[0].value, "hello");
         assert_eq!(resp.candidates[0].description.as_deref(), Some("alias hello=echo HI"));
@@ -1998,7 +2145,7 @@ mod tests {
             Some(LiveCompletion { id: 2, sent_ms: 0, tool: DriverTool::ZshComplete });
 
         // Mismatched id dropped.
-        session.ingest_live_completion(1, &["nope".to_string()]);
+        session.ingest_live_completion(1, &["nope".to_string()], false, None);
         assert!(session.live_completion.is_some(), "in-flight still pending after mismatch");
 
         // zsh v1 emits VALUES ONLY (no `\t` descriptions) — runtime alias
@@ -2006,10 +2153,14 @@ mod tests {
         session.ingest_live_completion(
             2,
             &["greethere".to_string(), "grep".to_string(), "groups".to_string()],
+            false,
+            None,
         );
         assert!(session.live_completion.is_none());
         let resp = session.completion_driver_poll().expect("a response is available");
         assert_eq!(resp.tool, DriverTool::ZshComplete);
+        assert!(resp.escape_as_filename, "zsh always escapes filename-style, ignoring the flag");
+        assert_eq!(resp.cur, None, "zsh carries no COMP_WORDBREAKS cur");
         assert_eq!(resp.candidates.len(), 3);
         assert_eq!(resp.candidates[0].value, "greethere", "runtime alias completes");
         assert_eq!(resp.candidates[0].description, None, "values-only in v1");
@@ -2030,16 +2181,23 @@ mod tests {
             Some(LiveCompletion { id: 4, sent_ms: 0, tool: DriverTool::BashComplete });
 
         // Mismatched id dropped.
-        session.ingest_live_completion(1, &["nope".to_string()]);
+        session.ingest_live_completion(1, &["nope".to_string()], false, None);
         assert!(session.live_completion.is_some(), "in-flight still pending after mismatch");
 
+        // bash carries the `-o filenames` flag AND its COMP_WORDBREAKS `cur`
+        // through to the response (#178 / #183); here a non-filename
+        // `complete -F` reply → escape_as_filename false, cur = "be".
         session.ingest_live_completion(
             4,
             &["beta".to_string(), "alpha".to_string(), "gamma".to_string()],
+            false,
+            Some("be".to_string()),
         );
         assert!(session.live_completion.is_none());
         let resp = session.completion_driver_poll().expect("a response is available");
         assert_eq!(resp.tool, DriverTool::BashComplete);
+        assert!(!resp.escape_as_filename, "bash threads -o filenames=false through verbatim");
+        assert_eq!(resp.cur.as_deref(), Some("be"), "bash threads its COMP_WORDBREAKS cur");
         assert_eq!(resp.candidates.len(), 3);
         assert_eq!(resp.candidates[0].value, "beta", "user `complete -F` candidate completes");
         assert_eq!(resp.candidates[0].description, None, "values-only in v1");
@@ -2359,6 +2517,197 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_aborts_pending_continuation_and_unlocks_the_pane() {
+        // Repro for the `echo "!"` lock. zsh's history expansion turns
+        // the double-quoted `!` into an unmatched quote, so the shell
+        // emits PS2 (our `continuation` marker) and stays mid-line-read.
+        // Termica restores the editor and re-promotes — but the shell is
+        // NOT idle at a confirmed prompt, it's waiting to finish the
+        // line, and a gate-swallowed Ctrl+C left no way out: every later
+        // submit just fed more text into the dangling line. Ctrl+C while
+        // a continuation is pending must abort it — SIGINT to unstick the
+        // shell, plus a reset of the continuation state so the next
+        // prompt starts clean.
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c(&dcs_promote_to_editor_cmd()), "t".into(), 0, None)
+                .expect("spawn");
+        // Reach ShellPromptEditor.
+        let stop = Instant::now() + Duration::from_secs(3);
+        loop {
+            session.drain();
+            if session.editor_is_active() {
+                break;
+            }
+            if Instant::now() >= stop {
+                panic!("editor never active");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Submit a command the shell deems incomplete, then inject the
+        // continuation marker the shell's PS2 would emit (direct parser
+        // feed — same path real shell-emitted bytes hit; see the sibling
+        // continuation test for why we can't get `/bin/sh` to emit PS2).
+        session.editor_mut().unwrap().insert_str("echo \"!\"");
+        session.submit_editor_command().expect("submit");
+        assert!(session.last_submitted.is_some());
+        let cont_bytes =
+            b"\x1bPTermica;{\"type\":\"continuation\",\"session\":\"t\",\"value\":\"\"}\x1b\\";
+        session.terminal_mut().feed(cont_bytes);
+        let stop = Instant::now() + Duration::from_secs(3);
+        loop {
+            session.drain();
+            if session.controller.last_transition().reason
+                == crate::shell::TransitionReason::ContinuationMarker
+            {
+                break;
+            }
+            if Instant::now() >= stop {
+                panic!("continuation never observed");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        // The pane is now in the continuation sub-state: editor active,
+        // restored text, `last_submitted` still set.
+        assert!(session.awaiting_continuation(), "should be awaiting continuation");
+        assert_eq!(session.blocks.editor_on_tail().unwrap().text(), "echo \"!\"\n");
+
+        // Ctrl+C aborts. State resets so the next submit is a clean
+        // first-submit, not a stale-prefix diff.
+        session.abort_continuation().expect("abort");
+        assert!(!session.awaiting_continuation(), "continuation must be cleared");
+        assert!(session.last_submitted.is_none(), "last_submitted must be cleared");
+        // The suppressor is primed to swallow the kernel's `^C\r\n` echo
+        // of the interrupt char (4 bytes after \r→\r\n expansion) so it
+        // doesn't bleed into the next command's block.
+        assert_eq!(
+            session.terminal.echo_suppressor().pending_len(),
+            4,
+            "abort must prime echo suppression for the `^C\\r\\n` interrupt echo"
+        );
+        assert!(
+            session.blocks.editor_on_tail().unwrap().is_empty(),
+            "editor must be cleared back to a fresh prompt"
+        );
+
+        // The `\x03` actually reached the PTY and interrupted the
+        // foreground line: the shell child takes the SIGINT and exits.
+        // This is what proves the abort unsticks the shell, not just our
+        // local state.
+        let stop = Instant::now() + Duration::from_secs(3);
+        while !session.is_exited() && Instant::now() < stop {
+            session.drain();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(session.is_exited(), "SIGINT from abort should have ended the shell line");
+    }
+
+    #[test]
+    fn retyping_a_different_command_during_continuation_heals_the_pane() {
+        // 2-Enter recovery. After `echo "!"` leaves the shell stuck at
+        // PS2, clearing the editor and submitting DIFFERENT text (text
+        // that no longer EXTENDS the half-sent line) must NOT feed the
+        // dangling line — that only re-locks the pane. Instead it aborts
+        // the stuck line (SIGINT), resets the continuation state, and
+        // KEEPS the retyped text in the editor so the next Enter — now at
+        // a fresh prompt — runs it as a clean first submit.
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c(&dcs_promote_to_editor_cmd()), "t".into(), 0, None)
+                .expect("spawn");
+        let stop = Instant::now() + Duration::from_secs(3);
+        loop {
+            session.drain();
+            if session.editor_is_active() {
+                break;
+            }
+            if Instant::now() >= stop {
+                panic!("editor never active");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        session.editor_mut().unwrap().insert_str("echo \"!\"");
+        session.submit_editor_command().expect("submit");
+        let cont_bytes =
+            b"\x1bPTermica;{\"type\":\"continuation\",\"session\":\"t\",\"value\":\"\"}\x1b\\";
+        session.terminal_mut().feed(cont_bytes);
+        let stop = Instant::now() + Duration::from_secs(3);
+        loop {
+            session.drain();
+            if session.controller.last_transition().reason
+                == crate::shell::TransitionReason::ContinuationMarker
+            {
+                break;
+            }
+            if Instant::now() >= stop {
+                panic!("continuation never observed");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(session.awaiting_continuation());
+
+        // Abandon the half-sent line: clear and retype something else.
+        let editor = session.editor_mut().unwrap();
+        editor.clear();
+        editor.insert_str("ls");
+        session.submit_editor_command().expect("heal submit");
+
+        // The continuation is aborted and reset; crucially the retyped
+        // text is KEPT (not consumed) so the next Enter submits it, and
+        // `last_submitted` is cleared so that next submit sends the full
+        // `ls` rather than a stale-prefix diff.
+        assert!(!session.awaiting_continuation(), "continuation must be reset");
+        assert!(session.last_submitted.is_none(), "last_submitted must be cleared, not diffed");
+        assert_eq!(
+            session.blocks.editor_on_tail().unwrap().text(),
+            "ls",
+            "retyped text must be kept in the editor for the 2nd Enter"
+        );
+        assert_eq!(
+            session.controller.mode(),
+            PaneMode::ShellPromptEditor,
+            "abort stays in the editor at the fresh prompt — no demote"
+        );
+
+        // The `\x03` reached the shell and aborted the foreground line.
+        let stop = Instant::now() + Duration::from_secs(3);
+        while !session.is_exited() && Instant::now() < stop {
+            session.drain();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(session.is_exited(), "SIGINT from the heal should have ended the shell line");
+    }
+
+    #[test]
+    fn abort_continuation_is_a_noop_at_an_idle_prompt() {
+        // No continuation pending (`last_submitted` is `None` at a fresh
+        // prompt), so abort must NOT send a stray `\x03` or clear the
+        // user's in-progress line — Ctrl+C stays inert at an idle prompt
+        // per spec/04.
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c(&dcs_promote_to_editor_cmd()), "t".into(), 0, None)
+                .expect("spawn");
+        let stop = Instant::now() + Duration::from_secs(3);
+        loop {
+            session.drain();
+            if session.editor_is_active() {
+                break;
+            }
+            if Instant::now() >= stop {
+                panic!("editor never active");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        session.editor_mut().unwrap().insert_str("echo keep me");
+        assert!(!session.awaiting_continuation());
+        session.abort_continuation().expect("abort");
+        assert_eq!(
+            session.blocks.editor_on_tail().unwrap().text(),
+            "echo keep me",
+            "abort at an idle prompt must not discard the typed line"
+        );
+        let _ = session.write(b"\x03"); // bring the shell down quickly
+    }
+
+    #[test]
     fn continuation_to_send_first_submit_sends_full_text() {
         // No prior continuation: every shell sends the whole editor text.
         for shell in [ShellSpec::Zsh, ShellSpec::Bash, ShellSpec::Fish] {
@@ -2390,6 +2739,36 @@ mod tests {
             "echo 1 &&\necho 2",
             "fish resends the whole buffer, not the suffix"
         );
+    }
+
+    #[test]
+    fn submit_abandons_continuation_zsh_bash_on_nonextending_text() {
+        // zsh/bash buffer a dangling line at the tty; retyping text that
+        // does NOT extend the half-sent command must abort it, not feed it.
+        for shell in [ShellSpec::Zsh, ShellSpec::Bash] {
+            assert!(submit_abandons_continuation(shell, Some("echo \"!\""), "ls"));
+            assert!(submit_abandons_continuation(shell, Some("echo 1 &&"), "different"));
+            // Appending (text still starts with `prev`) is NOT abandonment —
+            // it's the legitimate multi-line case (normal diff-submit).
+            assert!(!submit_abandons_continuation(shell, Some("echo 1 &&"), "echo 1 &&\necho 2"));
+        }
+    }
+
+    #[test]
+    fn submit_abandons_continuation_never_for_fish() {
+        // fish re-evals the whole cumulative buffer each submit, so it never
+        // gets stuck and must never be aborted — abandonment is gated off so
+        // a retype falls through to the normal whole-buffer resend.
+        assert!(!submit_abandons_continuation(ShellSpec::Fish, Some("echo \"!\""), "ls"));
+        assert!(!submit_abandons_continuation(ShellSpec::Fish, Some("echo 1 &&"), "different"));
+    }
+
+    #[test]
+    fn submit_abandons_continuation_false_with_no_prior() {
+        // Not in a continuation at all (no `last_submitted`) → nothing to abandon.
+        for shell in [ShellSpec::Zsh, ShellSpec::Bash, ShellSpec::Fish] {
+            assert!(!submit_abandons_continuation(shell, None, "ls"));
+        }
     }
 
     #[test]

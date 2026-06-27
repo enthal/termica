@@ -570,6 +570,17 @@ fn pty_passthrough_allowed(event: &egui::Event, editor_active: bool, editor_empt
     editor_empty && is_eof_chord(event)
 }
 
+/// Is this the "abort the pending continuation" gesture — Ctrl+C? It's
+/// pure so the cross-platform modifier matrix is tested without a live
+/// pane. `ctrl` is the physical Ctrl key on every platform; egui also
+/// sets `command` for it on Linux/Windows, which we ignore. We reject
+/// `shift` (Ctrl+Shift+C is the Linux copy chord) and `alt`, and a
+/// command-only press (macOS Cmd+C → copy) never matches because `ctrl`
+/// is false there.
+fn is_continuation_abort_chord(key: egui::Key, modifiers: egui::Modifiers) -> bool {
+    key == egui::Key::C && modifiers.ctrl && !modifiers.shift && !modifiers.alt
+}
+
 /// Pick the mouse cursor for the pane body from what the pointer is
 /// over. A Cmd-hovered link affordance (URL / file path) wins with the
 /// pointing hand — that's what a Cmd-click would activate. Otherwise
@@ -768,17 +779,26 @@ fn apply_event_to_editor(
                 }
                 return true;
             }
-            // Ctrl+C is deliberately NOT handled here, and is fully
-            // inert in the editor: the boundary gate
-            // ([`pty_passthrough_allowed`]) swallows it whether the
-            // editor is empty or not, so no `\x03` ever reaches the
-            // shell. In `ShellPromptEditor` the shell is idle at a
-            // confirmed prompt — there's nothing to interrupt, and a
-            // SIGINT would only print a cosmetic `^C`. (Interrupting a
-            // running program happens in `RawTerminal`, where the
-            // editor is inactive and Ctrl+C passes straight through.)
-            // It also never mutates the buffer — Ctrl+C never discards
-            // a typed line.
+            // Ctrl+C. At an idle prompt it's inert: the boundary gate
+            // ([`pty_passthrough_allowed`]) swallows it, so no `\x03`
+            // reaches the shell — there's nothing to interrupt and a
+            // SIGINT would only print a cosmetic `^C`, and it never
+            // discards the typed line. (Interrupting a running program
+            // happens in `RawTerminal`, where the editor is inactive and
+            // Ctrl+C passes straight through.) The ONE exception is a
+            // pending PS2 continuation: after a submit the shell deemed
+            // incomplete (`echo "!"` → unmatched quote, a trailing `&&`,
+            // an open quote/block/here-doc), the shell is mid-line-read,
+            // NOT idle. The continuation-restore masks that, and without
+            // an escape the pane locks — every later submit just feeds
+            // the dangling line. So here Ctrl+C aborts the continuation:
+            // SIGINT to unstick the shell + reset of the continuation
+            // state. Matches Ctrl+C at a PS2 prompt in any terminal.
+            if is_continuation_abort_chord(*key, *modifiers) && slot.session.awaiting_continuation()
+            {
+                let _ = slot.session.abort_continuation();
+                return true;
+            }
             // Word / line / doc boundary moves. Bindings differ by
             // OS — `classify_editor_motion` encodes both conventions.
             if let Some((motion, extending)) =
@@ -2666,12 +2686,33 @@ pub fn render_pane(
                 // Auto-accept a lone result only if this session was opened
                 // by Tab — never when it's a live re-filter from typing.
                 let allow_autoaccept = pending.from_tab;
+                // bash's `-o filenames` rule: a non-filename reply is inserted
+                // verbatim, not glob/space-escaped (#178). Captured before
+                // `candidates` is moved into the call.
+                let escape_as_filename = resp.escape_as_filename;
+                // Re-base the replace range onto bash's COMP_WORDBREAKS current
+                // word so `d FOO=ba`<Tab> replaces only `ba`, matching bash
+                // (#183). `accept` replaces `[origin_byte, cursor)`, so moving
+                // the popup's origin past the word-break is all it takes. When a
+                // word-break trims the range, the locals (gathered for the wider
+                // token) no longer apply, so drop them. Non-bash replies carry
+                // `cur == None` → unchanged.
+                let (origin_byte, token, trimmed) = match resp.cur.as_deref() {
+                    Some(cur) => crate::completion::rebase_replace_to_word(
+                        pending.origin_byte,
+                        &pending.token,
+                        cur,
+                    ),
+                    None => (pending.origin_byte, pending.token.clone(), false),
+                };
+                let locals = if trimmed { Vec::new() } else { pending.locals };
                 match crate::completion::resolve_driver(
-                    pending.origin_byte,
-                    &pending.token,
+                    origin_byte,
+                    &token,
                     pending.quote,
-                    pending.locals,
+                    locals,
                     resp.candidates,
+                    escape_as_filename,
                 ) {
                     Some(mut popup) => {
                         // Preserve the user's selection across an in-place
@@ -4939,6 +4980,68 @@ mod tests {
         assert!(!apply_event_to_editor(&ctrl_c, ctrl, &mut slot));
         assert!(!pty_passthrough_allowed(&ctrl_c, true, true));
         assert!(slot.session.editor_is_active());
+        assert!(slot.session.blocks().editor_on_tail().unwrap().is_empty());
+    }
+
+    // ---- Ctrl+C aborts a pending continuation -----------------------
+    //
+    // At an idle prompt Ctrl+C is inert (above). But after a submit the
+    // shell deemed incomplete (`echo "!"` → unmatched quote → PS2), the
+    // shell is mid-line-read, NOT idle — and the gate-swallowed Ctrl+C
+    // left the pane stuck forever. While a continuation is pending,
+    // Ctrl+C must abort it.
+
+    #[test]
+    fn continuation_abort_chord_matches_ctrl_c_cross_platform() {
+        // macOS: physical Ctrl+C is ctrl-only (Cmd+C is a separate copy
+        // event, never reported as Event::Key{C, ctrl}).
+        assert!(is_continuation_abort_chord(egui::Key::C, mods(true, false, false, false)));
+        // Linux/Windows: egui maps Ctrl→`command` too, so Ctrl+C carries
+        // both `ctrl` and `command` — we ignore `command`.
+        assert!(is_continuation_abort_chord(egui::Key::C, mods(true, false, false, true)));
+    }
+
+    #[test]
+    fn continuation_abort_chord_rejects_copy_and_other_chords() {
+        // macOS Cmd+C (command, not ctrl) is copy, never an abort.
+        assert!(!is_continuation_abort_chord(egui::Key::C, mods(false, false, false, true)));
+        // Ctrl+Shift+C is the Linux copy chord.
+        assert!(!is_continuation_abort_chord(egui::Key::C, mods(true, false, true, false)));
+        // Ctrl+Alt+C is not the abort gesture.
+        assert!(!is_continuation_abort_chord(egui::Key::C, mods(true, true, false, false)));
+        // Other Ctrl letters are not it.
+        assert!(!is_continuation_abort_chord(egui::Key::D, mods(true, false, false, false)));
+    }
+
+    #[test]
+    fn ctrl_c_during_continuation_routes_to_abort() {
+        use std::time::{Duration, Instant};
+        let mut slot = spawn_editor_active_slot();
+        // Drive into the continuation sub-state: submit an "incomplete"
+        // command, then inject the PS2 continuation marker.
+        slot.session.editor_mut().unwrap().insert_str("echo \"!\"");
+        slot.session.submit_editor_command().expect("submit");
+        let cont_bytes =
+            b"\x1bPTermica;{\"type\":\"continuation\",\"session\":\"t\",\"value\":\"\"}\x1b\\";
+        slot.session.terminal_mut().feed(cont_bytes);
+        let stop = Instant::now() + Duration::from_secs(3);
+        while !slot.session.awaiting_continuation() {
+            slot.session.drain();
+            if Instant::now() >= stop {
+                panic!("never reached the continuation sub-state");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Pre-fix: the editor did NOT consume Ctrl+C (returns false) and
+        // the boundary gate swallowed it, leaving the pane locked.
+        // Post-fix: the editor consumes it and aborts the continuation.
+        let ctrl = mods(true, false, false, false);
+        let ctrl_c = key_ev(egui::Key::C, ctrl);
+        assert!(
+            apply_event_to_editor(&ctrl_c, ctrl, &mut slot),
+            "Ctrl+C must be consumed (abort) while a continuation is pending"
+        );
+        assert!(!slot.session.awaiting_continuation(), "continuation must be cleared");
         assert!(slot.session.blocks().editor_on_tail().unwrap().is_empty());
     }
 
