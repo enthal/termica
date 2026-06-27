@@ -106,7 +106,12 @@ pub enum LifecycleEvent {
     /// escape glob/space chars for non-filename completions, #178). fish/zsh
     /// don't emit the field; absent ⇒ `false`, and the bash-only consumer in
     /// [`crate::pane`] maps fish/zsh to `true` regardless.
-    Completion { id: u64, lines: Vec<String>, filenames: bool },
+    ///
+    /// `cur` carries bash's `COMP_WORDBREAKS`-delimited current word — the text
+    /// the completion function actually completed (`d FOO=ba` ⇒ `ba`). Termica
+    /// uses it to re-base the accept replace range so only that word is replaced,
+    /// matching bash (#183). bash-only; fish/zsh omit it (⇒ `None`).
+    Completion { id: u64, lines: Vec<String>, filenames: bool, cur: Option<String> },
 }
 
 /// The shell kinds recognised in the `integration_ready` payload.
@@ -221,7 +226,10 @@ fn parse_message(value: &serde_json::Value) -> Option<LifecycleEvent> {
             // pane maps those tools to `true` itself (#178).
             let filenames =
                 obj.get("filenames").and_then(serde_json::Value::as_bool).unwrap_or(false);
-            Some(LifecycleEvent::Completion { id, lines, filenames })
+            // `cur` — bash's COMP_WORDBREAKS current word, for the replace-range
+            // rebase (bash only; absent ⇒ None, #183).
+            let cur = obj.get("cur").and_then(serde_json::Value::as_str).map(str::to_string);
+            Some(LifecycleEvent::Completion { id, lines, filenames, cur })
         }
         _ => None,
     }
@@ -479,6 +487,8 @@ mod tests {
                 ],
                 // No `filenames` field (fish/zsh shape) ⇒ false.
                 filenames: false,
+                // No `cur` field (fish/zsh shape) ⇒ None.
+                cur: None,
             })
         );
     }
@@ -496,6 +506,7 @@ mod tests {
                 id: 3,
                 lines: vec!["report[1].csv".into()],
                 filenames: true,
+                cur: None,
             })
         );
         // Explicit `false` is honoured (a non-filename `complete -F` reply).
@@ -508,6 +519,25 @@ mod tests {
                 id: 4,
                 lines: vec!["cur=[ba]".into()],
                 filenames: false,
+                cur: None,
+            })
+        );
+    }
+
+    #[test]
+    fn completion_marker_parses_cur_word() {
+        // bash carries its COMP_WORDBREAKS current word so Termica can re-base
+        // the replace range to it (#183). `cur="ba"` for `d FOO=ba`.
+        let b = body(
+            r#"{"type":"completion","session":"x","id":8,"filenames":false,"cur":"ba","value":["cur=[ba]"]}"#,
+        );
+        assert_eq!(
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::Completion {
+                id: 8,
+                lines: vec!["cur=[ba]".into()],
+                filenames: false,
+                cur: Some("ba".into()),
             })
         );
     }
@@ -519,7 +549,7 @@ mod tests {
         let b = body(r#"{"type":"completion","session":"x","id":1,"value":[]}"#);
         assert_eq!(
             parse_dcs_body(&b),
-            Some(LifecycleEvent::Completion { id: 1, lines: vec![], filenames: false })
+            Some(LifecycleEvent::Completion { id: 1, lines: vec![], filenames: false, cur: None })
         );
     }
 
@@ -540,7 +570,8 @@ mod tests {
             Some(LifecycleEvent::Completion {
                 id: 2,
                 lines: vec!["ok".into(), "two".into()],
-                filenames: false
+                filenames: false,
+                cur: None
             })
         );
     }

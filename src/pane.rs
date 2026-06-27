@@ -704,8 +704,9 @@ impl PaneSession {
             // the in-flight request and stash the candidates for
             // `completion_driver_poll`. Cloned out before `observe_event`
             // consumes the event below; it's inert to the mode machine (spec/05).
-            if let crate::markers::LifecycleEvent::Completion { id, lines, filenames } = &event {
-                self.ingest_live_completion(*id, lines, *filenames);
+            if let crate::markers::LifecycleEvent::Completion { id, lines, filenames, cur } = &event
+            {
+                self.ingest_live_completion(*id, lines, *filenames, cur.clone());
             }
             // Multi-line continuation: if the shell's parser saw an
             // incomplete command after submit and emitted `PS2` (as
@@ -1286,7 +1287,13 @@ impl PaneSession {
     /// late answer) is dropped. The reply carries the **raw** shell lines;
     /// parsing uses the one shared parser tagged with the originating tool,
     /// so the fish and zsh paths handle tabs / padded columns identically.
-    fn ingest_live_completion(&mut self, id: u64, lines: &[String], filenames: bool) {
+    fn ingest_live_completion(
+        &mut self,
+        id: u64,
+        lines: &[String],
+        filenames: bool,
+        cur: Option<String>,
+    ) {
         let Some(req) = self.live_completion.as_ref().filter(|f| f.id == id) else {
             return;
         };
@@ -1302,13 +1309,19 @@ impl PaneSession {
             DriverTool::BashComplete => filenames,
             _ => true,
         };
+        // bash's COMP_WORDBREAKS current word, for re-basing the replace range
+        // (#183). Only meaningful for bash; fish/zsh use the whole-token realign.
+        let cur = match tool {
+            DriverTool::BashComplete => cur,
+            _ => None,
+        };
         self.record_completion(&CompletionEvent::DriverResult {
             tool,
             candidates: candidates.len(),
             cache_hit: false,
         });
         self.live_completion_response =
-            Some(DriverResponse::live(tool, candidates, escape_as_filename));
+            Some(DriverResponse::live(tool, candidates, escape_as_filename, cur));
     }
 
     /// Drop an in-flight live-shell request the shell never answered within
@@ -1322,8 +1335,9 @@ impl PaneSession {
         {
             let tool = f.tool;
             self.live_completion = None;
-            // Empty fallback — escape flag is moot with no candidates.
-            self.live_completion_response = Some(DriverResponse::live(tool, Vec::new(), true));
+            // Empty fallback — escape flag / cur are moot with no candidates.
+            self.live_completion_response =
+                Some(DriverResponse::live(tool, Vec::new(), true, None));
         }
     }
 
@@ -2088,7 +2102,7 @@ mod tests {
             Some(LiveCompletion { id: 5, sent_ms: 0, tool: DriverTool::FishComplete });
 
         // A reply for a DIFFERENT id (a superseded request) is dropped.
-        session.ingest_live_completion(9, &["stale".to_string()], false);
+        session.ingest_live_completion(9, &["stale".to_string()], false, None);
         assert!(session.live_completion_response.is_none(), "mismatched id is ignored");
         assert!(session.live_completion.is_some(), "in-flight request still pending");
 
@@ -2100,11 +2114,13 @@ mod tests {
             5,
             &["hello\talias hello=echo HI".to_string(), "help\tDisplay help".to_string()],
             false,
+            None,
         );
         assert!(session.live_completion.is_none(), "in-flight cleared on a correlated reply");
         let resp = session.completion_driver_poll().expect("a response is available");
         assert_eq!(resp.tool, DriverTool::FishComplete);
         assert!(resp.escape_as_filename, "fish always escapes filename-style, ignoring the flag");
+        assert_eq!(resp.cur, None, "fish carries no COMP_WORDBREAKS cur");
         assert_eq!(resp.candidates.len(), 2);
         assert_eq!(resp.candidates[0].value, "hello");
         assert_eq!(resp.candidates[0].description.as_deref(), Some("alias hello=echo HI"));
@@ -2129,7 +2145,7 @@ mod tests {
             Some(LiveCompletion { id: 2, sent_ms: 0, tool: DriverTool::ZshComplete });
 
         // Mismatched id dropped.
-        session.ingest_live_completion(1, &["nope".to_string()], false);
+        session.ingest_live_completion(1, &["nope".to_string()], false, None);
         assert!(session.live_completion.is_some(), "in-flight still pending after mismatch");
 
         // zsh v1 emits VALUES ONLY (no `\t` descriptions) — runtime alias
@@ -2138,11 +2154,13 @@ mod tests {
             2,
             &["greethere".to_string(), "grep".to_string(), "groups".to_string()],
             false,
+            None,
         );
         assert!(session.live_completion.is_none());
         let resp = session.completion_driver_poll().expect("a response is available");
         assert_eq!(resp.tool, DriverTool::ZshComplete);
         assert!(resp.escape_as_filename, "zsh always escapes filename-style, ignoring the flag");
+        assert_eq!(resp.cur, None, "zsh carries no COMP_WORDBREAKS cur");
         assert_eq!(resp.candidates.len(), 3);
         assert_eq!(resp.candidates[0].value, "greethere", "runtime alias completes");
         assert_eq!(resp.candidates[0].description, None, "values-only in v1");
@@ -2163,20 +2181,23 @@ mod tests {
             Some(LiveCompletion { id: 4, sent_ms: 0, tool: DriverTool::BashComplete });
 
         // Mismatched id dropped.
-        session.ingest_live_completion(1, &["nope".to_string()], false);
+        session.ingest_live_completion(1, &["nope".to_string()], false, None);
         assert!(session.live_completion.is_some(), "in-flight still pending after mismatch");
 
-        // bash carries the `-o filenames` flag through to the response; here a
-        // non-filename `complete -F` reply (#178) → escape_as_filename false.
+        // bash carries the `-o filenames` flag AND its COMP_WORDBREAKS `cur`
+        // through to the response (#178 / #183); here a non-filename
+        // `complete -F` reply → escape_as_filename false, cur = "be".
         session.ingest_live_completion(
             4,
             &["beta".to_string(), "alpha".to_string(), "gamma".to_string()],
             false,
+            Some("be".to_string()),
         );
         assert!(session.live_completion.is_none());
         let resp = session.completion_driver_poll().expect("a response is available");
         assert_eq!(resp.tool, DriverTool::BashComplete);
         assert!(!resp.escape_as_filename, "bash threads -o filenames=false through verbatim");
+        assert_eq!(resp.cur.as_deref(), Some("be"), "bash threads its COMP_WORDBREAKS cur");
         assert_eq!(resp.candidates.len(), 3);
         assert_eq!(resp.candidates[0].value, "beta", "user `complete -F` candidate completes");
         assert_eq!(resp.candidates[0].description, None, "values-only in v1");

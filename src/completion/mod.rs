@@ -342,6 +342,32 @@ fn driver_target_for_shell(
     }
 }
 
+/// Re-base a bash completion's replace range onto the `COMP_WORDBREAKS`-delimited
+/// current word `cur` — what the completion function actually completed
+/// ([#183](https://github.com/enthal/termica/issues/183)).
+///
+/// Termica's editor token (`origin_byte` + `token`) splits on whitespace and
+/// quotes only; the bash sidecar splits `COMP_WORDS` on `$COMP_WORDBREAKS` too
+/// (`=`, `:`, …), so for `d FOO=ba` the function completes `cur="ba"`, not
+/// `FOO=ba`. bash replaces only that word, so the accept range must start after
+/// the last word-break. Since `cur` is the text from the last break to the
+/// cursor, it is a **suffix** of `token`; the new origin is `origin_byte +
+/// (token.len() - cur.len())` and the new token is `cur`. `token.ends_with(cur)`
+/// also keeps a byte-boundary-safe split.
+///
+/// Returns `(new_origin, new_token, trimmed)`. `trimmed` is true when a real
+/// word-break narrowed the range (so the caller drops the locals, which were
+/// gathered for the wider token). When `cur` isn't a proper suffix (an escaping
+/// mismatch, or `cur == token` for a `/`-only path where `/` is not a break),
+/// the range is left untouched and the existing path realign owns it.
+pub fn rebase_replace_to_word(origin_byte: usize, token: &str, cur: &str) -> (usize, String, bool) {
+    if cur.len() < token.len() && token.ends_with(cur) {
+        (origin_byte + (token.len() - cur.len()), cur.to_string(), true)
+    } else {
+        (origin_byte, token.to_string(), false)
+    }
+}
+
 /// Build the popup for a resolved driver result: merge the driver
 /// candidates over the carried locals and rank them. `None` when the
 /// merged list is empty (driver returned nothing and there were no
@@ -1041,6 +1067,51 @@ mod tests {
         // Token `~/Lib` starts at byte 3, length 5.
         popup.accept(&mut e, 5);
         assert_eq!(e.text(), "cd ~/Library ");
+    }
+
+    // ---- COMP_WORDBREAKS-aware replace range (#183) -------------------
+
+    #[test]
+    fn rebase_replace_to_word_trims_at_wordbreak() {
+        // `d FOO=ba`: token `FOO=ba` at byte 2; bash's `cur` is `ba`, so the
+        // replace range must start at the `b` (byte 6) and the token narrows to
+        // `ba` — bash replaces only the post-`=` word.
+        assert_eq!(rebase_replace_to_word(2, "FOO=ba", "ba"), (6, "ba".to_string(), true));
+        // `scp host:/pa`: `cur` is `/pa` after the `:` break (byte 9).
+        assert_eq!(rebase_replace_to_word(4, "host:/pa", "/pa"), (9, "/pa".to_string(), true));
+        // No word-break (`/` is not a COMP_WORDBREAKS char): `cur` == token,
+        // nothing changes — the existing path realign still owns this case.
+        assert_eq!(
+            rebase_replace_to_word(3, "/usr/lo", "/usr/lo"),
+            (3, "/usr/lo".to_string(), false)
+        );
+        // `foo:`<Tab> — `cur` is empty: replace range collapses to the cursor.
+        assert_eq!(rebase_replace_to_word(2, "foo:", ""), (6, "".to_string(), true));
+        // `cur` not a suffix of the token (e.g. an escaping mismatch): leave the
+        // range alone rather than corrupt it — safe fallback.
+        assert_eq!(rebase_replace_to_word(0, "my fi", "xy"), (0, "my fi".to_string(), false));
+    }
+
+    #[test]
+    fn bash_cur_rebase_then_resolve_accepts_only_the_word_after_the_break() {
+        // End-to-end (#183): `d FOO=ba`<Tab> with a function returning the
+        // diagnostic `cur=[ba]`. The bash sidecar reports `cur="ba"`; rebasing
+        // the replace range to the `=` word-break (as render_pane does) means
+        // accept replaces only `ba` → `d FOO=cur=[ba]`, matching bash — not the
+        // pre-fix `d cur=[ba]` (the whole `FOO=ba` token).
+        let mut e = crate::prompt_editor::PromptEditor::new();
+        e.insert_str("d FOO=ba");
+        let (origin, token, trimmed) = rebase_replace_to_word(2, "FOO=ba", "ba");
+        assert!(trimmed, "the `=` word-break trims the range");
+        // render_pane drops the locals when trimmed; none here anyway.
+        let locals: Vec<CompletionCandidate> = vec![];
+        let popup = resolve_driver(origin, &token, None, locals, vec![driver("cur=[ba]")], false)
+            .expect("popup");
+        assert_eq!(popup.origin_byte, 6, "replace starts after the `=` word-break");
+        // accept replaces [origin_byte, cursor) — exactly how render_pane drives it.
+        let cursor = e.text().len();
+        popup.accept(&mut e, cursor - popup.origin_byte);
+        assert_eq!(e.text(), "d FOO=cur=[ba] ");
     }
 
     // ---- no-local-listing fallback heuristics -------------------------

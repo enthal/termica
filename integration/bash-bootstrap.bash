@@ -117,6 +117,10 @@ __termica_bc_words=()
 # bash's `-o filenames` for the last capture (see `__termica_bc_capture`): 1 ⇒
 # filename completion (matches escaped on accept), 0 ⇒ insert verbatim (#178).
 __termica_bc_filenames=0
+# bash's COMP_WORDBREAKS current word for the last capture — the word the
+# completion function actually completed (`d FOO=ba` ⇒ `ba`). Termica re-bases
+# the accept replace range onto it (#183).
+__termica_bc_cur=""
 __termica_bc_split_words() {
     __termica_bc_words=()
     # `s` is assigned in its OWN `local` first: referencing `${#s}` in the same
@@ -165,6 +169,12 @@ __termica_bc_capture() {
     [[ -z "$line" || "$line" == *[[:space:]] ]] && COMP_WORDS+=("")
     COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 ))
     (( COMP_CWORD < 0 )) && COMP_CWORD=0
+    # The current word (the one being completed), recorded NOW so it is reported
+    # even on the early-return paths below — an empty `cur` paired with a wider
+    # token would make Termica wrongly trim the replace range (#183). It always
+    # equals the typed word here, so a no-completion command reports its own word
+    # (`cur == token`, no trim).
+    __termica_bc_cur="${COMP_WORDS[COMP_CWORD]}"
     # The command is the first whitespace-delimited word; with the readline
     # split that's still `COMP_WORDS[0]` for an ordinary command line.
     cmd="${COMP_WORDS[0]}"
@@ -228,15 +238,16 @@ __termica_bc_capture() {
 # Rust's shared parser handles all three. The extra top-level `id` field means
 # this can't reuse `termica_emit_raw`.
 __termica_emit_completion() {
-    local id="$1" json="[" first=1 c fn=false
+    local id="$1" json="[" first=1 c fn=false cur
     (( __termica_bc_filenames )) && fn=true
+    cur="$(termica_escape_json "$__termica_bc_cur")"
     for c in "${__termica_bc_rows[@]}"; do
         if (( first )); then first=0; else json+=","; fi
         json+="\"$(termica_escape_json "$c")\""
     done
     json+="]"
-    printf '\033PTermica;{"type":"completion","session":"%s","id":%s,"filenames":%s,"value":%s}\033\\' \
-        "${TERMICA_SESSION_ID:-}" "$id" "$fn" "$json"
+    printf '\033PTermica;{"type":"completion","session":"%s","id":%s,"filenames":%s,"cur":"%s","value":%s}\033\\' \
+        "${TERMICA_SESSION_ID:-}" "$id" "$fn" "$cur" "$json"
 }
 
 # The completion sentinel dispatched by Termica as a real command:
