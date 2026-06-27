@@ -114,6 +114,9 @@ __termica_bc_rows=()
 # (not a `local -n` nameref) keeps this working on bash 4.0–4.2, which have
 # bash-completion but not namerefs (4.3+).
 __termica_bc_words=()
+# bash's `-o filenames` for the last capture (see `__termica_bc_capture`): 1 ⇒
+# filename completion (matches escaped on accept), 0 ⇒ insert verbatim (#178).
+__termica_bc_filenames=0
 __termica_bc_split_words() {
     __termica_bc_words=()
     # `s` is assigned in its OWN `local` first: referencing `${#s}` in the same
@@ -144,6 +147,9 @@ __termica_bc_split_words() {
 
 __termica_bc_capture() {
     __termica_bc_rows=()
+    # Reset the `-o filenames` signal; set from the static spec and a `compopt`
+    # shim around the function call below (#178).
+    __termica_bc_filenames=0
     local line="$1"
     # All COMP_* are `local`, so they are gone when this returns — nothing can
     # leak into the next real command's bash-preexec DEBUG trap, which SKIPS
@@ -176,12 +182,38 @@ __termica_bc_capture() {
     [[ "$spec" =~ -F[[:space:]]+([^[:space:]]+) ]] || return 0
     func="${BASH_REMATCH[1]}"
     declare -F "$func" >/dev/null 2>&1 || return 0
+    # `-o filenames` can be set STATICALLY in the spec (`complete -o filenames
+    # -F ...`); record that before the function runs.
+    [[ "$spec" == *" -o filenames"* ]] && __termica_bc_filenames=1
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     (( COMP_CWORD > 0 )) && prev="${COMP_WORDS[COMP_CWORD-1]}"
+    # Most completions request filenames DYNAMICALLY (`_filedir` calls `compopt
+    # -o filenames`), invisible to `complete -p`. Shim `compopt` for the
+    # duration of the call to observe it (and `+o filenames` turning it back
+    # off), forwarding faithfully to the builtin so the completion behaves
+    # exactly as it would unshimmed. Restored immediately after.
+    compopt() {
+        local __op="" __a
+        for __a in "$@"; do
+            case "$__a" in
+                -o) __op="-o" ;;
+                +o) __op="+o" ;;
+                filenames)
+                    if [[ "$__op" == "+o" ]]; then
+                        __termica_bc_filenames=0
+                    else
+                        __termica_bc_filenames=1
+                    fi
+                    ;;
+            esac
+        done
+        builtin compopt "$@"
+    }
     # Completion functions are called as `func cmd cur prev`; they read the
     # COMP_* globals (set above) and fill COMPREPLY. Errors are swallowed.
     "$func" "$cmd" "$cur" "$prev" 2>/dev/null
+    unset -f compopt
     local -A __seen=()
     for c in "${COMPREPLY[@]}"; do
         [[ -z "$c" ]] && continue
@@ -196,14 +228,15 @@ __termica_bc_capture() {
 # Rust's shared parser handles all three. The extra top-level `id` field means
 # this can't reuse `termica_emit_raw`.
 __termica_emit_completion() {
-    local id="$1" json="[" first=1 c
+    local id="$1" json="[" first=1 c fn=false
+    (( __termica_bc_filenames )) && fn=true
     for c in "${__termica_bc_rows[@]}"; do
         if (( first )); then first=0; else json+=","; fi
         json+="\"$(termica_escape_json "$c")\""
     done
     json+="]"
-    printf '\033PTermica;{"type":"completion","session":"%s","id":%s,"value":%s}\033\\' \
-        "${TERMICA_SESSION_ID:-}" "$id" "$json"
+    printf '\033PTermica;{"type":"completion","session":"%s","id":%s,"filenames":%s,"value":%s}\033\\' \
+        "${TERMICA_SESSION_ID:-}" "$id" "$fn" "$json"
 }
 
 # The completion sentinel dispatched by Termica as a real command:
