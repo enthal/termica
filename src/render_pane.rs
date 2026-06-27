@@ -2473,11 +2473,27 @@ pub fn render_pane(
                 // verbatim, not glob/space-escaped (#178). Captured before
                 // `candidates` is moved into the call.
                 let escape_as_filename = resp.escape_as_filename;
+                // Re-base the replace range onto bash's COMP_WORDBREAKS current
+                // word so `d FOO=ba`<Tab> replaces only `ba`, matching bash
+                // (#183). `accept` replaces `[origin_byte, cursor)`, so moving
+                // the popup's origin past the word-break is all it takes. When a
+                // word-break trims the range, the locals (gathered for the wider
+                // token) no longer apply, so drop them. Non-bash replies carry
+                // `cur == None` → unchanged.
+                let (origin_byte, token, trimmed) = match resp.cur.as_deref() {
+                    Some(cur) => crate::completion::rebase_replace_to_word(
+                        pending.origin_byte,
+                        &pending.token,
+                        cur,
+                    ),
+                    None => (pending.origin_byte, pending.token.clone(), false),
+                };
+                let locals = if trimmed { Vec::new() } else { pending.locals };
                 match crate::completion::resolve_driver(
-                    pending.origin_byte,
-                    &pending.token,
+                    origin_byte,
+                    &token,
                     pending.quote,
-                    pending.locals,
+                    locals,
                     resp.candidates,
                     escape_as_filename,
                 ) {
