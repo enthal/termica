@@ -2489,12 +2489,17 @@ pub fn render_pane(
                 // Auto-accept a lone result only if this session was opened
                 // by Tab — never when it's a live re-filter from typing.
                 let allow_autoaccept = pending.from_tab;
+                // bash's `-o filenames` rule: a non-filename reply is inserted
+                // verbatim, not glob/space-escaped (#178). Captured before
+                // `candidates` is moved into the call.
+                let escape_as_filename = resp.escape_as_filename;
                 match crate::completion::resolve_driver(
                     pending.origin_byte,
                     &pending.token,
                     pending.quote,
                     pending.locals,
                     resp.candidates,
+                    escape_as_filename,
                 ) {
                     Some(mut popup) => {
                         // Preserve the user's selection across an in-place

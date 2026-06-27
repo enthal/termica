@@ -959,7 +959,10 @@ mod tests {
         assert_eq!(c.mode(), PaneMode::ShellPromptEditor);
         let before = c.last_transition().clone();
 
-        c.observe_event(LifecycleEvent::Completion { id: 1, lines: vec!["hello".into()] }, 9);
+        c.observe_event(
+            LifecycleEvent::Completion { id: 1, lines: vec!["hello".into()], filenames: false },
+            9,
+        );
 
         assert_eq!(c.mode(), PaneMode::ShellPromptEditor, "mode unchanged by a completion reply");
         assert_eq!(c.last_transition(), &before, "no transition recorded for a completion reply");

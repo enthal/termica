@@ -99,7 +99,14 @@ pub enum LifecycleEvent {
     /// reply says nothing about whether we're at a prompt; the bootstrap
     /// emits it and loops straight back to `read` without a preexec/precmd,
     /// so the pane mode never moves (spec/05).
-    Completion { id: u64, lines: Vec<String> },
+    ///
+    /// `filenames` carries bash's `-o filenames` signal: `true` when the
+    /// captured `complete -F` reply is a filename completion (matches must be
+    /// escaped on accept), `false` otherwise (insert verbatim — bash does not
+    /// escape glob/space chars for non-filename completions, #178). fish/zsh
+    /// don't emit the field; absent ⇒ `false`, and the bash-only consumer in
+    /// [`crate::pane`] maps fish/zsh to `true` regardless.
+    Completion { id: u64, lines: Vec<String>, filenames: bool },
 }
 
 /// The shell kinds recognised in the `integration_ready` payload.
@@ -210,7 +217,11 @@ fn parse_message(value: &serde_json::Value) -> Option<LifecycleEvent> {
             // the whole reply — mirrors `shell_vars`.
             let lines =
                 value?.as_array()?.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
-            Some(LifecycleEvent::Completion { id, lines })
+            // `-o filenames` (bash only). Absent for fish/zsh ⇒ false; the
+            // pane maps those tools to `true` itself (#178).
+            let filenames =
+                obj.get("filenames").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            Some(LifecycleEvent::Completion { id, lines, filenames })
         }
         _ => None,
     }
@@ -466,6 +477,37 @@ mod tests {
                     "help".into(),
                     "deployments    deploy    apps/v1".into(),
                 ],
+                // No `filenames` field (fish/zsh shape) ⇒ false.
+                filenames: false,
+            })
+        );
+    }
+
+    #[test]
+    fn completion_marker_parses_filenames_flag() {
+        // bash carries `-o filenames` so the accept path knows whether to
+        // shell-escape glob/space chars (#178). `true` ⇒ filename completion.
+        let b = body(
+            r#"{"type":"completion","session":"x","id":3,"filenames":true,"value":["report[1].csv"]}"#,
+        );
+        assert_eq!(
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::Completion {
+                id: 3,
+                lines: vec!["report[1].csv".into()],
+                filenames: true,
+            })
+        );
+        // Explicit `false` is honoured (a non-filename `complete -F` reply).
+        let b = body(
+            r#"{"type":"completion","session":"x","id":4,"filenames":false,"value":["cur=[ba]"]}"#,
+        );
+        assert_eq!(
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::Completion {
+                id: 4,
+                lines: vec!["cur=[ba]".into()],
+                filenames: false,
             })
         );
     }
@@ -475,7 +517,10 @@ mod tests {
         // `complete -C` found nothing — the reply still fires (so the
         // request never hangs), just with no lines.
         let b = body(r#"{"type":"completion","session":"x","id":1,"value":[]}"#);
-        assert_eq!(parse_dcs_body(&b), Some(LifecycleEvent::Completion { id: 1, lines: vec![] }));
+        assert_eq!(
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::Completion { id: 1, lines: vec![], filenames: false })
+        );
     }
 
     #[test]
@@ -492,7 +537,11 @@ mod tests {
         let b = body(r#"{"type":"completion","session":"x","id":2,"value":["ok",42,"two"]}"#);
         assert_eq!(
             parse_dcs_body(&b),
-            Some(LifecycleEvent::Completion { id: 2, lines: vec!["ok".into(), "two".into()] })
+            Some(LifecycleEvent::Completion {
+                id: 2,
+                lines: vec!["ok".into(), "two".into()],
+                filenames: false
+            })
         );
     }
 

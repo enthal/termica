@@ -172,17 +172,35 @@ pub struct DriverResponse {
     /// `true` when this response was served from the result cache rather
     /// than a fresh subprocess. Diagnostic only (drives `TERMICA_DUMP_EVENTS`).
     pub from_cache: bool,
+    /// Whether the candidates should be shell-escaped as filenames on accept
+    /// (bash's `-o filenames` rule — see
+    /// [`crate::completion::resolve_driver`]). `true` for every CLI driver and
+    /// the fish/zsh sidecars; only the bash sidecar reports `false`, for a
+    /// `complete -F` reply that isn't filename-oriented (#178).
+    pub escape_as_filename: bool,
 }
 
 impl DriverResponse {
     /// Build a response for a result that did NOT pass through the engine's
-    /// worker thread — the fish **live-shell** completion path, where
-    /// `PaneSession` correlates the reply marker itself and hands the
+    /// worker thread — the **live-shell** completion path (fish / zsh / bash),
+    /// where `PaneSession` correlates the reply marker itself and hands the
     /// candidates straight to the popup. There's no engine request to echo,
     /// so a placeholder id is used; this never re-enters the engine's
-    /// `poll` id-filter. See [spec/04a §"Fish sidecar"](../../../spec/04a-completion.md).
-    pub fn live(tool: DriverTool, candidates: Vec<CompletionCandidate>) -> Self {
-        DriverResponse { id: DriverRequestId(0), tool, candidates, from_cache: false }
+    /// `poll` id-filter. `escape_as_filename` carries bash's `-o filenames`
+    /// signal (always `true` for fish/zsh). See
+    /// [spec/04a §"Fish sidecar"](../../../spec/04a-completion.md).
+    pub fn live(
+        tool: DriverTool,
+        candidates: Vec<CompletionCandidate>,
+        escape_as_filename: bool,
+    ) -> Self {
+        DriverResponse {
+            id: DriverRequestId(0),
+            tool,
+            candidates,
+            from_cache: false,
+            escape_as_filename,
+        }
     }
 }
 
@@ -359,8 +377,13 @@ impl CompletionDriverEngine {
             // Cache hit: serve immediately, skip the worker. The next
             // `poll` (same render frame) returns this and the popup opens
             // with no subprocess and no flicker.
-            self.ready =
-                Some(DriverResponse { id, tool, candidates: candidates.clone(), from_cache: true });
+            self.ready = Some(DriverResponse {
+                id,
+                tool,
+                candidates: candidates.clone(),
+                from_cache: true,
+                escape_as_filename: true,
+            });
             self.inflight_key = None;
             return true;
         }
@@ -420,7 +443,13 @@ fn run_worker(
             Some(stdout) => parse_for(req.tool, &stdout, &req.line),
             None => Vec::new(),
         };
-        let resp = DriverResponse { id: req.id, tool: req.tool, candidates, from_cache: false };
+        let resp = DriverResponse {
+            id: req.id,
+            tool: req.tool,
+            candidates,
+            from_cache: false,
+            escape_as_filename: true,
+        };
         if result_tx.send(resp).is_err() {
             break; // pane dropped — stop working.
         }
