@@ -138,6 +138,29 @@ function termica_emit_completion
         $session $id $json
 end
 
+# True (exit 0) when `$argv[1]` is a syntactically INCOMPLETE command — fish's
+# parser wants MORE input (a trailing `&&` / `||` / `|`, an open
+# `for`/`if`/`while`/`switch`/`begin`/`function` block, an unbalanced quote, a
+# trailing `\`) — as opposed to merely WRONG. This is the fish equivalent of
+# bash/zsh emitting `PS2`: on an incomplete Enter we hand the editor back for
+# another line instead of erroring.
+#
+# fish exposes no in-process "is this complete?" query, so we parse-check with
+# a subprocess: `fish -n` (no-execute — it only PARSES, never runs the command
+# or its substitutions) exits non-zero for ANY syntax error, but only an
+# EOF-while-expecting-more error means "incomplete". The distinguishing
+# messages (stable across fish 3.x/4.x) are hitting the end of the input / end
+# of a string mid-construct. An unexpected token NOT at end-of-input is a real
+# error → return false so it EXECUTES and fish shows the user the error (the
+# safe default: never trap the user in a continuation they can't finish out of).
+function __termica_is_incomplete
+    # fish forbids a command substitution in command position, so resolve the
+    # running fish's binary into a variable first.
+    set -l __fish (status fish-path)
+    set -l __out ($__fish -n -c $argv[1] 2>&1)
+    string match -qr 'end of the input|quotes are not balanced|incomplete escape sequence' -- "$__out"
+end
+
 # ----- bootstrap sequence ------------------------------------------------
 
 set -l __termica_user_config_dir "$HOME/.config/fish"
@@ -237,6 +260,21 @@ while true
     # as end-of-options, it prints it literally (corrupting the base64).
     # The payload is base64 (`A–Za–z0–9+/=`), so it never starts with `-`.
     set -l __termica_cmd (printf '%s' "$__termica_line" | base64 -d 2>/dev/null | string collect --allow-empty)
+    # Multi-line continuation — the fish analog of bash/zsh `PS2`. If fish's
+    # parser considers the command INCOMPLETE (trailing `&&`, open block,
+    # unbalanced quote, …), do NOT execute it: emit a `continuation` marker so
+    # Termica re-promotes the editor with the submitted text restored, and loop
+    # back to read the next line. Skipping preexec / eval / command_finished /
+    # precmd keeps the incomplete submit inert to the block model (no Running
+    # block, no history). On the next submit Termica resends the WHOLE
+    # cumulative buffer (fish keeps no partial state — see
+    # `continuation_to_send` in src/pane.rs), which this re-checks. Empty input
+    # (a bare Enter) skips the check and falls through to the normal blank-line
+    # handling below.
+    if test -n "$__termica_cmd"; and __termica_is_incomplete "$__termica_cmd"
+        termica_emit_raw continuation '""'
+        continue
+    end
     termica_emit_string preexec "$__termica_cmd"
     eval $__termica_cmd
     set -l __termica_status $status

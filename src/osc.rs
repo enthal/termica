@@ -364,7 +364,11 @@ mod tests {
         );
         assert_eq!(
             sniffer.drain_events(),
-            vec![LifecycleEvent::IntegrationReady { shell: ShellKind::Zsh, version: 1 }]
+            vec![LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Zsh,
+                version: 1,
+                completion_degraded: false
+            }]
         );
     }
 
@@ -422,7 +426,11 @@ mod tests {
         }
         assert_eq!(
             sniffer.drain_events(),
-            vec![LifecycleEvent::IntegrationReady { shell: ShellKind::Zsh, version: 1 }]
+            vec![LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Zsh,
+                version: 1,
+                completion_degraded: false
+            }]
         );
     }
 

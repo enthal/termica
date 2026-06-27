@@ -604,9 +604,11 @@ fn close_all_popups(slot: &mut PaneSlot) {
 fn open_history_overlay(slot: &mut PaneSlot) {
     let prefill = slot.session.editor_mut().map(|e| e.text().to_string()).unwrap_or_default();
     let Some(history) = slot.session.history_ctx().cloned() else { return };
-    let Some(mut overlay) =
-        crate::history_overlay::HistoryOverlay::open(&history, slot.session.pane_id())
-    else {
+    let Some(mut overlay) = crate::history_overlay::HistoryOverlay::open(
+        &history,
+        slot.session.pane_id(),
+        slot.session.persist_pane_row(),
+    ) else {
         return;
     };
     if !prefill.is_empty() {
@@ -1194,6 +1196,13 @@ pub(crate) struct PaneGridLayout {
     pub cols: u16,
 }
 
+/// Whether to show the "Tab completion is limited" notice for a pane: the
+/// shell reported degraded completion (old bash, no bash-completion) AND the
+/// user hasn't dismissed it. Pure so the gate is testable without a UI.
+pub(crate) fn should_show_completion_notice(completion_degraded: bool, dismissed: bool) -> bool {
+    completion_degraded && !dismissed
+}
+
 pub fn render_pane(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -1288,6 +1297,35 @@ pub fn render_pane(
             .inner;
         if clicked {
             slot.ui.pending_action = Some(crate::pane_slot::PaneAction::RestartShell);
+        }
+        ui.separator();
+    }
+
+    // ---- completion-degraded notice (old bash) ----------------------
+    // Old bash (< 4.1, no bash-completion) reported that its live
+    // Tab-completion is degraded to the local sources only. The terminal and
+    // prompt editor are fully functional — only the long-tail completion is
+    // reduced — so this is a thin, dismissible notice, not a `Degraded` pane.
+    // Once dismissed it stays closed for the pane's life.
+    if should_show_completion_notice(view.completion_degraded, slot.ui.completion_notice_dismissed)
+    {
+        let dismiss = ui
+            .horizontal(|ui| {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Tab completion is limited — this bash is too old for bash-completion \
+                         (needs 4.1+). The terminal works normally.",
+                    )
+                    .size(12.0)
+                    .color(egui::Color32::from_gray(150)),
+                );
+                ui.add_space(8.0);
+                ui.button("Dismiss").clicked()
+            })
+            .inner;
+        if dismiss {
+            slot.ui.completion_notice_dismissed = true;
         }
         ui.separator();
     }
@@ -2454,6 +2492,7 @@ pub fn render_pane(
                 match crate::completion::resolve_driver(
                     pending.origin_byte,
                     &pending.token,
+                    pending.quote,
                     pending.locals,
                     resp.candidates,
                 ) {
@@ -3763,6 +3802,7 @@ pub fn render_pane(
                             origin_byte,
                             token,
                             locals,
+                            quote,
                             target,
                         } => {
                             slot.ui.completion_pending =
@@ -3770,6 +3810,7 @@ pub fn render_pane(
                                     origin_byte,
                                     token,
                                     locals,
+                                    quote,
                                     from_tab: true,
                                 });
                             slot.session.completion_driver_request(ctx, target);
@@ -3857,6 +3898,7 @@ pub fn render_pane(
                             origin_byte,
                             token,
                             locals,
+                            quote,
                             target,
                         } => {
                             // Keep any open popup VISIBLE (stale) while the
@@ -3870,6 +3912,7 @@ pub fn render_pane(
                                     origin_byte,
                                     token,
                                     locals,
+                                    quote,
                                     from_tab: false,
                                 });
                             slot.session.completion_driver_request(ctx, target);
@@ -3937,11 +3980,12 @@ pub fn render_pane(
                 slot.ui.needs_focus = true;
             }
             OverlayAction::ToggleScope => {
+                let db_pane_id = slot.session.persist_pane_row();
                 if let Some(history) = slot.session.history_ctx().cloned()
                     && let Some(overlay) = slot.ui.history_overlay.as_mut()
                 {
                     overlay.toggle_scope();
-                    overlay.refresh_entries(&history, slot.session.pane_id());
+                    overlay.refresh_entries(&history, slot.session.pane_id(), db_pane_id);
                     let cwd = slot.session.terminal().cwd().map(|p| p.display().to_string());
                     overlay.rerank(cwd.as_deref());
                 }
@@ -4070,6 +4114,16 @@ pub fn render_pane(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- completion-degraded notice gate ------------------------------
+
+    #[test]
+    fn completion_notice_shows_only_when_degraded_and_not_dismissed() {
+        assert!(should_show_completion_notice(true, false), "degraded + not dismissed → show");
+        assert!(!should_show_completion_notice(true, true), "dismissed → hidden");
+        assert!(!should_show_completion_notice(false, false), "not degraded → never show");
+        assert!(!should_show_completion_notice(false, true), "not degraded → never show");
+    }
 
     // ---- press_extends_selection (Shift+click extend) -----------------
 

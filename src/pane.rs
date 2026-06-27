@@ -66,6 +66,10 @@ pub struct PaneView {
     /// renderer should suppress the cell grid and show a placeholder
     /// instead.
     pub is_bootstrapping: bool,
+    /// `true` when integration is confirmed but the shell reported that live
+    /// Tab-completion is degraded (old bash with no bash-completion). Drives
+    /// the one-time dismissible UI notice; the terminal is fully functional.
+    pub completion_degraded: bool,
 }
 
 /// Live session: one PTY + one [`TerminalState`] + the reader thread
@@ -221,6 +225,11 @@ pub struct PaneSession {
     /// This pane's current `session` row id (its live PTY spawn), for
     /// stamping `ended_at` on close/quit.
     persist_session: Option<i64>,
+    /// Last cwd persisted to the durable `pane` row, so we only write on
+    /// an actual change. The pane forwards each change to the writer
+    /// thread (durable on change, never deferred to quit — the process can
+    /// vanish), so a restored pane resumes in the dir it was last in.
+    last_persisted_cwd: Option<std::path::PathBuf>,
     /// Which managed shell this pane runs. Drives shell-specific command
     /// submission framing ([`crate::submit_framing`]) — notably base64 for
     /// fish, whose non-interactive read-eval loop needs the whole command
@@ -270,6 +279,50 @@ const LIVE_COMPLETION_TIMEOUT_MS: i64 = 600;
 /// (no allocation) — the caller already owns both slices.
 fn effective_var_names<'a>(shell: Option<&'a [String]>, snapshot: &'a [String]) -> &'a [String] {
     shell.unwrap_or(snapshot)
+}
+
+/// The text to actually write to the PTY for a submit, given the pane's
+/// `shell`, any prior `last_submitted` (set ⟺ a multi-line continuation is in
+/// progress), and the current full editor `text`.
+///
+/// **zsh / bash** buffer the already-sent prefix at the tty: after an
+/// incomplete submit their parser holds `<prev>\n` and waits at `PS2`, so the
+/// re-submit must send only the **new suffix** — sending the whole buffer
+/// would feed `<prev>` twice. **fish** holds no partial command (its read-eval
+/// loop `eval`s each line as a whole unit and loops back to a fresh `read`),
+/// so a continuation re-submit must resend the **whole buffer** — there is no
+/// buffered prefix to avoid duplicating, and the bootstrap re-checks
+/// completeness of the cumulative command each time. Pure + tested.
+fn continuation_to_send(shell: ShellSpec, last_submitted: Option<&str>, text: &str) -> String {
+    match last_submitted {
+        Some(prev) if shell != ShellSpec::Fish && text.starts_with(prev) => {
+            // Strip the already-sent prefix + the separator `\n` the
+            // restore-on-continuation logic inserted.
+            let after = &text[prev.len()..];
+            after.strip_prefix('\n').unwrap_or(after).to_string()
+        }
+        _ => text.to_string(),
+    }
+}
+
+/// Whether a submit made *during* a pending continuation **abandons** the
+/// half-sent command (vs. extending it), so it must abort the dangling line
+/// rather than feed it.
+///
+/// Only **zsh / bash** buffer a dangling line at the tty (`PS2`): once their
+/// parser has swallowed an incomplete `<prev>\n` (an unmatched quote, a
+/// trailing `&&`, …) it keeps reading, and anything sent that doesn't *extend*
+/// `<prev>` just lengthens the stuck line — the lock this fix recovers from.
+/// **fish** holds no partial command (it re-`eval`s the whole cumulative
+/// buffer each submit — see [`continuation_to_send`]), so a retype simply
+/// re-evaluates fresh and can never lock; it must NOT be aborted. Hence the
+/// abandonment (and its SIGINT recovery) is gated to non-fish. Pure + tested.
+fn submit_abandons_continuation(
+    shell: ShellSpec,
+    last_submitted: Option<&str>,
+    text: &str,
+) -> bool {
+    shell != ShellSpec::Fish && last_submitted.is_some_and(|prev| !text.starts_with(prev))
 }
 
 impl PaneSession {
@@ -348,6 +401,7 @@ impl PaneSession {
             session_lock: None,
             persist_pane_row: None,
             persist_session: None,
+            last_persisted_cwd: None,
             shell: ShellSpec::Zsh,
             live_completion: None,
             live_completion_response: None,
@@ -417,6 +471,7 @@ impl PaneSession {
             session_lock: None,
             persist_pane_row: Some(pane_row_id),
             persist_session: None,
+            last_persisted_cwd: None,
             // A restored pane is `Dead`: no live shell, so it never issues
             // completion requests. Defaults mirror the bare `spawn` path;
             // `Restart` rebuilds a real pane with the right shell.
@@ -487,6 +542,7 @@ impl PaneSession {
             match begun {
                 Ok(record) => {
                     session.chunk_writer = Some(crate::persist::writer::ChunkWriter::spawn(
+                        persist.root().to_path_buf(),
                         record.dir,
                         persist.store_handle(),
                         record.session,
@@ -497,6 +553,9 @@ impl PaneSession {
                     session.session_lock = Some(record.lock);
                     session.persist_pane_row = Some(record.pane_row.0);
                     session.persist_session = Some(record.session.0);
+                    // Stamp recorded commands with the durable pane row so
+                    // `↑` recall survives restart (the pane reuses this row).
+                    session.capture_state.db_pane_id = Some(record.pane_row.0);
                 }
                 Err(e) => eprintln!("termica: persistence session start failed: {e}"),
             }
@@ -774,6 +833,21 @@ impl PaneSession {
             self.record_pending_transitions();
         }
 
+        // Persist the pane's cwd to its durable `pane` row on every
+        // change, so a restored pane resumes in the dir it was LAST in.
+        // Durable ON CHANGE, never deferred to quit — the process can
+        // vanish (crash, hard reset), so there is no guaranteed teardown
+        // in which to flush. Routed through the writer thread (off the UI
+        // thread; it owns the store + durable pane row). cwd changes are
+        // user-paced and deduped here, so this is cheap.
+        let current_cwd = self.current_cwd();
+        if current_cwd != self.last_persisted_cwd {
+            self.last_persisted_cwd = current_cwd.clone();
+            if let Some(writer) = &self.chunk_writer {
+                writer.set_cwd(current_cwd.as_ref().map(|p| p.display().to_string()));
+            }
+        }
+
         // 4G-async-context: drive the off-thread git probe. Request a
         // fresh probe when the cwd changed (the probe dedups internally)
         // or a command just finished (forced — same cwd, newly dirty),
@@ -855,6 +929,7 @@ impl PaneSession {
             screen_text: self.terminal.screen_text(),
             mode: Some(mode),
             is_bootstrapping: mode == PaneMode::Bootstrapping,
+            completion_degraded: self.controller.completion_degraded(),
         }
     }
 
@@ -923,9 +998,45 @@ impl PaneSession {
     /// blank the live terminal grid. The shell process is
     /// untouched — it'll redraw its prompt on the next prompt
     /// cycle, or when the user presses Enter.
+    ///
+    /// This is an **explicit discard**: it also deletes the pane's
+    /// persisted transcript from disk (chunk files + index rows + chips)
+    /// so the cleared content does not reappear on the next launch. The
+    /// pane's command history (`runs`) is deliberately kept — clearing
+    /// the screen never wipes `~/.zsh_history`. The disk delete runs on
+    /// the writer thread, serialized behind any in-flight block writes.
     pub fn clear_scrollback(&mut self) {
         self.blocks.clear_sealed();
         self.terminal.clear_all();
+        if let Some(writer) = &self.chunk_writer {
+            writer.clear();
+        }
+    }
+
+    /// Explicit close: delete this pane's persisted **transcript** (chunk
+    /// files + index rows + chips) while keeping its command **history**
+    /// (`runs`) — the same discard model as Cmd+K. A closed pane is not
+    /// restored on the next launch, so leaving its chunks would only
+    /// orphan them until gc. Queues the discard on the writer, then drains
+    /// it so the delete lands before the pane is dropped.
+    pub fn discard_persisted_transcript(&mut self) {
+        if let Some(writer) = &self.chunk_writer {
+            writer.clear();
+        }
+        self.flush_chunk_writer();
+    }
+
+    /// Drain this pane's background scrollback writer before teardown:
+    /// block until every queued chunk write AND `Clear` delete (Cmd+K /
+    /// close) has been applied, then drop the writer. Without this, a
+    /// quit immediately after a Cmd+K can exit before the async delete
+    /// lands, resurrecting the "cleared" transcript on next launch. Takes
+    /// the writer, so it is idempotent (a second call is a no-op) and the
+    /// pane writes nothing further.
+    pub fn flush_chunk_writer(&mut self) {
+        if let Some(writer) = self.chunk_writer.take() {
+            writer.finish();
+        }
     }
 
     /// Stable per-pane id. Used to salt egui widget IDs that may
@@ -1004,14 +1115,19 @@ impl PaneSession {
             self.blocks.editor_on_tail().map(|e| e.text().to_string()).unwrap_or_default();
         let current_cursor = self.blocks.editor_on_tail().map(|e| e.cursor()).unwrap_or_default();
         let app_run_id = ctx.app_run_id.clone();
+        // Scope ↑ recall to the DURABLE pane row when persistence is on,
+        // so history survives restart; otherwise fall back to this
+        // app-run's ephemeral pane (degraded mode).
+        let db_pane_id = self.persist_pane_row;
         let outcome = self.recall.step_back(
             || {
                 let store = match ctx.store.lock() {
                     Ok(s) => s,
                     Err(_) => return Vec::new(),
                 };
+                let scope = Scope::pane_recall(db_pane_id, pane_id as i64, &app_run_id);
                 store
-                    .recent(&Scope::Pane { pane_id: pane_id as i64, app_run_id: &app_run_id }, 500)
+                    .recent(&scope, 500)
                     .map(|rows| rows.into_iter().map(|r| r.text).collect())
                     .unwrap_or_default()
             },
@@ -1076,15 +1192,18 @@ impl PaneSession {
         target: (DriverTool, String, usize),
     ) {
         let (tool, line) = (target.0, target.1.clone());
-        // Live-shell path: a fish or zsh pane sitting at a prompt with
+        // Live-shell path: a fish, zsh, or bash pane sitting at a prompt with
         // confirmed integration answers from its OWN shell (so it sees
         // aliases / functions defined at runtime), via a PTY request rather
         // than a one-shot subprocess. The reply lands as a `completion`
-        // marker. `ZshComplete` has no one-shot form at all, so it MUST take
-        // this path; `FishComplete` falls through to the subprocess engine
-        // when the fish pane isn't live-capable (degraded integration).
-        if matches!(tool, DriverTool::FishComplete | DriverTool::ZshComplete)
-            && self.live_completion_capable()
+        // marker. `ZshComplete` / `BashComplete` have no one-shot form at all,
+        // so they MUST take this path; `FishComplete` falls through to the
+        // subprocess engine when the fish pane isn't live-capable (degraded
+        // integration).
+        if matches!(
+            tool,
+            DriverTool::FishComplete | DriverTool::ZshComplete | DriverTool::BashComplete
+        ) && self.live_completion_capable()
         {
             self.live_completion_request(tool, line);
             return;
@@ -1121,12 +1240,13 @@ impl PaneSession {
     }
 
     /// True when this pane can answer completion from its **live** shell:
-    /// it's a fish OR zsh pane, sitting at a prompt (`ShellPromptEditor`),
-    /// with shell integration confirmed. Only then is the bootstrap ready to
-    /// service a completion request (fish's read-eval loop; zsh's
-    /// `__termica_complete` sentinel + warm completion child).
+    /// it's a fish, zsh, OR bash pane, sitting at a prompt
+    /// (`ShellPromptEditor`), with shell integration confirmed. Only then is
+    /// the bootstrap ready to service a completion request (fish's read-eval
+    /// loop; zsh's `__termica_complete` sentinel + warm completion child;
+    /// bash's `__termica_complete` sentinel + in-process `COMPREPLY` capture).
     fn live_completion_capable(&self) -> bool {
-        matches!(self.shell, ShellSpec::Fish | ShellSpec::Zsh)
+        matches!(self.shell, ShellSpec::Fish | ShellSpec::Zsh | ShellSpec::Bash)
             && self.controller.mode() == PaneMode::ShellPromptEditor
             && matches!(
                 self.controller.integration(),
@@ -1259,9 +1379,11 @@ impl PaneSession {
         // as abandonment too — clearing the line and pressing Enter once
         // is the "just get me out" gesture.) The legitimate multi-line
         // case (the user APPENDED, so `text` still starts with
-        // `last_submitted`) falls through to the normal diff-submit.
+        // `last_submitted`) falls through to the normal diff-submit, as
+        // does fish, which buffers no dangling line and recovers by
+        // re-eval — see [`submit_abandons_continuation`].
         if self.awaiting_continuation()
-            && !self.last_submitted.as_deref().is_some_and(|prev| text.starts_with(prev))
+            && submit_abandons_continuation(self.shell, self.last_submitted.as_deref(), &text)
         {
             return self.abort_continuation_line();
         }
@@ -1310,15 +1432,7 @@ impl PaneSession {
         //   submit and is waiting for more); we only need to send
         //   `<new_lines>\r` — sending the whole thing would feed
         //   `<prev_sent>` to the shell TWICE.
-        let to_send: String = match self.last_submitted.as_deref() {
-            Some(prev) if text.starts_with(prev) => {
-                // Strip the already-sent prefix + the separator \n
-                // the restore-on-continuation logic inserted.
-                let after = &text[prev.len()..];
-                after.strip_prefix('\n').unwrap_or(after).to_string()
-            }
-            _ => text.clone(),
-        };
+        let to_send = continuation_to_send(self.shell, self.last_submitted.as_deref(), &text);
         // Track the full editor text (not `to_send`) so the next
         // Continuation restore can put the right cumulative text
         // back into the editor.
@@ -1355,8 +1469,14 @@ impl PaneSession {
     /// is pending, so Ctrl+C stays inert at an idle prompt (spec/04). The
     /// "abort but keep my retyped text" variant is the 2-Enter heal in
     /// [`Self::submit_editor_command`], which reuses the same primitive.
+    ///
+    /// No-op for **fish**: it buffers no dangling tty line (it re-`eval`s
+    /// the whole cumulative buffer each submit), so it never gets stuck
+    /// and needs no SIGINT recovery — same reasoning as
+    /// [`submit_abandons_continuation`]. Ctrl+C there stays inert, as
+    /// before fish continuation shipped.
     pub fn abort_continuation(&mut self) -> Result<(), PtyError> {
-        if !self.awaiting_continuation() {
+        if self.shell == ShellSpec::Fish || !self.awaiting_continuation() {
             return Ok(());
         }
         if let Some(editor) = self.blocks.editor_on_tail_mut() {
@@ -2019,6 +2139,36 @@ mod tests {
     }
 
     #[test]
+    fn bash_live_reply_correlates_by_id_and_tags_bash() {
+        // The same live-completion plumbing serves a bash pane: a reply
+        // carrying bash's value-only `COMPREPLY` lines is correlated by id and
+        // the candidates are tagged `BashComplete` (popup `bash` source chip).
+        let mut session =
+            PaneSession::spawn(5, 40, &sh_c("sleep 0.1"), "t".into(), 0, None).expect("spawn");
+        session.live_completion =
+            Some(LiveCompletion { id: 4, sent_ms: 0, tool: DriverTool::BashComplete });
+
+        // Mismatched id dropped.
+        session.ingest_live_completion(1, &["nope".to_string()]);
+        assert!(session.live_completion.is_some(), "in-flight still pending after mismatch");
+
+        session.ingest_live_completion(
+            4,
+            &["beta".to_string(), "alpha".to_string(), "gamma".to_string()],
+        );
+        assert!(session.live_completion.is_none());
+        let resp = session.completion_driver_poll().expect("a response is available");
+        assert_eq!(resp.tool, DriverTool::BashComplete);
+        assert_eq!(resp.candidates.len(), 3);
+        assert_eq!(resp.candidates[0].value, "beta", "user `complete -F` candidate completes");
+        assert_eq!(resp.candidates[0].description, None, "values-only in v1");
+        assert_eq!(
+            resp.candidates[0].source,
+            crate::completion::CompletionSource::Driver(DriverTool::BashComplete)
+        );
+    }
+
+    #[test]
     fn live_completion_timeout_falls_back_to_empty_response_tagged_by_tool() {
         let mut session =
             PaneSession::spawn(5, 40, &sh_c("sleep 0.1"), "t".into(), 0, None).expect("spawn");
@@ -2516,6 +2666,70 @@ mod tests {
             "abort at an idle prompt must not discard the typed line"
         );
         let _ = session.write(b"\x03"); // bring the shell down quickly
+    }
+
+    #[test]
+    fn continuation_to_send_first_submit_sends_full_text() {
+        // No prior continuation: every shell sends the whole editor text.
+        for shell in [ShellSpec::Zsh, ShellSpec::Bash, ShellSpec::Fish] {
+            assert_eq!(continuation_to_send(shell, None, "echo 1 &&"), "echo 1 &&");
+        }
+    }
+
+    #[test]
+    fn continuation_to_send_zsh_bash_send_only_the_suffix() {
+        // zsh/bash buffer `<prev>\n` at the tty (PS2), so a continuation
+        // re-submit sends only the new suffix beyond `last_submitted`.
+        for shell in [ShellSpec::Zsh, ShellSpec::Bash] {
+            assert_eq!(
+                continuation_to_send(shell, Some("echo 1 &&"), "echo 1 &&\necho 2"),
+                "echo 2",
+                "{shell:?} sends only the suffix"
+            );
+        }
+    }
+
+    #[test]
+    fn continuation_to_send_fish_sends_the_whole_buffer() {
+        // fish holds NO partial command across submits (it evals whole lines),
+        // so a continuation re-submit must resend the cumulative buffer — the
+        // suffix-diff that zsh/bash use would drop the prefix and run only
+        // `echo 2`, losing the `echo 1 &&` the user is continuing.
+        assert_eq!(
+            continuation_to_send(ShellSpec::Fish, Some("echo 1 &&"), "echo 1 &&\necho 2"),
+            "echo 1 &&\necho 2",
+            "fish resends the whole buffer, not the suffix"
+        );
+    }
+
+    #[test]
+    fn submit_abandons_continuation_zsh_bash_on_nonextending_text() {
+        // zsh/bash buffer a dangling line at the tty; retyping text that
+        // does NOT extend the half-sent command must abort it, not feed it.
+        for shell in [ShellSpec::Zsh, ShellSpec::Bash] {
+            assert!(submit_abandons_continuation(shell, Some("echo \"!\""), "ls"));
+            assert!(submit_abandons_continuation(shell, Some("echo 1 &&"), "different"));
+            // Appending (text still starts with `prev`) is NOT abandonment —
+            // it's the legitimate multi-line case (normal diff-submit).
+            assert!(!submit_abandons_continuation(shell, Some("echo 1 &&"), "echo 1 &&\necho 2"));
+        }
+    }
+
+    #[test]
+    fn submit_abandons_continuation_never_for_fish() {
+        // fish re-evals the whole cumulative buffer each submit, so it never
+        // gets stuck and must never be aborted — abandonment is gated off so
+        // a retype falls through to the normal whole-buffer resend.
+        assert!(!submit_abandons_continuation(ShellSpec::Fish, Some("echo \"!\""), "ls"));
+        assert!(!submit_abandons_continuation(ShellSpec::Fish, Some("echo 1 &&"), "different"));
+    }
+
+    #[test]
+    fn submit_abandons_continuation_false_with_no_prior() {
+        // Not in a continuation at all (no `last_submitted`) → nothing to abandon.
+        for shell in [ShellSpec::Zsh, ShellSpec::Bash, ShellSpec::Fish] {
+            assert!(!submit_abandons_continuation(shell, None, "ls"));
+        }
     }
 
     #[test]

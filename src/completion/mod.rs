@@ -217,6 +217,10 @@ pub enum CompletionPlan {
         origin_byte: usize,
         token: String,
         locals: Vec<CompletionCandidate>,
+        /// The quote context at the cursor ([`local::CompletionContext::quote`]),
+        /// carried so the driver result's values can be escaped for the same
+        /// context the local source already escaped for ([`resolve_driver`]).
+        quote: Option<char>,
         target: (DriverTool, String, usize),
     },
     /// Nothing to show (no driver, no local candidates).
@@ -232,6 +236,9 @@ pub struct PendingCompletion {
     pub origin_byte: usize,
     pub token: String,
     pub locals: Vec<CompletionCandidate>,
+    /// Quote context at the cursor, threaded to [`resolve_driver`] so the
+    /// driver values escape into the same context as the local candidates.
+    pub quote: Option<char>,
     /// `true` when this completion session was opened by an explicit `Tab`
     /// press, so a lone result may auto-accept. `false` for a live
     /// re-filter driven by typing — there the user stays in control and
@@ -242,9 +249,11 @@ pub struct PendingCompletion {
 }
 
 /// Decide what to do for the editor state at `cursor`. A driver-eligible
-/// command always yields [`CompletionPlan::AwaitDriver`] (even with no
-/// local matches); otherwise the local candidates open immediately, or
-/// [`CompletionPlan::Closed`] when there are none.
+/// command yields [`CompletionPlan::AwaitDriver`] (even with no local
+/// matches) — UNLESS the token is a path extension whose local listing
+/// already succeeded, in which case the local candidates open immediately
+/// (the sidecar is skipped). Otherwise the local candidates open
+/// immediately, or [`CompletionPlan::Closed`] when there are none.
 pub fn plan_completion(
     editor_text: &str,
     cursor: usize,
@@ -256,8 +265,20 @@ pub fn plan_completion(
 ) -> CompletionPlan {
     let (origin, token, locals) =
         local_candidates_at(editor_text, cursor, cwd, home, env_var_names, history_lookup);
-    if let Some(target) = driver_target_for_shell(editor_text, cursor, shell) {
-        return CompletionPlan::AwaitDriver { origin_byte: origin, token, locals, target };
+    // For a path-shaped token whose local listing succeeded, the local path
+    // source IS the authoritative, complete directory listing — the sidecar
+    // can only add redundant or junk path rows (see [`resolve_driver`]). Skip
+    // the sidecar round-trip entirely and open the local rows now: no spinner,
+    // no latency, and "the local listing is authoritative for paths" becomes a
+    // routing invariant rather than a post-hoc filter on the driver result.
+    let local_listing_is_authoritative = token.contains('/') && !locals.is_empty();
+    if !local_listing_is_authoritative
+        && let Some(target) = driver_target_for_shell(editor_text, cursor, shell)
+    {
+        // Recompute the (pure, cheap) quote context so the driver result can
+        // be escaped for the same context the local source escaped for.
+        let quote = local::completion_context(editor_text, cursor).quote;
+        return CompletionPlan::AwaitDriver { origin_byte: origin, token, locals, quote, target };
     }
     match CompletionPopup::new(origin, token, locals) {
         Some(popup) => CompletionPlan::Open(popup),
@@ -285,7 +306,13 @@ pub fn plan_completion(
 /// completion (command *and* argument position, like fish), so the user's
 /// own completions work. The capture is values-only in v1.
 ///
-/// **bash** keeps the per-tool driver path only (no sidecar yet).
+/// A **bash** pane behaves exactly like zsh: the per-tool cobra drivers stay
+/// AUTHORITATIVE for the tools that have them, and everything else — aliases,
+/// functions, built-ins, and tools with `bash-completion`-installed
+/// completions — routes to bash's live-shell completion (command *and*
+/// argument position). Unlike zsh's captive child, the managed bash captures
+/// completions in-process (`COMPREPLY` needs no readline context), but the
+/// routing and reply path are identical. Values-only in v1.
 fn driver_target_for_shell(
     editor_text: &str,
     cursor: usize,
@@ -296,16 +323,22 @@ fn driver_target_for_shell(
             let (line, point) = drivers::parse::fish_segment(editor_text, cursor)?;
             Some((DriverTool::FishComplete, line, point))
         }
-        ShellSpec::Zsh => {
+        // zsh and bash share the routing: cobra drivers win, the live shell
+        // takes the long tail. Only the tool tag (and capture mechanism)
+        // differ.
+        ShellSpec::Zsh | ShellSpec::Bash => {
             // Cobra drivers win for the tools that have them.
             if let Some(target) = drivers::parse::driver_target(editor_text, cursor) {
                 return Some(target);
             }
-            // Long tail → the live zsh shell (command + argument position).
+            // Long tail → the live shell (command + argument position).
             let (line, point) = drivers::parse::fish_segment(editor_text, cursor)?;
-            Some((DriverTool::ZshComplete, line, point))
+            let tool = match shell {
+                ShellSpec::Bash => DriverTool::BashComplete,
+                _ => DriverTool::ZshComplete,
+            };
+            Some((tool, line, point))
         }
-        ShellSpec::Bash => drivers::parse::driver_target(editor_text, cursor),
     }
 }
 
@@ -316,11 +349,125 @@ fn driver_target_for_shell(
 pub fn resolve_driver(
     origin_byte: usize,
     token: &str,
+    quote: Option<char>,
     locals: Vec<CompletionCandidate>,
     driver: Vec<CompletionCandidate>,
 ) -> Option<CompletionPopup> {
+    let driver = realign_driver_path_candidates(token, quote, driver);
     let merged = ranking::merge_ranked(vec![locals, driver], 200);
     CompletionPopup::new(origin_byte, token, merged)
+}
+
+/// Realign each driver/sidecar value to the whole-token convention the local
+/// path source uses ([`align_driver_value_to_token`]); for a **path-shaped**
+/// token, cull the self-evident junk; then canonicalise + escape every
+/// surviving value for the shell context.
+///
+/// **Path-shaped tokens reach here only when the local listing FAILED.**
+/// [`plan_completion`] skips the sidecar entirely whenever a path token's
+/// local listing succeeded — the local path source is then the authoritative,
+/// complete directory listing and the sidecar can only add redundant or junk
+/// rows. So by the time a driver result lands for a path token, there is no
+/// authoritative oracle (the directory couldn't be read, or it isn't a
+/// filesystem path at all), and we fall back to two cheap heuristics that
+/// drop the noise zsh emits (verified against the live captive child): the
+/// value must extend the token, and its leaf must not be one of the token's
+/// own directory components (`cd /usr/` → `usr` aligns to `/usr/usr`).
+///
+/// Every surviving value is **canonicalised then escaped for the shell
+/// context** (`quote`), mirroring the local path source: zsh's capture emits
+/// the SAME match both raw (`Application Support`) and pre-escaped
+/// (`Application\ Support`), so unescaping to the literal collapses the two
+/// (otherwise the pre-escaped form double-escapes), and re-escaping makes a
+/// name with a space round-trip.
+///
+/// Non-path tokens (command names, subcommands, flags — no `/`) skip the path
+/// suppression entirely — fuzzy/substring command completions must survive —
+/// but are still canonicalised + escaped, so an argument-position filename
+/// with a space (`vim my fi<Tab>`) round-trips too.
+fn realign_driver_path_candidates(
+    token: &str,
+    quote: Option<char>,
+    driver: Vec<CompletionCandidate>,
+) -> Vec<CompletionCandidate> {
+    let path_shaped = token.contains('/');
+    // The token's own directory components (`/usr/bin/af` → {usr, bin}), for
+    // the ancestor-component check.
+    let token_components: std::collections::HashSet<&str> = if path_shaped {
+        token
+            .rsplit_once('/')
+            .map(|(dir, _)| dir)
+            .unwrap_or("")
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+    let token_lower = token.to_lowercase();
+    driver
+        .into_iter()
+        .filter_map(|mut c| {
+            // Canonicalise first: zsh's capture emits the SAME match both raw
+            // (`Application Scripts`) and pre-escaped (`Application\ Scripts`);
+            // unescaping both to the literal lets them collapse and re-escape
+            // to one value (otherwise the pre-escaped one double-escapes).
+            let literal = local::unescape(&c.value);
+            c.display = literal.clone();
+            // Filters run on the UNESCAPED aligned value (the token is also
+            // unescaped, so prefix / component checks line up).
+            let aligned = align_driver_value_to_token(token, &literal);
+            if path_shaped {
+                // No authoritative local listing here (see above) — cull the
+                // self-evident junk. Must extend the typed token (case-
+                // insensitive — tolerant, only ever keeping more matches).
+                if !aligned.to_lowercase().starts_with(&token_lower) {
+                    return None;
+                }
+                // Drop an ancestor-component match (`/usr/` → `usr`): its leaf
+                // is a directory the token already names, never a real child.
+                let leaf = aligned.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+                if token_components.contains(leaf) {
+                    return None;
+                }
+            }
+            // Escape for the shell context, mirroring the local path source.
+            c.value = local::escape_for_context(&aligned, quote);
+            Some(c)
+        })
+        .collect()
+}
+
+/// Rewrite a driver candidate's `value` so it is the full replacement for
+/// the whole completion `token`, matching the convention the local path
+/// source uses.
+///
+/// Shell sidecars complete the **last path segment**: for the word `~/Lib`
+/// a sidecar returns `Library`, not `~/Library`. The popup replaces the
+/// entire token on accept, so a bare-segment value would drop the `~/`
+/// directory prefix the user typed (`cd ~/Lib<Tab>` → `cd Library`, which
+/// points at the wrong directory when cwd isn't `~`). Prepend the token's
+/// directory prefix — everything up to and including its last `/` — so the
+/// value only effectively replaces the partial last segment.
+///
+/// Leaves the value untouched when:
+/// - the token has no `/` (the whole token IS the segment: command names,
+///   subcommands, flags, git branches — `git che` → `checkout`); or
+/// - the value already carries the dir prefix (fish's `complete -C`
+///   returns the full word `~/Library/`) or is itself absolute (a path the
+///   sidecar already resolved) — both already full-token replacements.
+fn align_driver_value_to_token(token: &str, value: &str) -> String {
+    let Some(slash) = token.rfind('/') else {
+        return value.to_string();
+    };
+    // Up to and including the last `/` (`~/`, `/`, `src/`). `slash` is a
+    // byte index at an ASCII `/`, so `..=slash` is on a char boundary.
+    let dir_prefix = &token[..=slash];
+    if value.starts_with(dir_prefix) || value.starts_with('/') {
+        value.to_string()
+    } else {
+        format!("{dir_prefix}{value}")
+    }
 }
 
 /// Resolve a path-token's `dir_part` into a real filesystem path
@@ -575,39 +722,58 @@ mod tests {
     }
 
     #[test]
-    fn plan_non_driver_command_opens_locals_immediately() {
-        // `ls ` (not a driver) with a file → open the local list now,
-        // no waiting. Uses a **bash** pane: bash keeps the per-tool driver
-        // path only (no sidecar), so a non-cobra command opens locals
-        // immediately. (In a zsh pane `ls ` now routes to the live shell —
-        // covered by the zsh routing tests.)
+    fn plan_bash_cobra_tool_stays_authoritative_over_shell_capture() {
+        // Like zsh: a bash pane keeps the robust cobra driver for `git` — it
+        // must NOT route `git ch` through the shell capture.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("notes.txt"), b"").unwrap();
         let plan =
-            plan_completion("ls ", 3, Some(dir.path()), None, &[], ShellSpec::Bash, Vec::new);
+            plan_completion("git ch", 6, Some(dir.path()), None, &[], ShellSpec::Bash, Vec::new);
         match plan {
-            CompletionPlan::Open(popup) => {
-                assert!(popup.candidates.iter().any(|c| c.display.ends_with("notes.txt")));
+            CompletionPlan::AwaitDriver { target, .. } => {
+                assert_eq!(target.0, DriverTool::Git, "cobra git driver wins, not BashComplete");
             }
-            other => panic!("expected Open, got {other:?}"),
+            other => panic!("expected AwaitDriver(Git), got {other:?}"),
         }
     }
 
     #[test]
-    fn plan_non_driver_no_local_match_is_closed() {
-        // bash pane, non-cobra command, no local match → nothing. (zsh would
-        // instead await the live shell — see the zsh routing tests.)
+    fn plan_bash_long_tail_routes_to_live_shell_capture() {
+        // A non-cobra command in a bash pane — in BOTH argument and command
+        // position — routes to bash's live-shell completion (the long tail:
+        // aliases, functions, `bash-completion`-installed completions). The
+        // carried locals still merge into the popup after the reply.
         let dir = tempfile::tempdir().unwrap();
-        let plan = plan_completion(
-            "ls zzz_no_such",
-            14,
-            Some(dir.path()),
-            None,
-            &[],
-            ShellSpec::Bash,
-            Vec::new,
+        std::fs::write(dir.path().join("notes.txt"), b"").unwrap();
+        let arg =
+            plan_completion("ls notes", 8, Some(dir.path()), None, &[], ShellSpec::Bash, Vec::new);
+        match arg {
+            CompletionPlan::AwaitDriver { target, locals, .. } => {
+                assert_eq!(target.0, DriverTool::BashComplete);
+                assert_eq!(target.1, "ls notes");
+                assert!(
+                    locals.iter().any(|c| c.display.ends_with("notes.txt")),
+                    "local file candidates ride along to merge after the reply"
+                );
+            }
+            other => panic!("expected AwaitDriver(BashComplete), got {other:?}"),
+        }
+
+        let cmd =
+            plan_completion("frobni", 6, Some(dir.path()), None, &[], ShellSpec::Bash, Vec::new);
+        match cmd {
+            CompletionPlan::AwaitDriver { target, .. } => {
+                assert_eq!(target.0, DriverTool::BashComplete);
+                assert_eq!(target.1, "frobni");
+            }
+            other => panic!("expected AwaitDriver(BashComplete) for command name, got {other:?}"),
+        }
+
+        // Empty editor must NOT fire a capture request.
+        let empty = plan_completion("", 0, Some(dir.path()), None, &[], ShellSpec::Bash, Vec::new);
+        assert!(
+            !matches!(empty, CompletionPlan::AwaitDriver { .. }),
+            "empty editor must not flood the bash shell, got {empty:?}"
         );
-        assert!(matches!(plan, CompletionPlan::Closed), "no driver, no match → nothing");
     }
 
     #[test]
@@ -725,19 +891,232 @@ mod tests {
     }
 
     #[test]
+    fn plan_path_token_with_local_listing_skips_the_sidecar() {
+        // A path-shaped token whose local listing succeeded: the local path
+        // source IS the authoritative, complete directory listing, so the
+        // sidecar can only add redundant/junk path rows. Skip the round-trip
+        // and open the local rows immediately — NO AwaitDriver, no spinner.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
+        let text = format!("cd {}/", dir.path().display());
+        for shell in [ShellSpec::Zsh, ShellSpec::Fish] {
+            let plan =
+                plan_completion(&text, text.len(), Some(dir.path()), None, &[], shell, Vec::new);
+            match plan {
+                CompletionPlan::Open(popup) => {
+                    assert!(
+                        popup.candidates.iter().any(|c| c.value.ends_with("subdir/")),
+                        "local dir row present for {shell:?}, got {:?}",
+                        popup.candidates
+                    );
+                }
+                other => panic!("expected Open (sidecar skipped) for {shell:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn plan_path_token_without_local_listing_still_awaits_sidecar() {
+        // No local listing (the directory can't be read): there is no
+        // authoritative oracle, so the sidecar is still consulted — it may be
+        // the only source (a path the GUI can't stat, a non-filesystem arg).
+        let dir = tempfile::tempdir().unwrap();
+        let text = "cd /no_such_dir_xyz/foo";
+        let plan = plan_completion(
+            text,
+            text.len(),
+            Some(dir.path()),
+            None,
+            &[],
+            ShellSpec::Zsh,
+            Vec::new,
+        );
+        assert!(
+            matches!(plan, CompletionPlan::AwaitDriver { .. }),
+            "path token with no local listing must still await the sidecar, got {plan:?}"
+        );
+    }
+
+    #[test]
     fn resolve_driver_merges_driver_over_locals() {
         let locals = vec![CompletionCandidate::simple("notes.txt", CompletionSource::Path)];
         let driver = vec![CompletionCandidate::simple(
             "checkout",
             CompletionSource::Driver(DriverTool::Git),
         )];
-        let popup = resolve_driver(4, "ch", locals, driver).expect("merged popup");
+        let popup = resolve_driver(4, "ch", None, locals, driver).expect("merged popup");
         assert_eq!(popup.candidates[0].value, "checkout", "driver ranks above locals");
     }
 
     #[test]
     fn resolve_driver_empty_everything_is_none() {
-        assert!(resolve_driver(0, "", vec![], vec![]).is_none());
+        assert!(resolve_driver(0, "", None, vec![], vec![]).is_none());
+    }
+
+    // ---- bare-segment driver values get the token's dir prefix --------
+    //
+    // Shell sidecars complete the LAST path segment: `complete -C` / zsh
+    // capture return `Library` for the word `~/Lib`, not `~/Library`. The
+    // popup replaces the whole token on accept, so an un-prefixed value
+    // would drop the `~/` the user typed (`cd ~/Lib<Tab>` → `cd Library`,
+    // a path that doesn't exist relative to cwd). `resolve_driver` must
+    // realign such values to the convention the local path source already
+    // uses: the value is the full replacement for the whole token.
+
+    fn driver(value: &str) -> CompletionCandidate {
+        CompletionCandidate::simple(value, CompletionSource::Driver(DriverTool::ZshComplete))
+    }
+
+    #[test]
+    fn resolve_driver_prefixes_bare_segment_with_tilde_dir() {
+        // Token `~/Lib`; sidecar returns the bare segment `Library`.
+        let popup =
+            resolve_driver(3, "~/Lib", None, vec![], vec![driver("Library")]).expect("popup");
+        assert_eq!(popup.candidates[0].value, "~/Library", "dir prefix `~/` prepended");
+        // The menu still shows the bare segment — nicer, and matches a shell.
+        assert_eq!(popup.candidates[0].display, "Library");
+    }
+
+    #[test]
+    fn resolve_driver_prefixes_bare_segment_under_absolute_dir() {
+        // The same generalises to `/us<Tab>` → `usr` (broken) vs `/usr`.
+        let popup = resolve_driver(3, "/us", None, vec![], vec![driver("usr")]).expect("popup");
+        assert_eq!(popup.candidates[0].value, "/usr");
+    }
+
+    #[test]
+    fn resolve_driver_prefixes_bare_segment_under_relative_dir() {
+        let popup =
+            resolve_driver(3, "src/Ca", None, vec![], vec![driver("Cargo.toml")]).expect("popup");
+        assert_eq!(popup.candidates[0].value, "src/Cargo.toml");
+    }
+
+    #[test]
+    fn resolve_driver_leaves_full_word_value_untouched() {
+        // fish's `complete -C` returns the FULL word (`~/Library/`); it
+        // already carries the dir prefix, so it must not be double-prefixed.
+        let popup =
+            resolve_driver(3, "~/Lib", None, vec![], vec![driver("~/Library/")]).expect("popup");
+        assert_eq!(popup.candidates[0].value, "~/Library/");
+    }
+
+    #[test]
+    fn resolve_driver_leaves_non_path_token_untouched() {
+        // No `/` in the token: command names, subcommands, flags, branches
+        // — the whole token IS the segment. `git che` → `checkout`.
+        let popup =
+            resolve_driver(4, "che", None, vec![], vec![driver("checkout")]).expect("popup");
+        assert_eq!(popup.candidates[0].value, "checkout");
+    }
+
+    #[test]
+    fn resolve_driver_realigned_value_accepts_to_correct_path() {
+        // End-to-end: the reported bug. `cd ~/Lib<Tab>`, accept the sidecar
+        // candidate → the `~/` prefix survives, not `cd Library`. (No local
+        // twin here, so the sidecar row is what's accepted.)
+        let mut e = crate::prompt_editor::PromptEditor::new();
+        e.insert_str("cd ~/Lib");
+        let popup =
+            resolve_driver(3, "~/Lib", None, vec![], vec![driver("Library")]).expect("popup");
+        // Token `~/Lib` starts at byte 3, length 5.
+        popup.accept(&mut e, 5);
+        assert_eq!(e.text(), "cd ~/Library ");
+    }
+
+    // ---- no-local-listing fallback heuristics -------------------------
+    //
+    // For a path-shaped token whose local listing SUCCEEDED, the sidecar is
+    // skipped entirely upstream ([`plan_completion`]), so a driver result
+    // only reaches `resolve_driver` for a path token when there was no local
+    // listing. With no authoritative oracle, two cheap heuristics cull the
+    // self-evident junk: a real completion must EXTEND the token (drop any
+    // value that doesn't), and its leaf must not be one of the token's own
+    // directory components (`cd /usr/<Tab>` → `usr` → `/usr/usr`).
+
+    #[test]
+    fn resolve_driver_drops_path_values_that_do_not_extend_the_token() {
+        // `usr` / `bin` don't extend `/usr/bin/af`; `afclip` does.
+        let popup = resolve_driver(
+            3,
+            "/usr/bin/af",
+            None,
+            vec![],
+            vec![driver("usr"), driver("bin"), driver("afclip")],
+        )
+        .expect("popup");
+        let values: Vec<&str> = popup.candidates.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(values, vec!["/usr/bin/afclip"], "only the extending leaf survives");
+    }
+
+    #[test]
+    fn resolve_driver_keeps_non_extending_values_for_non_path_tokens() {
+        // The extend filter is path-only: a non-path token (no `/`) routes
+        // every candidate through the normal merge — fuzzy/substring command
+        // and flag completions must not be culled.
+        let popup =
+            resolve_driver(0, "co", None, vec![], vec![driver("checkout"), driver("commit")])
+                .expect("popup");
+        assert_eq!(popup.candidates.len(), 2);
+    }
+
+    #[test]
+    fn resolve_driver_drops_ancestor_component_fallback_without_local_listing() {
+        // No local listing (the dir couldn't be read): the ancestor-component
+        // heuristic still fires. `/usr/` → `usr` aligns to `/usr/usr` (leaf is
+        // the token's own component) → dropped; a real-looking leaf survives.
+        let popup = resolve_driver(3, "/usr/", None, vec![], vec![driver("usr"), driver("share")])
+            .expect("popup");
+        let values: Vec<&str> = popup.candidates.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(values, vec!["/usr/share"], "ancestor `usr` culled, real leaf kept");
+    }
+
+    // ---- escaping driver path values (spaces / metacharacters) --------
+    //
+    // The local path source escapes its values (`Application Support` →
+    // `Application\ Support`) but the sidecar returns the raw name. A
+    // surviving driver value must be escaped the same way so a name with a
+    // space round-trips into the shell. zsh's capture also emits the SAME
+    // match both raw and pre-escaped, so values are first canonicalised
+    // (unescaped) to collapse the two before re-escaping.
+
+    #[test]
+    fn resolve_driver_escapes_path_value_with_space() {
+        // No local twin: the surviving sidecar value must be shell-escaped.
+        let popup = resolve_driver(
+            3,
+            "~/Library/Application",
+            None,
+            vec![],
+            vec![driver("Application Support")],
+        )
+        .expect("popup");
+        assert_eq!(popup.candidates[0].value, "~/Library/Application\\ Support");
+    }
+
+    #[test]
+    fn resolve_driver_canonicalises_preescaped_value_without_local_twin() {
+        // No local twin: the two forms still collapse to ONE single-escaped
+        // row (not a double-escaped duplicate).
+        let popup = resolve_driver(
+            3,
+            "~/Library/Application",
+            None,
+            vec![],
+            vec![driver("Application Support"), driver("Application\\ Support")],
+        )
+        .expect("popup");
+        let values: Vec<&str> = popup.candidates.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(values, vec!["~/Library/Application\\ Support"]);
+    }
+
+    #[test]
+    fn resolve_driver_escapes_argument_filename_with_space_non_path_token() {
+        // A non-path token (`my fi`, no `/`) skips the path filters but still
+        // gets escaped — an argument-position filename with a space must round-
+        // trip (`vim my fi<Tab>` → `my\ file.txt`).
+        let popup =
+            resolve_driver(0, "my fi", None, vec![], vec![driver("my file.txt")]).expect("popup");
+        assert_eq!(popup.candidates[0].value, "my\\ file.txt");
     }
 
     #[test]

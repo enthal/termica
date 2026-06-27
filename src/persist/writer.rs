@@ -27,33 +27,54 @@ use crate::history::HistoryStore;
 use crate::persist::chunk::encode_chunk;
 use crate::persist::store::{PaneRowId, PersistError, SessionId};
 
+/// A unit of work for the writer thread. Both arrive on the same channel
+/// so they are serialized in submission order — a `Clear` queued after a
+/// `Seal` is applied after that block is written (and so deletes it),
+/// while a block sealed *after* a clear is written fresh and kept.
+enum WriterMsg {
+    /// Persist one sealed block.
+    Seal(SealedSnapshot),
+    /// Discard the pane's entire persisted transcript (Cmd+K / close) and
+    /// reset the writer's cursor, so subsequent blocks start a fresh
+    /// transcript. The pane's `runs` history is untouched.
+    Clear,
+    /// Record the pane's current cwd to its durable `pane` row. Sent on
+    /// every cwd change so a restored pane lands in the dir it was LAST in
+    /// — durable on change, never deferred to quit (the process can
+    /// vanish). `None` means "cwd unknown".
+    SetCwd(Option<String>),
+}
+
 /// Handle owned by `PaneSession`. Dropping it drops the channel
 /// `Sender`, the worker's `recv()` returns `Err`, and the thread exits
 /// — RAII teardown, no join needed (same as the probe threads).
 pub struct ChunkWriter {
-    tx: mpsc::Sender<SealedSnapshot>,
+    tx: mpsc::Sender<WriterMsg>,
     _worker: JoinHandle<()>,
 }
 
 impl ChunkWriter {
     /// Spawn the writer thread for one session. `dir` is the session's
     /// `…/scrollback/session-<id>/pane-<id>/` directory (created by
-    /// [`crate::persist::store::Persistence::begin_session`]); `store`
-    /// is the shared `termica.sqlite` handle.
+    /// [`crate::persist::store::Persistence::begin_session`]); `root` is
+    /// the data-dir root that chunk paths are relative to (needed to
+    /// delete a pane's chunks across *all* its session dirs on `Clear`);
+    /// `store` is the shared `termica.sqlite` handle.
     /// `start_line` is the writer's initial cumulative logical-line
     /// cursor — `0` for a fresh pane, the pane's current max `end_line`
     /// for a resumed one (restart), so chunks accumulate across restarts
     /// without overlapping line ranges.
     pub fn spawn(
+        root: PathBuf,
         dir: PathBuf,
         store: Arc<Mutex<HistoryStore>>,
         session: SessionId,
         pane_row: PaneRowId,
         start_line: u64,
     ) -> Self {
-        let (tx, rx) = mpsc::channel::<SealedSnapshot>();
+        let (tx, rx) = mpsc::channel::<WriterMsg>();
         let worker =
-            thread::spawn(move || run_worker(dir, store, session, pane_row, start_line, rx));
+            thread::spawn(move || run_worker(root, dir, store, session, pane_row, start_line, rx));
         Self { tx, _worker: worker }
     }
 
@@ -61,14 +82,32 @@ impl ChunkWriter {
     /// has already exited (pane tearing down), the send is dropped — the
     /// block stays in memory and is simply not persisted, never a crash.
     pub fn submit(&self, snapshot: SealedSnapshot) {
-        let _ = self.tx.send(snapshot);
+        let _ = self.tx.send(WriterMsg::Seal(snapshot));
     }
 
-    /// Drop the sender and join the worker, so every queued snapshot is
-    /// flushed before the assertions run. Test-only: production teardown
-    /// is the non-blocking RAII drop above.
-    #[cfg(test)]
-    pub(crate) fn join_and_finish(self) {
+    /// Queue a transcript discard (Cmd+K / close): the worker deletes
+    /// every chunk file + index row + chips for this pane and resets its
+    /// cursor. Serialized behind any already-queued `Seal`s. Best-effort,
+    /// like [`Self::submit`].
+    pub fn clear(&self) {
+        let _ = self.tx.send(WriterMsg::Clear);
+    }
+
+    /// Record the pane's current cwd to its durable `pane` row (off the UI
+    /// thread). Sent on every cwd change so a restored pane resumes in the
+    /// dir it was last in. Best-effort, like [`Self::submit`].
+    pub fn set_cwd(&self, cwd: Option<String>) {
+        let _ = self.tx.send(WriterMsg::SetCwd(cwd));
+    }
+
+    /// Drain and join the worker: drop the sender so the worker's
+    /// `recv()` returns `Err` once the queue empties, then block until it
+    /// has applied **every** queued message (pending `Seal`s AND a
+    /// `Clear`). This is the teardown flush (spec/08 §Teardown): an
+    /// explicit Cmd-K / close `Clear` is async, so without draining it
+    /// here a quit immediately after Cmd-K would exit before the delete
+    /// lands and the "cleared" transcript would resurrect on next launch.
+    pub fn finish(self) {
         let ChunkWriter { tx, _worker } = self;
         drop(tx);
         let _ = _worker.join();
@@ -76,15 +115,16 @@ impl ChunkWriter {
 }
 
 /// The worker loop: own the per-session cursor state (next sequence
-/// number, cumulative logical-line offset) and persist each snapshot in
+/// number, cumulative logical-line offset) and apply each message in
 /// arrival order. Exits when the channel closes (pane dropped).
 fn run_worker(
+    root: PathBuf,
     dir: PathBuf,
     store: Arc<Mutex<HistoryStore>>,
     session: SessionId,
     pane_row: PaneRowId,
     start_line: u64,
-    rx: mpsc::Receiver<SealedSnapshot>,
+    rx: mpsc::Receiver<WriterMsg>,
 ) {
     // Defensive: the directory was created at begin_session, but a
     // racing cleanup or a fresh recovery path may have removed it.
@@ -93,16 +133,46 @@ fn run_worker(
     // session); `cumulative_line` is per pane (continues across restarts).
     let mut next_seq: u64 = 1;
     let mut cumulative_line: u64 = start_line;
-    while let Ok(snapshot) = rx.recv() {
-        match write_chunk(&dir, &store, session, pane_row, next_seq, cumulative_line, &snapshot) {
-            Ok(lines_written) => {
-                // Always advance the file sequence (a chunk was written,
-                // even a zero-line one); advance the logical cursor by the
-                // lines this chunk added (0 for a no-output block).
-                cumulative_line += lines_written;
-                next_seq += 1;
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            WriterMsg::Seal(snapshot) => {
+                match write_chunk(
+                    &dir,
+                    &store,
+                    session,
+                    pane_row,
+                    next_seq,
+                    cumulative_line,
+                    &snapshot,
+                ) {
+                    Ok(lines_written) => {
+                        // Always advance the file sequence (a chunk was
+                        // written, even a zero-line one); advance the
+                        // logical cursor by the lines this chunk added (0
+                        // for a no-output block).
+                        cumulative_line += lines_written;
+                        next_seq += 1;
+                    }
+                    Err(e) => eprintln!("termica: scrollback chunk write failed: {e}"),
+                }
             }
-            Err(e) => eprintln!("termica: scrollback chunk write failed: {e}"),
+            WriterMsg::Clear => {
+                match clear_pane_chunks(&root, &store, pane_row) {
+                    Ok(_) => {}
+                    Err(e) => eprintln!("termica: scrollback clear failed: {e}"),
+                }
+                // The transcript is now empty: subsequent blocks start a
+                // fresh sequence at logical line 0.
+                next_seq = 1;
+                cumulative_line = 0;
+            }
+            WriterMsg::SetCwd(cwd) => {
+                if let Ok(s) = store.lock()
+                    && let Err(e) = s.set_pane_cwd(pane_row.0, cwd.as_deref())
+                {
+                    eprintln!("termica: pane cwd persist failed: {e}");
+                }
+            }
         }
     }
 }
@@ -177,6 +247,40 @@ pub fn write_chunk(
         store.insert_chunk_chips(chunk_id, &chips)?;
     }
     Ok(n_lines)
+}
+
+/// Delete every persisted chunk for one pane — file, index row, and
+/// chips — across all of the pane's sessions (chunks accumulate across
+/// restarts, keyed by the durable `pane` row). Returns the count
+/// removed.
+///
+/// This is the TRANSCRIPT half of an explicit discard (Cmd+K / close):
+/// the pane's command history (`runs`) is deliberately left intact, so
+/// clearing the screen — like the action it mirrors — never wipes
+/// `~/.zsh_history`. Files are unlinked first, then their rows (matching
+/// `gc`), so a crash mid-clear leaves a recoverable orphan file, never a
+/// row pointing at a gone file. The DB lock is **not** held across the
+/// filesystem unlinks.
+pub fn clear_pane_chunks(
+    root: &Path,
+    store: &Arc<Mutex<HistoryStore>>,
+    pane_row: PaneRowId,
+) -> Result<usize, PersistError> {
+    // Snapshot the rows under the lock, then release it before touching
+    // the filesystem (don't hold the single shared DB mutex across
+    // blocking unlinks).
+    let rows = {
+        let s = store.lock().map_err(|_| PersistError::Lock)?;
+        s.pane_scrollback_chunks(pane_row.0)?
+    };
+    for r in &rows {
+        let _ = std::fs::remove_file(root.join(&r.path));
+    }
+    let s = store.lock().map_err(|_| PersistError::Lock)?;
+    for r in &rows {
+        s.delete_scrollback_chunk(r.id)?;
+    }
+    Ok(rows.len())
 }
 
 #[cfg(test)]
@@ -358,16 +462,156 @@ mod tests {
     }
 
     #[test]
+    fn writer_clear_discards_prior_chunks_and_resets_cursor() {
+        // A `Clear` queued after a `Seal` removes that block; a block
+        // sealed AFTER the clear is written fresh from logical line 0.
+        let (_tmp, persist, rec) = fixture();
+        let store = persist.store_handle();
+        let writer = ChunkWriter::spawn(
+            persist.root().to_path_buf(),
+            rec.dir.clone(),
+            store.clone(),
+            rec.session,
+            rec.pane_row,
+            0,
+        );
+        writer.submit(snapshot(1, &["before clear", "second"])); // [0,2)
+        writer.clear();
+        writer.submit(snapshot(2, &["after clear"])); // fresh: [0,1)
+        writer.finish();
+
+        // Only the post-clear chunk survives, and the cursor reset to 0.
+        let s = store.lock().unwrap();
+        let mut stmt = s
+            .conn()
+            .prepare("SELECT start_line, end_line FROM scrollback_chunk ORDER BY id")
+            .unwrap();
+        let ranges: Vec<(i64, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(ranges, vec![(0, 1)], "pre-clear chunk gone; post-clear chunk starts at line 0");
+    }
+
+    #[test]
+    fn writer_persists_pane_cwd_on_set_cwd() {
+        // The pane forwards each cwd change to the writer thread (off the
+        // UI thread, durable on change — not at quit). The worker writes
+        // it to the durable `pane` row so a restored pane lands in the dir
+        // it was LAST in.
+        let (_tmp, persist, rec) = fixture();
+        let store = persist.store_handle();
+        // begin_session recorded the start cwd "/work".
+        assert_eq!(
+            store.lock().unwrap().pane_cwd(rec.pane_row.0).unwrap().as_deref(),
+            Some("/work")
+        );
+        let writer = ChunkWriter::spawn(
+            persist.root().to_path_buf(),
+            rec.dir.clone(),
+            store.clone(),
+            rec.session,
+            rec.pane_row,
+            0,
+        );
+        writer.set_cwd(Some("/work/sub/dir".to_string()));
+        writer.finish();
+
+        assert_eq!(
+            store.lock().unwrap().pane_cwd(rec.pane_row.0).unwrap().as_deref(),
+            Some("/work/sub/dir"),
+            "the latest cwd is persisted to the pane row"
+        );
+    }
+
+    #[test]
+    fn finish_applies_a_clear_queued_just_before_teardown() {
+        // Regression: a Cmd+K (or close) queues a `Clear` on the writer.
+        // If the process quits before the writer drains, the delete is
+        // lost and the "cleared" transcript resurrects on next launch
+        // (observed: clear two panes, quit, relaunch -> blocks came back).
+        // `finish()` is the teardown flush — it must apply the queued
+        // Clear, leaving the pane's transcript empty on disk.
+        let (_tmp, persist, rec) = fixture();
+        let store = persist.store_handle();
+        let writer = ChunkWriter::spawn(
+            persist.root().to_path_buf(),
+            rec.dir.clone(),
+            store.clone(),
+            rec.session,
+            rec.pane_row,
+            0,
+        );
+        writer.submit(snapshot(1, &["secret output", "line two"]));
+        writer.clear(); // Cmd+K
+        writer.finish(); // the flush a quit must perform — no new block in between
+
+        let s = store.lock().unwrap();
+        let n: i64 = s
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM scrollback_chunk WHERE pane_id = ?1",
+                [rec.pane_row.0],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "queued Clear applied on teardown — transcript not resurrected");
+    }
+
+    #[test]
+    fn clear_pane_chunks_deletes_transcript_but_keeps_history() {
+        // Cmd+K / close discards a pane's TRANSCRIPT (chunk files + index
+        // rows + chips) but NOT its command history (`runs`) — like
+        // clearing the screen doesn't wipe `~/.zsh_history`.
+        let (_tmp, persist, rec) = fixture();
+        let store = persist.store_handle();
+        let mut snap = snapshot(1, &["output a", "output b"]);
+        snap.meta =
+            crate::block::BlockMeta { command: "ls".into(), exit: Some(0), cwd: None, git: None };
+        write_chunk(&rec.dir, &store, rec.session, rec.pane_row, 1, 0, &snap).unwrap();
+        write_chunk(&rec.dir, &store, rec.session, rec.pane_row, 2, 2, &snapshot(2, &["more"]))
+            .unwrap();
+        // A command-history row for this pane — must survive the clear.
+        store.lock().unwrap().record_submit("ls", None, rec.pane_row.0, "app-run", 1000).unwrap();
+
+        let file1 = rec.dir.join("00000001.chunk.tmck");
+        let file2 = rec.dir.join("00000002.chunk.tmck");
+        assert!(file1.is_file() && file2.is_file());
+
+        let deleted = clear_pane_chunks(persist.root(), &store, rec.pane_row).unwrap();
+        assert_eq!(deleted, 2, "both chunks removed");
+
+        // Files gone.
+        assert!(!file1.exists() && !file2.exists(), "chunk files deleted");
+        let s = store.lock().unwrap();
+        // Index rows + chips gone.
+        let n_chunks: i64 =
+            s.conn().query_row("SELECT COUNT(*) FROM scrollback_chunk", [], |r| r.get(0)).unwrap();
+        let n_chips: i64 =
+            s.conn().query_row("SELECT COUNT(*) FROM chunk_chip", [], |r| r.get(0)).unwrap();
+        assert_eq!((n_chunks, n_chips), (0, 0), "no chunk rows or chips remain");
+        // History kept.
+        assert_eq!(s.count_runs().unwrap(), 1, "command history (runs) is untouched");
+    }
+
+    #[test]
     fn writer_thread_sequences_chunks_and_advances_logical_cursor() {
         let (_tmp, persist, rec) = fixture();
         let store = persist.store_handle();
-        let writer =
-            ChunkWriter::spawn(rec.dir.clone(), store.clone(), rec.session, rec.pane_row, 0);
+        let writer = ChunkWriter::spawn(
+            persist.root().to_path_buf(),
+            rec.dir.clone(),
+            store.clone(),
+            rec.session,
+            rec.pane_row,
+            0,
+        );
         // Three blocks: 2 lines, 0 lines (still persisted), 3 lines.
         writer.submit(snapshot(1, &["a", "b"]));
         writer.submit(snapshot(2, &[]));
         writer.submit(snapshot(3, &["c", "d", "e"]));
-        writer.join_and_finish();
+        writer.finish();
 
         // Three files now — the zero-output block is persisted too (seq 2),
         // so its command/exit can be restored.

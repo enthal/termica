@@ -33,7 +33,13 @@ pub enum LifecycleEvent {
     /// `{"type":"integration_ready","value":{"shell":"zsh","version":1}}`
     /// — the bootstrap completed successfully. Termica transitions
     /// the pane from `Bootstrapping` → `RawTerminal` on receipt.
-    IntegrationReady { shell: ShellKind, version: u32 },
+    ///
+    /// bash additionally reports `"bash_major":N` and `"completion":bool`
+    /// (false ⇒ bash-completion couldn't load — old bash — so live
+    /// Tab-completion is degraded to the local sources only). `completion`
+    /// is parsed into `completion_degraded`; a missing field (fish/zsh, which
+    /// never degrade) means `false`. `bash_major` is still ignored.
+    IntegrationReady { shell: ShellKind, version: u32, completion_degraded: bool },
     /// `{"type":"integration_error","value":"<reason>"}` — the
     /// bootstrap detected a problem and chose to fail loud rather
     /// than continue. Pane transitions to `Degraded`.
@@ -141,7 +147,10 @@ fn parse_message(value: &serde_json::Value) -> Option<LifecycleEvent> {
                 _ => ShellKind::Unknown,
             };
             let version = v.get("version").and_then(|n| n.as_u64())? as u32;
-            Some(LifecycleEvent::IntegrationReady { shell, version })
+            // `completion:false` (bash only) ⇒ degraded. Absent (fish/zsh, or
+            // an older bootstrap) ⇒ not degraded.
+            let completion_degraded = v.get("completion").and_then(|c| c.as_bool()) == Some(false);
+            Some(LifecycleEvent::IntegrationReady { shell, version, completion_degraded })
         }
         "integration_error" => {
             let reason = value?.as_str()?.to_string();
@@ -229,7 +238,11 @@ mod tests {
         );
         assert_eq!(
             parse_dcs_body(&b),
-            Some(LifecycleEvent::IntegrationReady { shell: ShellKind::Zsh, version: 1 })
+            Some(LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Zsh,
+                version: 1,
+                completion_degraded: false
+            })
         );
     }
 
@@ -240,7 +253,43 @@ mod tests {
         );
         assert_eq!(
             parse_dcs_body(&b),
-            Some(LifecycleEvent::IntegrationReady { shell: ShellKind::Bash, version: 1 })
+            Some(LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Bash,
+                version: 1,
+                completion_degraded: false
+            })
+        );
+    }
+
+    #[test]
+    fn integration_ready_bash_completion_false_is_degraded() {
+        // Old bash (3.2, no bash-completion) reports completion:false → the
+        // pane should know its Tab-completion is degraded so it can warn.
+        let b = body(
+            r#"{"type":"integration_ready","session":"x","value":{"shell":"bash","version":1,"bash_major":3,"completion":false}}"#,
+        );
+        assert_eq!(
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Bash,
+                version: 1,
+                completion_degraded: true
+            })
+        );
+    }
+
+    #[test]
+    fn integration_ready_bash_completion_true_is_not_degraded() {
+        let b = body(
+            r#"{"type":"integration_ready","session":"x","value":{"shell":"bash","version":1,"bash_major":5,"completion":true}}"#,
+        );
+        assert_eq!(
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Bash,
+                version: 1,
+                completion_degraded: false
+            })
         );
     }
 
@@ -251,7 +300,11 @@ mod tests {
         );
         assert_eq!(
             parse_dcs_body(&b),
-            Some(LifecycleEvent::IntegrationReady { shell: ShellKind::Fish, version: 1 })
+            Some(LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Fish,
+                version: 1,
+                completion_degraded: false
+            })
         );
     }
 
@@ -262,7 +315,11 @@ mod tests {
         );
         assert_eq!(
             parse_dcs_body(&b),
-            Some(LifecycleEvent::IntegrationReady { shell: ShellKind::Unknown, version: 1 })
+            Some(LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Unknown,
+                version: 1,
+                completion_degraded: false
+            })
         );
     }
 
