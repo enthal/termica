@@ -48,13 +48,34 @@ It embeds your existing `zsh`, `bash`, or `fish` — Termica is not a new shell,
 
 ## Status
 
-Termica is in **active development and pre-1.0**. The core terminal, the tab/split workspace, the prompt-editor mode machine, command history, tab completion, and scrollback persistence are all working day-to-day, but the format and behavior may still change and there are rough edges. There are **no prebuilt binaries yet** — for now you build from source (it's one `cargo` command). Follow the [issue tracker](https://github.com/enthal/termica/issues) for the roadmap.
+Termica is in **active development and pre-1.0**. The core terminal, the tab/split workspace, the prompt-editor mode machine, command history, tab completion, and scrollback persistence are all working day-to-day, but the format and behavior may still change and there are rough edges. Prebuilt installers are published on the [releases page](https://github.com/enthal/termica/releases/latest), or you can [build from source](#getting-started). Follow the [issue tracker](https://github.com/enthal/termica/issues) for the roadmap.
 
 ## Platform support
 
 macOS and Linux. Windows is not supported (and is not currently planned).
 
+## Download
+
+Prebuilt installers for each release are on the [latest release page](https://github.com/enthal/termica/releases/latest):
+
+- **macOS** — `Termica_<version>_aarch64.dmg` (Apple Silicon) or `Termica_<version>_x64.dmg` (Intel). Open the `.dmg` and drag **Termica** to **Applications**.
+- **Linux (x86-64)** — a `.deb` (`sudo apt install ./termica_<version>_amd64.deb`) or a portable `.AppImage` (`chmod +x` it and run).
+
+Prefer to build it yourself? See [Build from source](#getting-started).
+
+### Opening on macOS the first time
+
+The macOS builds are **not yet signed or notarized by Apple** (that's coming — it needs an Apple Developer membership). Because the `.dmg` is downloaded from the internet, the first launch is blocked with a message like *"Apple could not verify 'Termica' is free of malware."* To open it anyway:
+
+1. Try to open Termica once (double-click it in Applications). You'll get the warning — click **Done**.
+2. Open **System Settings → Privacy & Security**, scroll to the **Security** section, and click **Open Anyway** next to the Termica message.
+3. Confirm **Open Anyway**, then authenticate. macOS remembers the choice; subsequent launches are normal.
+
+Equivalently, from a terminal: `xattr -dr com.apple.quarantine /Applications/Termica.app`. This caveat goes away once notarized builds ship.
+
 ## Getting started
+
+Building from source needs only Rust — there are no other system prerequisites on macOS; on Linux you'll need the usual GUI/X11 dev packages (see the build dependencies in [.github/workflows/release.yml](.github/workflows/release.yml)).
 
 ### 1. Install Rust
 
