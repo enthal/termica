@@ -2224,6 +2224,32 @@ pub fn render_pane(
     let (rendered, links_in_view, highlighted_link) = scroll_inner.inner;
     let highlighted_link = highlighted_link.as_ref();
 
+    // A running command's OUTPUT is the live terminal grid, painted inside
+    // the scroll area above (the block loop only wired the running block's
+    // header chips + command label). Attach the same context menu to the
+    // grid so a right-click on the streaming output works too — otherwise
+    // the menu only opens on the header / command, not the part the user is
+    // actually looking at. A grid click is never on a header chip, so there
+    // is no chip item. Only when the tail is `Running`; an idle prompt's
+    // grid (or a sealed-only pane) has no command to copy.
+    let running_command: Option<String> = match slot.session.blocks().last() {
+        Some(crate::block::Block::Running { command, .. }) => Some(command.clone()),
+        _ => None,
+    };
+    if let Some(command) = running_command {
+        rendered.response.context_menu(|menu_ui| {
+            let terminal = slot.session.terminal();
+            let output = terminal.snapshot_lines_all();
+            let entries = crate::block_menu::running_context_menu_entries(
+                &command,
+                &output,
+                terminal.is_alternate_screen(),
+                None,
+            );
+            crate::block_menu::show_block_context_menu(menu_ui, &entries);
+        });
+    }
+
     // ---- Sticky-top block header (4E) -----------------------------
     //
     // Once the scroll area has laid out, pin the header of the block
