@@ -46,7 +46,7 @@ Defined `type` values:
 
 | `type` | `value` shape | When the shell emits it |
 |---|---|---|
-| `integration_ready` | `{"shell":"zsh", "version":1}` | End of bootstrap. The signal that ends `Bootstrapping` mode. bash additionally carries `"bash_major":N` and `"completion":true\|false` (false when bash-completion couldn't load — old bash — so live Tab-completion is degraded; consumers may ignore the extra fields). |
+| `integration_ready` | `{"shell":"zsh", "version":1}` | End of bootstrap. The signal that ends `Bootstrapping` mode. bash additionally carries `"bash_major":N` and `"completion":true\|false` (false when bash-completion couldn't load — old bash — so live Tab-completion is degraded). `completion:false` is parsed into `IntegrationState::Confirmed { completion_degraded: true }`, surfacing a dismissible "completion is limited" strip on the pane; `bash_major` is informational. |
 | `integration_error` | `{"reason":"<short>"}` | Bootstrap detected a problem and chose to fail loud rather than continue. Pane transitions to `Degraded`. |
 | `preexec` | command string | About to execute a command. |
 | `command_finished` | exit code (integer) | Foreground command returned. |

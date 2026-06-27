@@ -66,6 +66,10 @@ pub struct PaneView {
     /// renderer should suppress the cell grid and show a placeholder
     /// instead.
     pub is_bootstrapping: bool,
+    /// `true` when integration is confirmed but the shell reported that live
+    /// Tab-completion is degraded (old bash with no bash-completion). Drives
+    /// the one-time dismissible UI notice; the terminal is fully functional.
+    pub completion_degraded: bool,
 }
 
 /// Live session: one PTY + one [`TerminalState`] + the reader thread
@@ -529,6 +533,9 @@ impl PaneSession {
                     session.session_lock = Some(record.lock);
                     session.persist_pane_row = Some(record.pane_row.0);
                     session.persist_session = Some(record.session.0);
+                    // Stamp recorded commands with the durable pane row so
+                    // `↑` recall survives restart (the pane reuses this row).
+                    session.capture_state.db_pane_id = Some(record.pane_row.0);
                 }
                 Err(e) => eprintln!("termica: persistence session start failed: {e}"),
             }
@@ -902,6 +909,7 @@ impl PaneSession {
             screen_text: self.terminal.screen_text(),
             mode: Some(mode),
             is_bootstrapping: mode == PaneMode::Bootstrapping,
+            completion_degraded: self.controller.completion_degraded(),
         }
     }
 
@@ -1087,14 +1095,19 @@ impl PaneSession {
             self.blocks.editor_on_tail().map(|e| e.text().to_string()).unwrap_or_default();
         let current_cursor = self.blocks.editor_on_tail().map(|e| e.cursor()).unwrap_or_default();
         let app_run_id = ctx.app_run_id.clone();
+        // Scope ↑ recall to the DURABLE pane row when persistence is on,
+        // so history survives restart; otherwise fall back to this
+        // app-run's ephemeral pane (degraded mode).
+        let db_pane_id = self.persist_pane_row;
         let outcome = self.recall.step_back(
             || {
                 let store = match ctx.store.lock() {
                     Ok(s) => s,
                     Err(_) => return Vec::new(),
                 };
+                let scope = Scope::pane_recall(db_pane_id, pane_id as i64, &app_run_id);
                 store
-                    .recent(&Scope::Pane { pane_id: pane_id as i64, app_run_id: &app_run_id }, 500)
+                    .recent(&scope, 500)
                     .map(|rows| rows.into_iter().map(|r| r.text).collect())
                     .unwrap_or_default()
             },

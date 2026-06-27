@@ -17,8 +17,9 @@ Command history and transcript search are core to what Termica claims to be ("as
                 ┌────────────┴────────────┐
                 │                         │
        Pane scope                   Global scope
-       WHERE pane_id = ?            (no filter)
-        AND  app_run_id = ?
+       WHERE db_pane_id = ?         (no filter)
+       (persisted; else             │
+        pane_id + app_run_id)       │
                 │                         │
         ↑ / ↓ recall              ^R popup default
 ```
@@ -46,10 +47,16 @@ pub struct HistorySearch {
 
 pub enum HistoryScope {
     /// Only this pane in this Termica process.
-    /// Matches `WHERE pane_id = ? AND app_run_id = ?`. Default
-    /// for `↑` / `↓` recall — it's what a "pane history" intuition
-    /// should give the user.
+    /// Matches `WHERE pane_id = ? AND app_run_id = ?`. The `↑` / `↓`
+    /// recall fallback for panes WITHOUT persistence (degraded mode);
+    /// a persisted pane uses `DurablePane` instead.
     Pane { pane_id: PaneId, app_run_id: AppRunId },
+    /// Only this **durable** pane row (the persistent `pane` id a
+    /// restored/restarted pane reuses). Matches `WHERE db_pane_id = ?`.
+    /// Default for `↑` / `↓` recall when persistence is on, so pane
+    /// history survives restart — a new `app_run_id` and a new ephemeral
+    /// `PaneId`, but the same durable row.
+    DurablePane { db_pane_id: PaneRowId },
     /// Every row. Default for `^R`. cwd-proximity boosts the
     /// ranker but does not filter.
     Global,
@@ -94,7 +101,7 @@ The pane's `CommandRunBuffer` tracks open runs; only one can be open at a time p
 
 ## Pane-scope recall (↑ / ↓)
 
-Queries `runs WHERE pane_id = <this> AND app_run_id = <this process>`, ordered by `started_at DESC`. UI:
+For a **persisted** pane, queries `runs WHERE db_pane_id = <this durable pane row>`, ordered by `started_at DESC`. For a pane without persistence (degraded mode), falls back to `WHERE pane_id = <this> AND app_run_id = <this process>`. UI:
 
 - **Up arrow** in the editor: walks backwards through pane-scope history. Down arrow walks forward.
 - The popup is closed; this is the lightest-weight history surface.
@@ -102,7 +109,7 @@ Queries `runs WHERE pane_id = <this> AND app_run_id = <this process>`, ordered b
 
 A walk does not record into history; only `submit()` does.
 
-The `app_run_id` filter is what makes pane scope meaningful across restarts: pane numeric ids are minted by an in-memory counter and reuse freely, so without the UUID a fresh pane would inherit a closed pane's typing. When workspace restore eventually lands, restored panes can drop the `app_run_id` filter to recover their pre-restart history.
+Scope keys off the **durable** `pane` row (`db_pane_id`), stamped onto each recorded run, so `↑` history survives restart: a restored/restarted pane reuses its durable row even though its `app_run_id` and ephemeral `PaneId` are both new. That durable id is also what keeps panes isolated — ephemeral pane numeric ids are minted by an in-memory counter and reuse freely, so a fresh pane would otherwise inherit a closed pane's typing; the durable row is unique per pane and never reused. The degraded-mode fallback (`pane_id` + `app_run_id`) preserves the same isolation within a single process when there's no durable row to key on. Growth is bounded: recall walks at most the 500 most-recent rows, and `runs` is globally trimmed by gc ([spec/08](08-persistence.md)).
 
 ## Global history (^R)
 
@@ -117,7 +124,7 @@ SQLite-backed, identical schema (see [08](08-persistence.md)). Every Termica sub
 
 ### Scope
 
-- Default scope: `Global`. Toggle via **Tab** to `Pane` (the same `(pane_id, app_run_id)` slice the arrow keys walk). The popup's `lock_focus(true)` on its `TextEdit` lets Tab reach the popup instead of triggering egui focus navigation.
+- Default scope: `Global`. Toggle via **Tab** to `Pane` — the same slice the arrow keys walk: `DurablePane` (`db_pane_id`) for a persisted pane so it survives restart, falling back to the ephemeral `(pane_id, app_run_id)` slice for a degraded pane. The popup's `lock_focus(true)` on its `TextEdit` lets Tab reach the popup instead of triggering egui focus navigation.
 - Cwd proximity is a soft *boost* in the ranker, not a filter, so `^R` from a different directory still surfaces matches.
 
 ### Query semantics
