@@ -1027,7 +1027,35 @@ pub struct BlockHeader<'a> {
     pub faded: bool,
 }
 
-pub fn paint_block_header(ui: &mut egui::Ui, header: BlockHeader<'_>) -> Option<Response> {
+/// One painted header chip's hit-rect plus what a right-click on it copies:
+/// `name` is the menu-label suffix (`Copy <name>`) and `value` the chip's
+/// displayed text. Collected by [`paint_block_header`] so the block context
+/// menu can offer "Copy <chip>" for whichever chip the click landed on
+/// (spec/07 §"Per-block affordances").
+#[derive(Debug, Clone)]
+pub struct ChipHit {
+    pub rect: Rect,
+    pub name: &'static str,
+    pub value: String,
+}
+
+/// The chip (if any) whose painted rect contains `pos`. Pure hit-test over
+/// [`paint_block_header`]'s collected [`ChipHit`]s, used by the block
+/// context menu to decide whether to prepend a "Copy <chip>" item.
+pub fn chip_at(pos: Pos2, chips: &[ChipHit]) -> Option<&ChipHit> {
+    chips.iter().find(|c| c.rect.contains(pos))
+}
+
+/// What [`paint_block_header`] returns: the hover [`Response`] over the
+/// whole chip strip (`None` when no chips were painted) plus the per-chip
+/// hit-rects + copy values, so callers can route a right-click to the
+/// specific chip under the pointer.
+pub struct BlockHeaderRender {
+    pub response: Option<Response>,
+    pub chips: Vec<ChipHit>,
+}
+
+pub fn paint_block_header(ui: &mut egui::Ui, header: BlockHeader<'_>) -> BlockHeaderRender {
     let BlockHeader { cwd, home, exit, duration, git, pr, faded } = header;
     let font_id = FontId::monospace(DEFAULT_FONT_SIZE);
     let cell_w = ui.fonts_mut(|f| f.glyph_width(&font_id, 'M'));
@@ -1066,28 +1094,30 @@ pub fn paint_block_header(ui: &mut egui::Ui, header: BlockHeader<'_>) -> Option<
     // Each present field is a chip: `text`, `width`, and text `color`.
     // Collected left→right so the layout + paint share one source of
     // truth.
+    // Each chip carries a `&'static str` name (the menu label suffix for
+    // "Copy <name>" when right-clicked) alongside its text, width and color.
     let chip_w = |text: &str| text.chars().count() as f32 * cell_w + 2.0 * CHIP_PAD_X;
-    let mut chips: Vec<(&str, f32, Color32)> = Vec::with_capacity(6);
+    let mut chips: Vec<(&str, f32, Color32, &'static str)> = Vec::with_capacity(6);
     if !cwd_text.is_empty() {
-        chips.push((&cwd_text, chip_w(&cwd_text), BLOCK_HEADER_FG));
+        chips.push((&cwd_text, chip_w(&cwd_text), BLOCK_HEADER_FG, "path"));
     }
     if !branch_text.is_empty() {
-        chips.push((&branch_text, chip_w(&branch_text), BLOCK_HEADER_BRANCH_FG));
+        chips.push((&branch_text, chip_w(&branch_text), BLOCK_HEADER_BRANCH_FG, "git branch"));
     }
     if !sync_text.is_empty() {
-        chips.push((&sync_text, chip_w(&sync_text), BLOCK_HEADER_FG));
+        chips.push((&sync_text, chip_w(&sync_text), BLOCK_HEADER_FG, "git sync"));
     }
     if !dirty_text.is_empty() {
-        chips.push((&dirty_text, chip_w(&dirty_text), BLOCK_HEADER_DIRTY_FG));
+        chips.push((&dirty_text, chip_w(&dirty_text), BLOCK_HEADER_DIRTY_FG, "git changes"));
     }
     if !pr_text.is_empty() {
-        chips.push((&pr_text, chip_w(&pr_text), pr_color));
+        chips.push((&pr_text, chip_w(&pr_text), pr_color, "PR"));
     }
     if show_exit {
-        chips.push((&exit_text, chip_w(&exit_text), BLOCK_HEADER_EXIT_FAIL_FG));
+        chips.push((&exit_text, chip_w(&exit_text), BLOCK_HEADER_EXIT_FAIL_FG, "exit code"));
     }
     if !dur_text.is_empty() {
-        chips.push((&dur_text, chip_w(&dur_text), BLOCK_HEADER_FG));
+        chips.push((&dur_text, chip_w(&dur_text), BLOCK_HEADER_FG, "duration"));
     }
 
     // Sealed (historical) blocks render their chips muted — desaturated
@@ -1110,7 +1140,7 @@ pub fn paint_block_header(ui: &mut egui::Ui, header: BlockHeader<'_>) -> Option<
         // `item_spacing` gap after every allocated widget, and a
         // gratuitous gap above each block (cwd is None until shell
         // integration confirms) would shift the entire visual layout.
-        return None;
+        return BlockHeaderRender { response: None, chips: Vec::new() };
     }
 
     // Each chip is `text_width + 2 * CHIP_PAD_X` wide and
@@ -1125,7 +1155,8 @@ pub fn paint_block_header(ui: &mut egui::Ui, header: BlockHeader<'_>) -> Option<
     let radius = CHIP_CORNER_RADIUS as u8;
     let chip_stroke = egui::Stroke::new(1.0, BLOCK_HEADER_CHIP_STROKE);
     let mut x = rect.min.x;
-    for (text, w, fg) in chips {
+    let mut hits = Vec::with_capacity(chips.len());
+    for (text, w, fg, name) in chips {
         let chip_rect = Rect::from_min_size(Pos2::new(x, rect.min.y), Vec2::new(w, chip_h));
         painter.rect_filled(chip_rect, radius, BLOCK_HEADER_CHIP_BG);
         painter.rect_stroke(chip_rect, radius, chip_stroke, egui::StrokeKind::Inside);
@@ -1136,9 +1167,10 @@ pub fn paint_block_header(ui: &mut egui::Ui, header: BlockHeader<'_>) -> Option<
             font_id.clone(),
             fg,
         );
+        hits.push(ChipHit { rect: chip_rect, name, value: text.to_string() });
         x += w + CHIP_GAP;
     }
-    Some(response)
+    BlockHeaderRender { response: Some(response), chips: hits }
 }
 
 /// Paint a one-or-more-line command label in editor colors above the
@@ -1329,6 +1361,13 @@ pub struct SealedBlockRender {
     /// (empty cwd and zero exit). Used by the sticky-top-header layout
     /// (4E) to know how tall a pinned header is.
     pub header_height: f32,
+    /// Hover [`Response`] over the header chip strip (`None` when no
+    /// chips painted). The block context menu re-interacts this rect for
+    /// right-clicks; the chips themselves are in [`Self::chips`].
+    pub header_response: Option<Response>,
+    /// Per-chip hit-rects + copy values for the header, so a right-click
+    /// on a chip can offer "Copy <chip>" (spec/07 §"Per-block affordances").
+    pub chips: Vec<ChipHit>,
 }
 
 impl SealedBlockRender {
@@ -1372,8 +1411,8 @@ pub fn paint_sealed_block(
     // PR is a live-prompt-only affordance. Git is the context **captured
     // at command-start** (4G-async-context), frozen as history.
     let header = BlockHeader { faded: true, pr: None, ..header };
-    let header = paint_block_header(ui, header);
-    let header_height = header.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
+    let header_render = paint_block_header(ui, header);
+    let header_height = header_render.response.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
 
     let cmd_lines = if command.is_empty() { 0 } else { command.split('\n').count() };
     // Split the unified selection into command and snapshot pieces.
@@ -1431,6 +1470,8 @@ pub fn paint_sealed_block(
         snapshot: snapshot_response,
         command_lines: cmd_lines,
         header_height,
+        header_response: header_render.response,
+        chips: header_render.chips,
     }
 }
 
@@ -1739,6 +1780,32 @@ mod tests {
     //! by snapshot tests in `tests/snapshots.rs`.
 
     use super::*;
+
+    // ---- chip_at (block context-menu chip hit-test) -----------------
+
+    #[test]
+    fn chip_at_finds_the_chip_under_the_pointer_and_none_in_the_gaps() {
+        let chips = vec![
+            ChipHit {
+                rect: Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(40.0, 20.0)),
+                name: "path",
+                value: "~/code".to_string(),
+            },
+            ChipHit {
+                rect: Rect::from_min_size(Pos2::new(44.0, 0.0), Vec2::new(50.0, 20.0)),
+                name: "git branch",
+                value: "feat/x".to_string(),
+            },
+        ];
+        // Inside the second chip → that chip.
+        let hit = chip_at(Pos2::new(60.0, 10.0), &chips).expect("pointer is over the branch chip");
+        assert_eq!(hit.name, "git branch");
+        assert_eq!(hit.value, "feat/x");
+        // In the gap between chips → no hit.
+        assert!(chip_at(Pos2::new(42.0, 10.0), &chips).is_none());
+        // Below the strip entirely → no hit.
+        assert!(chip_at(Pos2::new(10.0, 100.0), &chips).is_none());
+    }
 
     // ---- painted_screen_rows (running-command paint extent) ---------
 

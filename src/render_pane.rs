@@ -411,6 +411,43 @@ pub fn paint_sticky_header(
     StickyHeaderRender { command: inner.inner }
 }
 
+/// Wire a block's right-click context menu onto every `response` that should
+/// open it (the full-width background, the header chips, the command label,
+/// the output / live grid). The chip under a secondary-click is latched into
+/// `ui` memory at open time — egui keeps the menu open across frames, so
+/// re-reading the moving pointer would drop the "Copy <chip>" item the instant
+/// the cursor entered the menu — and `build` turns that latched chip into the
+/// block-state-specific entries (sealed vs running). One helper so a new block
+/// surface is added to the `responses` slice, never forgotten (the bug that
+/// left a running command's live output without a menu).
+fn attach_block_menu(
+    ui: &egui::Ui,
+    latch_id: egui::Id,
+    chips: &[render::ChipHit],
+    responses: &[&egui::Response],
+    build: impl Fn(Option<(&str, &str)>) -> Vec<crate::block_menu::BlockMenuEntry>,
+) {
+    for resp in responses {
+        if resp.secondary_clicked() {
+            let chip = resp
+                .interact_pointer_pos()
+                .or_else(|| resp.hover_pos())
+                .and_then(|p| render::chip_at(p, chips))
+                .map(|c| (c.name.to_string(), c.value.clone()));
+            ui.data_mut(|d| d.insert_temp(latch_id, chip));
+        }
+    }
+    let render_menu = |menu_ui: &mut egui::Ui| {
+        let chip: Option<(String, String)> =
+            menu_ui.data(|d| d.get_temp::<Option<(String, String)>>(latch_id)).flatten();
+        let entries = build(chip.as_ref().map(|(n, v)| (n.as_str(), v.as_str())));
+        crate::block_menu::show_block_context_menu(menu_ui, &entries);
+    };
+    for resp in responses {
+        resp.context_menu(|menu_ui| render_menu(menu_ui));
+    }
+}
+
 /// Translate a `(Key, Modifiers)` pair into an [`EditorMotion`] +
 /// "extending" flag, honouring platform conventions:
 ///
@@ -1834,6 +1871,31 @@ pub fn render_pane(
                                     (other, _) => other,
                                 };
                                 let block_top = ui.next_widget_position().y;
+                                // Full-pane-width hit area for the block,
+                                // reserved BEFORE the content paints so the
+                                // command / output widgets register on top and
+                                // keep drag-to-select; the background only
+                                // catches right-clicks in the margins beside the
+                                // text. Sealed blocks always render a header
+                                // (the duration chip), so the height is header +
+                                // (optional command) + output rows, with egui's
+                                // inter-widget spacing between them.
+                                let sp = ui.spacing().item_spacing.y;
+                                let cmd_rows = if command.is_empty() {
+                                    0.0
+                                } else {
+                                    command.split('\n').count() as f32 * row_h + sp
+                                };
+                                let bg_h =
+                                    chip_h + sp + cmd_rows + visual_rows.len() as f32 * row_h;
+                                let block_bg = ui.interact(
+                                    egui::Rect::from_x_y_ranges(
+                                        ui.max_rect().x_range(),
+                                        block_top..=block_top + bg_h,
+                                    ),
+                                    ui.id().with(("block_bg", *id)),
+                                    egui::Sense::click(),
+                                );
                                 let sealed_render = render::paint_sealed_block(
                                     ui,
                                     command,
@@ -1864,6 +1926,45 @@ pub fn render_pane(
                                             STICKY_MAX_CMD_LINES,
                                         ),
                                 });
+                                // Right-click context menu (spec/07
+                                // §"Per-block affordances"): Copy block /
+                                // command / output, plus a "Copy <chip>" item
+                                // when the click landed on a header chip. Wired
+                                // onto the full-width background, the header chip
+                                // strip (re-interacted for clicks — it paints
+                                // hover-only), the command label, and the
+                                // output. Scoped so these borrows of
+                                // `sealed_render` release before it's moved into
+                                // `sealed_block_renders`.
+                                {
+                                    let header_click =
+                                        sealed_render.header_response.as_ref().map(|r| {
+                                            ui.interact(
+                                                r.rect,
+                                                ui.id().with(("block_ctx_header", *id)),
+                                                egui::Sense::click(),
+                                            )
+                                        });
+                                    let mut responses: Vec<&egui::Response> = vec![&block_bg];
+                                    if let Some(h) = &header_click {
+                                        responses.push(h);
+                                    }
+                                    if let Some(c) = &sealed_render.command {
+                                        responses.push(c);
+                                    }
+                                    responses.push(&sealed_render.snapshot);
+                                    attach_block_menu(
+                                        ui,
+                                        ui.id().with(("block_ctx_chip", *id)),
+                                        &sealed_render.chips,
+                                        &responses,
+                                        |chip| {
+                                            crate::block_menu::block_context_menu_entries(
+                                                command, snapshot, chip,
+                                            )
+                                        },
+                                    );
+                                }
                                 sealed_block_renders.push((*id, sealed_render));
                                 // Block separator — picked via
                                 // `cargo run --example pick_block_separator`
@@ -1885,6 +1986,33 @@ pub fn render_pane(
                             }
                             crate::block::Block::Running { id, command, header, .. } => {
                                 let block_top = ui.next_widget_position().y;
+                                let cmd_lines = if command.is_empty() {
+                                    0
+                                } else {
+                                    command.split('\n').count()
+                                };
+                                // Full-pane-width hit area for the running
+                                // block's header + command strip, reserved
+                                // before the content paints (same behind-content
+                                // rule as sealed blocks, so the command label
+                                // keeps drag-to-select). The streaming output
+                                // below is the live grid — already pane-width —
+                                // which gets the menu after the scroll area.
+                                let sp = ui.spacing().item_spacing.y;
+                                let bg_h = (row_h + 2.0 * render::CHIP_PAD_Y)
+                                    + if cmd_lines > 0 {
+                                        sp + cmd_lines as f32 * row_h
+                                    } else {
+                                        0.0
+                                    };
+                                let block_bg = ui.interact(
+                                    egui::Rect::from_x_y_ranges(
+                                        ui.max_rect().x_range(),
+                                        block_top..=block_top + bg_h,
+                                    ),
+                                    ui.id().with(("running_bg", *id)),
+                                    egui::Sense::click(),
+                                );
                                 // Live ticking duration (4G-live-duration): the
                                 // running command's elapsed time, refreshed each
                                 // frame via the repaint scheduled above.
@@ -1901,14 +2029,10 @@ pub fn render_pane(
                                         ..Default::default()
                                     },
                                 );
-                                let chip_h = hdr.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
+                                let chip_h =
+                                    hdr.response.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
                                 let cmd_resp = (!command.is_empty())
                                     .then(|| render::paint_command_label(ui, command));
-                                let cmd_lines = if command.is_empty() {
-                                    0
-                                } else {
-                                    command.split('\n').count()
-                                };
                                 let cmd_h =
                                     cmd_resp.as_ref().map(|r| r.rect.height()).unwrap_or(0.0);
                                 block_extents.push(BlockExtent {
@@ -1922,6 +2046,46 @@ pub fn render_pane(
                                             STICKY_MAX_CMD_LINES,
                                         ),
                                 });
+
+                                // Right-click context menu: wired onto the
+                                // full-width background, the header chip strip
+                                // (re-interacted — it paints hover-only), and the
+                                // command label. The running command's output
+                                // (the live grid) gets the same menu after the
+                                // scroll area, where its response exists. The
+                                // menu snapshots the live grid lazily at open
+                                // time (best-effort, may be mid-stream); in
+                                // alt-screen it offers Copy command / Copy screen.
+                                let header_click = hdr.response.as_ref().map(|r| {
+                                    ui.interact(
+                                        r.rect,
+                                        ui.id().with(("running_ctx_header", *id)),
+                                        egui::Sense::click(),
+                                    )
+                                });
+                                let mut responses: Vec<&egui::Response> = vec![&block_bg];
+                                if let Some(h) = &header_click {
+                                    responses.push(h);
+                                }
+                                if let Some(c) = &cmd_resp {
+                                    responses.push(c);
+                                }
+                                attach_block_menu(
+                                    ui,
+                                    ui.id().with(("running_ctx_chip", *id)),
+                                    &hdr.chips,
+                                    &responses,
+                                    |chip| {
+                                        let terminal = slot.session.terminal();
+                                        let output = terminal.snapshot_lines_all();
+                                        crate::block_menu::running_context_menu_entries(
+                                            command,
+                                            &output,
+                                            terminal.is_alternate_screen(),
+                                            chip,
+                                        )
+                                    },
+                                );
                             }
                             crate::block::Block::Prompt { .. } => {
                                 // The `Prompt` block's chrome lives in
@@ -2163,6 +2327,39 @@ pub fn render_pane(
     slot.ui.last_scroll_viewport_h = scroll_viewport.height();
     let (rendered, links_in_view, highlighted_link) = scroll_inner.inner;
     let highlighted_link = highlighted_link.as_ref();
+
+    // A running command's OUTPUT is the live terminal grid, painted inside
+    // the scroll area above (the block loop only wired the running block's
+    // header chips + command label). Attach the same context menu to the
+    // grid so a right-click on the streaming output works too — otherwise
+    // the menu only opens on the header / command, not the part the user is
+    // actually looking at. A grid click is never on a header chip, so there
+    // is no chip item. Only when the tail is `Running`; an idle prompt's
+    // grid (or a sealed-only pane) has no command to copy.
+    let running = match slot.session.blocks().last() {
+        Some(crate::block::Block::Running { id, command, .. }) => Some((*id, command.clone())),
+        _ => None,
+    };
+    if let Some((id, command)) = running {
+        // No chips on the grid (a grid click is never on a header chip), so an
+        // empty chip slice — the helper's chip hit-test simply returns `None`.
+        attach_block_menu(
+            ui,
+            ui.id().with(("running_ctx_chip", id)),
+            &[],
+            &[&rendered.response],
+            |chip| {
+                let terminal = slot.session.terminal();
+                let output = terminal.snapshot_lines_all();
+                crate::block_menu::running_context_menu_entries(
+                    &command,
+                    &output,
+                    terminal.is_alternate_screen(),
+                    chip,
+                )
+            },
+        );
+    }
 
     // ---- Sticky-top block header (4E) -----------------------------
     //
