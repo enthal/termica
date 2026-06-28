@@ -30,6 +30,7 @@
 
 pub mod block;
 pub mod block_links;
+pub mod block_menu;
 pub mod block_selection;
 pub mod completion;
 pub mod cursor_env;
@@ -337,10 +338,15 @@ pub fn run() -> eframe::Result<()> {
     }
     let positional_path = positionals.first().map(std::path::Path::new);
     let startup_cwd = crate::app::resolve_startup_cwd(positional_path);
+    // The explicit requested dir (Some only when a path was named), so a
+    // restored workspace can still open a tab there. `resolve_startup_cwd`
+    // already folds the same path into the fresh-start cwd above.
+    let requested_workspace_path = positional_path.and_then(crate::app::resolve_positional_dir);
     let app_opts = crate::app::TermicaAppOptions {
         open_chrome_picker: pick_chrome,
         open_watermark_picker: pick_watermark,
         startup_cwd: Some(startup_cwd),
+        requested_workspace_path,
         ..Default::default()
     };
     // Linux: register the icon + launcher entry under XDG before we

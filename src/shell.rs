@@ -960,7 +960,12 @@ mod tests {
         let before = c.last_transition().clone();
 
         c.observe_event(
-            LifecycleEvent::Completion { id: 1, lines: vec!["hello".into()], filenames: false },
+            LifecycleEvent::Completion {
+                id: 1,
+                lines: vec!["hello".into()],
+                filenames: false,
+                cur: None,
+            },
             9,
         );
 
