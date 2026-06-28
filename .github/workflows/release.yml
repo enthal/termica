@@ -133,6 +133,28 @@ jobs:
             xcrun stapler validate "$dmg"
           done
 
+      - name: Verify signature & notarization
+        # Actively assert the artifact is acceptable rather than trusting the
+        # staple step implicitly. Checks the .dmg via Gatekeeper, then mounts it
+        # and runs a full codesign verify + Gatekeeper exec check on Termica.app.
+        # `set -e` means any failure here fails the job.
+        if: runner.os == 'macOS' && env.HAS_APPLE_SIGNING == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for dmg in dist/*.dmg; do
+            echo "== verifying $dmg =="
+            spctl -a -vvv -t open --context context:primary-signature "$dmg"
+            mnt="$(mktemp -d)"
+            hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mnt"
+            trap 'hdiutil detach "$mnt" >/dev/null 2>&1 || true' EXIT
+            codesign --verify --deep --strict --verbose=2 "$mnt/Termica.app"
+            spctl -a -vvv -t exec "$mnt/Termica.app"
+            hdiutil detach "$mnt" >/dev/null
+            trap - EXIT
+          done
+
       - name: List artifacts
         shell: bash
         run: ls -la dist || true
