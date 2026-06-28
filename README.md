@@ -61,17 +61,9 @@ Prebuilt installers for each release are on the [latest release page](https://gi
 - **macOS** — `Termica_<version>_aarch64.dmg` (Apple Silicon) or `Termica_<version>_x64.dmg` (Intel). Open the `.dmg` and drag **Termica** to **Applications**.
 - **Linux (x86-64)** — a `.deb` (`sudo apt install ./termica_<version>_amd64.deb`) or a portable `.AppImage` (`chmod +x` it and run).
 
+The macOS builds are **signed with a Developer ID and notarized by Apple**, so they open normally — no Gatekeeper warning.
+
 Prefer to build it yourself? See [Build from source](#getting-started).
-
-### Opening on macOS the first time
-
-The macOS builds are **not yet signed or notarized by Apple** (that's coming — it needs an Apple Developer membership). Because the `.dmg` is downloaded from the internet, the first launch is blocked with a message like *"Apple could not verify 'Termica' is free of malware."* To open it anyway:
-
-1. Try to open Termica once (double-click it in Applications). You'll get the warning — click **Done**.
-2. Open **System Settings → Privacy & Security**, scroll to the **Security** section, and click **Open Anyway** next to the Termica message.
-3. Confirm **Open Anyway**, then authenticate. macOS remembers the choice; subsequent launches are normal.
-
-Equivalently, from a terminal: `xattr -dr com.apple.quarantine /Applications/Termica.app`. This caveat goes away once notarized builds ship.
 
 ## Getting started
 
