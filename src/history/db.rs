@@ -17,7 +17,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// Read on open via `PRAGMA user_version` and compared against
 /// the embedded constant; mismatching versions trigger the
 /// migration ladder.
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 /// One row in `runs`. `pane_id` / `app_run_id` / `cwd` are `None`
 /// for entries replayed from a shell-history file (those formats
@@ -40,12 +40,41 @@ pub struct Entry {
 /// Query filter for recall + search.
 ///
 /// - `Global` — every row in the table. Default for `^R`.
-/// - `Pane { pane_id, app_run_id }` — only this pane in this
-///   Termica run. Default for `↑` / `↓`.
+/// - `DurablePane { db_pane_id }` — only this durable pane row. Default
+///   for `↑` / `↓` on a persisted pane (survives restart).
+/// - `Pane { pane_id, app_run_id }` — only this pane in this Termica
+///   run. The `↑` / `↓` fallback when there's no persistence.
 #[derive(Debug, Clone)]
 pub enum Scope<'a> {
     Global,
-    Pane { pane_id: i64, app_run_id: &'a str },
+    Pane {
+        pane_id: i64,
+        app_run_id: &'a str,
+    },
+    /// Recall scoped to a **durable** `pane` row — spans every session
+    /// the pane has had, so `↑` history survives restart. Used when the
+    /// pane has persistence; otherwise `Pane` (per-app-run) is the
+    /// fallback.
+    DurablePane {
+        db_pane_id: i64,
+    },
+}
+
+impl<'a> Scope<'a> {
+    /// Build the "this pane" recall scope from a pane's identity. The
+    /// durable `pane` row wins whenever the pane has one, so recall
+    /// survives restart; a pane without persistence falls back to the
+    /// ephemeral `(pane_id, app_run_id)` slice.
+    ///
+    /// This is the single place that fallback rule lives — both `↑`/`↓`
+    /// recall and the `^R` "this pane" scope construct through it, so the
+    /// two can't drift.
+    pub fn pane_recall(db_pane_id: Option<i64>, pane_id: i64, app_run_id: &'a str) -> Self {
+        match db_pane_id {
+            Some(db_pane_id) => Scope::DurablePane { db_pane_id },
+            None => Scope::Pane { pane_id, app_run_id },
+        }
+    }
 }
 
 /// History store handle. Wraps a `rusqlite::Connection` so the
@@ -104,17 +133,65 @@ impl HistoryStore {
     fn migrate(&self) -> rusqlite::Result<()> {
         let current: u32 =
             self.conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?;
+        // Up to date — or NEWER than this binary understands. Never write
+        // `user_version` in that case: an older binary opening a DB a
+        // newer one migrated must not roll the version back (two binaries
+        // sharing one DB would otherwise ping-pong the version and corrupt
+        // the migration state — exactly what wedged a v5 DB back to v4).
+        if current >= SCHEMA_VERSION {
+            return Ok(());
+        }
         for v in (current + 1)..=SCHEMA_VERSION {
             match v {
                 1 => self.apply_v1()?,
                 2 => self.apply_v2()?,
                 3 => self.apply_v3()?,
                 4 => self.apply_v4()?,
+                5 => self.apply_v5()?,
                 _ => unreachable!("no migration for v{v}"),
             }
         }
         self.conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
+    }
+
+    /// Whether `table` has a column named `column`. Used so an
+    /// `ADD COLUMN` migration can be re-run safely (it hard-errors on a
+    /// duplicate column, which — paired with a rolled-back `user_version`
+    /// — otherwise bricks the whole store).
+    fn column_exists(&self, table: &str, column: &str) -> rusqlite::Result<bool> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn apply_v5(&self) -> rusqlite::Result<()> {
+        // Pane-local command history (↑ recall) that survives restart.
+        // `runs.pane_id` is the EPHEMERAL app PaneId and `app_run_id` is
+        // per-process, so the old `(pane_id, app_run_id)` recall scope
+        // goes empty after a restart. `db_pane_id` is the DURABLE `pane`
+        // row a restored/restarted pane reuses, so recall scoped to it
+        // spans every session the pane has had. NULL for pre-v5 rows and
+        // for panes without persistence (degraded mode) — those fall back
+        // to the per-app-run scope. Indexed for the recall query.
+        //
+        // Idempotent: only ADD the column if it isn't already there, so a
+        // stale `user_version` (e.g. rolled back by an older binary) that
+        // re-runs this step doesn't hard-fail on a duplicate column. The
+        // index already uses IF NOT EXISTS.
+        if !self.column_exists("runs", "db_pane_id")? {
+            self.conn.execute_batch("ALTER TABLE runs ADD COLUMN db_pane_id INTEGER;")?;
+        }
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_runs_db_pane
+                 ON runs(db_pane_id, started_at DESC);",
+        )
     }
 
     fn apply_v4(&self) -> rusqlite::Result<()> {
@@ -270,10 +347,27 @@ impl HistoryStore {
         app_run_id: &str,
         started_at_ms: i64,
     ) -> rusqlite::Result<i64> {
+        self.record_submit_with_pane(text, cwd, pane_id, app_run_id, started_at_ms, None)
+    }
+
+    /// Like [`Self::record_submit`] but also stamps the **durable** `pane`
+    /// row id (`db_pane_id`), so `↑` recall scoped to that pane survives
+    /// restart (a new `app_run_id` and ephemeral app PaneId). `None` when
+    /// persistence is off — recall then falls back to the per-app-run
+    /// scope.
+    pub fn record_submit_with_pane(
+        &self,
+        text: &str,
+        cwd: Option<&str>,
+        pane_id: i64,
+        app_run_id: &str,
+        started_at_ms: i64,
+        db_pane_id: Option<i64>,
+    ) -> rusqlite::Result<i64> {
         self.conn.execute(
-            "INSERT INTO runs (text, started_at, cwd, app_run_id, pane_id, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'termica')",
-            params![text, started_at_ms, cwd, app_run_id, pane_id],
+            "INSERT INTO runs (text, started_at, cwd, app_run_id, pane_id, db_pane_id, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'termica')",
+            params![text, started_at_ms, cwd, app_run_id, pane_id, db_pane_id],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -338,6 +432,15 @@ impl HistoryStore {
                  ORDER BY started_at DESC
                  LIMIT ?3",
                 vec![Box::new(*pane_id), Box::new(app_run_id.to_string()), Box::new(limit as i64)],
+            ),
+            Scope::DurablePane { db_pane_id } => (
+                "SELECT id, text, started_at, finished_at, exit_code, cwd, app_run_id,
+                        pane_id, source
+                 FROM runs
+                 WHERE db_pane_id = ?1
+                 ORDER BY started_at DESC
+                 LIMIT ?2",
+                vec![Box::new(*db_pane_id), Box::new(limit as i64)],
             ),
         };
         let mut stmt = self.conn.prepare(sql)?;
@@ -555,8 +658,21 @@ impl HistoryStore {
         Ok(())
     }
 
-    /// A pane row's last-known cwd (recorded at `begin_session`). Restore
-    /// seeds it onto the rebuilt pane so the tab title shows the path.
+    /// Update a pane row's last-known cwd. Called whenever the pane's cwd
+    /// changes (durable on change — never deferred to quit, since the
+    /// process can vanish), so a restored pane lands in the directory it
+    /// was last in, not the one it started in. No-op if `pane_id` is
+    /// unknown.
+    pub fn set_pane_cwd(&self, pane_id: i64, cwd: Option<&str>) -> rusqlite::Result<()> {
+        self.conn
+            .execute("UPDATE pane SET cwd = ?1 WHERE id = ?2", params![cwd, pane_id])
+            .map(|_| ())
+    }
+
+    /// A pane row's last-known cwd (recorded at `begin_session`, then kept
+    /// current by [`Self::set_pane_cwd`]). Restore seeds it onto the
+    /// rebuilt pane so the tab title shows the path and a restart starts
+    /// there.
     pub fn pane_cwd(&self, pane_id: i64) -> rusqlite::Result<Option<String>> {
         self.conn
             .query_row("SELECT cwd FROM pane WHERE id = ?1", params![pane_id], |r| r.get(0))
@@ -693,6 +809,28 @@ mod tests {
     }
 
     #[test]
+    fn set_pane_cwd_updates_the_pane_row() {
+        // A pane's cwd is recorded at session start, but must be updated
+        // as the user `cd`s so a restored pane lands in the dir it was
+        // LAST in — persisted on change, not at quit (the process can
+        // vanish). `set_pane_cwd` is that update; `pane_cwd` reads it back.
+        let s = store();
+        let (pane_id, _session_id) = s.begin_session_rows(Some("/start/dir"), "zsh", 1000).unwrap();
+        assert_eq!(s.pane_cwd(pane_id).unwrap().as_deref(), Some("/start/dir"));
+
+        s.set_pane_cwd(pane_id, Some("/new/dir")).unwrap();
+        assert_eq!(
+            s.pane_cwd(pane_id).unwrap().as_deref(),
+            Some("/new/dir"),
+            "restore now reads the last cwd, not the start cwd"
+        );
+
+        // Clearing is representable (cwd unknown) and round-trips.
+        s.set_pane_cwd(pane_id, None).unwrap();
+        assert_eq!(s.pane_cwd(pane_id).unwrap(), None);
+    }
+
+    #[test]
     fn open_in_memory_creates_runs_table() {
         let s = store();
         // The simplest "did the migration run" probe: a select
@@ -728,8 +866,8 @@ mod tests {
     /// act; this literal catches an accidental change to the constant
     /// without a matching migration arm + fixture test.
     #[test]
-    fn schema_version_is_four() {
-        assert_eq!(SCHEMA_VERSION, 4);
+    fn schema_version_is_five() {
+        assert_eq!(SCHEMA_VERSION, 5);
     }
 
     /// Every v3 table the Phase 9 persistence layer adds is present
@@ -755,7 +893,7 @@ mod tests {
     /// creates the new tables, and leaves the pre-existing row
     /// untouched. Forward-only migrations never rewrite earlier data.
     #[test]
-    fn migrate_v2_fixture_to_v3_adds_tables_and_preserves_runs() {
+    fn migrate_v2_fixture_to_latest_adds_tables_and_preserves_runs() {
         let conn = Connection::open_in_memory().unwrap();
         // The exact v1 + v2 schema as it shipped, stamped at v2, with
         // one row of data. No HistoryStore methods are used to build
@@ -776,10 +914,10 @@ mod tests {
         .unwrap();
         let store = HistoryStore { conn };
 
-        store.migrate().expect("v2 -> v4 migration applies cleanly");
+        store.migrate().expect("v2 -> latest migration applies cleanly");
 
         let v: u32 = store.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 4, "ladder advances the fixture to v4");
+        assert_eq!(v, SCHEMA_VERSION, "ladder advances the fixture to the latest version");
         for t in ["workspace", "window", "tab", "pane", "session", "scrollback_chunk", "chunk_chip"]
         {
             let n: i64 = store
@@ -788,6 +926,12 @@ mod tests {
                 .unwrap_or_else(|e| panic!("v3/v4 adds table `{t}`: {e}"));
             assert_eq!(n, 0);
         }
+        // v5 adds the `db_pane_id` column to `runs` (NULL for old rows).
+        let db_pane: Option<i64> = store
+            .conn
+            .query_row("SELECT db_pane_id FROM runs WHERE started_at = 123", [], |r| r.get(0))
+            .expect("v5 adds the db_pane_id column");
+        assert_eq!(db_pane, None, "the pre-existing row has no durable pane");
         let text: String = store
             .conn
             .query_row("SELECT text FROM runs WHERE started_at = 123", [], |r| r.get(0))
@@ -903,6 +1047,75 @@ mod tests {
         assert!(second.is_none(), "second insert is a no-op (no new row)");
         let entries = s.recent(&Scope::Global, 10).unwrap();
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn migrate_is_idempotent_when_column_present_but_version_stale() {
+        // Regression: an older binary (or a torn migration) left the
+        // db_pane_id column present but rolled user_version back to 4.
+        // Re-running the ladder must NOT fail with "duplicate column
+        // name" — that broke the whole store (no history, no restore).
+        let s = store(); // in_memory() already migrated to the latest
+        s.conn.execute_batch("PRAGMA user_version = 4;").unwrap();
+        s.migrate().expect("re-migration tolerates the already-added column");
+        let v: u32 = s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION, "ladder completes despite the existing column");
+        // The column still works for durable-pane recall.
+        s.record_submit_with_pane("x", None, 1, "run", 1, Some(7)).unwrap();
+        assert_eq!(s.recent(&Scope::DurablePane { db_pane_id: 7 }, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migrate_does_not_downgrade_a_newer_db() {
+        // A DB written by a NEWER binary (higher user_version) must open
+        // without rolling its version back — otherwise two binaries of
+        // different versions sharing one DB ping-pong the version and
+        // corrupt the migration state.
+        let s = store();
+        s.conn.execute_batch("PRAGMA user_version = 99;").unwrap();
+        s.migrate().expect("a newer DB opens cleanly");
+        let v: u32 = s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 99, "must not downgrade a DB from a newer binary");
+    }
+
+    #[test]
+    fn durable_pane_recall_spans_restarts() {
+        // A pane's up-arrow history is scoped to its DURABLE pane row, so
+        // it survives a restart — which brings a new app_run_id AND a new
+        // ephemeral app PaneId. Commands recorded under different app runs
+        // but the same durable pane recall together (newest first); a
+        // different durable pane never leaks in.
+        let s = store();
+        s.record_submit_with_pane("before restart", None, 1, "run-A", 100, Some(42)).unwrap();
+        s.record_submit_with_pane("after restart", None, 9, "run-B", 200, Some(42)).unwrap();
+        s.record_submit_with_pane("other pane", None, 1, "run-A", 150, Some(99)).unwrap();
+
+        let entries = s.recent(&Scope::DurablePane { db_pane_id: 42 }, 10).unwrap();
+        let texts: Vec<_> = entries.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["after restart", "before restart"],
+            "durable-pane recall spans restarts, newest first, isolated per pane"
+        );
+    }
+
+    #[test]
+    fn pane_recall_prefers_the_durable_row_and_falls_back_to_the_ephemeral_slice() {
+        // The single source of truth for the "durable wins, ephemeral is
+        // fallback" rule that both `↑`/`↓` recall and the Cmd+R "this pane"
+        // scope go through. A persisted pane (Some db_pane_id) recalls by
+        // its durable row; a degraded pane (None) by (pane_id, app_run_id).
+        match Scope::pane_recall(Some(7), 11, "run-A") {
+            Scope::DurablePane { db_pane_id } => assert_eq!(db_pane_id, 7),
+            other => panic!("Some(db_pane_id) must be durable, got {other:?}"),
+        }
+        match Scope::pane_recall(None, 11, "run-A") {
+            Scope::Pane { pane_id, app_run_id } => {
+                assert_eq!(pane_id, 11);
+                assert_eq!(app_run_id, "run-A");
+            }
+            other => panic!("None must fall back to the ephemeral pane, got {other:?}"),
+        }
     }
 
     #[test]

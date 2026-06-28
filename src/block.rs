@@ -1016,7 +1016,11 @@ mod tests {
         let mut term = TerminalState::new(5, 20);
         let before = stack.len();
         for ev in [
-            LifecycleEvent::IntegrationReady { shell: ShellKind::Zsh, version: 1 },
+            LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Zsh,
+                version: 1,
+                completion_degraded: false,
+            },
             LifecycleEvent::Precmd { cwd: "/tmp".into() },
             LifecycleEvent::Cwd { cwd: "/tmp".into() },
             LifecycleEvent::PromptVars { vars: serde_json::Map::new() },

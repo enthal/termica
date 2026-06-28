@@ -33,7 +33,13 @@ pub enum LifecycleEvent {
     /// `{"type":"integration_ready","value":{"shell":"zsh","version":1}}`
     /// — the bootstrap completed successfully. Termica transitions
     /// the pane from `Bootstrapping` → `RawTerminal` on receipt.
-    IntegrationReady { shell: ShellKind, version: u32 },
+    ///
+    /// bash additionally reports `"bash_major":N` and `"completion":bool`
+    /// (false ⇒ bash-completion couldn't load — old bash — so live
+    /// Tab-completion is degraded to the local sources only). `completion`
+    /// is parsed into `completion_degraded`; a missing field (fish/zsh, which
+    /// never degrade) means `false`. `bash_major` is still ignored.
+    IntegrationReady { shell: ShellKind, version: u32, completion_degraded: bool },
     /// `{"type":"integration_error","value":"<reason>"}` — the
     /// bootstrap detected a problem and chose to fail loud rather
     /// than continue. Pane transitions to `Degraded`.
@@ -93,7 +99,19 @@ pub enum LifecycleEvent {
     /// reply says nothing about whether we're at a prompt; the bootstrap
     /// emits it and loops straight back to `read` without a preexec/precmd,
     /// so the pane mode never moves (spec/05).
-    Completion { id: u64, lines: Vec<String> },
+    ///
+    /// `filenames` carries bash's `-o filenames` signal: `true` when the
+    /// captured `complete -F` reply is a filename completion (matches must be
+    /// escaped on accept), `false` otherwise (insert verbatim — bash does not
+    /// escape glob/space chars for non-filename completions, #178). fish/zsh
+    /// don't emit the field; absent ⇒ `false`, and the bash-only consumer in
+    /// [`crate::pane`] maps fish/zsh to `true` regardless.
+    ///
+    /// `cur` carries bash's `COMP_WORDBREAKS`-delimited current word — the text
+    /// the completion function actually completed (`d FOO=ba` ⇒ `ba`). Termica
+    /// uses it to re-base the accept replace range so only that word is replaced,
+    /// matching bash (#183). bash-only; fish/zsh omit it (⇒ `None`).
+    Completion { id: u64, lines: Vec<String>, filenames: bool, cur: Option<String> },
 }
 
 /// The shell kinds recognised in the `integration_ready` payload.
@@ -141,7 +159,10 @@ fn parse_message(value: &serde_json::Value) -> Option<LifecycleEvent> {
                 _ => ShellKind::Unknown,
             };
             let version = v.get("version").and_then(|n| n.as_u64())? as u32;
-            Some(LifecycleEvent::IntegrationReady { shell, version })
+            // `completion:false` (bash only) ⇒ degraded. Absent (fish/zsh, or
+            // an older bootstrap) ⇒ not degraded.
+            let completion_degraded = v.get("completion").and_then(|c| c.as_bool()) == Some(false);
+            Some(LifecycleEvent::IntegrationReady { shell, version, completion_degraded })
         }
         "integration_error" => {
             let reason = value?.as_str()?.to_string();
@@ -201,7 +222,14 @@ fn parse_message(value: &serde_json::Value) -> Option<LifecycleEvent> {
             // the whole reply — mirrors `shell_vars`.
             let lines =
                 value?.as_array()?.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
-            Some(LifecycleEvent::Completion { id, lines })
+            // `-o filenames` (bash only). Absent for fish/zsh ⇒ false; the
+            // pane maps those tools to `true` itself (#178).
+            let filenames =
+                obj.get("filenames").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            // `cur` — bash's COMP_WORDBREAKS current word, for the replace-range
+            // rebase (bash only; absent ⇒ None, #183).
+            let cur = obj.get("cur").and_then(serde_json::Value::as_str).map(str::to_string);
+            Some(LifecycleEvent::Completion { id, lines, filenames, cur })
         }
         _ => None,
     }
@@ -229,7 +257,11 @@ mod tests {
         );
         assert_eq!(
             parse_dcs_body(&b),
-            Some(LifecycleEvent::IntegrationReady { shell: ShellKind::Zsh, version: 1 })
+            Some(LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Zsh,
+                version: 1,
+                completion_degraded: false
+            })
         );
     }
 
@@ -240,7 +272,43 @@ mod tests {
         );
         assert_eq!(
             parse_dcs_body(&b),
-            Some(LifecycleEvent::IntegrationReady { shell: ShellKind::Bash, version: 1 })
+            Some(LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Bash,
+                version: 1,
+                completion_degraded: false
+            })
+        );
+    }
+
+    #[test]
+    fn integration_ready_bash_completion_false_is_degraded() {
+        // Old bash (3.2, no bash-completion) reports completion:false → the
+        // pane should know its Tab-completion is degraded so it can warn.
+        let b = body(
+            r#"{"type":"integration_ready","session":"x","value":{"shell":"bash","version":1,"bash_major":3,"completion":false}}"#,
+        );
+        assert_eq!(
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Bash,
+                version: 1,
+                completion_degraded: true
+            })
+        );
+    }
+
+    #[test]
+    fn integration_ready_bash_completion_true_is_not_degraded() {
+        let b = body(
+            r#"{"type":"integration_ready","session":"x","value":{"shell":"bash","version":1,"bash_major":5,"completion":true}}"#,
+        );
+        assert_eq!(
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Bash,
+                version: 1,
+                completion_degraded: false
+            })
         );
     }
 
@@ -251,7 +319,11 @@ mod tests {
         );
         assert_eq!(
             parse_dcs_body(&b),
-            Some(LifecycleEvent::IntegrationReady { shell: ShellKind::Fish, version: 1 })
+            Some(LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Fish,
+                version: 1,
+                completion_degraded: false
+            })
         );
     }
 
@@ -262,7 +334,11 @@ mod tests {
         );
         assert_eq!(
             parse_dcs_body(&b),
-            Some(LifecycleEvent::IntegrationReady { shell: ShellKind::Unknown, version: 1 })
+            Some(LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Unknown,
+                version: 1,
+                completion_degraded: false
+            })
         );
     }
 
@@ -409,6 +485,59 @@ mod tests {
                     "help".into(),
                     "deployments    deploy    apps/v1".into(),
                 ],
+                // No `filenames` field (fish/zsh shape) ⇒ false.
+                filenames: false,
+                // No `cur` field (fish/zsh shape) ⇒ None.
+                cur: None,
+            })
+        );
+    }
+
+    #[test]
+    fn completion_marker_parses_filenames_flag() {
+        // bash carries `-o filenames` so the accept path knows whether to
+        // shell-escape glob/space chars (#178). `true` ⇒ filename completion.
+        let b = body(
+            r#"{"type":"completion","session":"x","id":3,"filenames":true,"value":["report[1].csv"]}"#,
+        );
+        assert_eq!(
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::Completion {
+                id: 3,
+                lines: vec!["report[1].csv".into()],
+                filenames: true,
+                cur: None,
+            })
+        );
+        // Explicit `false` is honoured (a non-filename `complete -F` reply).
+        let b = body(
+            r#"{"type":"completion","session":"x","id":4,"filenames":false,"value":["cur=[ba]"]}"#,
+        );
+        assert_eq!(
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::Completion {
+                id: 4,
+                lines: vec!["cur=[ba]".into()],
+                filenames: false,
+                cur: None,
+            })
+        );
+    }
+
+    #[test]
+    fn completion_marker_parses_cur_word() {
+        // bash carries its COMP_WORDBREAKS current word so Termica can re-base
+        // the replace range to it (#183). `cur="ba"` for `d FOO=ba`.
+        let b = body(
+            r#"{"type":"completion","session":"x","id":8,"filenames":false,"cur":"ba","value":["cur=[ba]"]}"#,
+        );
+        assert_eq!(
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::Completion {
+                id: 8,
+                lines: vec!["cur=[ba]".into()],
+                filenames: false,
+                cur: Some("ba".into()),
             })
         );
     }
@@ -418,7 +547,10 @@ mod tests {
         // `complete -C` found nothing — the reply still fires (so the
         // request never hangs), just with no lines.
         let b = body(r#"{"type":"completion","session":"x","id":1,"value":[]}"#);
-        assert_eq!(parse_dcs_body(&b), Some(LifecycleEvent::Completion { id: 1, lines: vec![] }));
+        assert_eq!(
+            parse_dcs_body(&b),
+            Some(LifecycleEvent::Completion { id: 1, lines: vec![], filenames: false, cur: None })
+        );
     }
 
     #[test]
@@ -435,7 +567,12 @@ mod tests {
         let b = body(r#"{"type":"completion","session":"x","id":2,"value":["ok",42,"two"]}"#);
         assert_eq!(
             parse_dcs_body(&b),
-            Some(LifecycleEvent::Completion { id: 2, lines: vec!["ok".into(), "two".into()] })
+            Some(LifecycleEvent::Completion {
+                id: 2,
+                lines: vec!["ok".into(), "two".into()],
+                filenames: false,
+                cur: None
+            })
         );
     }
 

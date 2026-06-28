@@ -38,6 +38,11 @@ enum WriterMsg {
     /// reset the writer's cursor, so subsequent blocks start a fresh
     /// transcript. The pane's `runs` history is untouched.
     Clear,
+    /// Record the pane's current cwd to its durable `pane` row. Sent on
+    /// every cwd change so a restored pane lands in the dir it was LAST in
+    /// — durable on change, never deferred to quit (the process can
+    /// vanish). `None` means "cwd unknown".
+    SetCwd(Option<String>),
 }
 
 /// Handle owned by `PaneSession`. Dropping it drops the channel
@@ -86,6 +91,13 @@ impl ChunkWriter {
     /// like [`Self::submit`].
     pub fn clear(&self) {
         let _ = self.tx.send(WriterMsg::Clear);
+    }
+
+    /// Record the pane's current cwd to its durable `pane` row (off the UI
+    /// thread). Sent on every cwd change so a restored pane resumes in the
+    /// dir it was last in. Best-effort, like [`Self::submit`].
+    pub fn set_cwd(&self, cwd: Option<String>) {
+        let _ = self.tx.send(WriterMsg::SetCwd(cwd));
     }
 
     /// Drain and join the worker: drop the sender so the worker's
@@ -153,6 +165,13 @@ fn run_worker(
                 // fresh sequence at logical line 0.
                 next_seq = 1;
                 cumulative_line = 0;
+            }
+            WriterMsg::SetCwd(cwd) => {
+                if let Ok(s) = store.lock()
+                    && let Err(e) = s.set_pane_cwd(pane_row.0, cwd.as_deref())
+                {
+                    eprintln!("termica: pane cwd persist failed: {e}");
+                }
             }
         }
     }
@@ -473,6 +492,37 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(ranges, vec![(0, 1)], "pre-clear chunk gone; post-clear chunk starts at line 0");
+    }
+
+    #[test]
+    fn writer_persists_pane_cwd_on_set_cwd() {
+        // The pane forwards each cwd change to the writer thread (off the
+        // UI thread, durable on change — not at quit). The worker writes
+        // it to the durable `pane` row so a restored pane lands in the dir
+        // it was LAST in.
+        let (_tmp, persist, rec) = fixture();
+        let store = persist.store_handle();
+        // begin_session recorded the start cwd "/work".
+        assert_eq!(
+            store.lock().unwrap().pane_cwd(rec.pane_row.0).unwrap().as_deref(),
+            Some("/work")
+        );
+        let writer = ChunkWriter::spawn(
+            persist.root().to_path_buf(),
+            rec.dir.clone(),
+            store.clone(),
+            rec.session,
+            rec.pane_row,
+            0,
+        );
+        writer.set_cwd(Some("/work/sub/dir".to_string()));
+        writer.finish();
+
+        assert_eq!(
+            store.lock().unwrap().pane_cwd(rec.pane_row.0).unwrap().as_deref(),
+            Some("/work/sub/dir"),
+            "the latest cwd is persisted to the pane row"
+        );
     }
 
     #[test]

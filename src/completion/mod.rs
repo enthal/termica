@@ -306,7 +306,13 @@ pub fn plan_completion(
 /// completion (command *and* argument position, like fish), so the user's
 /// own completions work. The capture is values-only in v1.
 ///
-/// **bash** keeps the per-tool driver path only (no sidecar yet).
+/// A **bash** pane behaves exactly like zsh: the per-tool cobra drivers stay
+/// AUTHORITATIVE for the tools that have them, and everything else — aliases,
+/// functions, built-ins, and tools with `bash-completion`-installed
+/// completions — routes to bash's live-shell completion (command *and*
+/// argument position). Unlike zsh's captive child, the managed bash captures
+/// completions in-process (`COMPREPLY` needs no readline context), but the
+/// routing and reply path are identical. Values-only in v1.
 fn driver_target_for_shell(
     editor_text: &str,
     cursor: usize,
@@ -317,16 +323,48 @@ fn driver_target_for_shell(
             let (line, point) = drivers::parse::fish_segment(editor_text, cursor)?;
             Some((DriverTool::FishComplete, line, point))
         }
-        ShellSpec::Zsh => {
+        // zsh and bash share the routing: cobra drivers win, the live shell
+        // takes the long tail. Only the tool tag (and capture mechanism)
+        // differ.
+        ShellSpec::Zsh | ShellSpec::Bash => {
             // Cobra drivers win for the tools that have them.
             if let Some(target) = drivers::parse::driver_target(editor_text, cursor) {
                 return Some(target);
             }
-            // Long tail → the live zsh shell (command + argument position).
+            // Long tail → the live shell (command + argument position).
             let (line, point) = drivers::parse::fish_segment(editor_text, cursor)?;
-            Some((DriverTool::ZshComplete, line, point))
+            let tool = match shell {
+                ShellSpec::Bash => DriverTool::BashComplete,
+                _ => DriverTool::ZshComplete,
+            };
+            Some((tool, line, point))
         }
-        ShellSpec::Bash => drivers::parse::driver_target(editor_text, cursor),
+    }
+}
+
+/// Re-base a bash completion's replace range onto the `COMP_WORDBREAKS`-delimited
+/// current word `cur` — what the completion function actually completed
+/// ([#183](https://github.com/enthal/termica/issues/183)).
+///
+/// Termica's editor token (`origin_byte` + `token`) splits on whitespace and
+/// quotes only; the bash sidecar splits `COMP_WORDS` on `$COMP_WORDBREAKS` too
+/// (`=`, `:`, …), so for `d FOO=ba` the function completes `cur="ba"`, not
+/// `FOO=ba`. bash replaces only that word, so the accept range must start after
+/// the last word-break. Since `cur` is the text from the last break to the
+/// cursor, it is a **suffix** of `token`; the new origin is `origin_byte +
+/// (token.len() - cur.len())` and the new token is `cur`. `token.ends_with(cur)`
+/// also keeps a byte-boundary-safe split.
+///
+/// Returns `(new_origin, new_token, trimmed)`. `trimmed` is true when a real
+/// word-break narrowed the range (so the caller drops the locals, which were
+/// gathered for the wider token). When `cur` isn't a proper suffix (an escaping
+/// mismatch, or `cur == token` for a `/`-only path where `/` is not a break),
+/// the range is left untouched and the existing path realign owns it.
+pub fn rebase_replace_to_word(origin_byte: usize, token: &str, cur: &str) -> (usize, String, bool) {
+    if cur.len() < token.len() && token.ends_with(cur) {
+        (origin_byte + (token.len() - cur.len()), cur.to_string(), true)
+    } else {
+        (origin_byte, token.to_string(), false)
     }
 }
 
@@ -340,8 +378,9 @@ pub fn resolve_driver(
     quote: Option<char>,
     locals: Vec<CompletionCandidate>,
     driver: Vec<CompletionCandidate>,
+    escape_as_filename: bool,
 ) -> Option<CompletionPopup> {
-    let driver = realign_driver_path_candidates(token, quote, driver);
+    let driver = realign_driver_path_candidates(token, quote, driver, escape_as_filename);
     let merged = ranking::merge_ranked(vec![locals, driver], 200);
     CompletionPopup::new(origin_byte, token, merged)
 }
@@ -373,10 +412,21 @@ pub fn resolve_driver(
 /// suppression entirely — fuzzy/substring command completions must survive —
 /// but are still canonicalised + escaped, so an argument-position filename
 /// with a space (`vim my fi<Tab>`) round-trips too.
+///
+/// `escape_as_filename` mirrors bash's `-o filenames` rule ([#178]): bash only
+/// backslash-escapes glob/space metacharacters when the completion is a
+/// **filename** completion. When `false` (a bash `complete -F` function that is
+/// not filename-oriented — e.g. `cur=[ba]`, a branch name, a flag value), the
+/// aligned value is inserted **verbatim**, exactly as bash would. fish/zsh
+/// sidecars and CLI drivers always pass `true` (their captured values are
+/// filename-style and their space-handling depends on the escape).
+///
+/// [#178]: https://github.com/enthal/termica/issues/178
 fn realign_driver_path_candidates(
     token: &str,
     quote: Option<char>,
     driver: Vec<CompletionCandidate>,
+    escape_as_filename: bool,
 ) -> Vec<CompletionCandidate> {
     let path_shaped = token.contains('/');
     // The token's own directory components (`/usr/bin/af` → {usr, bin}), for
@@ -419,8 +469,15 @@ fn realign_driver_path_candidates(
                     return None;
                 }
             }
-            // Escape for the shell context, mirroring the local path source.
-            c.value = local::escape_for_context(&aligned, quote);
+            // Escape for the shell context, mirroring the local path source —
+            // but only for filename completions. bash inserts a non-filename
+            // `complete -F` reply verbatim (no glob/space escaping), so honour
+            // that and keep the aligned value as-is (#178).
+            c.value = if escape_as_filename {
+                local::escape_for_context(&aligned, quote)
+            } else {
+                aligned
+            };
             Some(c)
         })
         .collect()
@@ -710,39 +767,58 @@ mod tests {
     }
 
     #[test]
-    fn plan_non_driver_command_opens_locals_immediately() {
-        // `ls ` (not a driver) with a file → open the local list now,
-        // no waiting. Uses a **bash** pane: bash keeps the per-tool driver
-        // path only (no sidecar), so a non-cobra command opens locals
-        // immediately. (In a zsh pane `ls ` now routes to the live shell —
-        // covered by the zsh routing tests.)
+    fn plan_bash_cobra_tool_stays_authoritative_over_shell_capture() {
+        // Like zsh: a bash pane keeps the robust cobra driver for `git` — it
+        // must NOT route `git ch` through the shell capture.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("notes.txt"), b"").unwrap();
         let plan =
-            plan_completion("ls ", 3, Some(dir.path()), None, &[], ShellSpec::Bash, Vec::new);
+            plan_completion("git ch", 6, Some(dir.path()), None, &[], ShellSpec::Bash, Vec::new);
         match plan {
-            CompletionPlan::Open(popup) => {
-                assert!(popup.candidates.iter().any(|c| c.display.ends_with("notes.txt")));
+            CompletionPlan::AwaitDriver { target, .. } => {
+                assert_eq!(target.0, DriverTool::Git, "cobra git driver wins, not BashComplete");
             }
-            other => panic!("expected Open, got {other:?}"),
+            other => panic!("expected AwaitDriver(Git), got {other:?}"),
         }
     }
 
     #[test]
-    fn plan_non_driver_no_local_match_is_closed() {
-        // bash pane, non-cobra command, no local match → nothing. (zsh would
-        // instead await the live shell — see the zsh routing tests.)
+    fn plan_bash_long_tail_routes_to_live_shell_capture() {
+        // A non-cobra command in a bash pane — in BOTH argument and command
+        // position — routes to bash's live-shell completion (the long tail:
+        // aliases, functions, `bash-completion`-installed completions). The
+        // carried locals still merge into the popup after the reply.
         let dir = tempfile::tempdir().unwrap();
-        let plan = plan_completion(
-            "ls zzz_no_such",
-            14,
-            Some(dir.path()),
-            None,
-            &[],
-            ShellSpec::Bash,
-            Vec::new,
+        std::fs::write(dir.path().join("notes.txt"), b"").unwrap();
+        let arg =
+            plan_completion("ls notes", 8, Some(dir.path()), None, &[], ShellSpec::Bash, Vec::new);
+        match arg {
+            CompletionPlan::AwaitDriver { target, locals, .. } => {
+                assert_eq!(target.0, DriverTool::BashComplete);
+                assert_eq!(target.1, "ls notes");
+                assert!(
+                    locals.iter().any(|c| c.display.ends_with("notes.txt")),
+                    "local file candidates ride along to merge after the reply"
+                );
+            }
+            other => panic!("expected AwaitDriver(BashComplete), got {other:?}"),
+        }
+
+        let cmd =
+            plan_completion("frobni", 6, Some(dir.path()), None, &[], ShellSpec::Bash, Vec::new);
+        match cmd {
+            CompletionPlan::AwaitDriver { target, .. } => {
+                assert_eq!(target.0, DriverTool::BashComplete);
+                assert_eq!(target.1, "frobni");
+            }
+            other => panic!("expected AwaitDriver(BashComplete) for command name, got {other:?}"),
+        }
+
+        // Empty editor must NOT fire a capture request.
+        let empty = plan_completion("", 0, Some(dir.path()), None, &[], ShellSpec::Bash, Vec::new);
+        assert!(
+            !matches!(empty, CompletionPlan::AwaitDriver { .. }),
+            "empty editor must not flood the bash shell, got {empty:?}"
         );
-        assert!(matches!(plan, CompletionPlan::Closed), "no driver, no match → nothing");
     }
 
     #[test]
@@ -913,13 +989,13 @@ mod tests {
             "checkout",
             CompletionSource::Driver(DriverTool::Git),
         )];
-        let popup = resolve_driver(4, "ch", None, locals, driver).expect("merged popup");
+        let popup = resolve_driver(4, "ch", None, locals, driver, true).expect("merged popup");
         assert_eq!(popup.candidates[0].value, "checkout", "driver ranks above locals");
     }
 
     #[test]
     fn resolve_driver_empty_everything_is_none() {
-        assert!(resolve_driver(0, "", None, vec![], vec![]).is_none());
+        assert!(resolve_driver(0, "", None, vec![], vec![], true).is_none());
     }
 
     // ---- bare-segment driver values get the token's dir prefix --------
@@ -940,7 +1016,7 @@ mod tests {
     fn resolve_driver_prefixes_bare_segment_with_tilde_dir() {
         // Token `~/Lib`; sidecar returns the bare segment `Library`.
         let popup =
-            resolve_driver(3, "~/Lib", None, vec![], vec![driver("Library")]).expect("popup");
+            resolve_driver(3, "~/Lib", None, vec![], vec![driver("Library")], true).expect("popup");
         assert_eq!(popup.candidates[0].value, "~/Library", "dir prefix `~/` prepended");
         // The menu still shows the bare segment — nicer, and matches a shell.
         assert_eq!(popup.candidates[0].display, "Library");
@@ -949,14 +1025,15 @@ mod tests {
     #[test]
     fn resolve_driver_prefixes_bare_segment_under_absolute_dir() {
         // The same generalises to `/us<Tab>` → `usr` (broken) vs `/usr`.
-        let popup = resolve_driver(3, "/us", None, vec![], vec![driver("usr")]).expect("popup");
+        let popup =
+            resolve_driver(3, "/us", None, vec![], vec![driver("usr")], true).expect("popup");
         assert_eq!(popup.candidates[0].value, "/usr");
     }
 
     #[test]
     fn resolve_driver_prefixes_bare_segment_under_relative_dir() {
-        let popup =
-            resolve_driver(3, "src/Ca", None, vec![], vec![driver("Cargo.toml")]).expect("popup");
+        let popup = resolve_driver(3, "src/Ca", None, vec![], vec![driver("Cargo.toml")], true)
+            .expect("popup");
         assert_eq!(popup.candidates[0].value, "src/Cargo.toml");
     }
 
@@ -964,8 +1041,8 @@ mod tests {
     fn resolve_driver_leaves_full_word_value_untouched() {
         // fish's `complete -C` returns the FULL word (`~/Library/`); it
         // already carries the dir prefix, so it must not be double-prefixed.
-        let popup =
-            resolve_driver(3, "~/Lib", None, vec![], vec![driver("~/Library/")]).expect("popup");
+        let popup = resolve_driver(3, "~/Lib", None, vec![], vec![driver("~/Library/")], true)
+            .expect("popup");
         assert_eq!(popup.candidates[0].value, "~/Library/");
     }
 
@@ -974,7 +1051,7 @@ mod tests {
         // No `/` in the token: command names, subcommands, flags, branches
         // — the whole token IS the segment. `git che` → `checkout`.
         let popup =
-            resolve_driver(4, "che", None, vec![], vec![driver("checkout")]).expect("popup");
+            resolve_driver(4, "che", None, vec![], vec![driver("checkout")], true).expect("popup");
         assert_eq!(popup.candidates[0].value, "checkout");
     }
 
@@ -986,10 +1063,55 @@ mod tests {
         let mut e = crate::prompt_editor::PromptEditor::new();
         e.insert_str("cd ~/Lib");
         let popup =
-            resolve_driver(3, "~/Lib", None, vec![], vec![driver("Library")]).expect("popup");
+            resolve_driver(3, "~/Lib", None, vec![], vec![driver("Library")], true).expect("popup");
         // Token `~/Lib` starts at byte 3, length 5.
         popup.accept(&mut e, 5);
         assert_eq!(e.text(), "cd ~/Library ");
+    }
+
+    // ---- COMP_WORDBREAKS-aware replace range (#183) -------------------
+
+    #[test]
+    fn rebase_replace_to_word_trims_at_wordbreak() {
+        // `d FOO=ba`: token `FOO=ba` at byte 2; bash's `cur` is `ba`, so the
+        // replace range must start at the `b` (byte 6) and the token narrows to
+        // `ba` — bash replaces only the post-`=` word.
+        assert_eq!(rebase_replace_to_word(2, "FOO=ba", "ba"), (6, "ba".to_string(), true));
+        // `scp host:/pa`: `cur` is `/pa` after the `:` break (byte 9).
+        assert_eq!(rebase_replace_to_word(4, "host:/pa", "/pa"), (9, "/pa".to_string(), true));
+        // No word-break (`/` is not a COMP_WORDBREAKS char): `cur` == token,
+        // nothing changes — the existing path realign still owns this case.
+        assert_eq!(
+            rebase_replace_to_word(3, "/usr/lo", "/usr/lo"),
+            (3, "/usr/lo".to_string(), false)
+        );
+        // `foo:`<Tab> — `cur` is empty: replace range collapses to the cursor.
+        assert_eq!(rebase_replace_to_word(2, "foo:", ""), (6, "".to_string(), true));
+        // `cur` not a suffix of the token (e.g. an escaping mismatch): leave the
+        // range alone rather than corrupt it — safe fallback.
+        assert_eq!(rebase_replace_to_word(0, "my fi", "xy"), (0, "my fi".to_string(), false));
+    }
+
+    #[test]
+    fn bash_cur_rebase_then_resolve_accepts_only_the_word_after_the_break() {
+        // End-to-end (#183): `d FOO=ba`<Tab> with a function returning the
+        // diagnostic `cur=[ba]`. The bash sidecar reports `cur="ba"`; rebasing
+        // the replace range to the `=` word-break (as render_pane does) means
+        // accept replaces only `ba` → `d FOO=cur=[ba]`, matching bash — not the
+        // pre-fix `d cur=[ba]` (the whole `FOO=ba` token).
+        let mut e = crate::prompt_editor::PromptEditor::new();
+        e.insert_str("d FOO=ba");
+        let (origin, token, trimmed) = rebase_replace_to_word(2, "FOO=ba", "ba");
+        assert!(trimmed, "the `=` word-break trims the range");
+        // render_pane drops the locals when trimmed; none here anyway.
+        let locals: Vec<CompletionCandidate> = vec![];
+        let popup = resolve_driver(origin, &token, None, locals, vec![driver("cur=[ba]")], false)
+            .expect("popup");
+        assert_eq!(popup.origin_byte, 6, "replace starts after the `=` word-break");
+        // accept replaces [origin_byte, cursor) — exactly how render_pane drives it.
+        let cursor = e.text().len();
+        popup.accept(&mut e, cursor - popup.origin_byte);
+        assert_eq!(e.text(), "d FOO=cur=[ba] ");
     }
 
     // ---- no-local-listing fallback heuristics -------------------------
@@ -1011,6 +1133,7 @@ mod tests {
             None,
             vec![],
             vec![driver("usr"), driver("bin"), driver("afclip")],
+            true,
         )
         .expect("popup");
         let values: Vec<&str> = popup.candidates.iter().map(|c| c.value.as_str()).collect();
@@ -1023,7 +1146,7 @@ mod tests {
         // every candidate through the normal merge — fuzzy/substring command
         // and flag completions must not be culled.
         let popup =
-            resolve_driver(0, "co", None, vec![], vec![driver("checkout"), driver("commit")])
+            resolve_driver(0, "co", None, vec![], vec![driver("checkout"), driver("commit")], true)
                 .expect("popup");
         assert_eq!(popup.candidates.len(), 2);
     }
@@ -1033,8 +1156,9 @@ mod tests {
         // No local listing (the dir couldn't be read): the ancestor-component
         // heuristic still fires. `/usr/` → `usr` aligns to `/usr/usr` (leaf is
         // the token's own component) → dropped; a real-looking leaf survives.
-        let popup = resolve_driver(3, "/usr/", None, vec![], vec![driver("usr"), driver("share")])
-            .expect("popup");
+        let popup =
+            resolve_driver(3, "/usr/", None, vec![], vec![driver("usr"), driver("share")], true)
+                .expect("popup");
         let values: Vec<&str> = popup.candidates.iter().map(|c| c.value.as_str()).collect();
         assert_eq!(values, vec!["/usr/share"], "ancestor `usr` culled, real leaf kept");
     }
@@ -1057,6 +1181,7 @@ mod tests {
             None,
             vec![],
             vec![driver("Application Support")],
+            true,
         )
         .expect("popup");
         assert_eq!(popup.candidates[0].value, "~/Library/Application\\ Support");
@@ -1072,6 +1197,7 @@ mod tests {
             None,
             vec![],
             vec![driver("Application Support"), driver("Application\\ Support")],
+            true,
         )
         .expect("popup");
         let values: Vec<&str> = popup.candidates.iter().map(|c| c.value.as_str()).collect();
@@ -1083,9 +1209,34 @@ mod tests {
         // A non-path token (`my fi`, no `/`) skips the path filters but still
         // gets escaped — an argument-position filename with a space must round-
         // trip (`vim my fi<Tab>` → `my\ file.txt`).
-        let popup =
-            resolve_driver(0, "my fi", None, vec![], vec![driver("my file.txt")]).expect("popup");
+        let popup = resolve_driver(0, "my fi", None, vec![], vec![driver("my file.txt")], true)
+            .expect("popup");
         assert_eq!(popup.candidates[0].value, "my\\ file.txt");
+    }
+
+    #[test]
+    fn resolve_driver_non_filename_completion_inserts_glob_chars_verbatim() {
+        // #178: a bash `complete -F` function that is NOT a filename completion
+        // (no `-o filenames`) has its `COMPREPLY` inserted **verbatim** — bash
+        // does not escape glob metacharacters in that case. A value like
+        // `cur=[ba]` must round-trip unescaped, not become `cur=\[ba\]`.
+        let popup = resolve_driver(0, "cur=[ba", None, vec![], vec![driver("cur=[ba]")], false)
+            .expect("popup");
+        assert_eq!(popup.candidates[0].value, "cur=[ba]");
+        assert!(
+            !popup.candidates[0].value.contains('\\'),
+            "non-filename completion is inserted verbatim — no glob/space escaping"
+        );
+    }
+
+    #[test]
+    fn resolve_driver_filename_completion_still_escapes_glob_chars() {
+        // The other side of #178: when the completion IS a filename completion
+        // (`-o filenames`), a real filename containing a glob metachar must be
+        // escaped so the shell doesn't glob it on accept.
+        let popup = resolve_driver(0, "report", None, vec![], vec![driver("report[1].csv")], true)
+            .expect("popup");
+        assert_eq!(popup.candidates[0].value, "report\\[1\\].csv");
     }
 
     #[test]

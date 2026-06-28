@@ -344,10 +344,13 @@ fn completion_to_json(
 fn lifecycle_to_json(event: &LifecycleEvent, obj: &mut serde_json::Map<String, serde_json::Value>) {
     use serde_json::json;
     match event {
-        LifecycleEvent::IntegrationReady { shell, version } => {
+        LifecycleEvent::IntegrationReady { shell, version, completion_degraded } => {
             obj.insert("event".into(), json!("IntegrationReady"));
             obj.insert("shell".into(), json!(format!("{shell:?}")));
             obj.insert("version".into(), json!(version));
+            if *completion_degraded {
+                obj.insert("completion_degraded".into(), json!(true));
+            }
         }
         LifecycleEvent::IntegrationError { reason } => {
             obj.insert("event".into(), json!("IntegrationError"));
@@ -386,12 +389,14 @@ fn lifecycle_to_json(event: &LifecycleEvent, obj: &mut serde_json::Map<String, s
         LifecycleEvent::Continuation => {
             obj.insert("event".into(), json!("Continuation"));
         }
-        LifecycleEvent::Completion { id, lines } => {
+        LifecycleEvent::Completion { id, lines, filenames, cur } => {
             obj.insert("event".into(), json!("Completion"));
             obj.insert("id".into(), json!(id));
             // Count only — the candidate list can be long and the dump is
             // for tracing event flow, mirroring ShellVars above.
             obj.insert("count".into(), json!(lines.len()));
+            obj.insert("filenames".into(), json!(filenames));
+            obj.insert("cur".into(), json!(cur));
         }
     }
 }
@@ -459,7 +464,11 @@ mod tests {
         let rec = EventRecorder::new(&path).expect("open recorder");
         rec.record_lifecycle(
             3,
-            &LifecycleEvent::IntegrationReady { shell: ShellKind::Bash, version: 1 },
+            &LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Bash,
+                version: 1,
+                completion_degraded: false,
+            },
         );
         rec.record_lifecycle(3, &LifecycleEvent::Preexec { command: "ls -la".into() });
         rec.record_lifecycle(3, &LifecycleEvent::CommandFinished { exit: 0 });
@@ -488,7 +497,11 @@ mod tests {
         rec.record_spawn(0, ShellSpec::Zsh, &["zsh".into()]);
         rec.record_lifecycle(
             0,
-            &LifecycleEvent::IntegrationReady { shell: ShellKind::Zsh, version: 1 },
+            &LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Zsh,
+                version: 1,
+                completion_degraded: false,
+            },
         );
         rec.record_transition(
             0,
@@ -596,7 +609,11 @@ mod tests {
         let rec = EventRecorder::new(&path).expect("open recorder");
         rec.record_lifecycle(
             0,
-            &LifecycleEvent::IntegrationReady { shell: ShellKind::Bash, version: 1 },
+            &LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Bash,
+                version: 1,
+                completion_degraded: false,
+            },
         );
         drop(rec);
         let rows = parse_jsonl(&read_to_string(&path));
@@ -724,7 +741,11 @@ mod tests {
         );
         rec.record_lifecycle(
             0,
-            &LifecycleEvent::IntegrationReady { shell: ShellKind::Zsh, version: 1 },
+            &LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Zsh,
+                version: 1,
+                completion_degraded: false,
+            },
         );
         rec.record_pty_exit(0);
         drop(rec);
@@ -784,7 +805,11 @@ mod tests {
         rec.record_spawn(0, ShellSpec::Zsh, &["zsh".into()]);
         rec.record_lifecycle(
             0,
-            &LifecycleEvent::IntegrationReady { shell: ShellKind::Zsh, version: 1 },
+            &LifecycleEvent::IntegrationReady {
+                shell: ShellKind::Zsh,
+                version: 1,
+                completion_degraded: false,
+            },
         );
         rec.record_transition(
             0,

@@ -30,6 +30,7 @@
 
 pub mod block;
 pub mod block_links;
+pub mod block_menu;
 pub mod block_selection;
 pub mod completion;
 pub mod cursor_env;

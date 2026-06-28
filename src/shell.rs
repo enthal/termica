@@ -91,8 +91,11 @@ pub enum IntegrationState {
     /// No `IntegrationReady` lifecycle event has arrived yet.
     Unknown,
     /// The bootstrap announced a version we support. Editor
-    /// promotion is gated on this.
-    Confirmed { shell: ShellKind, version: u32 },
+    /// promotion is gated on this. `completion_degraded` is `true` when the
+    /// shell reported that live Tab-completion can't fully work (old bash with
+    /// no bash-completion) — the terminal is unaffected; only the long-tail
+    /// completion source is reduced. Drives the one-time UI notice.
+    Confirmed { shell: ShellKind, version: u32, completion_degraded: bool },
     /// The bootstrap announced a version we don't support, OR
     /// the bootstrap explicitly emitted `IntegrationError`, OR
     /// the bootstrap timeout expired.
@@ -225,10 +228,11 @@ impl PromptController {
 
     pub fn observe_event(&mut self, event: LifecycleEvent, frame: u64) {
         match event {
-            LifecycleEvent::IntegrationReady { shell, version } => {
+            LifecycleEvent::IntegrationReady { shell, version, completion_degraded } => {
                 self.shell_kind = Some(shell);
                 if version == SUPPORTED_PROTOCOL_VERSION {
-                    self.integration = IntegrationState::Confirmed { shell, version };
+                    self.integration =
+                        IntegrationState::Confirmed { shell, version, completion_degraded };
                     if self.mode == PaneMode::Bootstrapping {
                         self.transition(
                             PaneMode::RawTerminal,
@@ -421,6 +425,12 @@ impl PromptController {
     pub fn integration(&self) -> &IntegrationState {
         &self.integration
     }
+    /// True when integration is confirmed but the shell reported that live
+    /// Tab-completion is degraded (old bash with no bash-completion). Drives
+    /// the one-time UI notice; the terminal itself is fully functional.
+    pub fn completion_degraded(&self) -> bool {
+        matches!(self.integration, IntegrationState::Confirmed { completion_degraded: true, .. })
+    }
     pub fn last_transition(&self) -> &TransitionRecord {
         &self.last_transition
     }
@@ -515,6 +525,7 @@ mod tests {
             LifecycleEvent::IntegrationReady {
                 shell: ShellKind::Zsh,
                 version: SUPPORTED_PROTOCOL_VERSION,
+                completion_degraded: false,
             },
             frame,
         );
@@ -548,7 +559,7 @@ mod tests {
         assert_eq!(c.last_transition().reason, TransitionReason::BootstrapComplete);
         assert!(matches!(
             c.integration(),
-            IntegrationState::Confirmed { shell: ShellKind::Zsh, version: 1 }
+            IntegrationState::Confirmed { shell: ShellKind::Zsh, version: 1, .. }
         ));
     }
 
@@ -559,6 +570,7 @@ mod tests {
             LifecycleEvent::IntegrationReady {
                 shell: ShellKind::Zsh,
                 version: SUPPORTED_PROTOCOL_VERSION + 1,
+                completion_degraded: false,
             },
             1,
         );
@@ -914,6 +926,7 @@ mod tests {
             LifecycleEvent::IntegrationReady {
                 shell: ShellKind::Zsh,
                 version: SUPPORTED_PROTOCOL_VERSION,
+                completion_degraded: false,
             },
             1,
         );
@@ -946,7 +959,15 @@ mod tests {
         assert_eq!(c.mode(), PaneMode::ShellPromptEditor);
         let before = c.last_transition().clone();
 
-        c.observe_event(LifecycleEvent::Completion { id: 1, lines: vec!["hello".into()] }, 9);
+        c.observe_event(
+            LifecycleEvent::Completion {
+                id: 1,
+                lines: vec!["hello".into()],
+                filenames: false,
+                cur: None,
+            },
+            9,
+        );
 
         assert_eq!(c.mode(), PaneMode::ShellPromptEditor, "mode unchanged by a completion reply");
         assert_eq!(c.last_transition(), &before, "no transition recorded for a completion reply");
@@ -965,6 +986,7 @@ mod tests {
             LifecycleEvent::IntegrationReady {
                 shell: ShellKind::Zsh,
                 version: SUPPORTED_PROTOCOL_VERSION,
+                completion_degraded: false,
             },
             1,
         );
@@ -1000,6 +1022,7 @@ mod tests {
             LifecycleEvent::IntegrationReady {
                 shell: ShellKind::Bash,
                 version: SUPPORTED_PROTOCOL_VERSION,
+                completion_degraded: false,
             },
             1,
         );
