@@ -22,7 +22,7 @@ There is **no separate "running command" mode** — submitting a command *eagerl
 
 | Key | `ShellPromptEditor` (prompt) | `RawTerminal` (running a command) | `AlternateScreen` (vim / htop / less) |
 |---|---|---|---|
-| `Ctrl+C` | **Inert** — nothing sent (idle prompt; per [04](04-prompt-editor.md)) | `0x03` **SIGINT** to the foreground program | `0x03` **SIGINT** |
+| `Ctrl+C` | **Inert at an idle prompt** — nothing sent; **but** aborts a pending PS2 continuation (`0x03` + clears the editor — see [04 §Recovering from a stuck continuation](04-prompt-editor.md#recovering-from-a-stuck-continuation)) | `0x03` **SIGINT** to the foreground program | `0x03` **SIGINT** |
 | `Ctrl+A` / `E` / `T` | Termica editor: line start / line end / transpose | C0 byte to the program (`readline` may act on it) | C0 byte to the program |
 | `Tab` | Completion popup | `0x09` to the program | `0x09` to the program |
 | Arrows / `Home` / `End` | Editor caret motion | VT escape to the program | VT escape (SS3 form under DECCKM) |
@@ -124,7 +124,7 @@ Mouse (editor):
 
 | Shortcut | Action | Phase |
 |---|---|---|
-| Continuation marker re-entry | After a submit, a DCS-JSON `continuation` event from the shell (`PS2` fired) re-promotes the editor and restores `last_submitted + "\n"`; only the suffix beyond `last_submitted` is sent on the next submit. | ✅ Phase 4C polish ([#58](https://github.com/enthal/termica/pull/58)) |
+| Continuation marker re-entry | After a submit, a DCS-JSON `continuation` event from the shell (`PS2` fired) re-promotes the editor and restores `last_submitted + "\n"`; only the suffix beyond `last_submitted` is sent on the next submit. **Recovery** when the continuation is unwanted (e.g. `echo "!"`): Ctrl+C aborts the dangling line + clears the editor, and clearing/retyping a *different* command aborts the line while keeping the retyped text for a clean second Enter (2-Enter heal). See [04 §Recovering from a stuck continuation](04-prompt-editor.md#recovering-from-a-stuck-continuation). | ✅ Phase 4C polish ([#58](https://github.com/enthal/termica/pull/58)) |
 | `Cmd+F` / `Ctrl+Shift+F` | In-pane find overlay over the focused pane's sealed blocks (literal / case-insensitive / regex; `Aa` + `.*` toggles; All/Commands/Outputs filter). `Ctrl+Shift+F` on Linux because plain `Ctrl+F` is readline `forward-char`. Fuzzy is post-MVP. | ✅ Phase 8 ([`feat/in-pane-search`](https://github.com/enthal/termica/tree/feat/in-pane-search)) |
 | `↑` / `↓` (in find field) | Walk find-query history; `▾` opens the recent-query dropdown. | ✅ Phase 8 |
 | `Enter` / `Shift+Enter` (in find field) | Find searches from the bottom: `Enter` steps **up** (previous / older match), `Shift+Enter` steps **down** (next / newer). `Esc` dismisses. | ✅ Phase 8 |

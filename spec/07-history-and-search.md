@@ -187,12 +187,25 @@ The transcript view is structured as a vertical stack of **command blocks**, eac
 
 Each `Sealed` block ([04](04-prompt-editor.md)) carries a `BlockHeader` (cwd, git branch, dirty summary) and a `command + duration + exit` summary; these are the same fields populated into the persisted `CommandRun` record described below.
 
-Per-block affordances (Phase 7+ polish):
+Per-block affordances:
 
-- Click the header to collapse / expand the output.
-- Context menu / hover icons: copy command, copy output, copy command+output, rerun, pin, jump-to-output.
+- **Right-click context menu** (shipped). Right-clicking anywhere on a `Sealed` block — its header chips, command label, or output — opens a context menu with three always-present items, in this order:
+  - **Copy block** — the command line(s) followed by the output, joined by a single newline (either half omitted when empty).
+  - **Copy command** — the command line(s) only.
+  - **Copy output** — the output only.
+
+  All three copy width-independent text with each line's trailing space-padding trimmed and trailing blank lines dropped — the same clipboard rule as a block selection ([spec/04](04-prompt-editor.md)).
+
+  When the right-click lands on one of the block's header chips, a **Copy `<chip>`** item plus a divider are *prepended* before those three, where `<chip>` names the chip under the pointer (`path`, `git branch`, `git sync`, `git changes`, `exit code`, `duration`) and the item copies that chip's displayed text. This is the per-block counterpart to the Phase 5 status-header "copy branch / copy path" click actions ([spec/10](10-roadmap.md)).
+
+  A `Running` block — a command still executing, whose output is streaming in the live grid and is not yet frozen into a snapshot — copies a **best-effort snapshot of the live grid taken at click time** (it may be mid-stream). When the grid shows normal scrolling output, the menu is the same **Copy block / Copy command / Copy output** as a sealed block, reflecting the bytes printed so far; the grid rows are **unwrapped into width-independent logical lines** first (the same transform a sealed block stores), so a line that soft-wrapped at the terminal width copies as one line rather than broken at the wrap column. When the running command is in **alternate screen** (vim / htop / less / fzf — a full-screen TUI rather than a transcript), the menu instead offers **Copy command** and **Copy screen** (the visible grid **verbatim** — rows are *not* unwrapped, since a TUI's rows are independent) and omits **Copy block**, since there is no meaningful command-plus-output block. The prepended **Copy `<chip>`** behaves the same in both cases.
 - Failed (non-zero exit) blocks get a subtle red gutter mark.
 - Blocks are non-modal — scrolling moves them as a stack, but each is independently selectable / collapsible.
+
+Deferred (Phase 7+ polish):
+
+- Click the header to collapse / expand the output.
+- Further context-menu / hover-icon actions: rerun, pin, jump-to-output.
 
 `Rerun` puts the command back in the editor and submits it. It is **not** a "rerun-in-place" — the original sealed block stays; the new run is a fresh `Running` → `Sealed` block at the bottom of the stack.
 

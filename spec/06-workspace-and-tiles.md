@@ -40,6 +40,8 @@ The first pane's cwd at process startup is resolved by this fallback chain:
 
 `termica` accepts at most one positional argument. Subsequent positional args are an error and the process exits non-zero. Option arguments (`--pick-chrome`, etc.) are independent of the positional path slot.
 
+**Positional path vs. a restored workspace.** The fallback chain above resolves the *fresh-start* first-pane cwd. When a saved workspace is restored on launch ([spec/08](08-persistence.md)), its panes bring their own persisted cwds, so the chain's `current_dir` fallback does not apply. But an **explicit** positional path still means "give me a pane here": the workspace restores as usual **and** one new, focused tab is opened in the requested directory (added to the root `Tabs` container; if the restored root is not a `Tabs`, it is wrapped in one). So `termica ~/project` always lands you at a prompt in `~/project`, whether or not there was a workspace to restore — without discarding the restored panes. Launching with no path restores the workspace alone. The distinction is "was a path named" (resolved to a directory), not "is the resolved cwd non-default".
+
 Subsequent panes spawned during the session (Cmd+T, drag-drop, new tab via `[+]`) inherit cwd from the active pane in their parent Container per usual; this section is specifically about the first pane at process start.
 
 ## Why split tile / pane / registry
