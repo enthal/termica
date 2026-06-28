@@ -100,12 +100,16 @@ pub fn block_context_menu_entries(
 /// separator is added when the right-click landed on a header chip.
 ///
 /// - **Normal output** (`alt_screen == false`): the usual **Copy block** /
-///   **Copy command** / **Copy output**, where block / output reflect the
-///   bytes printed so far.
+///   **Copy command** / **Copy output**. The raw grid rows are first
+///   *unwrapped* into width-independent logical lines (the same
+///   [`crate::persist::chunk::unwrap_rows`] a sealed block stores), so a line
+///   that soft-wrapped at the terminal width copies as one line — matching
+///   sealed-block copy, not the momentary wrap.
 /// - **Alternate screen** (`alt_screen == true`, e.g. vim / htop / less): the
 ///   grid is a full-screen TUI, not a command transcript, so there is no
-///   meaningful "block". The menu offers **Copy command** and **Copy screen**
-///   (the visible grid) — no Copy block.
+///   meaningful "block" and the rows are *not* unwrapped (a TUI's rows are
+///   independent). The menu offers **Copy command** and **Copy screen** (the
+///   visible grid verbatim) — no Copy block.
 pub fn running_context_menu_entries(
     command: &str,
     output: &[StyledLine],
@@ -124,9 +128,10 @@ pub fn running_context_menu_entries(
             clipboard: block_output_text(output),
         });
     } else {
+        let logical = crate::persist::chunk::unwrap_rows(output);
         entries.push(BlockMenuEntry::Action {
             label: "Copy block".to_string(),
-            clipboard: block_full_text(command, output),
+            clipboard: block_full_text(command, &logical),
         });
         entries.push(BlockMenuEntry::Action {
             label: "Copy command".to_string(),
@@ -134,7 +139,7 @@ pub fn running_context_menu_entries(
         });
         entries.push(BlockMenuEntry::Action {
             label: "Copy output".to_string(),
-            clipboard: block_output_text(output),
+            clipboard: block_output_text(&logical),
         });
     }
     entries
@@ -181,6 +186,16 @@ mod tests {
 
     fn snap(rows: &[&str]) -> Vec<StyledLine> {
         rows.iter().map(|r| line(r)).collect()
+    }
+
+    /// A grid row whose last cell carries `WRAPLINE` — alacritty's soft-wrap
+    /// marker, meaning the next row is a continuation of this logical line.
+    fn wrapped(s: &str) -> StyledLine {
+        let mut l = line(s);
+        if let Some(last) = l.cells.last_mut() {
+            last.flags = Flags::WRAPLINE;
+        }
+        l
     }
 
     /// Helper: pull the clipboard payload of the `Action` with this label.
@@ -313,5 +328,26 @@ mod tests {
         let alt = running_context_menu_entries("c", &out, true, Some(("git branch", "feat/y")));
         assert_eq!(labels(&alt), ["Copy git branch", "<sep>", "Copy command", "Copy screen"]);
         assert_eq!(clip(&alt, "Copy git branch"), "feat/y");
+    }
+
+    #[test]
+    fn running_normal_output_unwraps_soft_wrapped_rows_to_logical_lines() {
+        // A line longer than the grid soft-wraps into two rows (WRAPLINE on
+        // the first). Copy block / output reflect ONE logical line — matching
+        // a sealed block — not the width-dependent wrap.
+        let output = vec![wrapped("0123456789"), line("abcde")];
+        let entries = running_context_menu_entries("ls", &output, false, None);
+        assert_eq!(clip(&entries, "Copy output"), "0123456789abcde");
+        assert_eq!(clip(&entries, "Copy block"), "ls\n0123456789abcde");
+    }
+
+    #[test]
+    fn running_alt_screen_keeps_raw_grid_rows_for_copy_screen() {
+        // The alt-screen grid is the literal screen: each row is its own line,
+        // NOT unwrapped — a TUI's rows are independent even if a cell happens
+        // to carry the wrap marker.
+        let output = vec![wrapped("0123456789"), line("abcde")];
+        let entries = running_context_menu_entries("vim", &output, true, None);
+        assert_eq!(clip(&entries, "Copy screen"), "0123456789\nabcde");
     }
 }

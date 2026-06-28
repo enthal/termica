@@ -320,6 +320,14 @@ pub struct StickyHeaderRender {
     /// Response over the pinned command label. Senses `click_and_drag`.
     /// `None` when the pinned block has an empty command line.
     pub command: Option<egui::Response>,
+    /// Click-sensing response over the pinned chip strip — re-interacted
+    /// because the chips paint hover-only — so a right-click on the pinned
+    /// chips opens the block menu. `None` when the pinned block paints no
+    /// chips.
+    pub header: Option<egui::Response>,
+    /// The pinned header's chips, so a right-click on one can offer
+    /// "Copy <chip>" (matching the inline block).
+    pub chips: Vec<render::ChipHit>,
 }
 
 /// The block-identifying content painted into a pinned (sticky) header:
@@ -389,10 +397,16 @@ pub fn paint_sticky_header(
             // Sticky pins a running / sealed block — no PR chip (it's a
             // live-prompt-only affordance). `faded` matches the pinned
             // block (sealed → muted, running → vivid).
-            let _ = render::paint_block_header(
+            let header_render = render::paint_block_header(
                 ui,
                 render::BlockHeader { cwd, home, exit, duration, git, faded, ..Default::default() },
             );
+            // Re-interact the chip strip for clicks (it paints hover-only) so
+            // a right-click on the pinned chips opens the block menu, the same
+            // as the inline header.
+            let header_click = header_render.response.as_ref().map(|r| {
+                ui.interact(r.rect, ui.id().with("sticky_header_click"), egui::Sense::click())
+            });
             let capped = cap_command_for_sticky(command, STICKY_MAX_CMD_LINES);
             // Interactive (not hover-only) so the foreground overlay
             // captures the press instead of leaking it to the output
@@ -406,9 +420,10 @@ pub fn paint_sticky_header(
                 egui::pos2(viewport.right(), bottom),
             );
             ui.painter().set(strip_idx, egui::Shape::rect_filled(strip, 0.0, render::DEFAULT_BG));
-            command_resp
+            (command_resp, header_click, header_render.chips)
         });
-    StickyHeaderRender { command: inner.inner }
+    let (command, header, chips) = inner.inner;
+    StickyHeaderRender { command, header, chips }
 }
 
 /// Wire a block's right-click context menu onto every `response` that should
@@ -2442,6 +2457,56 @@ pub fn render_pane(
             },
             slot.session.pane_id(),
         );
+        // Right-click context menu on the pinned header — the same menu as
+        // the inline block, wired onto the pinned chip strip + command label
+        // (the pinned copy is on top in z-order, so the inline responses
+        // beneath it never see the click). Entries are derived from the live
+        // block by id, so a running pin snapshots the live grid like its
+        // inline twin.
+        {
+            let mut responses: Vec<&egui::Response> = Vec::new();
+            if let Some(h) = &sticky.header {
+                responses.push(h);
+            }
+            if let Some(c) = &sticky.command {
+                responses.push(c);
+            }
+            if !responses.is_empty() {
+                attach_block_menu(
+                    ui,
+                    ui.id().with(("sticky_ctx_chip", sticky_id)),
+                    &sticky.chips,
+                    &responses,
+                    |chip| {
+                        slot.session
+                            .blocks()
+                            .iter()
+                            .find_map(|b| match b {
+                                crate::block::Block::Sealed { id, command, snapshot, .. }
+                                    if *id == sticky_id =>
+                                {
+                                    Some(crate::block_menu::block_context_menu_entries(
+                                        command, snapshot, chip,
+                                    ))
+                                }
+                                crate::block::Block::Running { id, command, .. }
+                                    if *id == sticky_id =>
+                                {
+                                    let t = slot.session.terminal();
+                                    Some(crate::block_menu::running_context_menu_entries(
+                                        command,
+                                        &t.snapshot_lines_all(),
+                                        t.is_alternate_screen(),
+                                        chip,
+                                    ))
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_default()
+                    },
+                );
+            }
+        }
         if sealed_rows.is_some()
             && let Some(resp) = sticky.command
         {
