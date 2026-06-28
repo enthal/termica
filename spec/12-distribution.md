@@ -89,7 +89,7 @@ The `.p12` stored in `APPLE_CERTIFICATE` MUST be a **full chain** — the *Devel
 
 Two stages, both on the macOS runners only:
 
-1. **Sign (cargo-packager).** With `APPLE_CERTIFICATE` + `APPLE_CERTIFICATE_PASSWORD` in the environment, `cargo packager` imports the `.p12` into a temporary keychain, derives the identity from the cert's CommonName, and runs `codesign --options runtime --timestamp` (hardened runtime + secure timestamp — notarization prerequisites), then builds the `.dmg` around the signed `.app`.
+1. **Sign (cargo-packager).** cargo-packager only runs its signing path when `macos.signing-identity` is set in config — `APPLE_CERTIFICATE` alone is ignored. The workflow injects that field into `Cargo.toml` in a step gated on the secrets (the identity string is the cert's CommonName, not a secret), so forks without the cert still build unsigned. Then, with `APPLE_CERTIFICATE` + `APPLE_CERTIFICATE_PASSWORD` in the environment, `cargo packager` imports the `.p12` into a temporary keychain and runs `codesign --options runtime --timestamp` (hardened runtime + secure timestamp — notarization prerequisites), building the `.dmg` around the signed `.app`.
 2. **Notarize + staple (`notarytool` / `stapler`).** A dedicated step submits each `.dmg` to Apple's notary service using the App Store Connect API key (`APPLE_API_KEY_P8` / `APPLE_API_KEY_ID` / `APPLE_API_ISSUER`) with `--wait`, then `xcrun stapler staple`s the ticket. `stapler` is the safety gate: it can only succeed on an *Accepted* notarization, so a rejected build fails the job rather than shipping.
 
 | GitHub Actions secret | Purpose |

@@ -76,11 +76,29 @@ jobs:
         # "[email protected]" in transit (same gotcha that hit the action ref).
         run: cargo binstall -y --force --version 0.11.8 cargo-packager
 
+      - name: Configure macOS signing identity
+        # cargo-packager only runs its signing path (import the cert into a temp
+        # keychain, then `codesign --options runtime --timestamp`) when
+        # `macos.signing-identity` is set in config — APPLE_CERTIFICATE alone is
+        # ignored. We inject it here, gated on the secrets, so forks without the
+        # cert still build unsigned (the committed Cargo.toml stays clean). The
+        # identity string is NOT secret — it's the cert's CommonName, embedded in
+        # every signed build.
+        if: runner.os == 'macOS' && env.HAS_APPLE_SIGNING == 'true'
+        shell: bash
+        run: |
+          cat >> Cargo.toml <<'EOF'
+
+          [package.metadata.packager.macos]
+          signing-identity = "Developer ID Application: Timothy James (V64896A4F2)"
+          EOF
+
       - name: Build & package
         env:
-          # macOS only: cargo-packager imports this .p12 into a temp keychain and
-          # signs Termica.app with the cert's CommonName, hardened runtime, and a
-          # secure timestamp. Empty on forks → it builds unsigned and continues.
+          # macOS only: with signing-identity configured (previous step),
+          # cargo-packager imports this .p12 into a temp keychain and signs
+          # Termica.app with hardened runtime + a secure timestamp. Empty on forks
+          # → no signing-identity, so it builds unsigned and continues.
           # (Notarization is handled by the next step, not by cargo-packager.)
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
