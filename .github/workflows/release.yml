@@ -42,12 +42,20 @@ jobs:
           - os: macos-14 # Apple Silicon
             label: macos-arm64
             formats: dmg
+            release_files: dist/*.dmg
           - os: macos-15-intel # Intel (macos-13 runner was retired)
             label: macos-x64
             formats: dmg
+            release_files: dist/*.dmg
           - os: ubuntu-22.04
             label: linux-x64
             formats: deb,appimage # comma-separated: space-separated reads the 2nd as a subcommand
+            # Per-platform globs: each job only produces its own artifacts, so
+            # listing all three formats here with fail_on_unmatched_files would
+            # fail every job on the patterns it can't match.
+            release_files: |
+              dist/*.deb
+              dist/*.AppImage
     steps:
       - uses: actions/checkout@v4
 
@@ -164,10 +172,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: termica-${{ matrix.label }}
-          path: |
-            dist/*.dmg
-            dist/*.deb
-            dist/*.AppImage
+          path: ${{ matrix.release_files }}
           if-no-files-found: error
 
       - name: Attach to GitHub Release (tagged runs)
@@ -176,7 +181,4 @@ jobs:
         with:
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: |
-            dist/*.dmg
-            dist/*.deb
-            dist/*.AppImage
+          files: ${{ matrix.release_files }}
