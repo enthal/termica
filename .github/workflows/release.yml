@@ -25,7 +25,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write # create releases / upload assets
+  contents: read # default for all jobs; the `release` job elevates to write
 
 jobs:
   package:
@@ -167,18 +167,38 @@ jobs:
         shell: bash
         run: ls -la dist || true
 
-      - name: Upload workflow artifacts (manual test runs)
-        if: github.event_name == 'workflow_dispatch'
+      # Always upload, so both manual test runs and the `release` job (tags) can
+      # collect them. The release job downloads every termica-* artifact.
+      - name: Upload built installers
         uses: actions/upload-artifact@v4
         with:
           name: termica-${{ matrix.label }}
           path: ${{ matrix.release_files }}
           if-no-files-found: error
 
-      - name: Attach to GitHub Release (tagged runs)
-        if: startsWith(github.ref, 'refs/tags/v')
+  # A single job creates the GitHub Release ONCE, after all matrix builds. Doing
+  # this per-matrix-job (the old design) made all three jobs call
+  # action-gh-release concurrently, each with generate_release_notes — which
+  # raced on creation and appended the auto-notes three times.
+  release:
+    name: Publish GitHub Release
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release / upload assets
+    steps:
+      - name: Download all built installers
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts # each artifact lands in artifacts/<name>/
+
+      - name: List downloaded files
+        run: find artifacts -type f -print
+
+      - name: Create GitHub Release with all installers
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: ${{ matrix.release_files }}
+          files: artifacts/**/*
