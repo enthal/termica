@@ -79,9 +79,28 @@ Listing in software centers (an AppStream `io.termica.Termica.metainfo.xml`) is 
 
 ### macOS
 
-- **Unsigned reality:** a not-notarized `.app` trips Gatekeeper — *"Termica can't be opened because Apple cannot check it for malware."* The user must right-click → Open once (or clear the quarantine attribute). Functional, but a friction wall for non-technical visitors.
-- **Signed + notarized:** opens cleanly. Requires the **Apple Developer Program ($99/yr)**, a *Developer ID Application* certificate, and an App Store Connect API key, stored as GitHub Actions secrets; CI runs `codesign` then `notarytool`.
-- **Decision (current):** **ship unsigned initially.** Termica's early audience is developers who tolerate the right-click step, and the download page MUST carry clear "first launch on macOS" instructions. The release workflow MUST be written so the signing/notarization steps run only `if` the secrets are present — adding the Apple account later is a drop-in, no restructuring. Revisit when promoting Termica beyond the developer audience.
+- **Unsigned reality:** a not-notarized `.app` trips Gatekeeper — *"Apple could not verify 'Termica' is free of malware."* The user must go to System Settings → Privacy & Security → *Open Anyway* (or clear the quarantine attribute). Functional, but a friction wall for non-technical visitors.
+- **Signed + notarized (current):** opens cleanly, even offline. Requires the **Apple Developer Program ($99/yr)**, a *Developer ID Application* certificate, and an App Store Connect API key, stored as GitHub Actions secrets.
+- **Decision (current): sign + notarize.** Termica has an enrolled Apple Developer account (Team `V64896A4F2`). The release workflow signs and notarizes whenever the Apple secrets are present (`HAS_APPLE_SIGNING`), and still produces working **unsigned** artifacts when they are not (e.g. forks) — so the signing path is additive, never load-bearing for a successful build.
+
+#### Mechanism (normative)
+
+The `.p12` stored in `APPLE_CERTIFICATE` MUST be a **full chain** — the *Developer ID Application* leaf, the **Developer ID Certification Authority (G2)** intermediate, and the private key — base64-encoded. GitHub's fresh keychains do not carry the G2 intermediate, so a leaf-only `.p12` yields "0 valid identities" and signing fails; bundling the intermediate makes the chain self-validate against the system roots.
+
+Two stages, both on the macOS runners only:
+
+1. **Sign (cargo-packager).** cargo-packager only runs its signing path when `macos.signing-identity` is set in config — `APPLE_CERTIFICATE` alone is ignored. The workflow injects that field into `Cargo.toml` in a step gated on the secrets (the identity string is the cert's CommonName, not a secret), so forks without the cert still build unsigned. Then, with `APPLE_CERTIFICATE` + `APPLE_CERTIFICATE_PASSWORD` in the environment, `cargo packager` imports the `.p12` into a temporary keychain and runs `codesign --options runtime --timestamp` (hardened runtime + secure timestamp — notarization prerequisites), building the `.dmg` around the signed `.app`.
+2. **Notarize + staple (`notarytool` / `stapler`).** A dedicated step submits each `.dmg` to Apple's notary service using the App Store Connect API key (`APPLE_API_KEY_P8` / `APPLE_API_KEY_ID` / `APPLE_API_ISSUER`) with `--wait`, then `xcrun stapler staple`s the ticket. `stapler` is the safety gate: it can only succeed on an *Accepted* notarization, so a rejected build fails the job rather than shipping.
+
+| GitHub Actions secret | Purpose |
+| --- | --- |
+| `APPLE_CERTIFICATE` | base64 of the full-chain Developer ID `.p12` |
+| `APPLE_CERTIFICATE_PASSWORD` | the `.p12` export password |
+| `APPLE_API_KEY_P8` | contents of the App Store Connect `AuthKey_*.p8` |
+| `APPLE_API_KEY_ID` | the API key's Key ID |
+| `APPLE_API_ISSUER` | the App Store Connect Issuer ID |
+
+The signed `.app` inside the `.dmg` carries Apple's notarization (recorded by hash); stapling the enclosing `.dmg` is what makes a freshly-downloaded image open without a prompt offline. Stapling the `.app` itself (for the copy-out-then-launch-offline edge case) is a possible future refinement.
 
 ### Linux
 
@@ -120,7 +139,7 @@ Now that the repository is public, GitHub's **merge queue** is available on the 
 
 | Decision | Default if unresolved |
 |---|---|
-| Apple Developer Program for notarization | Defer; ship unsigned, CI signing-ready |
+| Apple Developer Program for notarization | Resolved: enrolled; CI signs + notarizes (Team `V64896A4F2`) |
 | Two per-arch `.dmg`s vs one universal `.app` | Two-arch matrix (simpler) |
 | `cargo-packager` vs hand-rolled bundling | `cargo-packager` (one config, all formats) |
 | Nightly/canary channel | Skip until requested |
@@ -130,9 +149,9 @@ Now that the repository is public, GitHub's **merge queue** is available on the 
 
 Each phase is its own PR; downloads exist after Phase 1.
 
-1. **Release CI + versioning.** `cargo-packager` config, `release.yml` on `v*` tags building macOS (both arches) + Linux (AppImage + `.deb`) **unsigned**, and `release-plz` wiring. Cut `v0.1.0`.
-2. **Download UX.** Homepage smart OS-detect button + "first launch" notes; README badge + `releases/latest` link + install instructions. Replaces the current "build from source" framing.
-3. **macOS signing + notarization.** Once an Apple Developer account exists: add secrets + signing steps (already gated behind their presence).
+1. **Release CI + versioning.** ✅ `cargo-packager` config, `release.yml` on `v*` tags building macOS (both arches) + Linux (AppImage + `.deb`), and `release-plz` wiring.
+2. **macOS signing + notarization.** ✅ Apple Developer account enrolled; CI signs (full-chain `.p12`) and notarizes + staples the `.dmg`, gated behind `HAS_APPLE_SIGNING`. Cut a signed `v0.1.0`.
+3. **Download UX.** Homepage smart OS-detect button; README `releases/latest` links + install instructions. Replaces the current "build from source" framing.
 4. **Merge queue** + optional canary channel.
 5. **Post-MVP channels:** Homebrew cask, AUR, Flatpak, Windows — as demand appears. When Flatpak/Snap lands, also do the cursor-read portal swap noted under [Packaging](#packaging).
 
