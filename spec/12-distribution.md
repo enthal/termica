@@ -118,10 +118,17 @@ The GSettings probe is gated on a GNOME-family desktop (`XDG_CURRENT_DESKTOP` co
 
 The public contract is a set of **version-free URLs** so the site and README never need editing per release:
 
-- **Releases page (canonical):** `https://github.com/enthal/termica/releases/latest` redirects to the newest release; the page lists every asset. Used as the README download link and the homepage fallback.
+- **Stable per-asset URLs (primary):** `https://github.com/enthal/termica/releases/latest/download/<asset>` redirects to that asset in the newest non-prerelease release. This only works if the asset filename is identical every release, so release assets are **version-less, arch-only** (see Asset naming). These are the links the README and homepage use directly — no JS, no API, no per-release edits.
+- **Releases page (canonical / fallback):** `https://github.com/enthal/termica/releases/latest` lists every asset; used as the "all downloads / other platforms" link.
 - **Latest-version badge:** `https://img.shields.io/github/v/release/enthal/termica` in the README — auto-updates.
-- **Homepage smart button:** client-side JS fetches `https://api.github.com/repos/enthal/termica/releases/latest`, detects the visitor's OS/arch (`navigator.userAgentData` / `navigator.platform`), and sets the download button to the matching asset's URL (e.g. *"Download for macOS — Apple Silicon"*). Handles version-stamped asset filenames automatically and needs no per-release edits; falls back to the releases page if detection or the API call fails.
-- **Asset naming:** filenames SHOULD encode platform + arch (e.g. `Termica_0.2.0_aarch64.dmg`, `termica_0.2.0_amd64.deb`, `Termica-0.2.0-x86_64.AppImage`) so a human picking from the releases page can tell them apart; the smart button matches on these.
+- **Asset naming (normative):** public release assets are **version-less**, encoding only product + platform + arch, so the stable URLs above resolve forever:
+  - `Termica-macOS-AppleSilicon.dmg`
+  - `Termica-macOS-Intel.dmg`
+  - `Termica-Linux-x86_64.deb`
+  - `Termica-Linux-x86_64.AppImage`
+
+  cargo-packager emits version-stamped names (`Termica_0.1.0_aarch64.dmg`); the `release` job renames to the above before attaching. The version is conveyed by the tag, the release page, and the in-app version — not the filename (matching the prevailing practice for signed desktop apps). Because the homepage/README link to these names, **the names are a soft public contract** — renaming them later breaks existing links.
+- **Homepage OS highlight (enhancement):** a small client-side script MAY detect the visitor's OS (not arch — browsers can't reliably distinguish Apple Silicon from Intel) to visually emphasize the relevant download; the links themselves are static and work with JS disabled.
 
 The homepage MUST NOT hard-code a version string anywhere.
 

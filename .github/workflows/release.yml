@@ -196,9 +196,34 @@ jobs:
       - name: List downloaded files
         run: find artifacts -type f -print
 
+      - name: Normalize asset names (version-less, arch-only)
+        # cargo-packager bakes the version into filenames
+        # (Termica_0.1.0_aarch64.dmg). Rename to stable, version-less names so
+        # the homepage / README can link to the always-current
+        #   releases/latest/download/<name>
+        # URLs with no per-release edits. The version still lives in the tag,
+        # the release page, and the in-app version.
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          while IFS= read -r f; do
+            b="$(basename "$f")"
+            case "$b" in
+              *aarch64.dmg) dest="Termica-macOS-AppleSilicon.dmg" ;;
+              *x64.dmg)     dest="Termica-macOS-Intel.dmg" ;;
+              *.deb)        dest="Termica-Linux-x86_64.deb" ;;
+              *.AppImage)   dest="Termica-Linux-x86_64.AppImage" ;;
+              *) echo "::error::unexpected artifact: $b"; exit 1 ;;
+            esac
+            echo "$b -> $dest"
+            cp "$f" "out/$dest"
+          done < <(find artifacts -type f \( -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' \))
+          echo "=== normalized ==="; ls -la out
+
       - name: Create GitHub Release with all installers
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: artifacts/**/*
+          files: out/*
