@@ -56,14 +56,15 @@ macOS and Linux. Windows is not supported (and is not currently planned).
 
 ## Download
 
-Prebuilt installers for each release are on the [latest release page](https://github.com/enthal/termica/releases/latest):
+Download the latest release — these links always point at the newest version:
 
-- **macOS** — `Termica_<version>_aarch64.dmg` (Apple Silicon) or `Termica_<version>_x64.dmg` (Intel). Open the `.dmg` and drag **Termica** to **Applications**.
-- **Linux (x86-64)** — a `.deb` (`sudo apt install ./termica_<version>_amd64.deb`) or a portable `.AppImage` (`chmod +x` it and run).
+- **macOS (Apple Silicon)** — [Termica-macOS-AppleSilicon.dmg](https://github.com/enthal/termica/releases/latest/download/Termica-macOS-AppleSilicon.dmg)
+- **macOS (Intel)** — [Termica-macOS-Intel.dmg](https://github.com/enthal/termica/releases/latest/download/Termica-macOS-Intel.dmg)
+- **Linux (x86-64)** — [Termica-Linux-x86_64.deb](https://github.com/enthal/termica/releases/latest/download/Termica-Linux-x86_64.deb) or the portable [Termica-Linux-x86_64.AppImage](https://github.com/enthal/termica/releases/latest/download/Termica-Linux-x86_64.AppImage)
 
-The macOS builds are **signed with a Developer ID and notarized by Apple**, so they open normally — no Gatekeeper warning.
+On macOS, open the `.dmg` and drag **Termica** to **Applications**. On Linux, install the `.deb` with `sudo apt install ./Termica-Linux-x86_64.deb`, or `chmod +x` the `.AppImage` and run it.
 
-Prefer to build it yourself? See [Build from source](#getting-started).
+The macOS builds are **signed with a Developer ID and notarized by Apple**, so they open normally — no Gatekeeper warning. For all versions and release notes, see the [releases page](https://github.com/enthal/termica/releases). Prefer to build it yourself? See [Build from source](#getting-started).
 
 ## Getting started
 
