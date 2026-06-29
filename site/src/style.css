@@ -113,11 +113,36 @@ body {
   box-shadow: 0 0 0 1px rgba(30, 242, 248, 0.7), 0 10px 36px rgba(31, 123, 255, 0.4);
 }
 
+/* Per-platform download links under the primary button */
+.dl-all {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.4rem 1.25rem;
+  margin: 1.1rem auto 0;
+  font-size: 0.92rem;
+}
+
+.dl-all a {
+  color: var(--muted);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.dl-all a:hover { color: var(--cyan); border-bottom-color: rgba(30, 242, 248, 0.5); }
+
+/* The visitor's detected OS rows, lifted out of muted */
+.dl-all a.dl-recommended { color: var(--text); }
+
 .meta {
-  margin-top: 1.75rem;
+  margin-top: 1.5rem;
   font-size: 0.9rem;
   letter-spacing: 0.01em;
 }
+
+.meta a { color: var(--muted); }
+.meta a:hover { color: var(--cyan); }
 
 /* ---- Hero screenshot --------------------------------------------------- */
 .shot {
