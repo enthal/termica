@@ -1373,24 +1373,35 @@ pub fn render_pane(
     // ---- Dead pane: "Restart shell" affordance (9F) -----------------
     // A restored (or exited) pane shows its scrollback with no live
     // shell. Offer a restart that respawns a shell in the last cwd and
-    // keeps the transcript (the new output appends below it). A thin top
-    // strip — the scrollback still renders below.
+    // keeps the transcript (the new output appends below it).
+    //
+    // Pinned to the pane BOTTOM (not a top strip): rendered as a bottom
+    // panel so it sits flush at the bottom — where the live editor
+    // footer sits — and the scrollback above keeps the rest of the
+    // height. A bottom panel also auto-reserves its own height, so the
+    // ScrollArea below simply fills `ui.available_height()` with no
+    // manual height bookkeeping. The id is pane-scoped via `ui.id()`
+    // (the pane ui is already salted by `PaneId` in `behavior.rs`), so
+    // two Dead panes on screen never collide on the panel id.
     if view.mode == Some(crate::shell::PaneMode::Dead) {
-        let clicked = ui
-            .horizontal(|ui| {
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new("Shell exited")
-                        .size(12.0)
-                        .color(egui::Color32::from_gray(140)),
-                );
-                ui.button("Restart shell").clicked()
-            })
-            .inner;
-        if clicked {
-            slot.ui.pending_action = Some(crate::pane_slot::PaneAction::RestartShell);
-        }
-        ui.separator();
+        egui::TopBottomPanel::bottom(ui.id().with("dead-restart-affordance")).show_inside(
+            ui,
+            |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("Shell exited")
+                            .size(12.0)
+                            .color(egui::Color32::from_gray(140)),
+                    );
+                    if ui.button("Restart shell").clicked() {
+                        slot.ui.pending_action = Some(crate::pane_slot::PaneAction::RestartShell);
+                    }
+                });
+                ui.add_space(4.0);
+            },
+        );
     }
 
     // ---- completion-degraded notice (old bash) ----------------------
