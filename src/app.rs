@@ -30,6 +30,14 @@ use crate::{MIN_COLS, MIN_ROWS};
 /// accidentally-triggered modal doesn't pin the app open forever.
 const QUIT_CONFIRM_TIMEOUT_SECS: f64 = 60.0;
 
+/// How long to wait after the last structural layout change before
+/// persisting the layout blob (spec/08 §"Written on change"). A burst of
+/// edits (open three tabs, drag a split) coalesces into one debounced
+/// write rather than one write per frame. Measured against egui's
+/// monotonic input-time (`ctx.input(|i| i.time)`), not `Instant::now()`,
+/// so the debounce is deterministic and testable.
+const LAYOUT_SAVE_DEBOUNCE_SECS: f64 = 1.0;
+
 /// The top-level eframe application.
 ///
 /// Owns the layout tree + every live pane. egui_tiles owns the
@@ -186,6 +194,19 @@ pub struct TermicaApp {
     /// one. Consumed once by [`Self::bootstrap`] to open a tab there even
     /// over a restored workspace. See `TermicaAppOptions`.
     requested_workspace_path: Option<PathBuf>,
+    /// Structural fingerprint of the layout (tile topology + the
+    /// `db_pane_by_app` mapping) as of the last computed frame. Compared
+    /// each frame against a freshly-computed fingerprint to detect a
+    /// structural change worth persisting — see [`layout_fingerprint`].
+    /// `0` until the first frame computes one.
+    layout_fingerprint: u64,
+    /// egui input-time (`ctx.input(|i| i.time)`, monotonic seconds) at
+    /// which a pending debounced layout save should flush. `Some` while a
+    /// save is queued (a structural change happened &lt; debounce ago);
+    /// `None` when nothing is pending. The layout is persisted **on
+    /// change**, not on quit (spec/08) — the quit flush is only a
+    /// backstop, because the process can vanish with no teardown.
+    layout_save_deadline: Option<f64>,
 }
 
 impl TermicaApp {
@@ -204,38 +225,6 @@ impl TermicaApp {
             Some((store, root)) => (Some(store), Some(root)),
             None => (None, None),
         };
-        // Scrollback gc (9E): enforce the disk + `runs` growth caps on a
-        // background thread so launch never blocks on it. It skips live
-        // sessions (lock-held) and is conservative — see
-        // [`crate::persist::gc`]. Real wall-clock `now` is fine here
-        // (production, not a test).
-        if let (Some(store), Some(root)) = (history.as_ref(), persist_root.as_ref()) {
-            let persist = crate::persist::store::Persistence::new(root.clone(), store.clone());
-            let now_ms = now_unix_ms();
-            std::thread::spawn(move || {
-                match crate::persist::gc::gc(
-                    &persist,
-                    now_ms,
-                    &crate::persist::gc::GcCaps::default(),
-                ) {
-                    Ok(r)
-                        if r.chunks_deleted > 0
-                            || r.runs_trimmed > 0
-                            || r.tmp_files_deleted > 0 =>
-                    {
-                        eprintln!(
-                            "termica: gc reclaimed {} chunks ({} bytes), trimmed {} runs, removed {} temps",
-                            r.chunks_deleted,
-                            r.bytes_reclaimed,
-                            r.runs_trimmed,
-                            r.tmp_files_deleted
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => eprintln!("termica: gc failed: {e}"),
-                }
-            });
-        }
         let app_run_id = uuid::Uuid::new_v4().to_string();
         let mut app = Self {
             panes: HashMap::new(),
@@ -264,8 +253,18 @@ impl TermicaApp {
             last_window_title: String::new(),
             startup_cwd: opts.startup_cwd,
             requested_workspace_path: opts.requested_workspace_path,
+            layout_fingerprint: 0,
+            layout_save_deadline: None,
         };
         app.bootstrap();
+        // Scrollback gc runs AFTER restore, never concurrently. Both probe
+        // the same per-session `flock`s for liveness; `flock` contends even
+        // within one process (per open-file-description), so a gc probe that
+        // momentarily holds session-N's lock while restore is checking
+        // session-N would make restore see "held" → conclude the workspace
+        // is owned by a live process → bail to a fresh pane. Serializing
+        // them (restore first, then gc) removes that race entirely.
+        app.spawn_gc();
         app
     }
 
@@ -276,6 +275,35 @@ impl TermicaApp {
     fn history_ctx(&self) -> Option<crate::history::HistoryContext> {
         let store = self.history.clone()?;
         Some(crate::history::HistoryContext { store, app_run_id: self.app_run_id.clone() })
+    }
+
+    /// Spawn the scrollback gc (9E) on a background thread so launch never
+    /// blocks on it. It enforces the disk + `runs` growth caps and skips
+    /// live sessions (lock-held) — see [`crate::persist::gc`]. Real
+    /// wall-clock `now` is fine here (production, not a test).
+    ///
+    /// **Spawned only after restore** ([`Self::bootstrap`]): gc and restore
+    /// both probe per-session locks, and `flock` contends within one
+    /// process, so running gc concurrently with restore would race restore
+    /// into a spurious "workspace is live elsewhere" verdict.
+    fn spawn_gc(&self) {
+        let (Some(store), Some(root)) = (self.history.as_ref(), self.persist_root.as_ref()) else {
+            return;
+        };
+        let persist = crate::persist::store::Persistence::new(root.clone(), store.clone());
+        let now_ms = now_unix_ms();
+        std::thread::spawn(move || {
+            match crate::persist::gc::gc(&persist, now_ms, &crate::persist::gc::GcCaps::default()) {
+                Ok(r) if r.chunks_deleted > 0 || r.runs_trimmed > 0 || r.tmp_files_deleted > 0 => {
+                    eprintln!(
+                        "termica: gc reclaimed {} chunks ({} bytes), trimmed {} runs, removed {} temps",
+                        r.chunks_deleted, r.bytes_reclaimed, r.runs_trimmed, r.tmp_files_deleted
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("termica: gc failed: {e}"),
+            }
+        });
     }
 
     /// Build a per-pane [`Persistence`] handle from the shared store +
@@ -302,32 +330,44 @@ impl TermicaApp {
         }
     }
 
-    fn save_layout_on_quit(&self) {
-        let Some(store) = self.history.as_ref() else { return };
-        // Map every live pane's app id -> its durable db pane row id.
-        let mut db_pane_by_app = std::collections::HashMap::new();
+    /// Map every live pane's app id → its durable `pane` row id. A pane in
+    /// degraded / not-yet-persisted state (no row) is absent — the save
+    /// path prunes such leaves from the written tree so the blob stays
+    /// self-consistent (spec/08 §"The saved blob is self-consistent").
+    fn build_db_pane_by_app(&self) -> HashMap<u64, i64> {
+        let mut db_pane_by_app = HashMap::new();
         for (pane_id, slot) in &self.panes {
             if let Some(db) = slot.session.persist_pane_row() {
                 db_pane_by_app.insert(pane_id.0, db);
             }
         }
-        if db_pane_by_app.is_empty() {
-            return; // nothing persistable (degraded mode)
-        }
-        let layout =
-            crate::persist::layout::SavedLayout { tree: self.tree.clone(), db_pane_by_app };
-        let blob = match layout.to_blob() {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("termica: layout serialize failed: {e}");
-                return;
-            }
-        };
+        db_pane_by_app
+    }
+
+    /// Persist the current window layout (spec/08 §"Written on change").
+    /// Best-effort: a missing store, serialization failure, or DB error
+    /// degrades to "no restore next time", never a crash. Called both on
+    /// every debounced structural change and as the quit backstop.
+    ///
+    /// The written tree contains **only** leaves that map to a durable db
+    /// row: any unmapped (degraded) leaf is pruned first, so restore never
+    /// sees an unmapped leaf of our own making and the blob round-trips
+    /// self-consistently.
+    fn persist_layout_now(&self) {
+        let Some(store) = self.history.as_ref() else { return };
+        let db_pane_by_app = self.build_db_pane_by_app();
+        save_layout_self_consistent(store, &self.tree, db_pane_by_app, now_unix_ms());
+    }
+
+    /// Quit backstop: persist the layout one final time and stamp every
+    /// live session ended. The layout is already saved on change, so this
+    /// is belt-and-suspenders — but the `end_session` stamping (which only
+    /// makes sense at teardown) lives here, not in [`Self::persist_layout_now`].
+    fn save_layout_on_quit(&self) {
+        self.persist_layout_now();
+        let Some(store) = self.history.as_ref() else { return };
         let now = now_unix_ms();
         if let Ok(store) = store.lock() {
-            if let Err(e) = store.save_layout(&blob, now) {
-                eprintln!("termica: layout save failed: {e}");
-            }
             for slot in self.panes.values() {
                 if let Some(sid) = slot.session.persist_session() {
                     let _ = store.end_session(sid, now, None);
@@ -423,78 +463,39 @@ impl TermicaApp {
     }
 
     /// Rebuild the saved tile layout, recreating each pane in `Dead`
-    /// mode with its persisted scrollback. Returns `false` (so the
-    /// caller spawns a fresh pane) when there's no saved layout, it
-    /// can't be parsed, it has no panes, or any pane's session is still
-    /// locked by a live process (don't steal it).
+    /// mode with its persisted scrollback. Returns `false` (so the caller
+    /// spawns a fresh pane) only when there is **nothing restorable** — no
+    /// saved layout, it can't be parsed, it has no mapped leaves, or the
+    /// workspace is still owned by a live process (don't steal it).
+    ///
+    /// Restore is **resilient, not all-or-nothing** (spec/08 §"Restore
+    /// semantics"): a leaf the blob maps to nothing is pruned from the
+    /// tree and the rest still restore; a pane whose chunks are all
+    /// missing/corrupt restores as an empty `Dead` pane. One bad leaf
+    /// never costs the user their whole workspace.
     fn try_restore_workspace(&mut self) -> bool {
         let Some(persist) = self.persist() else { return false };
         let Some(store) = self.history.clone() else { return false };
+        let Some(plan) = plan_restore(&persist, &store) else { return false };
 
-        let blob = match store.lock() {
-            Ok(s) => s.latest_layout().ok().flatten(),
-            Err(_) => None,
-        };
-        let Some(blob) = blob else { return false };
-        let layout = match crate::persist::layout::SavedLayout::from_blob(&blob) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("termica: layout parse failed, starting fresh: {e}");
-                return false;
-            }
-        };
-        let leaves = layout.pane_ids();
-        if leaves.is_empty() {
-            return false;
-        }
-        if !leaves.iter().all(|p| layout.db_pane_by_app.contains_key(&p.0)) {
-            eprintln!("termica: saved layout has unmapped panes; starting fresh");
-            return false;
-        }
-
-        // Liveness: if any pane's latest session is still lock-held, the
-        // workspace belongs to a live process — don't adopt it.
-        for &db_pane in layout.db_pane_by_app.values() {
-            let Some(sid) =
-                store.lock().ok().and_then(|s| s.latest_session_for_pane(db_pane).ok().flatten())
-            else {
-                continue;
-            };
-            // `matches!` evaluates and immediately drops any acquired
-            // guard — we only want the verdict, not to hold the lock.
-            if matches!(
-                crate::persist::lock::SessionLock::try_acquire(&persist.session_dir(sid)),
-                Ok(None)
-            ) {
-                return false; // held by a live process -> don't steal it
-            }
-        }
-
-        // Build a Dead pane per leaf, reusing the saved app PaneIds so the
-        // tree's leaves resolve.
-        let mut max_app_id = 0u64;
-        for pane_id in &leaves {
-            let db_pane = layout.db_pane_by_app[&pane_id.0];
-            let blocks = crate::persist::restore::restore_blocks_for_pane(&persist, db_pane);
+        // Build a Dead pane per surviving leaf, reusing the saved app
+        // PaneIds so the tree's leaves resolve. Block loading (which
+        // touches the filesystem) is done here, off the decision path.
+        for p in &plan.panes {
+            let blocks = crate::persist::restore::restore_blocks_for_pane(&persist, p.db_pane);
             let stack = crate::block::BlockStack::with_restored_sealed(blocks);
-            let cwd = store
-                .lock()
-                .ok()
-                .and_then(|s| s.pane_cwd(db_pane).ok().flatten())
-                .map(std::path::PathBuf::from);
             let session = PaneSession::restored(
                 MIN_ROWS.max(24),
                 MIN_COLS.max(80),
                 stack,
-                pane_id.0,
-                db_pane,
-                cwd,
+                p.pane_id.0,
+                p.db_pane,
+                p.cwd.clone(),
             );
-            self.panes.insert(*pane_id, PaneSlot { session, ui: PaneUiState::default() });
-            max_app_id = max_app_id.max(pane_id.0);
+            self.panes.insert(p.pane_id, PaneSlot { session, ui: PaneUiState::default() });
         }
-        self.tree = layout.tree;
-        self.next_pane_id = max_app_id + 1;
+        self.tree = plan.tree;
+        self.next_pane_id = plan.next_pane_id;
         true
     }
 
@@ -1212,33 +1213,11 @@ impl eframe::App for TermicaApp {
             }
         }
 
-        // Defensive: every Tabs container must have an `active`
-        // that is **a real child of its own**. We've observed three
-        // ways this invariant can be violated:
-        //
-        //   1. `active = None` — fresh container with no selection.
-        //   2. `active = Some(t)` where `t` was removed from `tiles`.
-        //   3. `active = Some(t)` where `t` exists but is NOT in
-        //      this container's `children` (e.g. it's a sibling
-        //      Tabs container's tile). This one bites after a
-        //      drag-split: egui_tiles 0.14 leaves the source
-        //      container's `active` pointing at the drop target.
-        //
-        // In all three cases, adopt the first live child as active
-        // so the pane area paints something rather than nothing.
-        let live_tile_ids: HashSet<TileId> = self.tree.tiles.tile_ids().collect();
-        for tile in self.tree.tiles.tiles_mut() {
-            if let Tile::Container(egui_tiles::Container::Tabs(tabs)) = tile {
-                let active_is_own_live_child = tabs
-                    .active
-                    .is_some_and(|t| live_tile_ids.contains(&t) && tabs.children.contains(&t));
-                if !active_is_own_live_child
-                    && let Some(first) = tabs.children.iter().find(|t| live_tile_ids.contains(t))
-                {
-                    tabs.set_active(*first);
-                }
-            }
-        }
+        // Defensive: every Tabs container must have an `active` that is a
+        // real child of its own (see [`revalidate_tabs_active`] for the
+        // three ways this invariant gets violated). Restore runs the same
+        // pass after pruning unrestorable leaves.
+        revalidate_tabs_active(&mut self.tree);
 
         // Detect which panes are the active tab in their respective
         // Tabs container *this* frame. Any pane that's newly active
@@ -1343,6 +1322,35 @@ impl eframe::App for TermicaApp {
             }
         }
         self.panes.retain(|id, _| live_panes.contains(id));
+
+        // Persist the layout on structural change (spec/08 §"Written on
+        // change"), debounced so a burst of edits (open three tabs, drag a
+        // split) coalesces into one write. The tree is settled for this
+        // frame by now (post-`ui`, post-reconcile). The quit path saves
+        // separately, so skip here while quitting. The first frame's `0 ->
+        // real` fingerprint transition arms a save ~1s after launch, so
+        // even an untouched session is durable against a later kill —
+        // exactly the on-quit-only failure this replaces.
+        if !self.should_quit {
+            let db_pane_by_app = self.build_db_pane_by_app();
+            let fp = layout_fingerprint(&self.tree, &db_pane_by_app);
+            let now_s = ctx.input(|i| i.time);
+            let fp_changed = fp != self.layout_fingerprint;
+            if fp_changed {
+                self.layout_fingerprint = fp;
+                // Ensure the deadline-firing frame happens even if every
+                // pane is idle (no PTY traffic to trigger a repaint).
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+                    LAYOUT_SAVE_DEBOUNCE_SECS,
+                ));
+            }
+            let (save_now, new_deadline) =
+                debounce_decide(now_s, self.layout_save_deadline, fp_changed);
+            self.layout_save_deadline = new_deadline;
+            if save_now {
+                self.persist_layout_now();
+            }
+        }
     }
 }
 
@@ -1449,6 +1457,321 @@ fn collect_panes_in_tree_order(tree: &egui_tiles::Tree<PaneId>) -> Vec<(PaneId, 
     out
 }
 
+/// A deterministic structural fingerprint of a window's layout: the tile
+/// **topology** (container kinds + ordered children + leaf `PaneId`s +
+/// each Tabs container's active child) plus the `db_pane_by_app` mapping.
+///
+/// Used to detect a *structural* change worth persisting (spec/08
+/// §"Written on change"): a new/closed tab, a split, a drag-reorder, an
+/// active-tab switch, or a pane gaining/losing its durable db row all
+/// move the fingerprint. It deliberately **excludes** cwd (persisted
+/// independently by each pane's writer thread) and transient focus, so an
+/// idle pane churning output doesn't trigger layout writes.
+///
+/// Walks from the root (not the tiles map), so it is independent of
+/// `TileId` allocation order — two trees with the same shape but
+/// different internal ids fingerprint equal.
+fn layout_fingerprint(tree: &Tree<PaneId>, db_pane_by_app: &HashMap<u64, i64>) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    fn hash_tile(
+        tiles: &Tiles<PaneId>,
+        tile_id: TileId,
+        h: &mut std::collections::hash_map::DefaultHasher,
+    ) {
+        match tiles.get(tile_id) {
+            Some(Tile::Pane(p)) => {
+                0u8.hash(h); // leaf tag
+                p.0.hash(h);
+            }
+            Some(Tile::Container(c)) => {
+                1u8.hash(h); // container tag
+                (c.kind() as u8).hash(h);
+                let children = c.children_vec();
+                children.len().hash(h);
+                for child in &children {
+                    hash_tile(tiles, *child, h);
+                }
+                // Active-tab position (Tabs only) — switching tabs is a
+                // structural change we persist.
+                if let egui_tiles::Container::Tabs(tabs) = c {
+                    let active_idx =
+                        tabs.active.and_then(|a| children.iter().position(|&t| t == a));
+                    2u8.hash(h);
+                    active_idx.hash(h);
+                }
+            }
+            None => 3u8.hash(h), // dangling reference
+        }
+    }
+
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match tree.root {
+        Some(root) => hash_tile(&tree.tiles, root, &mut h),
+        None => 4u8.hash(&mut h), // empty tree
+    }
+    // db_pane_by_app, in a canonical (sorted) order — HashMap iteration
+    // order is otherwise nondeterministic and would flap the fingerprint.
+    let mut pairs: Vec<(u64, i64)> = db_pane_by_app.iter().map(|(k, v)| (*k, *v)).collect();
+    pairs.sort_unstable();
+    pairs.hash(&mut h);
+    h.finish()
+}
+
+/// Pure debounce decision for the layout save (spec/08 §"Written on
+/// change"). Given the current monotonic time `now_s`, the pending save
+/// `deadline` (if any), and whether the layout fingerprint changed this
+/// frame, returns `(should_save_now, new_deadline)`.
+///
+/// A structural change (re)arms the deadline to `now + debounce`, so a
+/// burst of edits coalesces into a single save once the dust settles. The
+/// save fires (and the deadline disarms) on the first frame at or past
+/// the deadline. Time is passed in — no `Instant::now()` — so the logic
+/// is unit-tested with fixed constants.
+fn debounce_decide(now_s: f64, deadline: Option<f64>, fp_changed: bool) -> (bool, Option<f64>) {
+    let deadline = if fp_changed { Some(now_s + LAYOUT_SAVE_DEBOUNCE_SECS) } else { deadline };
+    match deadline {
+        Some(d) if now_s >= d => (true, None),
+        other => (false, other),
+    }
+}
+
+/// Repair every Tabs container's `active` so it points at a real child of
+/// its own. We've observed three ways this invariant gets violated:
+///
+///   1. `active = None` — fresh container with no selection.
+///   2. `active = Some(t)` where `t` was removed from `tiles`.
+///   3. `active = Some(t)` where `t` exists but is NOT in this
+///      container's `children` (e.g. a sibling Tabs container's tile —
+///      egui_tiles 0.14 leaves the source container's `active` pointing
+///      at the drop target after a drag-split).
+///
+/// In all three cases, adopt the first live child as active so the pane
+/// area paints something rather than nothing. Run every frame from
+/// `update()` and once by restore after pruning unrestorable leaves
+/// (spec/08 §"Restore semantics") — pruning can leave a Tabs `active`
+/// dangling exactly like case 2/3.
+fn revalidate_tabs_active(tree: &mut Tree<PaneId>) {
+    let live_tile_ids: HashSet<TileId> = tree.tiles.tile_ids().collect();
+    for tile in tree.tiles.tiles_mut() {
+        if let Tile::Container(egui_tiles::Container::Tabs(tabs)) = tile {
+            let active_is_own_live_child = tabs
+                .active
+                .is_some_and(|t| live_tile_ids.contains(&t) && tabs.children.contains(&t));
+            if !active_is_own_live_child
+                && let Some(first) = tabs.children.iter().find(|t| live_tile_ids.contains(t))
+            {
+                tabs.set_active(*first);
+            }
+        }
+    }
+}
+
+/// Remove every leaf whose `PaneId` is not in `keep` from `tree`, then
+/// simplify and re-validate Tabs `active`. Returns the set of `PaneId`s
+/// that survived.
+///
+/// Shared by the save path (drop a live pane that has no durable db row,
+/// so the written blob is self-consistent) and the restore path (drop a
+/// leaf the blob maps to nothing). The simplify pass — driven by the same
+/// [`crate::behavior::simplification_options`] the live `tree.ui()` uses
+/// — collapses now-empty / single-child containers, re-wraps a lone pane
+/// in Tabs, and nulls the root when nothing is left. So pruning the only
+/// pane out of a split leaves a valid, minimal tree rather than an empty
+/// container with a dangling root.
+fn prune_tree_to_mapped(tree: &mut Tree<PaneId>, keep: &HashSet<PaneId>) -> HashSet<PaneId> {
+    // Collect the tiles to drop first — don't mutate while iterating.
+    let drop_tiles: Vec<TileId> = tree
+        .tiles
+        .iter()
+        .filter_map(|(id, tile)| match tile {
+            Tile::Pane(p) if !keep.contains(p) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    for tile_id in drop_tiles {
+        tree.remove_recursively(tile_id);
+    }
+    tree.simplify(&crate::behavior::simplification_options());
+    revalidate_tabs_active(tree);
+    // Recompute survivors from the simplified tree.
+    tree.tiles
+        .tiles()
+        .filter_map(|tile| match tile {
+            Tile::Pane(p) => Some(*p),
+            Tile::Container(_) => None,
+        })
+        .collect()
+}
+
+/// Write a **self-consistent** layout blob (spec/08 §"The saved blob is
+/// self-consistent") and return the surviving `PaneId`s, or `None` if
+/// there was nothing to persist.
+///
+/// The written tree contains only leaves present in `db_pane_by_app`: any
+/// unmapped (degraded / not-yet-persisted) leaf is pruned first, and map
+/// entries for pruned leaves are dropped, so restore is never handed an
+/// unmapped leaf of our own making. A free function (not a method) so the
+/// save core is unit-testable against a tempdir store without an app.
+fn save_layout_self_consistent(
+    store: &Mutex<HistoryStore>,
+    tree: &Tree<PaneId>,
+    db_pane_by_app: HashMap<u64, i64>,
+    now_ms: i64,
+) -> Option<HashSet<PaneId>> {
+    if db_pane_by_app.is_empty() {
+        return None; // nothing persistable (degraded mode)
+    }
+    let mut tree = tree.clone();
+    let keep: HashSet<PaneId> = db_pane_by_app.keys().map(|app_id| PaneId(*app_id)).collect();
+    let survivors = prune_tree_to_mapped(&mut tree, &keep);
+    if survivors.is_empty() {
+        return None; // pruned to nothing
+    }
+    let db_pane_by_app: HashMap<u64, i64> = db_pane_by_app
+        .into_iter()
+        .filter(|(app_id, _)| survivors.contains(&PaneId(*app_id)))
+        .collect();
+    let blob = match (crate::persist::layout::SavedLayout { tree, db_pane_by_app }).to_blob() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("termica: layout serialize failed: {e}");
+            return None;
+        }
+    };
+    if let Ok(store) = store.lock()
+        && let Err(e) = store.save_layout(&blob, now_ms)
+    {
+        eprintln!("termica: layout save failed: {e}");
+    }
+    Some(survivors)
+}
+
+/// What [`plan_restore`] resolves: the (pruned) tile tree to install plus,
+/// per surviving leaf, the durable `pane` row and last-known cwd the app
+/// needs to rebuild a `Dead` pane. Block loading is deliberately left to
+/// the caller (it touches the filesystem and produces heavy `Block`s).
+struct RestorePlan {
+    tree: Tree<PaneId>,
+    panes: Vec<RestoredPanePlan>,
+    next_pane_id: u64,
+}
+
+struct RestoredPanePlan {
+    pane_id: PaneId,
+    db_pane: i64,
+    cwd: Option<PathBuf>,
+}
+
+/// Decide what to restore from the most recent saved layout, or `None`
+/// when there is nothing restorable (spec/08 §"Restore semantics"):
+///
+/// - No saved blob / unparseable / no leaves → `None` (fresh start).
+/// - **Liveness (conservative, workspace-level):** if any mapped pane's
+///   latest session lock is currently held, the workspace belongs to a
+///   running Termica → `None`, never partially adopt it. This is the
+///   safety rule (point 1), distinct from the leaf pruning below.
+/// - **Resilience:** keep only leaves the blob maps to a durable db row,
+///   prune the rest (collapsing emptied containers). One unmapped leaf
+///   never aborts the whole restore. `None` only when *nothing* survives.
+///
+/// A free function so the full restore decision — including liveness —
+/// is unit-testable against a tempdir `Persistence` without standing up
+/// an eframe app or spawning a PTY.
+/// Is `session_id`'s lock held by a *live* process? Used by restore's
+/// liveness gate: a held lock means a running Termica owns that session,
+/// so the workspace must not be adopted.
+///
+/// Retries briefly because a held lock can look held *transiently* even
+/// when no process truly owns it — `flock` lives on the open
+/// file-description, so a sibling probe (a concurrently-spawning shell
+/// that inherits the fd across `fork` until CLOEXEC, or a gc liveness
+/// check) can hold it for an instant. A genuinely-live session stays held
+/// across every retry. Mirrors gc's `session_is_live`, but a probe ERROR
+/// (missing / inaccessible session dir) resolves to **not live** — a gone
+/// dir is a dead session, and restore must not be blocked by it.
+fn session_held_by_live_process(
+    persist: &crate::persist::store::Persistence,
+    session_id: i64,
+) -> bool {
+    const ATTEMPTS: u32 = 5;
+    let dir = persist.session_dir(session_id);
+    for attempt in 0..ATTEMPTS {
+        match crate::persist::lock::SessionLock::try_acquire(&dir) {
+            Ok(Some(_guard)) => return false, // free -> not live (guard dropped here)
+            Ok(None) => {}                    // held -> maybe transient; retry
+            Err(_) => return false, // can't probe -> not a live owner; don't block restore
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    true // persistently held -> genuinely live
+}
+
+fn plan_restore(
+    persist: &crate::persist::store::Persistence,
+    store: &Arc<Mutex<HistoryStore>>,
+) -> Option<RestorePlan> {
+    let blob = store.lock().ok().and_then(|s| s.latest_layout().ok().flatten())?;
+    let mut layout = match crate::persist::layout::SavedLayout::from_blob(&blob) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("termica: layout parse failed, starting fresh: {e}");
+            return None;
+        }
+    };
+    let leaves = layout.pane_ids();
+    if leaves.is_empty() {
+        return None;
+    }
+
+    // Liveness: any session lock held by a *live* process → the workspace
+    // is live elsewhere, leave it alone. The probe retries briefly so a
+    // sub-millisecond transient hold doesn't spuriously decline a restore.
+    for &db_pane in layout.db_pane_by_app.values() {
+        let Some(sid) =
+            store.lock().ok().and_then(|s| s.latest_session_for_pane(db_pane).ok().flatten())
+        else {
+            continue;
+        };
+        if session_held_by_live_process(persist, sid) {
+            return None; // held by a live process -> don't steal it
+        }
+    }
+
+    // Resilience: keep only mapped leaves; prune the rest.
+    let keep: HashSet<PaneId> =
+        leaves.iter().copied().filter(|p| layout.db_pane_by_app.contains_key(&p.0)).collect();
+    if keep.is_empty() {
+        eprintln!("termica: saved layout has no mapped panes; starting fresh");
+        return None;
+    }
+    let survivors = prune_tree_to_mapped(&mut layout.tree, &keep);
+    if survivors.is_empty() || layout.tree.root.is_none() {
+        return None;
+    }
+    if survivors.len() < leaves.len() {
+        eprintln!(
+            "termica: restored {} of {} saved panes; pruned {} unmapped leaf/leaves",
+            survivors.len(),
+            leaves.len(),
+            leaves.len() - survivors.len()
+        );
+    }
+
+    let mut panes = Vec::with_capacity(survivors.len());
+    let mut next_pane_id = 0u64;
+    for pane_id in &survivors {
+        let db_pane = layout.db_pane_by_app[&pane_id.0];
+        let cwd =
+            store.lock().ok().and_then(|s| s.pane_cwd(db_pane).ok().flatten()).map(PathBuf::from);
+        panes.push(RestoredPanePlan { pane_id: *pane_id, db_pane, cwd });
+        next_pane_id = next_pane_id.max(pane_id.0 + 1);
+    }
+    Some(RestorePlan { tree: layout.tree, panes, next_pane_id })
+}
+
 /// Optional knobs for `TermicaApp::new_with_options`. Defaults
 /// match what `TermicaApp::new` produced before — no behaviour
 /// change unless the caller asks for it.
@@ -1495,17 +1818,50 @@ pub struct TermicaAppOptions {
 /// 1. `positional_path` is a directory → it.
 /// 2. `positional_path` is a non-directory file with a parent →
 ///    that parent directory.
-/// 3. Else `std::env::current_dir()` if it succeeds.
+/// 3. Else `std::env::current_dir()` — but only when it is a real,
+///    meaningful directory. A bare `/` is treated as "knowing nothing":
+///    a GUI launch (Finder/Dock/`.dmg` via LaunchServices on macOS, or
+///    some Linux desktop launchers) hands the process a cwd of `/`,
+///    which is never what the user means. So `current_dir()` is honored
+///    only when it is not `/`, *or* when stdin is a TTY (a deliberate
+///    `cd / && termica` from a terminal is still honored).
 /// 4. Else `$HOME` if set.
 /// 5. Else `/`.
+///
+/// The ambient state (`current_dir`, `$HOME`, is-stdin-a-tty) is read
+/// here and handed to [`resolve_startup_cwd_inner`], which is pure so
+/// the fallback matrix is testable without depending on the test
+/// runner's cwd or tty.
 pub fn resolve_startup_cwd(positional_path: Option<&std::path::Path>) -> PathBuf {
+    use std::io::IsTerminal;
+    resolve_startup_cwd_inner(
+        positional_path,
+        std::env::current_dir().ok().as_deref(),
+        std::env::var_os("HOME"),
+        std::io::stdin().is_terminal(),
+    )
+}
+
+/// Pure core of [`resolve_startup_cwd`] — all ambient state is passed in.
+/// See that function's doc comment for the fallback chain.
+fn resolve_startup_cwd_inner(
+    positional_path: Option<&std::path::Path>,
+    current_dir: Option<&std::path::Path>,
+    home: Option<std::ffi::OsString>,
+    stdin_is_tty: bool,
+) -> PathBuf {
     if let Some(dir) = positional_path.and_then(resolve_positional_dir) {
         return dir;
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        return cwd;
+    // Honor `current_dir()` only when it is meaningful: not the bare
+    // filesystem root `/` (the GUI-launch sentinel), unless stdin is a
+    // TTY, in which case a deliberate `cd / && termica` is respected.
+    if let Some(cwd) = current_dir
+        && (cwd != std::path::Path::new("/") || stdin_is_tty)
+    {
+        return cwd.to_path_buf();
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = home {
         return PathBuf::from(home);
     }
     PathBuf::from("/")
@@ -1711,6 +2067,351 @@ mod tests {
         }
     }
 
+    // ---- layout_fingerprint: detect structural changes (spec/08) --
+
+    fn full_map() -> HashMap<u64, i64> {
+        // db rows for the 5 panes the split helper builds.
+        (1u64..=5).map(|i| (i, i as i64 + 100)).collect()
+    }
+
+    #[test]
+    fn fingerprint_is_stable_for_an_unchanged_tree() {
+        let (tree, _) = split_with_two_tab_containers();
+        let map = full_map();
+        assert_eq!(
+            layout_fingerprint(&tree, &map),
+            layout_fingerprint(&tree, &map),
+            "same tree + map → same fingerprint"
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_when_a_pane_is_added_or_removed() {
+        let (tree, _) = split_with_two_tab_containers();
+        let map = full_map();
+        let base = layout_fingerprint(&tree, &map);
+
+        // Remove a pane (close): different leaf set → different fp.
+        let (mut tree2, pairs) = split_with_two_tab_containers();
+        let p3_tile = pairs.iter().find(|(p, _)| *p == PaneId(3)).unwrap().1;
+        tree2.remove_recursively(p3_tile);
+        let mut map2 = map.clone();
+        map2.remove(&3);
+        assert_ne!(
+            base,
+            layout_fingerprint(&tree2, &map2),
+            "removing a pane moves the fingerprint"
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_when_active_tab_switches() {
+        let (mut tree, pairs) = split_with_two_tab_containers();
+        let map = full_map();
+        let base = layout_fingerprint(&tree, &map);
+        // Flip the left container's active tab from p1 to p2.
+        let p2_tile = pairs.iter().find(|(p, _)| *p == PaneId(2)).unwrap().1;
+        let parent = tree.tiles.parent_of(p2_tile).expect("p2 has a parent");
+        if let Some(Tile::Container(egui_tiles::Container::Tabs(tabs))) = tree.tiles.get_mut(parent)
+        {
+            tabs.set_active(p2_tile);
+        } else {
+            panic!("expected a Tabs parent");
+        }
+        assert_ne!(
+            base,
+            layout_fingerprint(&tree, &map),
+            "switching the active tab moves the fingerprint"
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_when_db_mapping_changes_but_not_on_unrelated_cwd() {
+        // The fingerprint includes the db mapping (so a pane gaining its
+        // durable row triggers a save) but NOT cwd (persisted separately).
+        let (tree, _) = split_with_two_tab_containers();
+        let map = full_map();
+        let base = layout_fingerprint(&tree, &map);
+
+        let mut remapped = map.clone();
+        remapped.insert(3, 999); // pane 3 now maps to a different db row
+        assert_ne!(
+            base,
+            layout_fingerprint(&tree, &remapped),
+            "db mapping change moves the fingerprint"
+        );
+
+        // cwd is not part of the fingerprint at all — there is no cwd
+        // input, which documents the exclusion: an idle pane changing
+        // directories never triggers a layout write.
+        assert_eq!(
+            base,
+            layout_fingerprint(&tree, &map),
+            "identical inputs → identical fingerprint"
+        );
+    }
+
+    // ---- debounce_decide: coalesce a burst into one save ----------
+
+    #[test]
+    fn debounce_arms_on_change_and_fires_after_the_window() {
+        // t=0: a structural change arms the deadline at 0 + 1.0; no save yet.
+        let (save, deadline) = debounce_decide(0.0, None, true);
+        assert!(!save, "no save on the frame the change happens");
+        assert_eq!(deadline, Some(LAYOUT_SAVE_DEBOUNCE_SECS));
+
+        // t=0.5: no change, still before the deadline → no save, deadline kept.
+        let (save, deadline) = debounce_decide(0.5, deadline, false);
+        assert!(!save);
+        assert_eq!(deadline, Some(LAYOUT_SAVE_DEBOUNCE_SECS));
+
+        // t=1.0: at the deadline → fire and disarm.
+        let (save, deadline) = debounce_decide(1.0, deadline, false);
+        assert!(save, "save fires at the deadline");
+        assert_eq!(deadline, None, "deadline disarms after firing");
+    }
+
+    #[test]
+    fn debounce_coalesces_a_later_change_by_resetting_the_deadline() {
+        // Change at t=0 arms deadline 1.0.
+        let (_, deadline) = debounce_decide(0.0, None, true);
+        assert_eq!(deadline, Some(1.0));
+        // A second change at t=0.5 pushes the deadline to 1.5 (coalescing).
+        let (save, deadline) = debounce_decide(0.5, deadline, true);
+        assert!(!save);
+        assert_eq!(deadline, Some(1.5), "a later change resets the debounce window");
+        // At t=1.0 the (reset) deadline hasn't passed → still no save.
+        let (save, deadline) = debounce_decide(1.0, deadline, false);
+        assert!(!save, "the earlier deadline was superseded");
+        assert_eq!(deadline, Some(1.5));
+        // At t=1.5 it fires once.
+        let (save, deadline) = debounce_decide(1.5, deadline, false);
+        assert!(save);
+        assert_eq!(deadline, None);
+    }
+
+    #[test]
+    fn debounce_idle_with_no_pending_save_does_nothing() {
+        let (save, deadline) = debounce_decide(42.0, None, false);
+        assert!(!save);
+        assert_eq!(deadline, None);
+    }
+
+    // ---- prune_tree_to_mapped: self-consistent layout (spec/08) ---
+
+    /// Every Tabs container's `active` must reference one of its own
+    /// children — the invariant `revalidate_tabs_active` guarantees.
+    fn assert_tabs_active_valid(tree: &Tree<PaneId>) {
+        for (_, tile) in tree.tiles.iter() {
+            if let Tile::Container(egui_tiles::Container::Tabs(tabs)) = tile
+                && let Some(active) = tabs.active
+            {
+                assert!(
+                    tabs.children.contains(&active),
+                    "Tabs.active {active:?} is not one of its own children {:?}",
+                    tabs.children
+                );
+            }
+        }
+    }
+
+    fn leaf_set(tree: &Tree<PaneId>) -> HashSet<PaneId> {
+        tree.tiles
+            .tiles()
+            .filter_map(|t| match t {
+                Tile::Pane(p) => Some(*p),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn prune_keeps_mapped_leaves_and_drops_the_rest() {
+        let (mut tree, _) = split_with_two_tab_containers();
+        let keep: HashSet<PaneId> = [PaneId(1), PaneId(3)].into_iter().collect();
+        let survivors = prune_tree_to_mapped(&mut tree, &keep);
+        assert_eq!(survivors, keep, "exactly the kept panes survive");
+        assert_eq!(leaf_set(&tree), keep, "the tree's leaves match the survivors");
+        assert!(tree.root.is_some(), "a non-empty prune leaves a valid root");
+        assert_tabs_active_valid(&tree);
+    }
+
+    #[test]
+    fn prune_collapses_an_emptied_split_side() {
+        // Drop the whole right container {p3,p4,p5}: the right Tabs empties
+        // and is pruned, the horizontal split is left single-child and
+        // collapses, so the surviving panes still form a valid tree.
+        let (mut tree, _) = split_with_two_tab_containers();
+        let keep: HashSet<PaneId> = [PaneId(1), PaneId(2)].into_iter().collect();
+        let survivors = prune_tree_to_mapped(&mut tree, &keep);
+        assert_eq!(survivors, keep);
+        assert_eq!(leaf_set(&tree), keep);
+        assert!(tree.root.is_some());
+        assert_tabs_active_valid(&tree);
+    }
+
+    #[test]
+    fn prune_to_nothing_empties_the_tree() {
+        let (mut tree, _) = split_with_two_tab_containers();
+        let survivors = prune_tree_to_mapped(&mut tree, &HashSet::new());
+        assert!(survivors.is_empty(), "no survivors when nothing is kept");
+        assert!(
+            tree.root.is_none(),
+            "an emptied tree has no root → restore falls through to fresh"
+        );
+    }
+
+    #[test]
+    fn pruned_tree_round_trips_with_no_unmapped_leaf() {
+        use crate::persist::layout::SavedLayout;
+        let (mut tree, _) = split_with_two_tab_containers();
+        let keep: HashSet<PaneId> = [PaneId(2), PaneId(4)].into_iter().collect();
+        let survivors = prune_tree_to_mapped(&mut tree, &keep);
+        // Build a self-consistent SavedLayout: map ONLY the survivors.
+        let db_pane_by_app: HashMap<u64, i64> =
+            survivors.iter().map(|p| (p.0, p.0 as i64 + 100)).collect();
+        let blob = SavedLayout { tree, db_pane_by_app }.to_blob().unwrap();
+        let back = SavedLayout::from_blob(&blob).unwrap();
+        for p in back.pane_ids() {
+            assert!(
+                back.db_pane_by_app.contains_key(&p.0),
+                "every restored leaf maps to a db row — no unmapped leaf in our own blob"
+            );
+        }
+        assert_eq!(leaf_set(&back.tree), keep);
+    }
+
+    // ---- plan_restore / save_layout_self_consistent (spec/08) -----
+
+    fn persistence()
+    -> (tempfile::TempDir, crate::persist::store::Persistence, Arc<Mutex<HistoryStore>>) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store =
+            Arc::new(Mutex::new(HistoryStore::open(&tmp.path().join("termica.sqlite")).unwrap()));
+        let persist =
+            crate::persist::store::Persistence::new(tmp.path().to_path_buf(), store.clone());
+        (tmp, persist, store)
+    }
+
+    fn tabs_tree(ids: &[u64]) -> Tree<PaneId> {
+        let mut tiles: Tiles<PaneId> = Tiles::default();
+        let panes: Vec<TileId> = ids.iter().map(|i| tiles.insert_pane(PaneId(*i))).collect();
+        let root = tiles.insert_tab_tile(panes);
+        Tree::new("test", root, tiles)
+    }
+
+    /// Persist a layout blob verbatim (no self-consistency prune) — used to
+    /// simulate an older / externally-mangled blob whose tree references a
+    /// leaf the map doesn't resolve, which restore must survive.
+    fn save_raw_layout(
+        store: &Arc<Mutex<HistoryStore>>,
+        tree: Tree<PaneId>,
+        map: HashMap<u64, i64>,
+    ) {
+        let blob =
+            crate::persist::layout::SavedLayout { tree, db_pane_by_app: map }.to_blob().unwrap();
+        store.lock().unwrap().save_layout(&blob, 1000).unwrap();
+    }
+
+    #[test]
+    fn plan_restore_keeps_mapped_panes_and_prunes_unmapped() {
+        let (_tmp, persist, store) = persistence();
+        // Two real persisted panes; their session locks released (the
+        // writing process has exited) so the workspace is adoptable.
+        let row_a = persist.begin_session(Some("/work/a"), "zsh", 1).unwrap().pane_row.0;
+        let row_b = persist.begin_session(Some("/work/b"), "zsh", 2).unwrap().pane_row.0;
+        // An INCONSISTENT blob: leaf p3 has no db mapping.
+        let map: HashMap<u64, i64> = [(1u64, row_a), (2, row_b)].into_iter().collect();
+        save_raw_layout(&store, tabs_tree(&[1, 2, 3]), map);
+
+        let plan = plan_restore(&persist, &store).expect("a partially-mapped layout is restorable");
+        let got: HashSet<PaneId> = plan.panes.iter().map(|p| p.pane_id).collect();
+        assert_eq!(
+            got,
+            [PaneId(1), PaneId(2)].into_iter().collect(),
+            "mapped panes restore; the unmapped p3 is pruned — NOT a whole-workspace abort"
+        );
+        assert_eq!(leaf_set(&plan.tree), got, "the installed tree's leaves match the survivors");
+        assert_eq!(plan.next_pane_id, 3, "next pane id is max(survivor) + 1");
+        // cwd is recovered from the pane row (a pane with no chunks still
+        // restores — as an empty Dead pane carrying its cwd).
+        let cwd_b = plan.panes.iter().find(|p| p.pane_id == PaneId(2)).unwrap().cwd.clone();
+        assert_eq!(cwd_b, Some(PathBuf::from("/work/b")));
+    }
+
+    #[test]
+    fn plan_restore_with_no_mapped_panes_starts_fresh() {
+        let (_tmp, persist, store) = persistence();
+        save_raw_layout(&store, tabs_tree(&[1, 2]), HashMap::new());
+        assert!(plan_restore(&persist, &store).is_none(), "no mapped panes → fresh start");
+    }
+
+    #[test]
+    fn session_held_by_live_process_distinguishes_held_free_and_missing() {
+        let (_tmp, persist, _store) = persistence();
+        // Held: keep the SessionRecord (and its lock) alive.
+        let rec = persist.begin_session(None, "zsh", 1).unwrap();
+        let sid = rec.session.0;
+        assert!(session_held_by_live_process(&persist, sid), "a held session lock reads as live");
+        drop(rec); // process exits -> lock released
+        assert!(
+            !session_held_by_live_process(&persist, sid),
+            "after the lock releases the session reads as not live"
+        );
+        // A missing session dir is a dead session, not a live owner — it
+        // must not block restore (would otherwise force a fresh start).
+        assert!(
+            !session_held_by_live_process(&persist, 999_999),
+            "a missing session dir resolves to not-live"
+        );
+    }
+
+    #[test]
+    fn plan_restore_declines_a_live_workspace_then_adopts_after_release() {
+        let (_tmp, persist, store) = persistence();
+        // Hold the session lock: the workspace is live in "another" process.
+        let rec = persist.begin_session(Some("/work/a"), "zsh", 1).unwrap();
+        let row_a = rec.pane_row.0;
+        save_raw_layout(&store, tabs_tree(&[1]), [(1u64, row_a)].into_iter().collect());
+        assert!(
+            plan_restore(&persist, &store).is_none(),
+            "a workspace whose session lock is held is never adopted (liveness is conservative)"
+        );
+        drop(rec); // process exits / crashes -> kernel releases the lock
+        assert!(
+            plan_restore(&persist, &store).is_some(),
+            "after the lock releases, the orphaned workspace is adopted (crash recovery)"
+        );
+    }
+
+    #[test]
+    fn save_layout_self_consistent_persists_without_quit_and_prunes() {
+        // The headline regression: the layout is persisted by a path that
+        // is NOT the quit hook, and the persisted blob is self-consistent
+        // (a degraded/unmapped leaf is pruned before write).
+        let (_tmp, _persist, store) = persistence();
+        let (tree, _) = split_with_two_tab_containers(); // 5 panes
+        let map: HashMap<u64, i64> = [(1u64, 101i64), (3, 103)].into_iter().collect();
+        let survivors =
+            save_layout_self_consistent(&store, &tree, map, 1000).expect("a layout was persisted");
+        assert_eq!(survivors, [PaneId(1), PaneId(3)].into_iter().collect());
+
+        let blob = store
+            .lock()
+            .unwrap()
+            .latest_layout()
+            .unwrap()
+            .expect("a layout is on disk without any quit having happened");
+        let back = crate::persist::layout::SavedLayout::from_blob(&blob).unwrap();
+        assert_eq!(leaf_set(&back.tree), [PaneId(1), PaneId(3)].into_iter().collect());
+        for p in back.pane_ids() {
+            assert!(
+                back.db_pane_by_app.contains_key(&p.0),
+                "no unmapped leaf in the persisted blob — self-consistent"
+            );
+        }
+    }
+
     // ---- resolve_startup_cwd: spec/06 fallback chain --------------
 
     #[test]
@@ -1765,5 +2466,66 @@ mod tests {
         let resolved = resolve_startup_cwd(None);
         // current_dir() should succeed in the test environment.
         assert_eq!(resolved, std::env::current_dir().expect("current_dir in test"));
+    }
+
+    // ---- resolve_startup_cwd_inner: the `/` GUI-launch carve-out ----
+
+    #[test]
+    fn startup_cwd_slash_from_gui_launch_falls_to_home() {
+        // The reported bug: a Finder/.dmg launch hands the process cwd
+        // `/`, which must NOT become the first pane's cwd. With no
+        // positional path and a non-TTY stdin, `/` falls through to $HOME.
+        let home = std::ffi::OsString::from("/home/u");
+        let got = resolve_startup_cwd_inner(
+            None,
+            Some(std::path::Path::new("/")),
+            Some(home),
+            false, // not a tty → GUI launch
+        );
+        assert_eq!(got, PathBuf::from("/home/u"));
+    }
+
+    #[test]
+    fn startup_cwd_slash_with_home_unset_is_root() {
+        let got = resolve_startup_cwd_inner(None, Some(std::path::Path::new("/")), None, false);
+        assert_eq!(got, PathBuf::from("/"), "only `/` when $HOME is also unset");
+    }
+
+    #[test]
+    fn startup_cwd_real_dir_is_used_as_is() {
+        // A meaningful current_dir (terminal launch in a project) is
+        // honored regardless of $HOME.
+        let got = resolve_startup_cwd_inner(
+            None,
+            Some(std::path::Path::new("/work/proj")),
+            Some(std::ffi::OsString::from("/home/u")),
+            false,
+        );
+        assert_eq!(got, PathBuf::from("/work/proj"));
+    }
+
+    #[test]
+    fn startup_cwd_slash_from_terminal_is_honored() {
+        // A deliberate `cd / && termica` from a shell (stdin is a TTY)
+        // keeps `/` rather than overriding it with $HOME.
+        let got = resolve_startup_cwd_inner(
+            None,
+            Some(std::path::Path::new("/")),
+            Some(std::ffi::OsString::from("/home/u")),
+            true, // tty
+        );
+        assert_eq!(got, PathBuf::from("/"));
+    }
+
+    #[test]
+    fn startup_cwd_positional_dir_wins_over_everything() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let got = resolve_startup_cwd_inner(
+            Some(dir.path()),
+            Some(std::path::Path::new("/")),
+            Some(std::ffi::OsString::from("/home/u")),
+            false,
+        );
+        assert_eq!(got, dir.path().to_path_buf(), "an explicit path always wins");
     }
 }
