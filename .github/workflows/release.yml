@@ -5,10 +5,19 @@ name: Release
 # - On a `v*` tag (pushed by release-plz with a PAT — see release-plz.yml):
 #   build, package, and create/update the GitHub Release with the artifacts.
 # - On manual dispatch: build + package and upload as workflow artifacts only
-#   (no release). Use this to test the pipeline without cutting a version.
+#   (no release). Use this to test the pipeline (incl. signing) without cutting
+#   a version.
 #
-# macOS builds are UNSIGNED for now (see spec/12-distribution.md); the signing
-# steps will slot in later, gated behind secrets.
+# macOS code signing + notarization (see spec/12-distribution.md):
+#   - cargo-packager imports the Developer ID cert from APPLE_CERTIFICATE (a
+#     base64 full-chain .p12 — leaf + Developer ID G2 intermediate + key) into a
+#     temporary keychain and signs Termica.app with hardened runtime + a secure
+#     timestamp, then builds the .dmg around it.
+#   - A dedicated step then submits the .dmg to Apple's notary service with an
+#     App Store Connect API key and staples the ticket, so the downloaded image
+#     opens with no Gatekeeper prompt (even offline).
+# Both are gated on HAS_APPLE_SIGNING (the secrets being present); without them
+# the build still succeeds, producing unsigned artifacts.
 
 on:
   push:
@@ -16,12 +25,16 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write # create releases / upload assets
+  contents: read # default for all jobs; the `release` job elevates to write
 
 jobs:
   package:
     name: Package (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
+    env:
+      # True only when the Apple secrets are configured (i.e. on this repo, not
+      # forks). The signing/notarization steps below no-op when false.
+      HAS_APPLE_SIGNING: ${{ secrets.APPLE_CERTIFICATE != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -29,12 +42,20 @@ jobs:
           - os: macos-14 # Apple Silicon
             label: macos-arm64
             formats: dmg
+            release_files: dist/*.dmg
           - os: macos-15-intel # Intel (macos-13 runner was retired)
             label: macos-x64
             formats: dmg
+            release_files: dist/*.dmg
           - os: ubuntu-22.04
             label: linux-x64
             formats: deb,appimage # comma-separated: space-separated reads the 2nd as a subcommand
+            # Per-platform globs: each job only produces its own artifacts, so
+            # listing all three formats here with fail_on_unmatched_files would
+            # fail every job on the patterns it can't match.
+            release_files: |
+              dist/*.deb
+              dist/*.AppImage
     steps:
       - uses: actions/checkout@v4
 
@@ -63,31 +84,146 @@ jobs:
         # "[email protected]" in transit (same gotcha that hit the action ref).
         run: cargo binstall -y --force --version 0.11.8 cargo-packager
 
+      - name: Configure macOS signing identity
+        # cargo-packager only runs its signing path (import the cert into a temp
+        # keychain, then `codesign --options runtime --timestamp`) when
+        # `macos.signing-identity` is set in config — APPLE_CERTIFICATE alone is
+        # ignored. We inject it here, gated on the secrets, so forks without the
+        # cert still build unsigned (the committed Cargo.toml stays clean). The
+        # identity string is NOT secret — it's the cert's CommonName, embedded in
+        # every signed build.
+        if: runner.os == 'macOS' && env.HAS_APPLE_SIGNING == 'true'
+        shell: bash
+        run: |
+          cat >> Cargo.toml <<'EOF'
+
+          [package.metadata.packager.macos]
+          signing-identity = "Developer ID Application: Timothy James (V64896A4F2)"
+          EOF
+
       - name: Build & package
+        env:
+          # macOS only: with signing-identity configured (previous step),
+          # cargo-packager imports this .p12 into a temp keychain and signs
+          # Termica.app with hardened runtime + a secure timestamp. Empty on forks
+          # → no signing-identity, so it builds unsigned and continues.
+          # (Notarization is handled by the next step, not by cargo-packager.)
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: cargo packager --release --formats ${{ matrix.formats }} --verbose
+
+      - name: Notarize & staple the DMG
+        # macOS only, and only when the Apple secrets exist. Submits the signed
+        # .dmg to Apple's notary service and staples the ticket. `stapler` is the
+        # safety gate: it can only succeed if notarization was Accepted, so a
+        # rejected build fails the job here rather than shipping a bad artifact.
+        if: runner.os == 'macOS' && env.HAS_APPLE_SIGNING == 'true'
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s\n' "$APPLE_API_KEY_P8" > "$key"
+          trap 'rm -f "$key"' EXIT
+          shopt -s nullglob
+          dmgs=(dist/*.dmg)
+          if [ ${#dmgs[@]} -eq 0 ]; then
+            echo "::error::No .dmg found to notarize"; exit 1
+          fi
+          for dmg in "${dmgs[@]}"; do
+            echo "Notarizing $dmg"
+            xcrun notarytool submit "$dmg" \
+              --key "$key" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" \
+              --wait
+            xcrun stapler staple "$dmg"
+            xcrun stapler validate "$dmg"
+          done
+
+      - name: Verify signature & notarization
+        # Actively assert the artifact is acceptable rather than trusting the
+        # staple step implicitly. Checks the .dmg via Gatekeeper, then mounts it
+        # and runs a full codesign verify + Gatekeeper exec check on Termica.app.
+        # `set -e` means any failure here fails the job.
+        if: runner.os == 'macOS' && env.HAS_APPLE_SIGNING == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for dmg in dist/*.dmg; do
+            echo "== verifying $dmg =="
+            spctl -a -vvv -t open --context context:primary-signature "$dmg"
+            mnt="$(mktemp -d)"
+            hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mnt"
+            trap 'hdiutil detach "$mnt" >/dev/null 2>&1 || true' EXIT
+            codesign --verify --deep --strict --verbose=2 "$mnt/Termica.app"
+            spctl -a -vvv -t exec "$mnt/Termica.app"
+            hdiutil detach "$mnt" >/dev/null
+            trap - EXIT
+          done
 
       - name: List artifacts
         shell: bash
         run: ls -la dist || true
 
-      - name: Upload workflow artifacts (manual test runs)
-        if: github.event_name == 'workflow_dispatch'
+      # Always upload, so both manual test runs and the `release` job (tags) can
+      # collect them. The release job downloads every termica-* artifact.
+      - name: Upload built installers
         uses: actions/upload-artifact@v4
         with:
           name: termica-${{ matrix.label }}
-          path: |
-            dist/*.dmg
-            dist/*.deb
-            dist/*.AppImage
+          path: ${{ matrix.release_files }}
           if-no-files-found: error
 
-      - name: Attach to GitHub Release (tagged runs)
-        if: startsWith(github.ref, 'refs/tags/v')
+  # A single job creates the GitHub Release ONCE, after all matrix builds. Doing
+  # this per-matrix-job (the old design) made all three jobs call
+  # action-gh-release concurrently, each with generate_release_notes — which
+  # raced on creation and appended the auto-notes three times.
+  release:
+    name: Publish GitHub Release
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release / upload assets
+    steps:
+      - name: Download all built installers
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts # each artifact lands in artifacts/<name>/
+
+      - name: List downloaded files
+        run: find artifacts -type f -print
+
+      - name: Normalize asset names (version-less, arch-only)
+        # cargo-packager bakes the version into filenames
+        # (Termica_0.1.0_aarch64.dmg). Rename to stable, version-less names so
+        # the homepage / README can link to the always-current
+        #   releases/latest/download/<name>
+        # URLs with no per-release edits. The version still lives in the tag,
+        # the release page, and the in-app version.
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          while IFS= read -r f; do
+            b="$(basename "$f")"
+            case "$b" in
+              *aarch64.dmg) dest="Termica-macOS-AppleSilicon.dmg" ;;
+              *x64.dmg)     dest="Termica-macOS-Intel.dmg" ;;
+              *.deb)        dest="Termica-Linux-x86_64.deb" ;;
+              *.AppImage)   dest="Termica-Linux-x86_64.AppImage" ;;
+              *) echo "::error::unexpected artifact: $b"; exit 1 ;;
+            esac
+            echo "$b -> $dest"
+            cp "$f" "out/$dest"
+          done < <(find artifacts -type f \( -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' \))
+          echo "=== normalized ==="; ls -la out
+
+      - name: Create GitHub Release with all installers
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: |
-            dist/*.dmg
-            dist/*.deb
-            dist/*.AppImage
+          files: out/*

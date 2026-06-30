@@ -46,10 +46,23 @@
   </figure>
 
   <div class="cta">
-    <a class="btn btn-primary" href="https://github.com/enthal/termica">
-      View on GitHub
+    <a class="btn btn-primary" id="primary-download"
+       href="https://github.com/enthal/termica/releases/latest/download/Termica-macOS-AppleSilicon.dmg">
+      Download
     </a>
-    <p class="meta muted">Built in Rust with egui · Open source</p>
+
+    <p class="dl-all" id="dl-all">
+      <a data-os="mac" href="https://github.com/enthal/termica/releases/latest/download/Termica-macOS-AppleSilicon.dmg">macOS&nbsp;·&nbsp;Apple&nbsp;Silicon</a>
+      <a data-os="mac" href="https://github.com/enthal/termica/releases/latest/download/Termica-macOS-Intel.dmg">macOS&nbsp;·&nbsp;Intel</a>
+      <a data-os="linux" href="https://github.com/enthal/termica/releases/latest/download/Termica-Linux-x86_64.deb">Linux&nbsp;·&nbsp;.deb</a>
+      <a data-os="linux" href="https://github.com/enthal/termica/releases/latest/download/Termica-Linux-x86_64.AppImage">Linux&nbsp;·&nbsp;.AppImage</a>
+    </p>
+
+    <p class="meta muted">
+      Signed &amp; notarized on macOS ·
+      <a class="footer-link" href="https://github.com/enthal/termica/releases/latest">All&nbsp;releases</a> ·
+      <a class="footer-link" href="https://github.com/enthal/termica">GitHub</a>
+    </p>
   </div>
 
   <main class="features">
@@ -95,6 +108,30 @@
 
   <script>
     document.getElementById('year').textContent = new Date().getFullYear();
+
+    // Point the primary button at the visitor's OS and highlight its rows.
+    // Links are static (releases/latest/download/...), so this only enhances:
+    // with JS off, the button downloads the macOS build and all platforms are
+    // listed. Browsers can't reliably tell Apple Silicon from Intel, so macOS
+    // defaults to Apple Silicon with Intel one click away in the list.
+    (function () {
+      var BASE = "https://github.com/enthal/termica/releases/latest/download/";
+      var btn = document.getElementById('primary-download');
+      if (!btn) return;
+      var ua = navigator.userAgent || "", plat = navigator.platform || "", os = null;
+      if (/Mac/i.test(plat) || /Mac OS X/i.test(ua)) os = 'mac';
+      else if ((/Linux/i.test(plat) || /Linux/i.test(ua)) && !/Android/i.test(ua)) os = 'linux';
+      else if (/Win/i.test(plat) || /Windows/i.test(ua)) os = 'win';
+
+      if (os === 'mac') { btn.textContent = "Download for macOS"; btn.href = BASE + "Termica-macOS-AppleSilicon.dmg"; }
+      else if (os === 'linux') { btn.textContent = "Download for Linux"; btn.href = BASE + "Termica-Linux-x86_64.AppImage"; }
+      else if (os === 'win') { btn.textContent = "View releases"; btn.href = "https://github.com/enthal/termica/releases/latest"; }
+
+      if (os === 'mac' || os === 'linux') {
+        var rows = document.querySelectorAll('#dl-all a[data-os="' + os + '"]');
+        for (var i = 0; i < rows.length; i++) rows[i].classList.add('dl-recommended');
+      }
+    })();
   </script>
 </body>
 </html>

@@ -36,7 +36,7 @@ It embeds your existing `zsh`, `bash`, or `fish` — Termica is not a new shell,
 
 - **A real terminal.** Full VT/ANSI emulation, alternate-screen apps, mouse reporting, bracketed paste, true color. vim/htop/less/fzf/ssh/tmux just work.
 - **Editor-driven prompt.** At a known shell prompt, the line editor becomes a native editor: click to place the cursor, drag to select, multiline editing, undo/redo, and shell syntax highlighting. Press Enter to send the command.
-- **Structured command blocks.** Each command and its output are sealed into a block you can select across, copy, and read back with its exit status.
+- **Structured command blocks.** Each command and its output are sealed into a block you can select across and read back with its exit status. Right-click for a context menu to copy the whole block, just the command, or just the output; while you scroll a long output, a sticky header keeps the command and its cwd / exit-code / duration chips pinned in view.
 - **Scrollback that survives restarts.** Sealed blocks — their output, command, and exit status — are written to disk as you work. Relaunch (or recover from a crash) and your panes come back with their transcripts intact; a per-pane *Restart shell* brings the live shell back and new output appends below the restored history. Old scrollback is bounded and aged out automatically, never silently dropped.
 - **Command history that remembers.** Backed by SQLite and seeded from your existing shell history. Walk it with ↑/↓ in the prompt, or open a fuzzy-search overlay with Ctrl+R, scoped to the current pane or everywhere.
 - **Find in the transcript.** Cmd+F opens an in-pane find bar that searches your command blocks — match case, regex, and an All / Commands / Outputs filter — highlighting hits over the grid. Enter / Shift+Enter step through matches; ↑/↓ recall previous searches.
@@ -48,13 +48,27 @@ It embeds your existing `zsh`, `bash`, or `fish` — Termica is not a new shell,
 
 ## Status
 
-Termica is in **active development and pre-1.0**. The core terminal, the tab/split workspace, the prompt-editor mode machine, command history, tab completion, and scrollback persistence are all working day-to-day, but the format and behavior may still change and there are rough edges. There are **no prebuilt binaries yet** — for now you build from source (it's one `cargo` command). Follow the [issue tracker](https://github.com/enthal/termica/issues) for the roadmap.
+Termica is in **active development and pre-1.0**. The core terminal, the tab/split workspace, the prompt-editor mode machine, command history, tab completion, and scrollback persistence are all working day-to-day, but the format and behavior may still change and there are rough edges. Prebuilt installers are published on the [releases page](https://github.com/enthal/termica/releases/latest), or you can [build from source](#getting-started). Follow the [issue tracker](https://github.com/enthal/termica/issues) for the roadmap.
 
 ## Platform support
 
 macOS and Linux. Windows is not supported (and is not currently planned).
 
+## Download
+
+Download the latest release — these links always point at the newest version:
+
+- **macOS (Apple Silicon)** — [Termica-macOS-AppleSilicon.dmg](https://github.com/enthal/termica/releases/latest/download/Termica-macOS-AppleSilicon.dmg)
+- **macOS (Intel)** — [Termica-macOS-Intel.dmg](https://github.com/enthal/termica/releases/latest/download/Termica-macOS-Intel.dmg)
+- **Linux (x86-64)** — [Termica-Linux-x86_64.deb](https://github.com/enthal/termica/releases/latest/download/Termica-Linux-x86_64.deb) or the portable [Termica-Linux-x86_64.AppImage](https://github.com/enthal/termica/releases/latest/download/Termica-Linux-x86_64.AppImage)
+
+On macOS, open the `.dmg` and drag **Termica** to **Applications**. On Linux, install the `.deb` with `sudo apt install ./Termica-Linux-x86_64.deb`, or `chmod +x` the `.AppImage` and run it.
+
+The macOS builds are **signed with a Developer ID and notarized by Apple**, so they open normally — no Gatekeeper warning. For all versions and release notes, see the [releases page](https://github.com/enthal/termica/releases). Prefer to build it yourself? See [Build from source](#getting-started).
+
 ## Getting started
+
+Building from source needs only Rust — there are no other system prerequisites on macOS; on Linux you'll need the usual GUI/X11 dev packages (see the build dependencies in [.github/workflows/release.yml](.github/workflows/release.yml)).
 
 ### 1. Install Rust
 
@@ -78,6 +92,8 @@ That launches Termica with a fresh pane running your default shell. To install t
 cargo install --path .
 termica
 ```
+
+Pass a directory to start there — `termica ~/projects/foo` (or `termica .`) opens a tab in that folder.
 
 ### Shell integration
 
