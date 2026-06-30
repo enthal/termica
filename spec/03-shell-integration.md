@@ -235,6 +235,8 @@ Procedure:
 
 The bootstrap is a regular sourced file — comments work, multi-line constructs work, no shell tricks needed. ZLE is not involved (we are not writing to the PTY's stdin).
 
+**Pre-first-command output becomes its own block.** Anything the shell *prints* while sourcing the user's dotfiles (`~/.zshenv`, `~/.zshrc`, a version-manager banner, an MOTD echo) lands on the grid before the first command ever runs. On `integration_ready`, Termica seals that accumulated output into a standalone **output-only block** — empty command, no chips, just the lines (`BlockStack::seal_pre_command_output`) — so it is *not* prepended to the first command's block. A **silent** init (no output) seals nothing: no empty block appears. The output-only block persists and restores exactly like any sealed block (the writer's per-pane logical-line cursor advances by its line count, the chunk has no `command` chip), so storage and recovery are unaffected — it simply restores as bare output above the first command.
+
 `.zshenv` semantics are preserved by this flow:
 
 - Our managed interactive shell sources `~/.zshenv` (step 4b), matching what vanilla interactive zsh would do.
