@@ -97,7 +97,7 @@ Pass a directory to start there — `termica ~/projects/foo` (or `termica .`) op
 
 ### Shell integration
 
-On launch, Termica spawns a *managed* copy of your shell: it sources your real dotfiles (`.zshrc` / `.bashrc` / fish config) and then installs the lifecycle hooks that power prompt detection, command blocks, and history capture. You don't have to edit any config files.
+On launch, Termica spawns a *managed* copy of your shell: it sources your real dotfiles (`.zshrc` / `.bashrc` / fish config) and then installs the lifecycle hooks that power prompt detection, command blocks, and history capture. You don't have to edit any config files. On zsh the managed shell runs as a **login** shell — just like Terminal.app or iTerm2 — so your `PATH` (Homebrew, `path_helper`, `.zprofile`) matches a normal terminal.
 
 To opt out and run a plain shell with normal rc-file processing:
 
