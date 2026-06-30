@@ -2635,6 +2635,66 @@ pub fn render_pane(
         let caret_active =
             render::should_show_caret(editor_in_mode, pane_focused, viewport_focused);
 
+        // ---- Focused-editor chrome: geometry + opaque backing --------
+        //
+        // The chrome (soft glow / outline) wraps the chip + editor as a
+        // single visual unit. Its geometry is computed ONCE here and
+        // reused for both the opaque backing (painted now, BELOW the chip
+        // + editor) and the border stroke (painted AFTER them, further
+        // down). The backing fills the bordered region with the terminal
+        // background so scrollback can't show through the band between
+        // the editor content and the border; it must land above the
+        // scrollback but below the editor content, hence painting it here
+        // on `ui.painter()` before the chip + editor.
+        //
+        // Animate opacity toward the caret-active target — half-second
+        // fade either direction so the chrome breathes in / out instead
+        // of popping; while in transit, request a fast repaint so it runs
+        // even when the PTY is idle. Lifted above the editor paint so the
+        // same value drives the backing and the border in one frame.
+        const CHROME_FADE_SECS: f32 = 0.5;
+        let target_opacity: f32 = if caret_active { 1.0 } else { 0.0 };
+        let dt = ctx.input(|i| i.stable_dt);
+        let step = (dt / CHROME_FADE_SECS).clamp(0.0, 1.0);
+        slot.ui.chrome_opacity = if (slot.ui.chrome_opacity - target_opacity).abs() <= step {
+            target_opacity
+        } else if slot.ui.chrome_opacity < target_opacity {
+            slot.ui.chrome_opacity + step
+        } else {
+            slot.ui.chrome_opacity - step
+        };
+        if slot.ui.chrome_opacity != target_opacity {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+        // Body width comes from the ui's CLIP rect, not its available /
+        // layout width: egui_tiles can hand the pane a layout rect wider
+        // than the pane and rely on the clip to keep paint inside it. Pad
+        // each side a few px so the border stroke doesn't sit ON the
+        // chip's left edge or fall off the pane's right edge (on the
+        // rightmost pane `pane_clip.right()` IS the window edge).
+        let pane_clip = ui.clip_rect();
+        const CHROME_LEFT_PAD: f32 = 4.0;
+        const CHROME_RIGHT_PAD: f32 = 6.0;
+        let chrome_body = egui::Rect::from_min_max(
+            egui::pos2(footer_origin.x - CHROME_LEFT_PAD, footer_origin.y),
+            egui::pos2(pane_clip.right() - CHROME_RIGHT_PAD, footer_origin.y + chip_h + editor_h),
+        );
+        let chrome_chip_rect = if has_prompt_cwd {
+            let body_w = (pane_clip.right() - footer_origin.x).max(0.0);
+            Some(egui::Rect::from_min_size(footer_origin, egui::vec2(body_w, chip_h)))
+        } else {
+            None
+        };
+        if slot.ui.chrome_opacity > 0.0 {
+            crate::focused_chrome::paint_backing(
+                ui.painter(),
+                chrome_chip_rect,
+                chrome_body,
+                chrome_variant,
+                slot.ui.chrome_opacity,
+            );
+        }
+
         if has_prompt_cwd
             && let Some(crate::block::Block::Prompt { header, .. }) = slot.session.blocks().last()
         {
@@ -2845,87 +2905,26 @@ pub fn render_pane(
             slot.ui.completion_pending = None;
         }
 
-        // Focused-editor chrome. Dispatched via the
-        // [`crate::focused_chrome::paint`] table so the second
-        // OS window (chrome picker) can swap the variant live.
-        // The chip bar + editor are wrapped as a single visual
-        // unit — the user asked for "include the chip bar."
+        // Focused-editor chrome BORDER. Dispatched via the
+        // [`crate::focused_chrome::paint`] table so the second OS window
+        // (chrome picker) can swap the variant live. Painted AFTER the
+        // chip + editor (and the opaque backing painted above) so the
+        // stroke lands on top. Geometry (`chrome_body` / `chrome_chip_rect`
+        // / opacity) was computed above — reused here so the border and
+        // its backing are always derived from the same rect.
         //
-        // Wraparound fix: use `ctx.layer_painter(layer_id)` to
-        // get a painter on the SAME layer (so the chrome paints
-        // on top of the chip + editor that landed there earlier)
-        // with `Rect::EVERYTHING` for the clip rect.
-        // `Painter::with_clip_rect` *intersects* with the existing
-        // clip rather than replacing it, so the previous
-        // `clone().with_clip_rect(viewport_rect)` didn't widen
-        // the pane's tight clip and three sides of the stroke got
-        // cut. Same trick the focused-tab underline uses
-        // (`behavior::paint_focused_tab_underline`).
-        // Animate the focused-editor chrome's opacity toward the
-        // caret-active target. Half-second fade either direction so
-        // the chrome breathes in/out instead of popping. While the
-        // value is in transit we request a fast repaint so the
-        // animation runs smoothly even if the PTY is idle.
-        const CHROME_FADE_SECS: f32 = 0.5;
-        let target_opacity: f32 = if caret_active { 1.0 } else { 0.0 };
-        let dt = ctx.input(|i| i.stable_dt);
-        let step = (dt / CHROME_FADE_SECS).clamp(0.0, 1.0);
-        slot.ui.chrome_opacity = if (slot.ui.chrome_opacity - target_opacity).abs() <= step {
-            target_opacity
-        } else if slot.ui.chrome_opacity < target_opacity {
-            slot.ui.chrome_opacity + step
-        } else {
-            slot.ui.chrome_opacity - step
-        };
-        if slot.ui.chrome_opacity != target_opacity {
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
-        }
-
+        // Wraparound fix: `ctx.layer_painter(layer_id)` gets a painter on
+        // the SAME layer with a clip rect widened a few px OUTSIDE the
+        // pane's horizontal bounds so the outer glow rings (which expand
+        // 5+ px) actually render instead of being cut at the pane edge.
+        // `Painter::with_clip_rect` *intersects* with the existing clip,
+        // so we hand it the widened rect directly. egui_tiles' gap_width
+        // is bumped to 16 px in `behavior.rs` so this 8 px overhang sits
+        // in the splitter gap and never bleeds into a neighbor pane; the
+        // vertical infinity keeps the top/bottom edges from being chopped
+        // by the footer's tight clip. Same trick the focused-tab
+        // underline uses (`behavior::paint_focused_tab_underline`).
         if slot.ui.chrome_opacity > 0.0 {
-            // Body width comes from the ui's CLIP rect, not its
-            // available-width / layout rect. egui_tiles can give
-            // the pane_ui a layout rect that's wider than the
-            // pane and rely on the clip_rect to keep paint inside
-            // the pane — which is exactly why the editor's text
-            // content clips correctly at the pane's right edge
-            // while a decoration drawn at `available_width`
-            // overshoots into the divider or off-screen.
-            let pane_clip = ui.clip_rect();
-            let body_w = (pane_clip.right() - footer_origin.x).max(0.0);
-            let chip_rect = if has_prompt_cwd {
-                Some(egui::Rect::from_min_size(footer_origin, egui::vec2(body_w, chip_h)))
-            } else {
-                None
-            };
-            // The chrome (glow / outline) wraps the chip+editor with a
-            // little pad on each side so its stroke doesn't sit ON the
-            // chip edge (left) or fall off the pane's right edge (right)
-            // — on the rightmost pane `pane_clip.right()` IS the window
-            // edge, so a flush right edge gets clipped. Both sides float
-            // a few px inside the pane.
-            const CHROME_LEFT_PAD: f32 = 4.0;
-            const CHROME_RIGHT_PAD: f32 = 6.0;
-            let combined = egui::Rect::from_min_max(
-                egui::pos2(footer_origin.x - CHROME_LEFT_PAD, footer_origin.y),
-                egui::pos2(
-                    pane_clip.right() - CHROME_RIGHT_PAD,
-                    footer_origin.y + chip_h + editor_h,
-                ),
-            );
-            // Chrome painter: layer-painter (so we're not clipped
-            // to the footer's tight vertical clip — variants paint
-            // a few px above + below the body, which `ui.painter()`
-            // would chop), but with a CLIP RECT that includes a few
-            // pixels OUTSIDE the pane's horizontal bounds so the
-            // chrome's outer L/R strokes (glow expands by 5+ px)
-            // actually render. Without this overhang, the side
-            // strokes are clipped exactly at the pane edge and only
-            // the top + bottom edges show. egui_tiles' gap_width is
-            // bumped to 16 px in `behavior.rs` so this 8 px overhang
-            // sits inside the splitter gap and never bleeds into a
-            // neighbor pane. The vertical infinity keeps the
-            // bottom/top edges intact (footer's natural clip would
-            // chop them).
             const CHROME_OUTER_OVERHANG: f32 = 8.0;
             let chrome_clip = egui::Rect::from_min_max(
                 egui::pos2(pane_clip.left() - CHROME_OUTER_OVERHANG, -f32::INFINITY),
@@ -2934,8 +2933,8 @@ pub fn render_pane(
             let painter = ctx.layer_painter(ui.layer_id()).with_clip_rect(chrome_clip);
             crate::focused_chrome::paint(
                 &painter,
-                chip_rect,
-                combined,
+                chrome_chip_rect,
+                chrome_body,
                 chrome_variant,
                 slot.ui.chrome_opacity,
             );
