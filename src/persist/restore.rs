@@ -276,4 +276,60 @@ mod tests {
         let rec = p.begin_session(None, "zsh", 1).unwrap();
         assert!(restore_blocks_for_pane(&p, rec.pane_row.0).is_empty());
     }
+
+    #[test]
+    fn pre_command_output_block_persists_and_restores_without_confusing_the_index() {
+        // The "before first command" output-only block (empty command, no
+        // chips) must persist as a normal chunk and restore as bare output
+        // — and the FIRST command's chunk must continue the logical-line
+        // cursor right after it, contiguous and non-overlapping. This is
+        // the storage/recovery correctness the feature must not break.
+        let (_tmp, p) = persistence();
+        let rec = p.begin_session(None, "zsh", 1).unwrap();
+        let store = p.store_handle();
+
+        // Output-only init block at [0, 2): default meta = empty command.
+        let init = snap(&["init line 1", "init line 2"]);
+        write_chunk(&rec.dir, &store, rec.session, rec.pane_row, 1, 0, &init).unwrap();
+        // First command's block continues at line 2: [2, 3), with a command.
+        let mut cmd = snap(&["hello"]);
+        cmd.meta = crate::block::BlockMeta {
+            command: "echo hello".into(),
+            exit: Some(0),
+            cwd: None,
+            git: None,
+        };
+        write_chunk(&rec.dir, &store, rec.session, rec.pane_row, 2, 2, &cmd).unwrap();
+
+        // The chunk index is contiguous and non-overlapping.
+        let rows = store.lock().unwrap().pane_scrollback_chunks(rec.pane_row.0).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].start_line, rows[0].end_line), (0, 2), "init block covers [0,2)");
+        assert_eq!(
+            (rows[1].start_line, rows[1].end_line),
+            (2, 3),
+            "the command block continues right after, no gap/overlap"
+        );
+
+        // Restore: first an output-only block, then the command block.
+        let blocks = restore_blocks_for_pane(&p, rec.pane_row.0);
+        assert_eq!(blocks.len(), 2);
+        match &blocks[0] {
+            Block::Sealed { id, command, exit, snapshot, .. } => {
+                assert_eq!(*id, BlockId(0));
+                assert!(command.is_empty(), "the init block restores with NO command label");
+                assert_eq!(*exit, None, "and no exit chip");
+                assert_eq!(snapshot.len(), 2, "its two init lines survive");
+            }
+            other => panic!("expected an output-only Sealed block first, got {other:?}"),
+        }
+        match &blocks[1] {
+            Block::Sealed { id, command, exit, .. } => {
+                assert_eq!(*id, BlockId(1), "ids stay contiguous 0..n");
+                assert_eq!(command, "echo hello");
+                assert_eq!(*exit, Some(0));
+            }
+            other => panic!("expected the command block second, got {other:?}"),
+        }
+    }
 }
