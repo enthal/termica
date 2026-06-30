@@ -362,12 +362,26 @@ pub fn run() -> eframe::Result<()> {
         // how Linux desktops link the live window to the installed
         // `.desktop` entry and its icon. Harmless on other platforms.
         .with_app_id(APP_ID);
+    // Reopen the window where it was last (spec/08). The monitor size is
+    // not known yet, so we apply the saved geometry as-is here and the
+    // app clamps it to the *current* monitor on the first frame (fit to a
+    // smaller screen). A missing/old blob leaves the default size above.
+    if let Some(geom) = app::read_saved_window_geometry() {
+        viewport = viewport
+            .with_inner_size([geom.inner_width, geom.inner_height])
+            .with_position([geom.pos_x, geom.pos_y]);
+    }
     if let Some(icon) = load_app_icon() {
         viewport = viewport.with_icon(icon);
     }
 
     let options = eframe::NativeOptions {
         viewport,
+        // We persist window geometry ourselves (in `termica.sqlite`,
+        // written incrementally on change — survives a kill, unlike
+        // eframe's on-interval/on-exit `.ron` save). Disable eframe's
+        // parallel window-state persistence so the two don't fight.
+        persist_window: false,
         // macOS: suppress winit's default application menu. Its
         // Quit item calls `[NSApplication terminate:]` directly,
         // exiting before `update()` can render the quit-confirm
