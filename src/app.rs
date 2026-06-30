@@ -225,38 +225,6 @@ impl TermicaApp {
             Some((store, root)) => (Some(store), Some(root)),
             None => (None, None),
         };
-        // Scrollback gc (9E): enforce the disk + `runs` growth caps on a
-        // background thread so launch never blocks on it. It skips live
-        // sessions (lock-held) and is conservative — see
-        // [`crate::persist::gc`]. Real wall-clock `now` is fine here
-        // (production, not a test).
-        if let (Some(store), Some(root)) = (history.as_ref(), persist_root.as_ref()) {
-            let persist = crate::persist::store::Persistence::new(root.clone(), store.clone());
-            let now_ms = now_unix_ms();
-            std::thread::spawn(move || {
-                match crate::persist::gc::gc(
-                    &persist,
-                    now_ms,
-                    &crate::persist::gc::GcCaps::default(),
-                ) {
-                    Ok(r)
-                        if r.chunks_deleted > 0
-                            || r.runs_trimmed > 0
-                            || r.tmp_files_deleted > 0 =>
-                    {
-                        eprintln!(
-                            "termica: gc reclaimed {} chunks ({} bytes), trimmed {} runs, removed {} temps",
-                            r.chunks_deleted,
-                            r.bytes_reclaimed,
-                            r.runs_trimmed,
-                            r.tmp_files_deleted
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => eprintln!("termica: gc failed: {e}"),
-                }
-            });
-        }
         let app_run_id = uuid::Uuid::new_v4().to_string();
         let mut app = Self {
             panes: HashMap::new(),
@@ -289,6 +257,14 @@ impl TermicaApp {
             layout_save_deadline: None,
         };
         app.bootstrap();
+        // Scrollback gc runs AFTER restore, never concurrently. Both probe
+        // the same per-session `flock`s for liveness; `flock` contends even
+        // within one process (per open-file-description), so a gc probe that
+        // momentarily holds session-N's lock while restore is checking
+        // session-N would make restore see "held" → conclude the workspace
+        // is owned by a live process → bail to a fresh pane. Serializing
+        // them (restore first, then gc) removes that race entirely.
+        app.spawn_gc();
         app
     }
 
@@ -299,6 +275,35 @@ impl TermicaApp {
     fn history_ctx(&self) -> Option<crate::history::HistoryContext> {
         let store = self.history.clone()?;
         Some(crate::history::HistoryContext { store, app_run_id: self.app_run_id.clone() })
+    }
+
+    /// Spawn the scrollback gc (9E) on a background thread so launch never
+    /// blocks on it. It enforces the disk + `runs` growth caps and skips
+    /// live sessions (lock-held) — see [`crate::persist::gc`]. Real
+    /// wall-clock `now` is fine here (production, not a test).
+    ///
+    /// **Spawned only after restore** ([`Self::bootstrap`]): gc and restore
+    /// both probe per-session locks, and `flock` contends within one
+    /// process, so running gc concurrently with restore would race restore
+    /// into a spurious "workspace is live elsewhere" verdict.
+    fn spawn_gc(&self) {
+        let (Some(store), Some(root)) = (self.history.as_ref(), self.persist_root.as_ref()) else {
+            return;
+        };
+        let persist = crate::persist::store::Persistence::new(root.clone(), store.clone());
+        let now_ms = now_unix_ms();
+        std::thread::spawn(move || {
+            match crate::persist::gc::gc(&persist, now_ms, &crate::persist::gc::GcCaps::default()) {
+                Ok(r) if r.chunks_deleted > 0 || r.runs_trimmed > 0 || r.tmp_files_deleted > 0 => {
+                    eprintln!(
+                        "termica: gc reclaimed {} chunks ({} bytes), trimmed {} runs, removed {} temps",
+                        r.chunks_deleted, r.bytes_reclaimed, r.runs_trimmed, r.tmp_files_deleted
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("termica: gc failed: {e}"),
+            }
+        });
     }
 
     /// Build a per-pane [`Persistence`] handle from the shared store +
@@ -1673,6 +1678,37 @@ struct RestoredPanePlan {
 /// A free function so the full restore decision — including liveness —
 /// is unit-testable against a tempdir `Persistence` without standing up
 /// an eframe app or spawning a PTY.
+/// Is `session_id`'s lock held by a *live* process? Used by restore's
+/// liveness gate: a held lock means a running Termica owns that session,
+/// so the workspace must not be adopted.
+///
+/// Retries briefly because a held lock can look held *transiently* even
+/// when no process truly owns it — `flock` lives on the open
+/// file-description, so a sibling probe (a concurrently-spawning shell
+/// that inherits the fd across `fork` until CLOEXEC, or a gc liveness
+/// check) can hold it for an instant. A genuinely-live session stays held
+/// across every retry. Mirrors gc's `session_is_live`, but a probe ERROR
+/// (missing / inaccessible session dir) resolves to **not live** — a gone
+/// dir is a dead session, and restore must not be blocked by it.
+fn session_held_by_live_process(
+    persist: &crate::persist::store::Persistence,
+    session_id: i64,
+) -> bool {
+    const ATTEMPTS: u32 = 5;
+    let dir = persist.session_dir(session_id);
+    for attempt in 0..ATTEMPTS {
+        match crate::persist::lock::SessionLock::try_acquire(&dir) {
+            Ok(Some(_guard)) => return false, // free -> not live (guard dropped here)
+            Ok(None) => {}                    // held -> maybe transient; retry
+            Err(_) => return false, // can't probe -> not a live owner; don't block restore
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    true // persistently held -> genuinely live
+}
+
 fn plan_restore(
     persist: &crate::persist::store::Persistence,
     store: &Arc<Mutex<HistoryStore>>,
@@ -1690,19 +1726,16 @@ fn plan_restore(
         return None;
     }
 
-    // Liveness: any held session lock → the workspace is live elsewhere.
+    // Liveness: any session lock held by a *live* process → the workspace
+    // is live elsewhere, leave it alone. The probe retries briefly so a
+    // sub-millisecond transient hold doesn't spuriously decline a restore.
     for &db_pane in layout.db_pane_by_app.values() {
         let Some(sid) =
             store.lock().ok().and_then(|s| s.latest_session_for_pane(db_pane).ok().flatten())
         else {
             continue;
         };
-        // `matches!` evaluates and immediately drops any acquired guard —
-        // we only want the verdict, not to hold the lock.
-        if matches!(
-            crate::persist::lock::SessionLock::try_acquire(&persist.session_dir(sid)),
-            Ok(None)
-        ) {
+        if session_held_by_live_process(persist, sid) {
             return None; // held by a live process -> don't steal it
         }
     }
@@ -2311,6 +2344,26 @@ mod tests {
         let (_tmp, persist, store) = persistence();
         save_raw_layout(&store, tabs_tree(&[1, 2]), HashMap::new());
         assert!(plan_restore(&persist, &store).is_none(), "no mapped panes → fresh start");
+    }
+
+    #[test]
+    fn session_held_by_live_process_distinguishes_held_free_and_missing() {
+        let (_tmp, persist, _store) = persistence();
+        // Held: keep the SessionRecord (and its lock) alive.
+        let rec = persist.begin_session(None, "zsh", 1).unwrap();
+        let sid = rec.session.0;
+        assert!(session_held_by_live_process(&persist, sid), "a held session lock reads as live");
+        drop(rec); // process exits -> lock released
+        assert!(
+            !session_held_by_live_process(&persist, sid),
+            "after the lock releases the session reads as not live"
+        );
+        // A missing session dir is a dead session, not a live owner — it
+        // must not block restore (would otherwise force a fresh start).
+        assert!(
+            !session_held_by_live_process(&persist, 999_999),
+            "a missing session dir resolves to not-live"
+        );
     }
 
     #[test]
