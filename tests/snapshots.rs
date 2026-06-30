@@ -535,6 +535,24 @@ fn snapshot_focused_chrome_glow_backing_is_opaque() {
 }
 
 #[test]
+fn snapshot_focused_chrome_backing_without_border_when_unfocused() {
+    // The command area keeps its opaque backing even when the pane is NOT
+    // focused (no glow): the backing is painted always, the border only
+    // when focused. So scrollback can't run up against the chips on an
+    // inactive pane. This renders the backing alone (no border call) over
+    // a vivid scrollback stand-in — the card stays opaque, no glow.
+    use termica::focused_chrome::{self, ChromeVariant};
+    let mut harness =
+        Harness::builder().with_size(egui::Vec2::new(400.0, 120.0)).build_ui(move |ui| {
+            let painter = ui.painter();
+            painter.rect_filled(ui.max_rect(), 0.0, egui::Color32::from_rgb(0xb0, 0x10, 0x10));
+            let body = egui::Rect::from_min_max(egui::pos2(40.0, 40.0), egui::pos2(360.0, 90.0));
+            focused_chrome::paint_backing(painter, None, body, ChromeVariant::I, 1.0);
+        });
+    harness.snapshot_options("focused_chrome_backing_unfocused", &drawn_glyph_snapshot_options());
+}
+
+#[test]
 fn snapshot_paint_sealed_block_reflows_long_line_at_narrow_width() {
     // Phase 9B: a logical line longer than the pane wraps into several
     // visual rows at render time. Build logical lines the way production

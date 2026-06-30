@@ -90,6 +90,12 @@ fn opaque_with_opacity(c: egui::Color32, opacity: f32) -> egui::Color32 {
 /// [`paint_glow`] so the fill and the stroke can never drift apart.
 const GLOW_INNER_OFFSET: f32 = 2.0;
 
+/// Opaque headroom the backing keeps ABOVE the chip row — a touch more
+/// than [`GLOW_INNER_OFFSET`] so scrollback doesn't crowd the chips,
+/// active pane or not. Only the top grows; the other three edges stay at
+/// `GLOW_INNER_OFFSET` so they meet the glow's inner ring exactly.
+const GLOW_TOP_HEADROOM: f32 = 4.0;
+
 /// The opaque-backing rectangle for a variant: the region the editor's
 /// own terminal background must cover so scrollback can't show through
 /// the gap between the editor content and the border stroke. Returned
@@ -109,9 +115,23 @@ fn backing_shape(
     match variant {
         // Round / accent outline + subtle fill: edge at `expand(3.0)` r6.
         A | B | C | J => Some((body_rect.expand(3.0), 6.0)),
-        // Soft glow: innermost stroke at `expand(GLOW_INNER_OFFSET)`,
-        // matching radius `6.0 + GLOW_INNER_OFFSET` (see `paint_glow`).
-        I => Some((body_rect.expand(GLOW_INNER_OFFSET), 6.0 + GLOW_INNER_OFFSET)),
+        // Soft glow: left / right / bottom at `expand(GLOW_INNER_OFFSET)`
+        // (the innermost ring `paint_glow` strokes, radius
+        // `6.0 + GLOW_INNER_OFFSET`); the top grows to `GLOW_TOP_HEADROOM`
+        // for opaque breathing room above the chips.
+        I => Some((
+            egui::Rect::from_min_max(
+                egui::pos2(
+                    body_rect.left() - GLOW_INNER_OFFSET,
+                    body_rect.top() - GLOW_TOP_HEADROOM,
+                ),
+                egui::pos2(
+                    body_rect.right() + GLOW_INNER_OFFSET,
+                    body_rect.bottom() + GLOW_INNER_OFFSET,
+                ),
+            ),
+            6.0 + GLOW_INNER_OFFSET,
+        )),
         // Doubled hairline: inner stroke at `expand(2.0)` r5.
         K => Some((body_rect.expand(2.0), 5.0)),
         // Lane: filled band at `expand2(0, 3)`, square corners.
@@ -122,6 +142,22 @@ fn backing_shape(
         // Chip-tint decorates only the chip — back just that footprint.
         L => chip_rect.map(|r| (r.expand2(egui::vec2(2.0, 2.0)), 4.0)),
     }
+}
+
+/// The opaque-backing rectangle for `variant` — the rounded region the
+/// command-area background fills, reaching the border's inner edge — or
+/// `None` if the variant backs nothing body-shaped (pass `chip_rect:
+/// None` to get only the body-enclosing fill, so chip-only variants
+/// report `None` rather than a chip-sized rect). Callers clip the footer
+/// content to this rect's right edge so chips / command text reach the
+/// border and clip there, flush with the stroke, instead of spilling
+/// past it.
+pub fn backing_rect(
+    variant: ChromeVariant,
+    body_rect: egui::Rect,
+    chip_rect: Option<egui::Rect>,
+) -> Option<egui::Rect> {
+    backing_shape(variant, body_rect, chip_rect).map(|(rect, _)| rect)
 }
 
 /// Paint the opaque editor backing for `variant`. Call this BEFORE the
@@ -274,16 +310,28 @@ mod tests {
     }
 
     /// The fix's load-bearing invariant: the glow's opaque backing must
-    /// reach exactly the innermost glow ring, so no scrollback shows in
-    /// the band between the editor and the border. Both derive from
-    /// `GLOW_INNER_OFFSET`; this pins them together.
+    /// reach exactly the innermost glow ring on the left / right / bottom,
+    /// so no scrollback shows in the band between the editor and the
+    /// border (both derive from `GLOW_INNER_OFFSET`). The top is allowed
+    /// extra opaque headroom (`GLOW_TOP_HEADROOM`) above the chips.
     #[test]
     fn glow_backing_meets_inner_ring() {
         let (rect, rounding) =
             backing_shape(ChromeVariant::I, body(), None).expect("glow variant backs the editor");
-        // Same rect + radius the innermost ring in `paint_glow` strokes.
-        assert_eq!(rect, body().expand(GLOW_INNER_OFFSET));
+        assert_eq!(rect.right(), body().right() + GLOW_INNER_OFFSET);
+        assert_eq!(rect.left(), body().left() - GLOW_INNER_OFFSET);
+        assert_eq!(rect.bottom(), body().bottom() + GLOW_INNER_OFFSET);
+        assert_eq!(rect.top(), body().top() - GLOW_TOP_HEADROOM);
         assert_eq!(rounding, 6.0 + GLOW_INNER_OFFSET);
+    }
+
+    /// The content-clip right edge (`backing_rect(..).right()`) must land
+    /// on the border's inner edge so chips / command clip flush with the
+    /// border, not short of it.
+    #[test]
+    fn glow_content_clip_is_flush_with_border() {
+        let rect = backing_rect(ChromeVariant::I, body(), None).expect("glow backs the editor");
+        assert_eq!(rect.right(), body().right() + GLOW_INNER_OFFSET);
     }
 
     /// Outline-family variants back out to their stroke at `expand(3.0)`.
