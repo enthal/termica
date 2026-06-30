@@ -18,6 +18,11 @@
 //! ```
 //!
 //! - The pane is born with exactly one `Prompt` block.
+//! - When [`LifecycleEvent::IntegrationReady`] arrives (the shell finished
+//!   sourcing its dotfiles), anything those dotfiles *printed* is sealed
+//!   into a standalone **output-only** `Sealed` block (empty command, no
+//!   chips) so it isn't prepended to the first command — see
+//!   [`BlockStack::seal_pre_command_output`]. A silent init seals nothing.
 //! - When [`LifecycleEvent::Preexec`] arrives, the live tail's
 //!   `Prompt` transforms into `Running`, carrying the command string.
 //! - When [`LifecycleEvent::CommandFinished`] arrives, the live tail's
@@ -349,6 +354,18 @@ impl BlockStack {
         self.blocks.iter().any(|b| matches!(b, Block::Sealed { .. }))
     }
 
+    /// Has any **command** sealed into scrollback? Unlike
+    /// [`Self::has_sealed_blocks`], an output-only block (the
+    /// pre-first-command dotfile output — empty command) does **not**
+    /// count. This gates the blank-pane watermark, which should linger
+    /// behind shell-init output until the user runs their first command
+    /// (spec/03 §"Pre-first-command output").
+    pub fn has_command_block(&self) -> bool {
+        self.blocks
+            .iter()
+            .any(|b| matches!(b, Block::Sealed { command, .. } if !command.is_empty()))
+    }
+
     /// Borrow the live tail block. Always present by invariant; only
     /// returns `Option` so the API stays defensive in case a future
     /// caller manages to clear the stack out from under us (it
@@ -387,6 +404,12 @@ impl BlockStack {
                 None
             }
             LifecycleEvent::CommandFinished { exit } => self.seal_running(*exit, terminal, frame),
+            // The shell finished its init (sourced the user's dotfiles) and
+            // is ready. Seal anything it printed during init into its own
+            // output-only block so it isn't prepended to the first command.
+            LifecycleEvent::IntegrationReady { .. } => {
+                self.seal_pre_command_output(terminal, frame)
+            }
             LifecycleEvent::Precmd { cwd } | LifecycleEvent::Cwd { cwd } => {
                 self.update_tail_cwd(cwd.clone());
                 None
@@ -553,6 +576,79 @@ impl BlockStack {
         Some(produced)
     }
 
+    /// Seal whatever the shell printed *before the first command* — its
+    /// dotfile / init output (`~/.zshenv`, `~/.zshrc`, …) — into a
+    /// standalone **output-only** block: empty command, no chips, just the
+    /// lines. Called once per session when the shell signals it is ready
+    /// (`IntegrationReady`), so that init output is its own block instead
+    /// of being prepended to the first command's block (spec/03, spec/04).
+    ///
+    /// No-op (returns `None`, creates no block) when:
+    /// - the tail isn't a fresh command-less `Prompt` (we never seal
+    ///   mid-command), or
+    /// - the grid holds no visible output — a **silent** `~/.zshrc` must
+    ///   not produce an empty block.
+    ///
+    /// The returned [`SealedSnapshot`] persists as a normal chunk (the
+    /// writer's per-pane logical-line cursor advances by its line count,
+    /// exactly like any sealed block), so it stores and restores without
+    /// disturbing chunk indexing or `BlockId` contiguity. Mirrors
+    /// [`Self::seal_running`]; snapshot-before-reset is load-bearing.
+    fn seal_pre_command_output(
+        &mut self,
+        terminal: &mut TerminalState,
+        frame: u64,
+    ) -> Option<SealedSnapshot> {
+        use alacritty_terminal::grid::Dimensions;
+
+        // Only at a fresh, command-less prompt — never mid-command.
+        let tail = self.blocks.last()?;
+        let Block::Prompt { id, header, .. } = tail else { return None };
+        let id = *id;
+        let header = header.clone();
+
+        let emit_cols = terminal.grid().columns() as u32;
+        let snapshot = crate::persist::chunk::unwrap_rows(&terminal.snapshot_lines_all());
+        // A silent init seals nothing — no empty block.
+        if snapshot.is_empty() {
+            return None;
+        }
+        terminal.reset_for_new_block();
+        let now_ms = self.event_clock_ms;
+
+        // Output-only: empty command, no exit, no cwd/git chips.
+        let meta = BlockMeta { command: String::new(), exit: None, cwd: None, git: None };
+        let produced = SealedSnapshot {
+            block_id: id,
+            lines: snapshot.clone(),
+            emit_cols,
+            start_time_ms: now_ms,
+            end_time_ms: now_ms,
+            meta,
+        };
+        let sealed = Block::Sealed {
+            id,
+            header: BlockHeader::default(),
+            command: String::new(),
+            snapshot,
+            duration: Duration::ZERO,
+            exit: None,
+        };
+        // Replace the tail Prompt with the sealed block, then push a fresh
+        // Prompt — same order as `seal_running`, so "last is always live"
+        // is never observed false from outside.
+        let last = self.blocks.last_mut().expect("checked above");
+        *last = sealed;
+        let new_id = self.alloc_id();
+        self.blocks.push(Block::Prompt {
+            id: new_id,
+            header,
+            started_at_frame: frame,
+            editor: PromptEditor::new(),
+        });
+        Some(produced)
+    }
+
     /// Mutable access to the editor on the live tail block, if any.
     /// `None` when the tail is not a `Prompt` (e.g. a `Running`
     /// command is executing) — input routing in `render_pane`
@@ -634,6 +730,31 @@ mod tests {
         // Clearing scrollback returns to the pristine, watermark-eligible state.
         stack.clear_sealed();
         assert!(!stack.has_sealed_blocks(), "clear_sealed drops sealed blocks");
+    }
+
+    #[test]
+    fn has_command_block_ignores_output_only_init_block() {
+        // The watermark lingers until the first COMMAND. An output-only
+        // init block (dotfile output) is "sealed" but is not a command, so
+        // it must NOT count as a command block.
+        let mut stack = fresh_stack();
+        let mut term = TerminalState::new(5, 40);
+        term.feed(b"init banner");
+        stack.observe_lifecycle_event(&integration_ready(), &mut term, 1);
+        assert!(stack.has_sealed_blocks(), "the init output IS a sealed block");
+        assert!(
+            !stack.has_command_block(),
+            "...but it is output-only, so no COMMAND has sealed — watermark stays"
+        );
+
+        // First real command seals → now there's a command block.
+        stack.observe_lifecycle_event(
+            &LifecycleEvent::Preexec { command: "ls".into() },
+            &mut term,
+            2,
+        );
+        stack.observe_lifecycle_event(&LifecycleEvent::CommandFinished { exit: 0 }, &mut term, 3);
+        assert!(stack.has_command_block(), "a finished command counts as a command block");
     }
 
     #[test]
@@ -735,6 +856,90 @@ mod tests {
         match stack.last().unwrap() {
             Block::Prompt { id, .. } => assert_eq!(*id, BlockId(1)),
             other => panic!("expected Prompt tail, got {other:?}"),
+        }
+    }
+
+    fn integration_ready() -> LifecycleEvent {
+        LifecycleEvent::IntegrationReady {
+            shell: ShellKind::Zsh,
+            version: 1,
+            completion_degraded: false,
+        }
+    }
+
+    #[test]
+    fn integration_ready_seals_init_output_as_an_output_only_block() {
+        // Shell-init output (dotfile output printed before the first
+        // command) becomes its OWN block — empty command, no chips —
+        // instead of being prepended to the first command's block.
+        let mut stack = fresh_stack();
+        let mut term = TerminalState::new(5, 40);
+        term.feed(b"sourcing ~/.zshrc\r\nnvm loaded");
+        let produced = stack.observe_lifecycle_event(&integration_ready(), &mut term, 7);
+
+        // A snapshot is produced for the writer, with NO chips.
+        let snap = produced.expect("init output seals a block");
+        assert!(snap.meta.command.is_empty(), "no command label");
+        assert_eq!(snap.meta.exit, None, "no exit chip");
+        assert_eq!(snap.meta.cwd, None, "no cwd chip");
+        assert!(snap.meta.git.is_none(), "no git chip");
+        assert_eq!(snap.lines.len(), 2, "both init lines captured");
+
+        // Stack is now [Sealed(output-only), fresh Prompt].
+        assert_eq!(stack.len(), 2);
+        match stack.iter().next().unwrap() {
+            Block::Sealed { command, exit, snapshot, .. } => {
+                assert!(command.is_empty(), "output-only block has no command");
+                assert_eq!(*exit, None, "no exit code");
+                assert_eq!(snapshot.len(), 2, "the init lines are the block's output");
+            }
+            other => panic!("expected an output-only Sealed block, got {other:?}"),
+        }
+        assert!(matches!(stack.last().unwrap(), Block::Prompt { .. }), "fresh prompt tail");
+    }
+
+    #[test]
+    fn integration_ready_with_silent_init_creates_no_block() {
+        // A silent ~/.zshrc (no output) must NOT produce an empty block.
+        let mut stack = fresh_stack();
+        let mut term = TerminalState::new(5, 40);
+        let produced = stack.observe_lifecycle_event(&integration_ready(), &mut term, 7);
+        assert!(produced.is_none(), "no output → no snapshot");
+        assert_eq!(stack.len(), 1, "still just the initial prompt; no empty block created");
+        assert!(matches!(stack.last().unwrap(), Block::Prompt { .. }));
+    }
+
+    #[test]
+    fn output_only_block_then_first_command_keep_contiguous_ids() {
+        // The pre-command output block (id 0) must not disturb BlockId
+        // monotonicity for the first real command — restore + the live
+        // tail both rely on contiguous 0..n ids.
+        let mut stack = fresh_stack();
+        let mut term = TerminalState::new(5, 40);
+        term.feed(b"init line");
+        stack.observe_lifecycle_event(&integration_ready(), &mut term, 1);
+        stack.observe_lifecycle_event(
+            &LifecycleEvent::Preexec { command: "ls".into() },
+            &mut term,
+            2,
+        );
+        stack.observe_lifecycle_event(&LifecycleEvent::CommandFinished { exit: 0 }, &mut term, 3);
+
+        let sealed: Vec<(u64, String, Option<i32>)> = stack
+            .iter()
+            .filter_map(|b| match b {
+                Block::Sealed { id, command, exit, .. } => Some((id.0, command.clone(), *exit)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sealed,
+            vec![(0, String::new(), None), (1, "ls".to_string(), Some(0))],
+            "output-only block id 0, first command id 1"
+        );
+        match stack.last().unwrap() {
+            Block::Prompt { id, .. } => assert_eq!(id.0, 2, "live tail keeps the next id"),
+            other => panic!("expected Prompt(2) tail, got {other:?}"),
         }
     }
 

@@ -257,17 +257,20 @@ pub(crate) fn capped_command_height(full_h: f32, total_lines: usize, max: usize)
 }
 
 /// The blank-pane watermark shows only while the pane is *pristine*:
-/// not in alt-screen, no command sealed into scrollback, and none
-/// currently running. The `tail_is_running` term is the fix for the
-/// long-running-first-command bug — without it, a running first command
-/// (nothing sealed yet) kept the watermark up behind its output until
-/// it exited. Pure; unit-tested.
+/// not in alt-screen, no **command** sealed into scrollback, and none
+/// currently running. `has_command_block` (not "has any sealed block")
+/// is deliberate: shell-init output seals into an output-only block
+/// (spec/03), and the watermark should **linger behind that init output**
+/// until the user actually runs their first command. The
+/// `tail_is_running` term is the fix for the long-running-first-command
+/// bug — without it, a running first command (nothing sealed yet) kept
+/// the watermark up behind its output until it exited. Pure; unit-tested.
 pub(crate) fn should_show_watermark(
     in_alt_screen: bool,
-    has_sealed: bool,
+    has_command_block: bool,
     tail_is_running: bool,
 ) -> bool {
-    !in_alt_screen && !has_sealed && !tail_is_running
+    !in_alt_screen && !has_command_block && !tail_is_running
 }
 
 /// The first `max` lines of `command` for the pinned header, with a
@@ -1902,18 +1905,22 @@ pub fn render_pane(
                                 // command / output widgets register on top and
                                 // keep drag-to-select; the background only
                                 // catches right-clicks in the margins beside the
-                                // text. Sealed blocks always render a header
-                                // (the duration chip), so the height is header +
-                                // (optional command) + output rows, with egui's
-                                // inter-widget spacing between them.
+                                // text. A command block renders a header (the
+                                // chip strip) + optional command + output rows,
+                                // with egui's inter-widget spacing between them.
+                                // An output-only block (empty command, spec/03)
+                                // paints NO header and no command, so it reserves
+                                // neither — just its output rows.
+                                let output_only = command.is_empty();
                                 let sp = ui.spacing().item_spacing.y;
                                 let cmd_rows = if command.is_empty() {
                                     0.0
                                 } else {
                                     command.split('\n').count() as f32 * row_h + sp
                                 };
+                                let header_rows = if output_only { 0.0 } else { chip_h + sp };
                                 let bg_h =
-                                    chip_h + sp + cmd_rows + visual_rows.len() as f32 * row_h;
+                                    header_rows + cmd_rows + visual_rows.len() as f32 * row_h;
                                 let block_bg = ui.interact(
                                     egui::Rect::from_x_y_ranges(
                                         ui.max_rect().x_range(),
@@ -1922,6 +1929,9 @@ pub fn render_pane(
                                     ui.id().with(("block_bg", *id)),
                                     egui::Sense::click(),
                                 );
+                                // An output-only block carries NO chips — not
+                                // even a duration ("0s" is meaningless when it
+                                // isn't a command).
                                 let sealed_render = render::paint_sealed_block(
                                     ui,
                                     command,
@@ -1930,8 +1940,8 @@ pub fn render_pane(
                                     render::BlockHeader {
                                         cwd: header.cwd.as_deref(),
                                         home,
-                                        exit: *exit,
-                                        duration: Some(*duration),
+                                        exit: if output_only { None } else { *exit },
+                                        duration: if output_only { None } else { Some(*duration) },
                                         git: header.git.as_ref(),
                                         ..Default::default()
                                     },
@@ -4353,7 +4363,7 @@ pub fn render_pane(
         matches!(slot.session.blocks().last(), Some(crate::block::Block::Running { .. }));
     let show_watermark = should_show_watermark(
         in_alt_screen,
-        slot.session.blocks().has_sealed_blocks(),
+        slot.session.blocks().has_command_block(),
         tail_is_running,
     );
     let watermark_fade = ctx.animate_bool_with_time(
