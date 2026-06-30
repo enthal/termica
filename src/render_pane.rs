@@ -187,6 +187,12 @@ pub fn compute_footer_height(
 /// multiline command can't grow the pinned strip without bound.
 pub(crate) const STICKY_MAX_CMD_LINES: usize = 4;
 
+/// Top margin (logical px) above a pinned (sticky) header's content, so
+/// the chip isn't jammed against the pane's top edge. The matching left
+/// indent reuses [`LEFT_GUTTER`] (the scroll area's block inner margin)
+/// so the pinned chip lines up with the inline headers it stands in for.
+const STICKY_HEADER_TOP_PAD: f32 = 6.0;
+
 /// Screen-space vertical extent of one block painted in the pane's
 /// scroll area, plus `sticky_h` — the height of what gets pinned when
 /// the block is sticky: its header chrome (cwd / exit chip) and its
@@ -394,33 +400,67 @@ pub fn paint_sticky_header(
             // to the union of everything painted (chip + command).
             let strip_idx = ui.painter().add(egui::Shape::Noop);
             let top = ui.next_widget_position().y;
-            // Sticky pins a running / sealed block — no PR chip (it's a
-            // live-prompt-only affordance). `faded` matches the pinned
-            // block (sealed → muted, running → vivid).
-            let header_render = render::paint_block_header(
-                ui,
-                render::BlockHeader { cwd, home, exit, duration, git, faded, ..Default::default() },
-            );
-            // Re-interact the chip strip for clicks (it paints hover-only) so
-            // a right-click on the pinned chips opens the block menu, the same
-            // as the inline header.
-            let header_click = header_render.response.as_ref().map(|r| {
-                ui.interact(r.rect, ui.id().with("sticky_header_click"), egui::Sense::click())
-            });
-            let capped = cap_command_for_sticky(command, STICKY_MAX_CMD_LINES);
-            // Interactive (not hover-only) so the foreground overlay
-            // captures the press instead of leaking it to the output
-            // below; the response is routed by the caller.
-            let command_resp = (!capped.is_empty()).then(|| {
-                render::paint_command_label_with_selection(ui, &capped, command_selection, faded)
-            });
+            // Pad the pinned content to match an inline header: indent it by
+            // the same `LEFT_GUTTER` the scroll area gives block content via
+            // its inner margin (otherwise the pinned chip snaps flush to the
+            // pane's top-left corner), plus a small top margin so it isn't
+            // jammed against the top edge. The opaque strip is sized from
+            // `top` (the viewport top) below, so it still occludes content
+            // scrolling underneath including the padding.
+            let inner = egui::Frame::NONE
+                .inner_margin(egui::Margin {
+                    left: LEFT_GUTTER as i8,
+                    top: STICKY_HEADER_TOP_PAD as i8,
+                    ..egui::Margin::ZERO
+                })
+                .show(ui, |ui| {
+                    // Sticky pins a running / sealed block — no PR chip (it's a
+                    // live-prompt-only affordance). `faded` matches the pinned
+                    // block (sealed → muted, running → vivid).
+                    let header_render = render::paint_block_header(
+                        ui,
+                        render::BlockHeader {
+                            cwd,
+                            home,
+                            exit,
+                            duration,
+                            git,
+                            faded,
+                            ..Default::default()
+                        },
+                    );
+                    // Re-interact the chip strip for clicks (it paints
+                    // hover-only) so a right-click on the pinned chips opens the
+                    // block menu, the same as the inline header.
+                    let header_click = header_render.response.as_ref().map(|r| {
+                        ui.interact(
+                            r.rect,
+                            ui.id().with("sticky_header_click"),
+                            egui::Sense::click(),
+                        )
+                    });
+                    let capped = cap_command_for_sticky(command, STICKY_MAX_CMD_LINES);
+                    // Interactive (not hover-only) so the foreground overlay
+                    // captures the press instead of leaking it to the output
+                    // below; the response is routed by the caller.
+                    let command_resp = (!capped.is_empty()).then(|| {
+                        render::paint_command_label_with_selection(
+                            ui,
+                            &capped,
+                            command_selection,
+                            faded,
+                        )
+                    });
+                    (command_resp, header_click, header_render.chips)
+                })
+                .inner;
             let bottom = ui.next_widget_position().y;
             let strip = egui::Rect::from_min_max(
                 egui::pos2(viewport.left(), top),
                 egui::pos2(viewport.right(), bottom),
             );
             ui.painter().set(strip_idx, egui::Shape::rect_filled(strip, 0.0, render::DEFAULT_BG));
-            (command_resp, header_click, header_render.chips)
+            inner
         });
     let (command, header, chips) = inner.inner;
     StickyHeaderRender { command, header, chips }
@@ -2646,6 +2686,84 @@ pub fn render_pane(
         let caret_active =
             render::should_show_caret(editor_in_mode, pane_focused, viewport_focused);
 
+        // ---- Focused-editor chrome: geometry + opaque backing --------
+        //
+        // The chrome (soft glow / outline) wraps the chip + editor as a
+        // single visual unit. Its geometry is computed ONCE here and
+        // reused for both the opaque backing (painted now, BELOW the chip
+        // + editor) and the border stroke (painted AFTER them, further
+        // down). The backing fills the bordered region with the terminal
+        // background so scrollback can't show through the band between
+        // the editor content and the border; it must land above the
+        // scrollback but below the editor content, hence painting it here
+        // on `ui.painter()` before the chip + editor.
+        //
+        // Animate opacity toward the caret-active target — half-second
+        // fade either direction so the chrome breathes in / out instead
+        // of popping; while in transit, request a fast repaint so it runs
+        // even when the PTY is idle. Lifted above the editor paint so the
+        // same value drives the backing and the border in one frame.
+        const CHROME_FADE_SECS: f32 = 0.5;
+        let target_opacity: f32 = if caret_active { 1.0 } else { 0.0 };
+        let dt = ctx.input(|i| i.stable_dt);
+        let step = (dt / CHROME_FADE_SECS).clamp(0.0, 1.0);
+        slot.ui.chrome_opacity = if (slot.ui.chrome_opacity - target_opacity).abs() <= step {
+            target_opacity
+        } else if slot.ui.chrome_opacity < target_opacity {
+            slot.ui.chrome_opacity + step
+        } else {
+            slot.ui.chrome_opacity - step
+        };
+        if slot.ui.chrome_opacity != target_opacity {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+        // Body width comes from the ui's CLIP rect, not its available /
+        // layout width: egui_tiles can hand the pane a layout rect wider
+        // than the pane and rely on the clip to keep paint inside it. Pad
+        // each side a few px so the border stroke doesn't sit ON the
+        // chip's left edge or fall off the pane's right edge (on the
+        // rightmost pane `pane_clip.right()` IS the window edge).
+        let pane_clip = ui.clip_rect();
+        const CHROME_LEFT_PAD: f32 = 4.0;
+        const CHROME_RIGHT_PAD: f32 = 6.0;
+        let chrome_body = egui::Rect::from_min_max(
+            egui::pos2(footer_origin.x - CHROME_LEFT_PAD, footer_origin.y),
+            egui::pos2(pane_clip.right() - CHROME_RIGHT_PAD, footer_origin.y + chip_h + editor_h),
+        );
+        let chrome_chip_rect = if has_prompt_cwd {
+            let body_w = (pane_clip.right() - footer_origin.x).max(0.0);
+            Some(egui::Rect::from_min_size(footer_origin, egui::vec2(body_w, chip_h)))
+        } else {
+            None
+        };
+        // Opaque backing for the command area — painted ALWAYS, not only
+        // when focused, so the prompt reads as a solid card and scrollback
+        // keeps its spacing above the chips whether or not this is the
+        // active pane. The border (glow) is what fades with focus; the
+        // backing is steady (full opacity).
+        crate::focused_chrome::paint_backing(
+            ui.painter(),
+            chrome_chip_rect,
+            chrome_body,
+            chrome_variant,
+            1.0,
+        );
+        // Clip the footer's own content (chip row + editor text) to the
+        // RIGHT edge of the opaque backing — i.e. flush with the border's
+        // inner edge — so a long cwd / branch chip or a long command
+        // reaches the rounded border and clips there, rather than spilling
+        // past it (or stopping short of it). Only the right edge is bounded
+        // (the border floats inside the pane's right edge); top / bottom
+        // stay open so editor descenders still clear the last row (see the
+        // `ui.painter()` note at the editor paint). Pass `None` for the
+        // chip rect so chip-only variants fall back to the body edge.
+        let content_right = crate::focused_chrome::backing_rect(chrome_variant, chrome_body, None)
+            .map_or(chrome_body.right(), |r| r.right());
+        let footer_content_clip = egui::Rect::from_min_max(
+            egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY),
+            egui::pos2(content_right, f32::INFINITY),
+        );
+
         if has_prompt_cwd
             && let Some(crate::block::Block::Prompt { header, .. }) = slot.session.blocks().last()
         {
@@ -2656,6 +2774,10 @@ pub fn render_pane(
             // otherwise allocates at the ui's left edge, leaving the
             // prompt chip hard-left while the editor / glow were inset.
             ui.horizontal(|ui| {
+                // Keep the chip row inside the bordered area (see
+                // `footer_content_clip`): a long path / branch is clipped
+                // at the border rather than spilling past it.
+                ui.set_clip_rect(footer_content_clip.intersect(ui.clip_rect()));
                 ui.add_space(LEFT_GUTTER);
                 let _ = render::paint_block_header(
                     ui,
@@ -2729,9 +2851,13 @@ pub fn render_pane(
             // (`p`, `g`, `y`, `q`) clear the rect's bottom edge
             // instead of being clipped off. The footer reserves
             // `FOOTER_DESCENDER_PAD` extra pixels below the last row
-            // for exactly this overflow.
+            // for exactly this overflow. Bound only the RIGHT edge to the
+            // border interior (`footer_content_clip`) so a long command
+            // clips at the border instead of bleeding past it, while the
+            // open top / bottom still let descenders through.
+            let editor_painter = ui.painter().with_clip_rect(footer_content_clip);
             render::paint_prompt_editor_at(
-                ui.painter(),
+                &editor_painter,
                 editor,
                 editor_rect.min,
                 cell_w,
@@ -2856,87 +2982,26 @@ pub fn render_pane(
             slot.ui.completion_pending = None;
         }
 
-        // Focused-editor chrome. Dispatched via the
-        // [`crate::focused_chrome::paint`] table so the second
-        // OS window (chrome picker) can swap the variant live.
-        // The chip bar + editor are wrapped as a single visual
-        // unit — the user asked for "include the chip bar."
+        // Focused-editor chrome BORDER. Dispatched via the
+        // [`crate::focused_chrome::paint`] table so the second OS window
+        // (chrome picker) can swap the variant live. Painted AFTER the
+        // chip + editor (and the opaque backing painted above) so the
+        // stroke lands on top. Geometry (`chrome_body` / `chrome_chip_rect`
+        // / opacity) was computed above — reused here so the border and
+        // its backing are always derived from the same rect.
         //
-        // Wraparound fix: use `ctx.layer_painter(layer_id)` to
-        // get a painter on the SAME layer (so the chrome paints
-        // on top of the chip + editor that landed there earlier)
-        // with `Rect::EVERYTHING` for the clip rect.
-        // `Painter::with_clip_rect` *intersects* with the existing
-        // clip rather than replacing it, so the previous
-        // `clone().with_clip_rect(viewport_rect)` didn't widen
-        // the pane's tight clip and three sides of the stroke got
-        // cut. Same trick the focused-tab underline uses
-        // (`behavior::paint_focused_tab_underline`).
-        // Animate the focused-editor chrome's opacity toward the
-        // caret-active target. Half-second fade either direction so
-        // the chrome breathes in/out instead of popping. While the
-        // value is in transit we request a fast repaint so the
-        // animation runs smoothly even if the PTY is idle.
-        const CHROME_FADE_SECS: f32 = 0.5;
-        let target_opacity: f32 = if caret_active { 1.0 } else { 0.0 };
-        let dt = ctx.input(|i| i.stable_dt);
-        let step = (dt / CHROME_FADE_SECS).clamp(0.0, 1.0);
-        slot.ui.chrome_opacity = if (slot.ui.chrome_opacity - target_opacity).abs() <= step {
-            target_opacity
-        } else if slot.ui.chrome_opacity < target_opacity {
-            slot.ui.chrome_opacity + step
-        } else {
-            slot.ui.chrome_opacity - step
-        };
-        if slot.ui.chrome_opacity != target_opacity {
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
-        }
-
+        // Wraparound fix: `ctx.layer_painter(layer_id)` gets a painter on
+        // the SAME layer with a clip rect widened a few px OUTSIDE the
+        // pane's horizontal bounds so the outer glow rings (which expand
+        // 5+ px) actually render instead of being cut at the pane edge.
+        // `Painter::with_clip_rect` *intersects* with the existing clip,
+        // so we hand it the widened rect directly. egui_tiles' gap_width
+        // is bumped to 16 px in `behavior.rs` so this 8 px overhang sits
+        // in the splitter gap and never bleeds into a neighbor pane; the
+        // vertical infinity keeps the top/bottom edges from being chopped
+        // by the footer's tight clip. Same trick the focused-tab
+        // underline uses (`behavior::paint_focused_tab_underline`).
         if slot.ui.chrome_opacity > 0.0 {
-            // Body width comes from the ui's CLIP rect, not its
-            // available-width / layout rect. egui_tiles can give
-            // the pane_ui a layout rect that's wider than the
-            // pane and rely on the clip_rect to keep paint inside
-            // the pane — which is exactly why the editor's text
-            // content clips correctly at the pane's right edge
-            // while a decoration drawn at `available_width`
-            // overshoots into the divider or off-screen.
-            let pane_clip = ui.clip_rect();
-            let body_w = (pane_clip.right() - footer_origin.x).max(0.0);
-            let chip_rect = if has_prompt_cwd {
-                Some(egui::Rect::from_min_size(footer_origin, egui::vec2(body_w, chip_h)))
-            } else {
-                None
-            };
-            // The chrome (glow / outline) wraps the chip+editor with a
-            // little pad on each side so its stroke doesn't sit ON the
-            // chip edge (left) or fall off the pane's right edge (right)
-            // — on the rightmost pane `pane_clip.right()` IS the window
-            // edge, so a flush right edge gets clipped. Both sides float
-            // a few px inside the pane.
-            const CHROME_LEFT_PAD: f32 = 4.0;
-            const CHROME_RIGHT_PAD: f32 = 6.0;
-            let combined = egui::Rect::from_min_max(
-                egui::pos2(footer_origin.x - CHROME_LEFT_PAD, footer_origin.y),
-                egui::pos2(
-                    pane_clip.right() - CHROME_RIGHT_PAD,
-                    footer_origin.y + chip_h + editor_h,
-                ),
-            );
-            // Chrome painter: layer-painter (so we're not clipped
-            // to the footer's tight vertical clip — variants paint
-            // a few px above + below the body, which `ui.painter()`
-            // would chop), but with a CLIP RECT that includes a few
-            // pixels OUTSIDE the pane's horizontal bounds so the
-            // chrome's outer L/R strokes (glow expands by 5+ px)
-            // actually render. Without this overhang, the side
-            // strokes are clipped exactly at the pane edge and only
-            // the top + bottom edges show. egui_tiles' gap_width is
-            // bumped to 16 px in `behavior.rs` so this 8 px overhang
-            // sits inside the splitter gap and never bleeds into a
-            // neighbor pane. The vertical infinity keeps the
-            // bottom/top edges intact (footer's natural clip would
-            // chop them).
             const CHROME_OUTER_OVERHANG: f32 = 8.0;
             let chrome_clip = egui::Rect::from_min_max(
                 egui::pos2(pane_clip.left() - CHROME_OUTER_OVERHANG, -f32::INFINITY),
@@ -2945,8 +3010,8 @@ pub fn render_pane(
             let painter = ctx.layer_painter(ui.layer_id()).with_clip_rect(chrome_clip);
             crate::focused_chrome::paint(
                 &painter,
-                chip_rect,
-                combined,
+                chrome_chip_rect,
+                chrome_body,
                 chrome_variant,
                 slot.ui.chrome_opacity,
             );
