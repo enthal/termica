@@ -157,14 +157,7 @@ impl<'a> Behavior<PaneId> for TabBehavior<'a> {
     }
 
     fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
-        // By default egui_tiles prunes Tabs containers with only one
-        // child, which silently removes our tab strip whenever there's
-        // exactly one pane. We want the tab strip to ALWAYS be visible
-        // (so the `[+]` button is reachable and the user has a clear
-        // affordance for tabs even from the empty state) — hence
-        // `all_panes_must_have_tabs = true`, which the docs say wins
-        // over `prune_single_child_tabs`.
-        egui_tiles::SimplificationOptions { all_panes_must_have_tabs: true, ..Default::default() }
+        simplification_options()
     }
 
     fn top_bar_right_ui(
@@ -255,6 +248,20 @@ impl<'a> Behavior<PaneId> for TabBehavior<'a> {
         }
         response
     }
+}
+
+/// The tree-simplification policy Termica drives egui_tiles with, in one
+/// place so the per-frame `tree.ui()` pass and the restore/save-time
+/// `tree.simplify(…)` prune (spec/08) agree exactly.
+///
+/// By default egui_tiles prunes Tabs containers with only one child,
+/// which silently removes our tab strip whenever there's exactly one
+/// pane. We want the tab strip to ALWAYS be visible (so the `[+]` button
+/// is reachable and the user has a clear affordance for tabs even from
+/// the empty state) — hence `all_panes_must_have_tabs = true`, which the
+/// docs say wins over `prune_single_child_tabs`.
+pub(crate) fn simplification_options() -> egui_tiles::SimplificationOptions {
+    egui_tiles::SimplificationOptions { all_panes_must_have_tabs: true, ..Default::default() }
 }
 
 /// Paint the blue underline that marks the app-wide focused tab.

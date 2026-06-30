@@ -34,8 +34,8 @@ The first pane's cwd at process startup is resolved by this fallback chain:
    - `<path>` is a directory → first pane's cwd is `<path>`.
    - `<path>` is a non-directory file → first pane's cwd is the file's parent directory.
    - `<path>` doesn't exist → fall through.
-2. **No positional arg, or step 1 fell through**: the cwd of the process that spawned `termica` (`std::env::current_dir()`).
-3. **`current_dir()` errored** (deleted directory, permissions): `$HOME` if set in the environment.
+2. **No positional arg, or step 1 fell through**: the cwd of the process that spawned `termica` (`std::env::current_dir()`) — **but only when it is a real, meaningful directory.** A bare `/` is treated as "knowing nothing": a GUI launch (Finder/Dock/`.dmg` via LaunchServices on macOS, or some Linux desktop launchers) gives the process a cwd of `/`, which is never what the user means. So `current_dir()` is honored here only when it is **not `/`**, *or* when stdin is a TTY (a deliberate `cd / && termica` from a terminal is honored). Otherwise fall through.
+3. **`current_dir()` errored, or was a non-TTY `/`**: `$HOME` if set in the environment.
 4. **`$HOME` unset**: `/`.
 
 `termica` accepts at most one positional argument. Subsequent positional args are an error and the process exits non-zero. Option arguments (`--pick-chrome`, etc.) are independent of the positional path slot.
