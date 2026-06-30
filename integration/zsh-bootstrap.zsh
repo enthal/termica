@@ -419,11 +419,26 @@ if [[ -n "$__termica_wrapper_zdotdir" && "$HISTFILE" == "$__termica_wrapper_zdot
 fi
 unset __termica_wrapper_zdotdir
 
+# 2c. Source the user's real .zprofile. Termica spawns zsh as a LOGIN
+#     shell (`zsh -i -l`) so `/etc/zprofile` runs `path_helper` (the macOS
+#     PATH builder reading `/etc/paths` + `/etc/paths.d/*`). But the ZDOTDIR
+#     redirect aims the per-user profile lookup at our wrapper dir, so zsh
+#     looked for `$ZDOTDIR/.zprofile` (absent) and skipped the user's — the
+#     same skip-and-recover dance as .zshenv / .zshrc. Vanilla login order
+#     sources .zprofile BEFORE .zshrc; we honour that. Without this the user
+#     loses every PATH entry set in .zprofile (`brew shellenv`, manual
+#     prepends, `~/.local/bin`).
+[[ -r "$__termica_user_zdotdir/.zprofile" ]] && source "$__termica_user_zdotdir/.zprofile"
+
 # 3. Source the user's real .zshrc. Same skip-and-recover dance:
 #    zsh would normally have sourced `$ZDOTDIR/.zshrc` automatically,
 #    but its ZDOTDIR pointed at our wrapper dir (and this IS that
 #    file). Source the user's instead.
 [[ -r "$__termica_user_zdotdir/.zshrc" ]] && source "$__termica_user_zdotdir/.zshrc"
+
+# 3b. Source the user's real .zlogin — sourced AFTER .zshrc in a vanilla
+#     login zsh, skipped here for the same ZDOTDIR-redirect reason.
+[[ -r "$__termica_user_zdotdir/.zlogin" ]] && source "$__termica_user_zdotdir/.zlogin"
 
 # 4. Reassert hooks after user config has had its chance. If any
 #    framework cleared `precmd_functions` or `preexec_functions`,

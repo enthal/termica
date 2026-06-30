@@ -120,8 +120,8 @@ The strict tests-first rule from [CLAUDE.md](../CLAUDE.md) applies to **the enti
 
 **Known gaps tracked for later:**
 
-- System-wide rc files (`/etc/zshrc`, `/etc/bashrc`) not sourced in v1.
-- Login-shell emulation (sourcing `.zprofile`, `.zlogin`) not in v1.
+- System-wide rc files: zsh reads `/etc/zshenv`, `/etc/zprofile`, `/etc/zshrc`, `/etc/zlogin` natively (no `--no_rcs`). bash's `/etc/profile` / `/etc/bashrc` are still not sourced under the `--rcfile` wrapper.
+- Login-shell emulation: ✅ done for **zsh** ([#197](https://github.com/enthal/termica/pull/197)) — spawned `zsh -i -l`, and the bootstrap recovers the user's `.zprofile` / `.zlogin` past the `ZDOTDIR` redirect, so PATH (`path_helper`, `brew shellenv`, `~/.local/bin`) matches a normal terminal. **bash and fish are still non-login**: bash's `--rcfile` is ignored by a login bash (it reads profile files, not `~/.bashrc`) and fish's `--no-config` spawn bypasses its config — both need separate work before login-only PATH edits survive there.
 - Nested shells (running `zsh` / `bash` / `fish` inside a Termica-managed shell) do not get integration in v1 — the nested shell is un-integrated; pane mode degrades naturally because no lifecycle messages arrive.
 - Remote integration (ssh, docker exec, kubectl exec) is post-MVP.
 
