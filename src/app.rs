@@ -207,6 +207,19 @@ pub struct TermicaApp {
     /// change**, not on quit (spec/08) — the quit flush is only a
     /// backstop, because the process can vanish with no teardown.
     layout_save_deadline: Option<f64>,
+    /// The OS window's last-sampled size + position (egui logical points),
+    /// captured each frame from the viewport. Persisted in the layout blob
+    /// so a relaunch reopens where the window was (spec/08); folded into
+    /// the layout fingerprint so a resize/move arms the same debounced
+    /// save. `None` until the first frame reports a viewport rect.
+    last_window_geometry: Option<crate::persist::layout::WindowGeometry>,
+    /// One-shot guard: the restored window has been clamped to fit the
+    /// current monitor. The saved geometry is applied by the
+    /// `ViewportBuilder` before the monitor size is known, so on the first
+    /// frame that reports a monitor we re-fit the window to it (a
+    /// workspace saved on a large display opens usably on a smaller one).
+    /// Set once and never re-fit, so the user can freely resize after.
+    window_restore_clamped: bool,
 }
 
 impl TermicaApp {
@@ -255,6 +268,8 @@ impl TermicaApp {
             requested_workspace_path: opts.requested_workspace_path,
             layout_fingerprint: 0,
             layout_save_deadline: None,
+            last_window_geometry: None,
+            window_restore_clamped: false,
         };
         app.bootstrap();
         // Scrollback gc runs AFTER restore, never concurrently. Both probe
@@ -353,10 +368,48 @@ impl TermicaApp {
     /// row: any unmapped (degraded) leaf is pruned first, so restore never
     /// sees an unmapped leaf of our own making and the blob round-trips
     /// self-consistently.
+    /// One-shot on launch: fit the restored window to the *current*
+    /// monitor (spec/08 "fit to the new screen"). The saved geometry was
+    /// applied by the `ViewportBuilder` before the monitor size was known,
+    /// so once egui reports a monitor we clamp the live window to it. Runs
+    /// at most once — afterward the user resizes freely. A window that
+    /// already fits is left exactly alone (no resize flash).
+    fn fit_restored_window_to_monitor(&mut self, ctx: &egui::Context) {
+        if self.window_restore_clamped {
+            return;
+        }
+        let geom = sample_window_geometry(ctx);
+        let monitor = ctx.input(|i| i.viewport().monitor_size);
+        // Wait until both the window rect and the monitor size are known.
+        let (Some(geom), Some(mon)) = (geom, monitor) else { return };
+        self.window_restore_clamped = true;
+        let fitted = geom.clamp_to_monitor(Some((mon.x, mon.y)));
+        if (fitted.inner_width - geom.inner_width).abs() >= 1.0
+            || (fitted.inner_height - geom.inner_height).abs() >= 1.0
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                fitted.inner_width,
+                fitted.inner_height,
+            )));
+        }
+        if (fitted.pos_x - geom.pos_x).abs() >= 1.0 || (fitted.pos_y - geom.pos_y).abs() >= 1.0 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                fitted.pos_x,
+                fitted.pos_y,
+            )));
+        }
+    }
+
     fn persist_layout_now(&self) {
         let Some(store) = self.history.as_ref() else { return };
         let db_pane_by_app = self.build_db_pane_by_app();
-        save_layout_self_consistent(store, &self.tree, db_pane_by_app, now_unix_ms());
+        save_layout_self_consistent(
+            store,
+            &self.tree,
+            db_pane_by_app,
+            self.last_window_geometry,
+            now_unix_ms(),
+        );
     }
 
     /// Quit backstop: persist the layout one final time and stamp every
@@ -836,6 +889,11 @@ impl eframe::App for TermicaApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
             self.native_dark_theme_applied = true;
         }
+
+        // One-shot on launch: fit the restored window to the current
+        // monitor once egui reports its size (spec/08). No-op if the
+        // window already fits or nothing was restored.
+        self.fit_restored_window_to_monitor(ctx);
 
         // Drain every pane up front so this frame decides the next
         // repaint cadence from actual activity. Drained panes also
@@ -1332,8 +1390,14 @@ impl eframe::App for TermicaApp {
         // even an untouched session is durable against a later kill —
         // exactly the on-quit-only failure this replaces.
         if !self.should_quit {
+            // Sample the OS window geometry this frame; folded into the
+            // fingerprint so a resize/move arms the same debounced layout
+            // save and is persisted for the next launch (spec/08).
+            if let Some(g) = sample_window_geometry(ctx) {
+                self.last_window_geometry = Some(g);
+            }
             let db_pane_by_app = self.build_db_pane_by_app();
-            let fp = layout_fingerprint(&self.tree, &db_pane_by_app);
+            let fp = layout_fingerprint(&self.tree, &db_pane_by_app, self.last_window_geometry);
             let now_s = ctx.input(|i| i.time);
             let fp_changed = fp != self.layout_fingerprint;
             if fp_changed {
@@ -1431,6 +1495,21 @@ fn init_history_store(
     Some((Arc::new(Mutex::new(store)), data_dir))
 }
 
+/// Pre-read the saved window geometry (size + position) *before* the
+/// window is built, so the `ViewportBuilder` can reopen it where it was
+/// (spec/08). A standalone, **replay-free** open of the same
+/// `termica.sqlite` the app re-opens normally in [`TermicaApp::new`] — a
+/// single quick `SELECT`, then dropped. `None` (no data dir, open failed,
+/// no saved layout, or a pre-geometry blob) → the window opens at its
+/// default size and the OS picks the position.
+pub fn read_saved_window_geometry() -> Option<crate::persist::layout::WindowGeometry> {
+    let dirs = directories::ProjectDirs::from("", "", crate::APP_STORAGE_NAME)?;
+    let path = dirs.data_dir().join("termica.sqlite");
+    let store = HistoryStore::open(&path).ok()?;
+    let blob = store.latest_layout().ok().flatten()?;
+    crate::persist::layout::SavedLayout::from_blob(&blob).ok()?.window_geometry
+}
+
 /// Walk the tile tree DFS, collecting `(PaneId, TileId)` for every
 /// leaf pane in tree order (left→right, top→bottom). Pure helper
 /// used by [`TermicaApp::cycle_pane_global`] to give a deterministic
@@ -1457,6 +1536,26 @@ fn collect_panes_in_tree_order(tree: &egui_tiles::Tree<PaneId>) -> Vec<(PaneId, 
     out
 }
 
+/// Sample the OS window's size + position from the egui viewport for this
+/// frame. `inner_rect` is the drawable area; `outer_rect` (title-bar
+/// inclusive) gives the on-screen position — fall back to `inner_rect`
+/// when the platform doesn't report an outer rect. `None` until the
+/// platform first reports a viewport rect (the very first frame), so the
+/// caller simply keeps the previous geometry until one arrives.
+fn sample_window_geometry(ctx: &egui::Context) -> Option<crate::persist::layout::WindowGeometry> {
+    ctx.input(|i| {
+        let vp = i.viewport();
+        let inner = vp.inner_rect?;
+        let outer = vp.outer_rect.unwrap_or(inner);
+        Some(crate::persist::layout::WindowGeometry {
+            inner_width: inner.width(),
+            inner_height: inner.height(),
+            pos_x: outer.min.x,
+            pos_y: outer.min.y,
+        })
+    })
+}
+
 /// A deterministic structural fingerprint of a window's layout: the tile
 /// **topology** (container kinds + ordered children + leaf `PaneId`s +
 /// each Tabs container's active child) plus the `db_pane_by_app` mapping.
@@ -1471,7 +1570,11 @@ fn collect_panes_in_tree_order(tree: &egui_tiles::Tree<PaneId>) -> Vec<(PaneId, 
 /// Walks from the root (not the tiles map), so it is independent of
 /// `TileId` allocation order — two trees with the same shape but
 /// different internal ids fingerprint equal.
-fn layout_fingerprint(tree: &Tree<PaneId>, db_pane_by_app: &HashMap<u64, i64>) -> u64 {
+fn layout_fingerprint(
+    tree: &Tree<PaneId>,
+    db_pane_by_app: &HashMap<u64, i64>,
+    window_geometry: Option<crate::persist::layout::WindowGeometry>,
+) -> u64 {
     use std::hash::{Hash, Hasher};
 
     fn hash_tile(
@@ -1515,6 +1618,20 @@ fn layout_fingerprint(tree: &Tree<PaneId>, db_pane_by_app: &HashMap<u64, i64>) -
     let mut pairs: Vec<(u64, i64)> = db_pane_by_app.iter().map(|(k, v)| (*k, *v)).collect();
     pairs.sort_unstable();
     pairs.hash(&mut h);
+    // Window geometry, quantized to whole points so sub-pixel jitter
+    // doesn't re-arm the save every frame. A real resize/move (≥1 pt)
+    // moves the fingerprint and arms the debounced write.
+    5u8.hash(&mut h);
+    match window_geometry {
+        Some(g) => {
+            6u8.hash(&mut h);
+            (g.inner_width.round() as i32).hash(&mut h);
+            (g.inner_height.round() as i32).hash(&mut h);
+            (g.pos_x.round() as i32).hash(&mut h);
+            (g.pos_y.round() as i32).hash(&mut h);
+        }
+        None => 7u8.hash(&mut h),
+    }
     h.finish()
 }
 
@@ -1617,6 +1734,7 @@ fn save_layout_self_consistent(
     store: &Mutex<HistoryStore>,
     tree: &Tree<PaneId>,
     db_pane_by_app: HashMap<u64, i64>,
+    window_geometry: Option<crate::persist::layout::WindowGeometry>,
     now_ms: i64,
 ) -> Option<HashSet<PaneId>> {
     if db_pane_by_app.is_empty() {
@@ -1632,7 +1750,9 @@ fn save_layout_self_consistent(
         .into_iter()
         .filter(|(app_id, _)| survivors.contains(&PaneId(*app_id)))
         .collect();
-    let blob = match (crate::persist::layout::SavedLayout { tree, db_pane_by_app }).to_blob() {
+    let blob = match (crate::persist::layout::SavedLayout { tree, db_pane_by_app, window_geometry })
+        .to_blob()
+    {
         Ok(b) => b,
         Err(e) => {
             eprintln!("termica: layout serialize failed: {e}");
@@ -2079,8 +2199,8 @@ mod tests {
         let (tree, _) = split_with_two_tab_containers();
         let map = full_map();
         assert_eq!(
-            layout_fingerprint(&tree, &map),
-            layout_fingerprint(&tree, &map),
+            layout_fingerprint(&tree, &map, None),
+            layout_fingerprint(&tree, &map, None),
             "same tree + map → same fingerprint"
         );
     }
@@ -2089,7 +2209,7 @@ mod tests {
     fn fingerprint_changes_when_a_pane_is_added_or_removed() {
         let (tree, _) = split_with_two_tab_containers();
         let map = full_map();
-        let base = layout_fingerprint(&tree, &map);
+        let base = layout_fingerprint(&tree, &map, None);
 
         // Remove a pane (close): different leaf set → different fp.
         let (mut tree2, pairs) = split_with_two_tab_containers();
@@ -2099,7 +2219,7 @@ mod tests {
         map2.remove(&3);
         assert_ne!(
             base,
-            layout_fingerprint(&tree2, &map2),
+            layout_fingerprint(&tree2, &map2, None),
             "removing a pane moves the fingerprint"
         );
     }
@@ -2108,7 +2228,7 @@ mod tests {
     fn fingerprint_changes_when_active_tab_switches() {
         let (mut tree, pairs) = split_with_two_tab_containers();
         let map = full_map();
-        let base = layout_fingerprint(&tree, &map);
+        let base = layout_fingerprint(&tree, &map, None);
         // Flip the left container's active tab from p1 to p2.
         let p2_tile = pairs.iter().find(|(p, _)| *p == PaneId(2)).unwrap().1;
         let parent = tree.tiles.parent_of(p2_tile).expect("p2 has a parent");
@@ -2120,7 +2240,7 @@ mod tests {
         }
         assert_ne!(
             base,
-            layout_fingerprint(&tree, &map),
+            layout_fingerprint(&tree, &map, None),
             "switching the active tab moves the fingerprint"
         );
     }
@@ -2131,13 +2251,13 @@ mod tests {
         // durable row triggers a save) but NOT cwd (persisted separately).
         let (tree, _) = split_with_two_tab_containers();
         let map = full_map();
-        let base = layout_fingerprint(&tree, &map);
+        let base = layout_fingerprint(&tree, &map, None);
 
         let mut remapped = map.clone();
         remapped.insert(3, 999); // pane 3 now maps to a different db row
         assert_ne!(
             base,
-            layout_fingerprint(&tree, &remapped),
+            layout_fingerprint(&tree, &remapped, None),
             "db mapping change moves the fingerprint"
         );
 
@@ -2146,9 +2266,39 @@ mod tests {
         // directories never triggers a layout write.
         assert_eq!(
             base,
-            layout_fingerprint(&tree, &map),
+            layout_fingerprint(&tree, &map, None),
             "identical inputs → identical fingerprint"
         );
+    }
+
+    #[test]
+    fn fingerprint_tracks_window_geometry_but_ignores_subpixel_jitter() {
+        use crate::persist::layout::WindowGeometry;
+        let (tree, _) = split_with_two_tab_containers();
+        let map = full_map();
+        let g =
+            WindowGeometry { inner_width: 1200.0, inner_height: 800.0, pos_x: 10.0, pos_y: 20.0 };
+        let base = layout_fingerprint(&tree, &map, Some(g));
+
+        // A real move (≥ 1 pt) moves the fingerprint → arms a save.
+        let moved = WindowGeometry { pos_x: 40.0, ..g };
+        assert_ne!(
+            base,
+            layout_fingerprint(&tree, &map, Some(moved)),
+            "a window move is persisted"
+        );
+
+        // Sub-point jitter (< 0.5 pt, rounds to the same whole point) does
+        // NOT move it — otherwise every frame of a HiDPI drag re-arms.
+        let jitter = WindowGeometry { pos_x: 10.3, inner_width: 1200.4, ..g };
+        assert_eq!(
+            base,
+            layout_fingerprint(&tree, &map, Some(jitter)),
+            "sub-point jitter is quantized away"
+        );
+
+        // Presence/absence of geometry is itself a change.
+        assert_ne!(base, layout_fingerprint(&tree, &map, None), "gaining/losing geometry counts");
     }
 
     // ---- debounce_decide: coalesce a burst into one save ----------
@@ -2270,7 +2420,7 @@ mod tests {
         // Build a self-consistent SavedLayout: map ONLY the survivors.
         let db_pane_by_app: HashMap<u64, i64> =
             survivors.iter().map(|p| (p.0, p.0 as i64 + 100)).collect();
-        let blob = SavedLayout { tree, db_pane_by_app }.to_blob().unwrap();
+        let blob = SavedLayout { tree, db_pane_by_app, window_geometry: None }.to_blob().unwrap();
         let back = SavedLayout::from_blob(&blob).unwrap();
         for p in back.pane_ids() {
             assert!(
@@ -2308,8 +2458,13 @@ mod tests {
         tree: Tree<PaneId>,
         map: HashMap<u64, i64>,
     ) {
-        let blob =
-            crate::persist::layout::SavedLayout { tree, db_pane_by_app: map }.to_blob().unwrap();
+        let blob = crate::persist::layout::SavedLayout {
+            tree,
+            db_pane_by_app: map,
+            window_geometry: None,
+        }
+        .to_blob()
+        .unwrap();
         store.lock().unwrap().save_layout(&blob, 1000).unwrap();
     }
 
@@ -2392,8 +2547,8 @@ mod tests {
         let (_tmp, _persist, store) = persistence();
         let (tree, _) = split_with_two_tab_containers(); // 5 panes
         let map: HashMap<u64, i64> = [(1u64, 101i64), (3, 103)].into_iter().collect();
-        let survivors =
-            save_layout_self_consistent(&store, &tree, map, 1000).expect("a layout was persisted");
+        let survivors = save_layout_self_consistent(&store, &tree, map, None, 1000)
+            .expect("a layout was persisted");
         assert_eq!(survivors, [PaneId(1), PaneId(3)].into_iter().collect());
 
         let blob = store
