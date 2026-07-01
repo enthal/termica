@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-06-30
+
+### Fixed
+
+- Spawn the managed zsh as a **login** shell (`zsh -i -l`) so `PATH` matches a normal terminal (Terminal.app / iTerm2): `/etc/zprofile` runs `path_helper`, and the bootstrap recovers the user's `~/.zprofile` / `~/.zlogin` past the `ZDOTDIR` redirect — restoring Homebrew, Go, `~/.local/bin`, and other login-only entries that a GUI-launched shell otherwise lost. bash and fish remain non-login for now ([#197](https://github.com/enthal/termica/pull/197)).
+
 ## [0.2.0] - 2026-06-30
 
 ### Added
@@ -19,5 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Restore **all** panes on restart (not just one) and stop a fresh pane opening at `/`: default a fresh pane's cwd to `$HOME`, persist layout on change rather than only on quit, and make restore resilient to a single bad pane ([#191](https://github.com/enthal/termica/pull/191)).
 - Opaque command-area card: backing fill, flush clip, headroom, and padded pinned header ([#194](https://github.com/enthal/termica/pull/194)).
 - Create the GitHub Release once per tag, not once per build-matrix job ([#188](https://github.com/enthal/termica/pull/188)).
+
+[0.2.1]: https://github.com/enthal/termica/compare/v0.2.0...v0.2.1
 
 [0.2.0]: https://github.com/enthal/termica/compare/v0.1.0...v0.2.0
