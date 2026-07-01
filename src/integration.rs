@@ -174,7 +174,15 @@ fn managed_spawn_for_inner(
             })?;
             env.push(("ZDOTDIR".into(), wrapper_str.to_string()));
             Ok(ManagedSpawn {
-                argv: vec!["zsh".into(), "-i".into()],
+                // `-l` (login) so zsh sources `/etc/zprofile` — on macOS that
+                // runs `path_helper`, which rebuilds PATH from `/etc/paths` +
+                // `/etc/paths.d/*` (Homebrew, Go, cryptexes). A GUI-launched
+                // Termica otherwise inherits launchd's bare PATH and silently
+                // loses those entries vs. a normal terminal. The ZDOTDIR
+                // redirect means zsh skips the user's `$ZDOTDIR/.zprofile` /
+                // `.zlogin` (it finds the wrapper's, which are absent); the
+                // bootstrap sources the real ones itself, same as `.zshrc`.
+                argv: vec!["zsh".into(), "-i".into(), "-l".into()],
                 pty_bootstrap: None,
                 env,
                 wrapper_dir: Some(wrapper),
@@ -254,8 +262,11 @@ fn new_wrapper_dir(prefix: &str) -> io::Result<TempDir> {
 /// The pane will stay in `Bootstrapping` until the timeout, then
 /// transition to `Degraded`.
 fn unmanaged_spawn(shell: ShellSpec, session_id: &str) -> ManagedSpawn {
+    // `-l` (login) on zsh for PATH parity with a normal terminal (see the
+    // managed branch). No ZDOTDIR redirect here, so a plain login zsh sources
+    // `/etc/zprofile` + `~/.zprofile` + `~/.zlogin` natively.
     let argv = match shell {
-        ShellSpec::Zsh => vec!["zsh".into(), "-i".into()],
+        ShellSpec::Zsh => vec!["zsh".into(), "-i".into(), "-l".into()],
         ShellSpec::Bash => vec!["bash".into(), "-i".into()],
         ShellSpec::Fish => vec!["fish".into(), "-i".into()],
     };
@@ -327,7 +338,11 @@ mod tests {
     #[test]
     fn managed_spawn_zsh_uses_zdotdir_wrapper() {
         let spec = managed_spawn_for_inner(ShellSpec::Zsh, "session-id", false).expect("spawn");
-        assert_eq!(spec.argv, vec!["zsh".to_string(), "-i".into()]);
+        // `-l` (login) so zsh sources `/etc/zprofile` → `path_helper` and the
+        // bootstrap recovers the user's `~/.zprofile`/`~/.zlogin` (spec/03,
+        // "Login shell"). Without it, GUI-launched Termica inherits launchd's
+        // bare PATH and loses Homebrew/Go/`~/.local/bin`/path_helper entries.
+        assert_eq!(spec.argv, vec!["zsh".to_string(), "-i".into(), "-l".into()]);
         // ZDOTDIR redirect; no PTY-write needed.
         assert!(spec.pty_bootstrap.is_none());
         let env_keys: Vec<&str> = spec.env.iter().map(|(k, _)| k.as_str()).collect();
@@ -368,7 +383,10 @@ mod tests {
     #[test]
     fn opt_out_uses_unmanaged_spawn() {
         let spec = managed_spawn_for_inner(ShellSpec::Zsh, "x", true).expect("spawn");
-        assert_eq!(spec.argv, vec!["zsh", "-i"]);
+        // Even with integration off, a login shell so PATH matches a normal
+        // terminal. No ZDOTDIR redirect here, so a plain login zsh sources
+        // `/etc/zprofile` + `~/.zprofile` natively — no bootstrap needed.
+        assert_eq!(spec.argv, vec!["zsh", "-i", "-l"]);
         assert!(spec.pty_bootstrap.is_none());
     }
 

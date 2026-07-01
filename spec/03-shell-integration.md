@@ -192,14 +192,20 @@ Procedure:
    (e.g. ~/Library/Application Support/Termica/zsh-wrapper/).
    Write Termica's bootstrap as `.zshrc` and an empty `.zshenv`.
 
-2. Spawn `zsh -i` with `ZDOTDIR=<wrapper-dir>` in the child env.
-   The pane enters Bootstrapping (spec/05): display suppressed,
-   user keystrokes dropped.
+2. Spawn `zsh -i -l` (interactive **login**) with `ZDOTDIR=<wrapper-dir>`
+   in the child env. The pane enters Bootstrapping (spec/05): display
+   suppressed, user keystrokes dropped.
 
-3. zsh follows its normal startup:
-     - Reads /etc/zshenv (system-wide; out of v1 scope, see below).
+3. zsh follows its normal login-interactive startup:
+     - Reads /etc/zshenv (system-wide).
      - Reads $ZDOTDIR/.zshenv → our empty file → no-op.
+     - For login: reads /etc/zprofile (on macOS, runs `path_helper`).
+     - For login: reads $ZDOTDIR/.zprofile → absent in wrapper → no-op
+       (the user's real one is recovered by our wrapper, step 4c).
+     - Reads /etc/zshrc (on macOS, pins HISTFILE — repaired in step 4f).
      - For interactive: reads $ZDOTDIR/.zshrc → our wrapper.
+     - For login: reads /etc/zlogin, then $ZDOTDIR/.zlogin → absent →
+       no-op (the user's real one is recovered by our wrapper, step 4h).
 
 4. Our wrapper .zshrc:
      a. Sets a TERMICA_BOOTSTRAPPED guard against double-load.
@@ -222,8 +228,13 @@ Procedure:
         touched. If HISTFILE points inside the remembered wrapper ZDOTDIR,
         it's rebased onto the real `${ZDOTDIR:-$HOME}`. The user's own
         `.zshrc` (next step) can still override it.
-     g. Sources `$ZDOTDIR/.zshrc` if it exists (similarly skipped by
-        zsh because of our ZDOTDIR override).
+     g. Sources `${ZDOTDIR:-$HOME}/.zprofile` if it exists, then (next)
+        `.zshrc`, then `.zlogin` — login order. zsh skipped all three
+        because the ZDOTDIR override aimed the lookups at our wrapper dir
+        (which has none of them). `path_helper`'s system PATH came from
+        `/etc/zprofile` at step 3; this recovers the user's *own* profile
+        PATH edits (`brew shellenv`, `~/.local/bin`) that would otherwise
+        be lost — a GUI-launched shell starts from launchd's bare PATH.
      h. Defines preexec / precmd hook functions and calls
         `termica_ensure_hooks` — idempotent reassertion after any
         prompt framework (oh-my-zsh, p10k, etc.) has had its say.
@@ -243,9 +254,9 @@ The bootstrap is a regular sourced file — comments work, multi-line constructs
 - Non-interactive children of our managed shell (`zsh -c '…'` from a tool or agent) source `~/.zshenv` automatically via zsh's own startup. We do not touch this; zsh handles it.
 - `.zshrc` is sourced only for our interactive shell. Agent / tool children get `.zshenv` but not `.zshrc`, exactly as on a stock zsh install.
 
-**System files.** `/etc/zshenv` and `/etc/zshrc` are NOT sourced by the bootstrap in v1. They are normally read by zsh as part of startup but `--no_rcs` skips them. On macOS, `/etc/zshrc` runs `path_helper` and sets some default behaviour; this is a known gap for v1 and tracked in [10](10-roadmap.md). Users who need them can opt into a later compatibility flag. The most common reason `/etc/zshrc` matters — Apple's `TERM_PROGRAM=Apple_Terminal` gating — is irrelevant to us because we set `TERM_PROGRAM=Termica`.
+**System files.** We do **not** use `--no_rcs`; the ZDOTDIR redirect drives integration instead. So zsh reads the system files normally as part of its own startup: `/etc/zshenv`, `/etc/zprofile` (login — runs `path_helper` on macOS, the source of the base PATH), `/etc/zshrc` (pins HISTFILE — repaired in the bootstrap), and `/etc/zlogin`. Apple's `TERM_PROGRAM=Apple_Terminal` gating in `/etc/zshrc` is irrelevant to us because we set `TERM_PROGRAM=Termica`.
 
-**Login shell.** v1 emulates interactive **non-login** zsh. Login-shell emulation (sourcing `.zprofile`, `.zlogin`, `.zlogout`) is a later compatibility mode.
+**Login shell.** Termica's managed zsh is an interactive **login** shell (`zsh -i -l`), matching how Terminal.app and iTerm2 launch zsh — so PATH and other login-only setup are identical to a normal terminal. The system login files run natively; the user's own `~/.zprofile` and `~/.zlogin` are recovered by the bootstrap (the ZDOTDIR redirect hides them from zsh's per-user lookup, exactly as for `~/.zshrc`), sourced in vanilla login order: `.zshenv` → `.zprofile` → `.zshrc` → `.zlogin`. `.zlogout` is not run (Termica tears the PTY down without a clean logout; a no-op for PATH/env). **bash and fish remain non-login** for now: bash's `--rcfile` integration is ignored by a login bash (which reads profile files, not `~/.bashrc`), and fish's `--no-config` spawn bypasses its config entirely — both need separate work, tracked in [10](10-roadmap.md), so on those shells login-only PATH edits are still missed.
 
 ### bash — managed startup via `--rcfile`
 
@@ -325,7 +336,7 @@ If `integration_ready` does not arrive within 3 seconds of shell spawn:
 
 `integration_error` (emitted by the bootstrap itself on a detected problem) transitions to `Degraded` immediately, with the error reason in the banner.
 
-`TERMICA_NO_SHELL_INTEGRATION=1` skips the bootstrap entirely: the shell launches with normal rc loading (no `--no_rcs` / `--norc` / `--no-config`), the pane goes straight to `RawTerminal`, and integration is permanently unavailable for that pane. Provided as an escape hatch for debugging or for users whose rc files are too unusual to manage.
+`TERMICA_NO_SHELL_INTEGRATION=1` skips the bootstrap entirely: the shell launches with normal rc loading (no `--no_rcs` / `--norc` / `--no-config`), the pane goes straight to `RawTerminal`, and integration is permanently unavailable for that pane. zsh still launches as a login shell (`zsh -i -l`) for PATH parity with a normal terminal — and with no `ZDOTDIR` redirect here, a plain login zsh sources `/etc/zprofile` + `~/.zprofile` + `~/.zlogin` natively, no bootstrap recovery needed. Provided as an escape hatch for debugging or for users whose rc files are too unusual to manage.
 
 ### Naming and namespacing
 
