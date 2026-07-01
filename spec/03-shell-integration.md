@@ -336,7 +336,7 @@ If `integration_ready` does not arrive within 3 seconds of shell spawn:
 
 `integration_error` (emitted by the bootstrap itself on a detected problem) transitions to `Degraded` immediately, with the error reason in the banner.
 
-`TERMICA_NO_SHELL_INTEGRATION=1` skips the bootstrap entirely: the shell launches with normal rc loading (no `--no_rcs` / `--norc` / `--no-config`), the pane goes straight to `RawTerminal`, and integration is permanently unavailable for that pane. Provided as an escape hatch for debugging or for users whose rc files are too unusual to manage.
+`TERMICA_NO_SHELL_INTEGRATION=1` skips the bootstrap entirely: the shell launches with normal rc loading (no `--no_rcs` / `--norc` / `--no-config`), the pane goes straight to `RawTerminal`, and integration is permanently unavailable for that pane. zsh still launches as a login shell (`zsh -i -l`) for PATH parity with a normal terminal — and with no `ZDOTDIR` redirect here, a plain login zsh sources `/etc/zprofile` + `~/.zprofile` + `~/.zlogin` natively, no bootstrap recovery needed. Provided as an escape hatch for debugging or for users whose rc files are too unusual to manage.
 
 ### Naming and namespacing
 
